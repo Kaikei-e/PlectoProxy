@@ -1,0 +1,28 @@
+// Unit test for a Node tooling module or a JS/TS filter's pure logic.
+// Runner: Vitest (`npx vitest run`) or node:test. No DOM / no Svelte — Plecto has no frontend.
+
+import { describe, expect, test, vi } from "vitest";
+// import { {{functionName}} } from "./{{module}}.js";
+
+describe("{{ModuleName}}", () => {
+  test("success: returns the expected decision/value", () => {
+    // const got = {{functionName}}(/* valid input */);
+    // expect(got).toEqual({ tag: "continue" });
+  });
+
+  test("untrusted input is handled, never throws unexpectedly", () => {
+    // const got = () => {{functionName}}(/* malformed input */);
+    // expect(got).not.toThrow();                 // or assert it returns a short-circuit decision
+  });
+
+  test("edge: empty / max-size / boundary", () => {
+    // const got = {{functionName}}(/* boundary input */);
+    // expect(got).toMatchObject({ tag: "modified" });
+  });
+
+  test("host capability is invoked via the injected import only", () => {
+    const hostKv = { get: vi.fn(), set: vi.fn() };
+    // {{functionName}}(input, { kv: hostKv });
+    // expect(hostKv.get).toHaveBeenCalledWith("rate:" + key);
+  });
+});

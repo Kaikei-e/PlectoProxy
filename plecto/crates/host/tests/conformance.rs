@@ -19,14 +19,14 @@ fn component_bytes() -> Vec<u8> {
 #[test]
 fn component_satisfies_plecto_filter_world() {
     let host = Host::new().unwrap();
-    host.load(&component_bytes())
+    host.load("filter-hello", &component_bytes())
         .expect("filter-hello must satisfy plecto:filter@0.1.0 (imports/exports resolve)");
 }
 
 #[test]
 fn response_hook_is_honoured() {
     let host = Host::new().unwrap();
-    let filter = host.load(&component_bytes()).unwrap();
+    let filter = host.load("filter-hello", &component_bytes()).unwrap();
 
     let resp = HttpResponse {
         status: 200,

@@ -27,7 +27,7 @@ fn request(headers: &[(&str, &str)]) -> HttpRequest {
 #[test]
 fn continues_when_request_is_not_blocked() {
     let host = Host::new().unwrap();
-    let filter = host.load(&component_bytes()).unwrap();
+    let filter = host.load("filter-hello", &component_bytes()).unwrap();
 
     let (decision, logs) = filter.on_request(&request(&[])).unwrap();
 
@@ -42,7 +42,7 @@ fn continues_when_request_is_not_blocked() {
 #[test]
 fn short_circuits_when_block_header_present() {
     let host = Host::new().unwrap();
-    let filter = host.load(&component_bytes()).unwrap();
+    let filter = host.load("filter-hello", &component_bytes()).unwrap();
 
     let (decision, _logs) = filter
         .on_request(&request(&[("x-plecto-block", "1")]))

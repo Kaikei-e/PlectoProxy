@@ -16,3 +16,12 @@ repository = "https://github.com/Kaikei-e/Plecto"
 [workspace.dependencies]
 wasmtime = "45.0.2"
 anyhow = "1"
+# redb: embedded transactional KV — durable host-state backend (ADR 000004).
+redb = "4.1"
+# parking_lot: non-poisoning locks. A panicking filter thread must not cascade a
+# poisoned lock across every later request (ADR 000011). Sync today; redb's blocking
+# story moves behind a pool only when wasmtime 46 makes host calls async.
+parking_lot = "0.12"
+# tracing: host-internal diagnostics (never println!, bp-rust). Distinct from the
+# host-log capability, which is the filter-facing log surface.
+tracing = "0.1"

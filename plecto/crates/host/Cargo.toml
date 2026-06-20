@@ -8,8 +8,15 @@ repository.workspace = true
 [dependencies]
 wasmtime = { workspace = true }
 anyhow = { workspace = true }
+redb = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
 
 # build.rs builds the filter-hello guest (wasm32-unknown-unknown) and wraps the
 # core module into a Component Model component, hermetically (no external CLI).
 [build-dependencies]
 wit-component = "0.252"
+
+[dev-dependencies]
+# unique on-disk paths for the redb backend's unit tests
+tempfile = "3"

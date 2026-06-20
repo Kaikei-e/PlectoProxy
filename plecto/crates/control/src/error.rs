@@ -9,6 +9,17 @@ pub enum ControlError {
     #[error("manifest parse error: {0}")]
     ManifestParse(#[from] toml::de::Error),
 
+    /// The manifest could not be canonicalised for content-hashing. Serialising our own
+    /// derived types is infallible in practice; a typed variant keeps `content_hash`
+    /// panic-free (bp-rust: no `expect` outside binary entry points).
+    #[error("manifest serialisation failed: {0}")]
+    ManifestSerialize(#[from] serde_json::Error),
+
+    /// `reload_from_disk` was called on a `Control` built from an in-memory manifest (no
+    /// backing path). Construct with `from_manifest_path` / `load_at` to enable disk reload.
+    #[error("control plane has no manifest path on disk to reload from")]
+    NoManifestPath,
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 

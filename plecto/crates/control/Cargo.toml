@@ -22,6 +22,12 @@ arc-swap = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 oci-spec = { workspace = true }
+# tracing: control-plane diagnostics for the reload loop (bp-rust: never println!).
+tracing = { workspace = true }
+# signal-hook: pure-Rust, no-tokio SIGHUP receiver behind the `ReloadSource` seam. SIGHUP is
+# the operator's explicit "push a new static manifest" trigger (ADR 000008: static config, no
+# xDS dynamic push). The trait keeps the loop fake-testable; this is the thin unix adapter.
+signal-hook = "0.3"
 
 [dev-dependencies]
 # unique temp dirs for OCI-layout fixtures and trusted-key PEM files

@@ -1,0 +1,155 @@
+//! plecto-control — the control plane (ADR 000007 / 000008).
+//!
+//! A single declarative TOML manifest pins filters by OCI digest and declares one chain. An
+//! `ArtifactStore` resolves each filter from a local, offline OCI image-layout (remote
+//! registry fetch via `wkg` is an out-of-band operator step, kept out of the runtime), the
+//! `Host` loads it through the ADR 000006 provenance gate, and a chain dispatcher drives a
+//! request through the loaded filters. `reload` rebuilds the set and swaps it **atomically**
+//! (ArcSwap): new requests see the new set, in-flight holders keep the old one until it
+//! drops. Single-node-first (ADR 000008).
+//!
+//! The trust policy lives on the `Host` and is fixed at construction; changing trust roots
+//! requires a new `Control`. `reload` swaps only the filter set + chain (same `Host`, same
+//! epoch ticker), so a runaway filter stays bounded across reloads.
+
+mod artifact;
+mod chain;
+mod error;
+mod manifest;
+pub mod oci;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use plecto_host::{LoadedFilter, SignedArtifact};
+
+pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
+pub use chain::ChainOutcome;
+pub use error::ControlError;
+pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Trust};
+
+// Re-export the host surface a caller drives the control plane with, so they need not depend
+// on `plecto-host` directly for the common path.
+pub use plecto_host::{Host, HttpRequest, HttpResponse, TrustPolicy};
+
+/// The atomically-swappable active configuration: the loaded filters and the chain order.
+/// Held behind an `ArcSwap`; never mutated in place — `reload` replaces it wholesale.
+pub(crate) struct ActiveConfig {
+    pub(crate) filters: HashMap<String, Arc<LoadedFilter>>,
+    pub(crate) chain: Vec<String>,
+}
+
+/// The control plane: owns the `Host` (and thus the trust policy + epoch ticker) and the
+/// artifact store, and holds the active filter set behind an `ArcSwap` for lock-free reads
+/// and atomic reload.
+pub struct Control {
+    host: Host,
+    store: Box<dyn ArtifactStore>,
+    active: ArcSwap<ActiveConfig>,
+}
+
+impl Control {
+    /// Build a control plane entirely from a manifest and a base directory — the ops
+    /// entrypoint. Reads the trusted-key PEMs (ADR 000006), constructs the `Host`, and
+    /// resolves filters from offline OCI image-layouts under `base_dir` (ADR 000007). Every
+    /// path in the manifest (`trust.keys`, each filter `source`) is resolved relative to
+    /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
+    pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
+        let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
+        for key_path in &manifest.trust.keys {
+            pems.push(std::fs::read(base_dir.join(key_path))?);
+        }
+        let trust =
+            TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
+        let host = Host::new(trust).map_err(|e| ControlError::HostInit(e.to_string()))?;
+        let store = oci::OciLayoutStore::new(base_dir);
+        Self::load(host, manifest, Box::new(store))
+    }
+
+    /// Build from a pre-constructed `Host` (carrying its `TrustPolicy`) and an artifact store
+    /// — the testable core. Each manifest filter is resolved through `store` (digest pin),
+    /// loaded through the host's ADR 000006 gate (signature + SBOM), and the chain order is
+    /// validated against the loaded set. Any failure aborts the build (nothing is loaded
+    /// half-way into a live set).
+    pub fn load(
+        host: Host,
+        manifest: &Manifest,
+        store: Box<dyn ArtifactStore>,
+    ) -> Result<Self, ControlError> {
+        let active = build_active(&host, manifest, store.as_ref())?;
+        Ok(Self {
+            host,
+            store,
+            active: ArcSwap::from_pointee(active),
+        })
+    }
+
+    /// Atomically swap to a new manifest's filter set + chain (ADR 000007: build the new set
+    /// fully, then switch in one store; the old set is drained as its `Arc` refs drop). If any
+    /// filter fails to resolve / verify / load, the swap does **not** happen and the current
+    /// set stays live — reload is all-or-nothing. The trust policy is fixed at construction.
+    pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
+        let active = build_active(&self.host, manifest, self.store.as_ref())?;
+        self.active.store(Arc::new(active));
+        Ok(())
+    }
+
+    /// Drive a request through the chain. Returns whether to forward the (possibly edited)
+    /// request upstream, or to respond now (a filter short-circuited, or the chain failed
+    /// closed on a trap / deadline).
+    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
+        chain::dispatch_request(&self.active.load(), request)
+    }
+
+    /// Drive a response back through the chain in reverse, applying response edits. A trapped
+    /// filter yields a fail-closed 5xx.
+    pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
+        chain::dispatch_response(&self.active.load(), response)
+    }
+
+    /// The ids currently loaded (for diagnostics / tests). Order is unspecified.
+    pub fn loaded_ids(&self) -> Vec<String> {
+        self.active.load().filters.keys().cloned().collect()
+    }
+}
+
+/// Resolve + verify + load every manifest filter into a fresh `ActiveConfig`. Pure w.r.t. the
+/// live set: it touches nothing until it fully succeeds, so a failed `reload` leaves the
+/// running set untouched.
+fn build_active(
+    host: &Host,
+    manifest: &Manifest,
+    store: &dyn ArtifactStore,
+) -> Result<ActiveConfig, ControlError> {
+    let mut filters: HashMap<String, Arc<LoadedFilter>> = HashMap::new();
+    for entry in &manifest.filters {
+        if filters.contains_key(&entry.id) {
+            return Err(ControlError::DuplicateFilterId(entry.id.clone()));
+        }
+        let artifact = store.resolve(&entry.source, &entry.digest)?;
+        let signed = SignedArtifact {
+            component_bytes: &artifact.component,
+            component_signature: &artifact.component_signature,
+            sbom: &artifact.sbom,
+            sbom_signature: &artifact.sbom_signature,
+        };
+        let loaded = host
+            .load(&entry.id, &signed, entry.load_options())
+            .map_err(|err| ControlError::Load {
+                id: entry.id.clone(),
+                err,
+            })?;
+        filters.insert(entry.id.clone(), Arc::new(loaded));
+    }
+    for id in &manifest.chain.filters {
+        if !filters.contains_key(id) {
+            return Err(ControlError::UnknownChainFilter(id.clone()));
+        }
+    }
+    Ok(ActiveConfig {
+        filters,
+        chain: manifest.chain.filters.clone(),
+    })
+}

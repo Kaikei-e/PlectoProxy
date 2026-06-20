@@ -789,6 +789,13 @@ pub mod test_support {
             TrustPolicy::from_pem_keys([self.public_key_pem.as_bytes()])
         }
     }
+
+    /// The compiled `filter-hello` component bytes — the shared conformance fixture, built by
+    /// this crate's `build.rs`. Exposed so dependent crates (e.g. `plecto-control`) can load a
+    /// real `plecto:filter` component in their own tests.
+    pub fn filter_hello_component() -> Vec<u8> {
+        std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
+    }
 }
 
 #[cfg(test)]

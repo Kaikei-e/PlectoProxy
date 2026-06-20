@@ -4,7 +4,7 @@
 # wasm32-wasip2 (see crates/host/build.rs).
 [workspace]
 resolver = "3"
-members = ["crates/host"]
+members = ["crates/host", "crates/control"]
 exclude = ["crates/filter-hello"]
 
 [workspace.package]
@@ -31,3 +31,21 @@ tracing = "0.1"
 # `sign-blob` over the component/SBOM bytes; the registry fetch + base64 decode is the
 # ADR 000007 / wkg boundary, kept out of the host.
 sigstore = { version = "0.14.0", default-features = false }
+
+# --- plecto-control (ADR 000007 / 000008): declarative manifest, OCI artifact load,
+# --- chain dispatch, atomic hot-reload. ---
+# thiserror: typed domain errors in the control library layer (bp-rust).
+thiserror = "2"
+# serde + toml: the declarative manifest (ADR 000008 static config). TOML mirrors Cargo.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# serde_json: serialize the OCI image-manifest blob to bytes we digest + write (ADR 000007).
+serde_json = "1"
+# arc-swap: lock-free atomic swap of the active filter set on reload (ADR 000007).
+arc-swap = "1"
+# sha2 + hex: OCI content-digest pinning (sha256 over blob bytes), pure-Rust / offline.
+sha2 = "0.10"
+hex = "0.4"
+# oci-spec: spec-correct OCI image-layout types; we own the std::fs layout + sha256 verify
+# (offline local artifact, no registry/tokio/openssl — ADR 000007 boundary with wkg).
+oci-spec = { version = "0.10", default-features = false, features = ["image"] }

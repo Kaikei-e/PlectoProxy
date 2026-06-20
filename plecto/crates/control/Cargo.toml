@@ -1,0 +1,28 @@
+[package]
+name = "plecto-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# plecto-control — the control plane (ADR 000007 / 000008): a single declarative TOML
+# manifest pins filters by OCI digest, an offline OCI image-layout store resolves them,
+# the host loads them (ADR 000006 provenance), a chain dispatcher drives a request through
+# them, and reload swaps the active set atomically. Single-node-first; remote registry fetch
+# (wkg) is an out-of-band operator step, not embedded here.
+
+[dependencies]
+plecto-host = { path = "../host" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+arc-swap = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+oci-spec = { workspace = true }
+
+[dev-dependencies]
+# unique temp dirs for OCI-layout fixtures and trusted-key PEM files
+tempfile = "3"

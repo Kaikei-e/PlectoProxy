@@ -26,7 +26,7 @@ wit_bindgen::generate!({
 use crate::plecto::filter::host_counter;
 use crate::plecto::filter::host_log;
 use crate::plecto::filter::host_ratelimit::{self, Bucket};
-use crate::plecto::filter::types::Header;
+use crate::plecto::filter::types::{Header, RequestEdit, ResponseEdit};
 
 struct FilterHello;
 
@@ -75,6 +75,18 @@ impl Guest for FilterHello {
             core::hint::black_box(&big);
         }
 
+        // Ask the host to rewrite the request and continue (chain-dispatch edit application,
+        // ADR 000007). The next filter / upstream sees the added header.
+        if has_header(&req, "x-plecto-addheader") {
+            return RequestDecision::Modified(RequestEdit {
+                set_headers: vec![Header {
+                    name: "x-plecto-added".to_string(),
+                    value: "1".to_string(),
+                }],
+                remove_headers: vec![],
+            });
+        }
+
         if has_header(&req, "x-plecto-ratelimit") {
             let outcome = host_ratelimit::try_acquire(
                 "default",
@@ -111,7 +123,23 @@ impl Guest for FilterHello {
         }
     }
 
-    fn on_response(_resp: HttpResponse) -> ResponseDecision {
+    fn on_response(resp: HttpResponse) -> ResponseDecision {
+        // Opt-in response rewrite (gated on a header so default responses still `continue`):
+        // exercises the response-side chain dispatch + edit application (ADR 000007).
+        if resp
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("x-plecto-respedit"))
+        {
+            return ResponseDecision::Modified(ResponseEdit {
+                set_status: None,
+                set_headers: vec![Header {
+                    name: "x-plecto-respadded".to_string(),
+                    value: "1".to_string(),
+                }],
+                remove_headers: vec![],
+            });
+        }
         ResponseDecision::Continue
     }
 }

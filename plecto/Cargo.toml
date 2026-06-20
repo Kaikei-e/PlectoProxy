@@ -1,12 +1,16 @@
-[package]
-name = "plecto"
+# Plecto workspace — the native-Rust half (fast path / wasmtime host).
+# The wasm32-wasip2 guest (crates/filter-hello) is EXCLUDED so `cargo test --all`
+# never tries to build it for the host target; it is built separately for
+# wasm32-wasip2 (see crates/host/build.rs).
+[workspace]
+resolver = "3"
+members = ["crates/host"]
+exclude = ["crates/filter-hello"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
-wasm-bindgen = "0.2.125"
-console_error_panic_hook = "0.1.7"
+[workspace.dependencies]
 wasmtime = "45.0.2"
+anyhow = "1"

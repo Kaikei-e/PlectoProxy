@@ -1,0 +1,100 @@
+// plecto:filter — the typed contract between the native fast path (host) and
+// WASM filters (extension plane). See ADR 000001 / 000002.
+//
+// v0.1.0 scope (ADR 000010): sync, header-only, Plecto's OWN http types.
+// stream<u8> bodies, async funcs, and wasi:http type reuse arrive in a later
+// increment, once wasmtime 46 ships Component Model async by default
+// (ADR 000003 / 000005). Until then this world is buildable+runnable on the
+// stable wasmtime 45 toolchain with no experimental flags.
+package plecto:filter@0.1.0;
+
+interface types {
+    // A single HTTP header field.
+    record header {
+        name: string,
+        value: string,
+    }
+
+    // The request as seen by a filter. Header-only in v0.1.0 (no body).
+    record http-request {
+        method: string,
+        // path including query, e.g. "/api?x=1"
+        path: string,
+        authority: string,
+        scheme: string,
+        headers: list<header>,
+    }
+
+    // A response a filter synthesises when it short-circuits the chain.
+    record http-response {
+        status: u16,
+        headers: list<header>,
+        body: list<u8>,
+    }
+
+    // A rewrite a filter asks the host to apply to the request before continuing.
+    record request-edit {
+        set-headers: list<header>,
+        remove-headers: list<string>,
+    }
+
+    // A rewrite a filter asks the host to apply to the response before continuing.
+    record response-edit {
+        set-status: option<u16>,
+        set-headers: list<header>,
+        remove-headers: list<string>,
+    }
+
+    // The typed outcome of a request-side filter (Tenet 3). Never a bare flag.
+    variant request-decision {
+        // pass unchanged to the next filter
+        %continue,
+        // apply the edit, then continue
+        modified(request-edit),
+        // stop the chain and synthesise this response now (don't reach upstream)
+        short-circuit(http-response),
+    }
+
+    // The typed outcome of a response-side filter.
+    variant response-decision {
+        %continue,
+        modified(response-edit),
+    }
+}
+
+// --- host-API: deny-by-default capabilities (ADR 000006). One capability per
+// --- interface; a filter touches only what the host explicitly lends it.
+
+interface host-log {
+    enum level { trace, debug, info, warn, error }
+    log: func(level: level, message: string);
+}
+
+interface host-clock {
+    // wall-clock milliseconds since the Unix epoch
+    now-ms: func() -> u64;
+}
+
+interface host-kv {
+    // host-held state (ADR 000004). Backed by an in-memory map in v0.1.0;
+    // the redb backend arrives with ADR 000004's runtime work.
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>);
+    delete: func(key: string);
+}
+
+world filter {
+    use types.{http-request, http-response, request-decision, response-decision};
+
+    // granted capabilities (deny-by-default: only these are importable)
+    import host-log;
+    import host-clock;
+    import host-kv;
+
+    // heavy, once-per-instance initialisation (Tenet 4)
+    export init: func();
+
+    // hot path — one call per request / response
+    export on-request: func(req: http-request) -> request-decision;
+    export on-response: func(resp: http-response) -> response-decision;
+}

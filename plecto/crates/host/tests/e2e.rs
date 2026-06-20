@@ -140,3 +140,45 @@ fn rate_limit_short_circuits_after_capacity() {
         _ => panic!("expected short-circuit once the bucket is empty"),
     }
 }
+
+#[test]
+fn rate_limit_counting_is_host_native_across_fresh_untrusted_instances() {
+    // ADR 000005 conformance (mechanism 3: super-hot paths go host-native). The token
+    // bucket's refill + counting live host-side and never cross the WASM boundary, so the
+    // count is NOT held in a filter's linear memory. This test makes that claim falsifiable:
+    // run under `untrusted`, where every request gets a FRESH instance with fresh linear
+    // memory (init re-runs, so `init-calls` climbs 1→2→3). If counting lived in WASM memory
+    // it would reset each request and the bucket would never drain; because it is host-native,
+    // the same capacity-2 bucket still drains across those fresh instances and the third
+    // request is denied 429.
+    let host = Host::new().unwrap();
+    let filter = host
+        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
+        .unwrap();
+
+    let limited = request(&[("x-plecto-ratelimit", "1")]);
+
+    for n in 1..=2 {
+        let (decision, logs) = filter.on_request(&limited).unwrap();
+        assert_eq!(
+            init_calls(&logs),
+            n,
+            "untrusted instance must be fresh each request (init re-runs)"
+        );
+        assert!(
+            matches!(decision, RequestDecision::Continue),
+            "request {n} within capacity should continue even on a fresh instance"
+        );
+    }
+
+    let (decision, logs) = filter.on_request(&limited).unwrap();
+    assert_eq!(
+        init_calls(&logs),
+        3,
+        "third request is still a fresh instance"
+    );
+    assert!(
+        matches!(decision, RequestDecision::ShortCircuit(resp) if resp.status == 429),
+        "host-native bucket drains across fresh instances → third request denied 429"
+    );
+}

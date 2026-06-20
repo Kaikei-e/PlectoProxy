@@ -31,7 +31,9 @@ use crate::plecto::filter::types::Header;
 struct FilterHello;
 
 fn has_header(req: &HttpRequest, name: &str) -> bool {
-    req.headers.iter().any(|h| h.name.eq_ignore_ascii_case(name))
+    req.headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case(name))
 }
 
 impl Guest for FilterHello {
@@ -51,7 +53,11 @@ impl Guest for FilterHello {
             let outcome = host_ratelimit::try_acquire(
                 "default",
                 1,
-                Bucket { capacity: 2, refill_tokens: 1, refill_interval_ms: 60_000 },
+                Bucket {
+                    capacity: 2,
+                    refill_tokens: 1,
+                    refill_interval_ms: 60_000,
+                },
             );
             if !outcome.allowed {
                 return RequestDecision::ShortCircuit(HttpResponse {

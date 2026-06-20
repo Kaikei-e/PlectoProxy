@@ -175,12 +175,13 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 ├── plecto/                    # Rust workspace（native 側）
 │   ├── wit/world.wit          # plecto:filter 契約（contract-first）
 │   └── crates/
-│       ├── host/              # wasmtime 埋め込み: Linker, InstancePre, host-API
+│       ├── host/              # wasmtime 埋め込み: Linker, InstancePre, host-API（+ CONTEXT.md）
+│       ├── control/           # control plane: manifest, OCI load, chain, reload（+ CONTEXT.md）
 │       └── filter-hello/      # 例フィルタ（wasm32-unknown-unknown ゲスト）
 ├── demo/                      # 旧 wasm-bindgen PoC（参考保全）
 ├── docs/ADR/                  # Architecture Decision Records（000001–000011）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
-└── CONTEXT.md                 # ドメイン用語集
+└── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）
 ```
 
 ## 設計判断（ADR）

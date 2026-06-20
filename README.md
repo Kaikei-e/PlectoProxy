@@ -175,12 +175,13 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 ├── plecto/                    # Rust workspace (the native half)
 │   ├── wit/world.wit          # the plecto:filter contract (contract-first)
 │   └── crates/
-│       ├── host/              # wasmtime embedding: Linker, InstancePre, host-API
+│       ├── host/              # wasmtime embedding: Linker, InstancePre, host-API (+ CONTEXT.md)
+│       ├── control/           # control plane: manifest, OCI load, chain, reload (+ CONTEXT.md)
 │       └── filter-hello/      # example filter (wasm32-unknown-unknown guest)
 ├── demo/                      # legacy wasm-bindgen PoC (kept for reference)
 ├── docs/ADR/                  # Architecture Decision Records (000001–000011)
 ├── CLAUDE.md                  # project conventions & design summary
-└── CONTEXT.md                 # domain glossary
+└── CONTEXT-MAP.md             # domain glossary map (split per context)
 ```
 
 ## Design decisions

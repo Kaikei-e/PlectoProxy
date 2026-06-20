@@ -17,9 +17,10 @@ mod chain;
 mod error;
 mod manifest;
 pub mod oci;
+mod reload;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -29,25 +30,34 @@ pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::ChainOutcome;
 pub use error::ControlError;
 pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Trust};
+#[cfg(unix)]
+pub use reload::SignalReloadSource;
+pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
 // on `plecto-host` directly for the common path.
 pub use plecto_host::{Host, HttpRequest, HttpResponse, TrustPolicy};
 
-/// The atomically-swappable active configuration: the loaded filters and the chain order.
-/// Held behind an `ArcSwap`; never mutated in place — `reload` replaces it wholesale.
+/// The atomically-swappable active configuration: the loaded filters, the chain order, and
+/// the `content_hash` of the manifest that produced them. Held behind an `ArcSwap`; never
+/// mutated in place — `reload` replaces it wholesale. The hash rides with the config it
+/// describes so `reload_from_disk` can compare the running `config version` without a
+/// separate lock.
 pub(crate) struct ActiveConfig {
     pub(crate) filters: HashMap<String, Arc<LoadedFilter>>,
     pub(crate) chain: Vec<String>,
+    pub(crate) hash: String,
 }
 
 /// The control plane: owns the `Host` (and thus the trust policy + epoch ticker) and the
 /// artifact store, and holds the active filter set behind an `ArcSwap` for lock-free reads
-/// and atomic reload.
+/// and atomic reload. `manifest_path` is `Some` only when the plane was built from an on-disk
+/// manifest — that is what `reload_from_disk` (and the SIGHUP loop) re-reads.
 pub struct Control {
     host: Host,
     store: Box<dyn ArtifactStore>,
     active: ArcSwap<ActiveConfig>,
+    manifest_path: Option<PathBuf>,
 }
 
 impl Control {
@@ -57,14 +67,7 @@ impl Control {
     /// path in the manifest (`trust.keys`, each filter `source`) is resolved relative to
     /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
     pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
-        let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
-        for key_path in &manifest.trust.keys {
-            pems.push(std::fs::read(base_dir.join(key_path))?);
-        }
-        let trust =
-            TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
-        let host = Host::new(trust).map_err(|e| ControlError::HostInit(e.to_string()))?;
-        let store = oci::OciLayoutStore::new(base_dir);
+        let (host, store) = build_host_and_store(manifest, base_dir)?;
         Self::load(host, manifest, Box::new(store))
     }
 
@@ -83,6 +86,44 @@ impl Control {
             host,
             store,
             active: ArcSwap::from_pointee(active),
+            manifest_path: None,
+        })
+    }
+
+    /// Build the whole control plane from a single on-disk manifest file — the
+    /// disk-reloadable ops entrypoint (ADR 000007 / 000008). Like `from_manifest`, but reads
+    /// and *remembers* the manifest path so SIGHUP / `reload_from_disk` can pick up an
+    /// operator's edits. Trusted-key PEMs and filter layouts resolve relative to the
+    /// manifest's own directory.
+    pub fn from_manifest_path(manifest_path: &Path) -> Result<Self, ControlError> {
+        let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let manifest = read_manifest(manifest_path)?;
+        let (host, store) = build_host_and_store(&manifest, base_dir)?;
+        let active = build_active(&host, &manifest, &store)?;
+        Ok(Self {
+            host,
+            store: Box::new(store),
+            active: ArcSwap::from_pointee(active),
+            manifest_path: Some(manifest_path.to_path_buf()),
+        })
+    }
+
+    /// Like `load`, but the manifest lives on disk at `manifest_path`: the path is remembered
+    /// so `reload_from_disk` can re-read it, while artifacts still resolve through the injected
+    /// `store` (so a test can pair an on-disk manifest with an in-memory artifact store). The
+    /// trust policy stays fixed on `host`.
+    pub fn load_at(
+        host: Host,
+        manifest_path: &Path,
+        store: Box<dyn ArtifactStore>,
+    ) -> Result<Self, ControlError> {
+        let manifest = read_manifest(manifest_path)?;
+        let active = build_active(&host, &manifest, store.as_ref())?;
+        Ok(Self {
+            host,
+            store,
+            active: ArcSwap::from_pointee(active),
+            manifest_path: Some(manifest_path.to_path_buf()),
         })
     }
 
@@ -94,6 +135,38 @@ impl Control {
         let active = build_active(&self.host, manifest, self.store.as_ref())?;
         self.active.store(Arc::new(active));
         Ok(())
+    }
+
+    /// Re-read the on-disk manifest and reload if its `config version` changed. The trigger
+    /// (SIGHUP, `serve_reloads`) is content-free, so this is where the new config is actually
+    /// read. Idempotent: an unchanged manifest (same semantic `content_hash`) is a no-op —
+    /// no rebuild, no drain. A changed one is built fully and swapped atomically; on any
+    /// build failure the running set is left untouched (fail-closed) and the error returned.
+    ///
+    /// Errors with `NoManifestPath` if this plane was not built from an on-disk manifest
+    /// (`load` / `from_manifest`); use `from_manifest_path` / `load_at` for a reloadable plane.
+    pub fn reload_from_disk(&self) -> Result<ReloadOutcome, ControlError> {
+        let path = self
+            .manifest_path
+            .as_ref()
+            .ok_or(ControlError::NoManifestPath)?;
+        let manifest = read_manifest(path)?;
+        let new_hash = manifest.content_hash()?;
+        // Cheap idempotency gate: skip the rebuild + drain entirely when the config version
+        // is unchanged (a comment-only edit, or a spurious trigger).
+        if new_hash == self.active.load().hash {
+            return Ok(ReloadOutcome::Unchanged);
+        }
+        // Build the new set fully before swapping; on failure the running set is untouched.
+        let active = build_active(&self.host, &manifest, self.store.as_ref())?;
+        self.active.store(Arc::new(active));
+        Ok(ReloadOutcome::Reloaded { hash: new_hash })
+    }
+
+    /// The active config's `content_hash` (ADR 000008 `config version`): the audit identity of
+    /// what is loaded right now, and the unit a future opt-in consensus layer would agree on.
+    pub fn config_version(&self) -> String {
+        self.active.load().hash.clone()
     }
 
     /// Drive a request through the chain. Returns whether to forward the (possibly edited)
@@ -113,6 +186,29 @@ impl Control {
     pub fn loaded_ids(&self) -> Vec<String> {
         self.active.load().filters.keys().cloned().collect()
     }
+}
+
+/// Read + parse a manifest from disk (shared by the on-disk constructors and `reload_from_disk`).
+fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
+    let toml = std::fs::read_to_string(path)?;
+    Manifest::from_toml(&toml)
+}
+
+/// Construct the `Host` (trust roots from the manifest's PEMs, ADR 000006) and the offline OCI
+/// artifact store, both rooted at `base_dir`. Shared by `from_manifest` and `from_manifest_path`.
+fn build_host_and_store(
+    manifest: &Manifest,
+    base_dir: &Path,
+) -> Result<(Host, oci::OciLayoutStore), ControlError> {
+    let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
+    for key_path in &manifest.trust.keys {
+        pems.push(std::fs::read(base_dir.join(key_path))?);
+    }
+    let trust =
+        TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
+    let host = Host::new(trust).map_err(|e| ControlError::HostInit(e.to_string()))?;
+    let store = oci::OciLayoutStore::new(base_dir);
+    Ok((host, store))
 }
 
 /// Resolve + verify + load every manifest filter into a fresh `ActiveConfig`. Pure w.r.t. the
@@ -151,5 +247,6 @@ fn build_active(
     Ok(ActiveConfig {
         filters,
         chain: manifest.chain.filters.clone(),
+        hash: manifest.content_hash()?,
     })
 }

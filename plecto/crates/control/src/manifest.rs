@@ -4,13 +4,15 @@
 //! fast-path server exists; v0.1 has a single chain.
 
 use plecto_host::LoadOptions;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::ControlError;
 
 /// A parsed manifest. Deserialised from TOML; no I/O happens here (key files and artifacts
-/// are resolved by `Control`).
-#[derive(Debug, Clone, Deserialize)]
+/// are resolved by `Control`). `Serialize` exists only to derive the semantic content hash
+/// (`content_hash`) — the canonical, representation-independent identity of the config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(default)]
@@ -23,7 +25,7 @@ pub struct Manifest {
 }
 
 /// Trust roots: paths (manifest-relative) to trusted signer public keys, PEM (ADR 000006).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trust {
     #[serde(default)]
@@ -31,7 +33,7 @@ pub struct Trust {
 }
 
 /// One filter to load, pinned by OCI digest.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterEntry {
     /// Host-assigned identity; namespaces the filter's KV (ADR 000011) and names it in chains.
@@ -48,7 +50,7 @@ pub struct FilterEntry {
 }
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationKind {
     #[default]
@@ -58,7 +60,7 @@ pub enum IsolationKind {
 
 /// The single ordered chain for v0.1 (named chains / route matching are deferred to the
 /// fast-path server).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chain {
     #[serde(default)]
@@ -69,6 +71,21 @@ impl Manifest {
     /// Parse a manifest from a TOML string.
     pub fn from_toml(s: &str) -> Result<Self, ControlError> {
         Ok(toml::from_str(s)?)
+    }
+
+    /// The **semantic** content hash of this manifest — `sha256:<hex>` over a canonical
+    /// serialisation, not over the raw TOML. Two manifests that mean the same thing (differing
+    /// only in comments, whitespace, key order, or an explicit default written vs. omitted)
+    /// hash identically; any meaningful change flips the hash.
+    ///
+    /// This is the manifest's `config version`: the unit `reload_from_disk` compares for
+    /// idempotency, the value an operator audits, and the value a future opt-in consensus
+    /// layer (ADR 000008 openraft) would agree on. Canonical form is `serde_json` over the
+    /// derived `Serialize` — deterministic because the struct field order is fixed and the
+    /// manifest holds no maps (only ordered `Vec`s).
+    pub fn content_hash(&self) -> Result<String, ControlError> {
+        let bytes = serde_json::to_vec(self)?;
+        Ok(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))))
     }
 }
 
@@ -124,6 +141,82 @@ filters = ["auth", "rl"]
         assert_eq!(m.filters[1].isolation, IsolationKind::Trusted);
         assert_eq!(m.filters[1].request_deadline_ms, Some(25));
         assert_eq!(m.chain.filters, vec!["auth".to_string(), "rl".to_string()]);
+    }
+
+    #[test]
+    fn content_hash_is_semantic_not_textual() {
+        // Representation noise that does NOT change meaning must NOT change the hash:
+        // comments, whitespace, key order, and an explicit default (`isolation = "untrusted"`)
+        // written vs. omitted all canonicalise away.
+        let terse = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+
+[chain]
+filters = ["auth"]
+"#,
+        )
+        .unwrap();
+
+        let noisy = Manifest::from_toml(
+            r#"
+# a leading comment
+[chain]
+filters = ["auth"]   # chain first, with trailing comment
+
+[[filter]]
+digest   = "sha256:abc"
+source   = "artifacts/auth"
+id       = "auth"
+isolation = "untrusted"   # the default, written explicitly
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            terse.content_hash().unwrap(),
+            noisy.content_hash().unwrap(),
+            "semantically identical manifests must share a content hash"
+        );
+        assert!(terse.content_hash().unwrap().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn content_hash_changes_on_meaningful_edit() {
+        let v1 = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+
+[chain]
+filters = ["auth"]
+"#,
+        )
+        .unwrap();
+        // Same filter, different chain (drops it) — a real config change.
+        let v2 = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+
+[chain]
+filters = []
+"#,
+        )
+        .unwrap();
+
+        assert_ne!(
+            v1.content_hash().unwrap(),
+            v2.content_hash().unwrap(),
+            "a chain change must flip the content hash"
+        );
     }
 
     #[test]

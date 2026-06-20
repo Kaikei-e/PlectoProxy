@@ -2,6 +2,7 @@
 name = "filter-hello"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 # A WASM Component Model guest implementing `plecto:filter`. Built for
 # wasm32-wasip2 (crates/host/build.rs drives it). Declares its own [workspace]

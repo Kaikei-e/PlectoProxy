@@ -23,7 +23,7 @@ Plecto pairs **two complementary halves** through a typed [WIT](https://componen
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (10 ADRs) and the first vertical slice — the `plecto:filter` contract, a wasmtime host that loads and runs filters, an example filter, and a full test suite — is green and on CI. **The data path (TLS/HTTP/routing/upstream) is not built yet; Plecto cannot proxy live traffic today.** This is a foundation you can read, run the tests on, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (11 ADRs) and the first vertical slice — the `plecto:filter` contract, a wasmtime host that loads and runs filters, an example filter, and a full test suite — is green and on CI. **The data path (TLS/HTTP/routing/upstream) is not built yet; Plecto cannot proxy live traffic today.** This is a foundation you can read, run the tests on, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto?
 
@@ -89,11 +89,15 @@ interface types {
 }
 
 // deny-by-default: one capability per interface; a filter imports only what it is lent.
-interface host-kv  { get: func(key: string) -> option<list<u8>>; set: func(key: string, value: list<u8>); /* … */ }
-interface host-log { log: func(level: level, message: string); }
+interface host-kv      { get: func(key: string) -> option<list<u8>>; set: func(key: string, value: list<u8>); /* … */ }
+interface host-counter { increment: func(key: string, delta: s64) -> s64; /* atomic named counter */ }
+interface host-log     { log: func(level: level, message: string); }
+// host-ratelimit keeps the token bucket host-native — the hot-path refill/counting never crosses
+// the WASM boundary; the filter only decides to consult it and on what key (ADR 000005).
 
 world filter {
-  import host-log;   import host-clock;   import host-kv;   // granted capabilities only
+  // granted capabilities only — log · clock · kv · counter · rate-limit
+  import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
   export init: func();                                       // heavy, once per instance
   export on-request:  func(req: http-request)  -> request-decision;   // hot path
   export on-response: func(resp: http-response) -> response-decision;  // hot path
@@ -151,8 +155,8 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 
 - **M0 — Foundation** ✅ *(done)*
   The `plecto:filter@0.1.0` contract, a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
-- **M1 — Filter runtime hardening**
-  `InstancePre` + pooling-allocator instance reuse, epoch metering + memory limits, pooling zeroization, redb-backed host KV / counters. The trusted = pooled-init-once / untrusted = per-request-zeroize split is *forced* (not just perf) by the init/zeroization knot. — [ADR 4](docs/ADR/000004.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
+- **M1 — Filter runtime hardening** 🚧 *(core landed)*
+  **Landed:** the trust-branched runtime — `InstancePre`; trusted = one init-once instance on a pooling engine, untrusted = fresh-per-request on an on-demand engine (linear memory fresh by construction, so no zeroization needed); redb-backed host KV + atomic counters + **host-native token-bucket rate limiting**; every host-API key namespaced per filter; ephemeral hot-path state skips the per-commit fsync. **Pending:** epoch metering + memory limits, and the per-worker instance + state sharding the pooling payoff waits on. The trusted/untrusted split is *forced* (not just perf) by the init/zeroization knot. — [ADR 4](docs/ADR/000004.md) · [5](docs/ADR/000005.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
 - **M2 — The data path (fast path)**
   TCP/TLS listener, HTTP/1.1 → 2 → 3, routing, real filter-chain dispatch, upstream connection management & load balancing. *This is what turns Plecto into an actual proxy.*
 - **M3 — Async & bodies** *(two-stage trigger)*
@@ -174,7 +178,7 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │       ├── host/              # wasmtime embedding: Linker, InstancePre, host-API
 │       └── filter-hello/      # example filter (wasm32-unknown-unknown guest)
 ├── demo/                      # legacy wasm-bindgen PoC (kept for reference)
-├── docs/ADR/                  # Architecture Decision Records (000001–000010)
+├── docs/ADR/                  # Architecture Decision Records (000001–000011)
 ├── CLAUDE.md                  # project conventions & design summary
 └── CONTEXT.md                 # domain glossary
 ```

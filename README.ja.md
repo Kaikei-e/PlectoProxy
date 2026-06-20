@@ -23,7 +23,7 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 速さが価値になる経路は native Rust のまま。あなたのリクエスト・ロジックはサンドボックス化された WASM コンポーネントとして走り、**ホストが明示的に貸した能力以外、何も触れない** — 規約ではなくサンドボックスがそれを強制する。
 
 > [!WARNING]
-> **現状: 初期開発段階。** 設計は確定済み（10 本の ADR）で、最初の縦スライス — `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・例フィルタ・テスト一式 — は green で CI に載っている。**データ経路（TLS/HTTP/ルーティング/upstream）はまだ未実装で、現時点で実トラフィックをプロキシできない。** 今は「読める・テストを回せる・フィルタを書ける基盤」である。[ロードマップ](#ロードマップ)参照。
+> **現状: 初期開発段階。** 設計は確定済み（11 本の ADR）で、最初の縦スライス — `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・例フィルタ・テスト一式 — は green で CI に載っている。**データ経路（TLS/HTTP/ルーティング/upstream）はまだ未実装で、現時点で実トラフィックをプロキシできない。** 今は「読める・テストを回せる・フィルタを書ける基盤」である。[ロードマップ](#ロードマップ)参照。
 
 ## なぜ Plecto か
 
@@ -89,11 +89,15 @@ interface types {
 }
 
 // deny-by-default: 能力ごとに 1 interface。フィルタは貸与されたものだけを import する。
-interface host-kv  { get: func(key: string) -> option<list<u8>>; set: func(key: string, value: list<u8>); /* … */ }
-interface host-log { log: func(level: level, message: string); }
+interface host-kv      { get: func(key: string) -> option<list<u8>>; set: func(key: string, value: list<u8>); /* … */ }
+interface host-counter { increment: func(key: string, delta: s64) -> s64; /* アトミックな名前付き counter */ }
+interface host-log     { log: func(level: level, message: string); }
+// host-ratelimit は token bucket をホストネイティブに保つ —— ホット経路の refill/カウントは WASM 境界を
+// 跨がず、フィルタは「consult するか・どのキーで」を判断するだけ（ADR 000005）。
 
 world filter {
-  import host-log;   import host-clock;   import host-kv;   // 貸与された能力のみ
+  // 貸与された能力のみ —— log · clock · kv · counter · rate-limit
+  import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
   export init: func();                                       // 重い・instance ごと一度
   export on-request:  func(req: http-request)  -> request-decision;   // ホット経路
   export on-response: func(resp: http-response) -> response-decision;  // ホット経路
@@ -151,8 +155,8 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 
 - **M0 — 基盤** ✅ *(完了)*
   `plecto:filter@0.1.0` 契約、フィルタをロード&実行する wasmtime ホスト、deny-by-default の能力境界（log / clock / kv）、例フィルタ、E2E/conformance/unit テスト、CI。— [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
-- **M1 — フィルタ runtime の堅牢化**
-  `InstancePre` + pooling-allocator によるインスタンス再利用、epoch 計量 + メモリ上限、pooling ゼロ化、redb-backed host KV / counter。trusted = pooled+init-once / untrusted = per-request+zeroize の分岐は perf でなく init/zeroization の矛盾ゆえの**必然**。— [ADR 4](docs/ADR/000004.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
+- **M1 — フィルタ runtime の堅牢化** 🚧 *(中核は着地)*
+  **着地:** trust 分岐ランタイム —— `InstancePre`、trusted = pooling エンジン上の init-once 単一インスタンス、untrusted = on-demand エンジンで per-request fresh（線形メモリは構造的に fresh ゆえゼロ化不要）、redb-backed host KV + アトミック counter + **ホストネイティブな token-bucket rate limit**、全 host-API キーをフィルタごとに名前空間化、ephemeral なホット経路は毎コミット fsync を省く。**保留:** epoch 計量 + メモリ上限、および pooling の利得が待つ per-worker インスタンス + 状態 sharding。trusted/untrusted の分岐は perf でなく init/zeroization の矛盾ゆえの**必然**。— [ADR 4](docs/ADR/000004.md) · [5](docs/ADR/000005.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md)
 - **M2 — データ経路（fast path）**
   TCP/TLS リスナ、HTTP/1.1 → 2 → 3、ルーティング、実リクエストでのフィルタチェーン駆動、upstream コネクション管理 & ロードバランシング。*Plecto を実際のプロキシにする段。*
 - **M3 — async & ボディ** *(2段トリガ)*
@@ -174,7 +178,7 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │       ├── host/              # wasmtime 埋め込み: Linker, InstancePre, host-API
 │       └── filter-hello/      # 例フィルタ（wasm32-unknown-unknown ゲスト）
 ├── demo/                      # 旧 wasm-bindgen PoC（参考保全）
-├── docs/ADR/                  # Architecture Decision Records（000001–000010）
+├── docs/ADR/                  # Architecture Decision Records（000001–000011）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
 └── CONTEXT.md                 # ドメイン用語集
 ```

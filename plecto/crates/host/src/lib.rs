@@ -38,25 +38,51 @@ pub struct LogLine {
 /// In-memory now; the redb backend arrives with ADR 000004.
 type Kv = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+/// Delimiter the host uses to namespace KV keys by filter identity. A filter can
+/// never remove the host-applied prefix, so it cannot reach another filter's
+/// namespace — capability isolation across a chain (ADR 000006). Filter ids must
+/// not contain this byte (enforced by `Host::load`).
+const KV_NS_DELIM: char = '\u{1f}';
+
+/// Lock the shared KV, recovering from a poisoned mutex instead of cascading the
+/// panic across every subsequent request (the map stays structurally valid).
+fn lock_kv(kv: &Kv) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
+    kv.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Per-request host state. Holds the capability handles lent to a filter and the
 /// request-scoped log buffer. Created fresh per request (Store-per-request, Fork 4).
 pub struct HostState {
     kv: Kv,
+    /// Host-owned prefix (`"{filter_id}\u{1f}"`) applied to every KV key so each
+    /// filter sees an isolated keyspace. The filter cannot observe or alter it.
+    kv_prefix: String,
     logs: Vec<LogLine>,
+    /// Wall-clock ms captured once at request start: a stable per-request snapshot
+    /// (see `host-clock` in the WIT).
     now_ms: u64,
 }
 
 impl HostState {
-    fn new(kv: Kv) -> Self {
+    fn new(kv: Kv, kv_prefix: String) -> Self {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         Self {
             kv,
+            kv_prefix,
             logs: Vec::new(),
             now_ms,
         }
+    }
+
+    /// Namespace a filter-supplied key into this filter's isolated keyspace.
+    fn kv_key(&self, key: &str) -> String {
+        let mut k = String::with_capacity(self.kv_prefix.len() + key.len());
+        k.push_str(&self.kv_prefix);
+        k.push_str(key);
+        k
     }
 }
 
@@ -73,28 +99,24 @@ impl bindings::plecto::filter::host_log::Host for HostState {
 
 impl bindings::plecto::filter::host_clock::Host for HostState {
     fn now_ms(&mut self) -> u64 {
+        // per-request snapshot (captured in `HostState::new`)
         self.now_ms
     }
 }
 
 impl bindings::plecto::filter::host_kv::Host for HostState {
     fn get(&mut self, key: String) -> Option<Vec<u8>> {
-        self.kv
-            .lock()
-            .expect("kv mutex poisoned")
-            .get(&key)
-            .cloned()
+        lock_kv(&self.kv).get(&self.kv_key(&key)).cloned()
     }
 
     fn set(&mut self, key: String, value: Vec<u8>) {
-        self.kv
-            .lock()
-            .expect("kv mutex poisoned")
-            .insert(key, value);
+        let k = self.kv_key(&key);
+        lock_kv(&self.kv).insert(k, value);
     }
 
     fn delete(&mut self, key: String) {
-        self.kv.lock().expect("kv mutex poisoned").remove(&key);
+        let k = self.kv_key(&key);
+        lock_kv(&self.kv).remove(&k);
     }
 }
 
@@ -120,7 +142,15 @@ impl Host {
     /// Pre-instantiate a filter component: type-check and resolve imports up front
     /// (`InstancePre`, wasmtime-host skill / ADR 000004). The returned handle is
     /// reusable; per-worker pooling is deferred to ADR 000004.
-    pub fn load(&self, component_bytes: &[u8]) -> Result<LoadedFilter> {
+    ///
+    /// `filter_id` is the host-assigned identity used to namespace this filter's KV
+    /// keyspace (ADR 000006). It must be non-empty and free of the namespace
+    /// delimiter; the filter never sees or controls it.
+    pub fn load(&self, filter_id: &str, component_bytes: &[u8]) -> Result<LoadedFilter> {
+        anyhow::ensure!(
+            !filter_id.is_empty() && !filter_id.contains(KV_NS_DELIM),
+            "filter id must be non-empty and must not contain the KV namespace delimiter"
+        );
         let component = Component::from_binary(&self.engine, component_bytes)?;
         let mut linker = Linker::<HostState>::new(&self.engine);
         // deny-by-default: lend ONLY the plecto host-API. No WASI is added.
@@ -132,6 +162,7 @@ impl Host {
         Ok(LoadedFilter {
             engine: self.engine.clone(),
             kv: self.kv.clone(),
+            kv_prefix: format!("{filter_id}{KV_NS_DELIM}"),
             pre,
         })
     }
@@ -141,6 +172,7 @@ impl Host {
 pub struct LoadedFilter {
     engine: Engine,
     kv: Kv,
+    kv_prefix: String,
     pre: FilterPre<HostState>,
 }
 
@@ -148,7 +180,10 @@ impl LoadedFilter {
     /// Run the request-side hook for one request. Returns the typed decision plus
     /// any log lines the filter emitted (captured via the host-log capability).
     pub fn on_request(&self, req: &HttpRequest) -> Result<(RequestDecision, Vec<LogLine>)> {
-        let mut store = Store::new(&self.engine, HostState::new(self.kv.clone()));
+        let mut store = Store::new(
+            &self.engine,
+            HostState::new(self.kv.clone(), self.kv_prefix.clone()),
+        );
         let filter = self.pre.instantiate(&mut store)?;
         filter.call_init(&mut store)?;
         let decision = filter.call_on_request(&mut store, req)?;
@@ -158,7 +193,10 @@ impl LoadedFilter {
 
     /// Run the response-side hook for one response.
     pub fn on_response(&self, resp: &HttpResponse) -> Result<(ResponseDecision, Vec<LogLine>)> {
-        let mut store = Store::new(&self.engine, HostState::new(self.kv.clone()));
+        let mut store = Store::new(
+            &self.engine,
+            HostState::new(self.kv.clone(), self.kv_prefix.clone()),
+        );
         let filter = self.pre.instantiate(&mut store)?;
         filter.call_init(&mut store)?;
         let decision = filter.call_on_response(&mut store, resp)?;
@@ -176,7 +214,10 @@ mod tests {
     use bindings::plecto::filter::host_log::Host as LogHost;
 
     fn state() -> HostState {
-        HostState::new(Arc::new(Mutex::new(HashMap::new())))
+        HostState::new(
+            Arc::new(Mutex::new(HashMap::new())),
+            "test\u{1f}".to_string(),
+        )
     }
 
     #[test]
@@ -187,6 +228,27 @@ mod tests {
         assert_eq!(KvHost::get(&mut s, "k".into()), Some(b"v".to_vec()));
         KvHost::delete(&mut s, "k".into());
         assert_eq!(KvHost::get(&mut s, "k".into()), None);
+    }
+
+    #[test]
+    fn kv_is_namespaced_per_filter() {
+        // Two filters sharing one backing store must not see each other's keys
+        // (capability isolation across a chain, ADR 000006).
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = HostState::new(shared.clone(), "filter-a\u{1f}".to_string());
+        let mut b = HostState::new(shared.clone(), "filter-b\u{1f}".to_string());
+
+        KvHost::set(&mut a, "count".into(), b"1".to_vec());
+        assert_eq!(
+            KvHost::get(&mut b, "count".into()),
+            None,
+            "b must not see a"
+        );
+        assert_eq!(KvHost::get(&mut a, "count".into()), Some(b"1".to_vec()));
+
+        // a key that embeds the delimiter still cannot escape a's namespace
+        KvHost::set(&mut a, format!("x{}count", '\u{1f}'), b"evil".to_vec());
+        assert_eq!(KvHost::get(&mut b, "count".into()), None);
     }
 
     #[test]

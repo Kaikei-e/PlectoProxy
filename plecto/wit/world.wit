@@ -71,7 +71,9 @@ interface host-log {
 }
 
 interface host-clock {
-    // wall-clock milliseconds since the Unix epoch
+    // Wall-clock milliseconds since the Unix epoch, captured once at request
+    // start: a stable per-request snapshot. Repeated calls within one request
+    // return the same value (deterministic TTL / rate-limit logic).
     now-ms: func() -> u64;
 }
 

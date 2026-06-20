@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use sigstore::crypto::{CosignVerificationKey, Signature};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{
@@ -77,6 +78,12 @@ const DEFAULT_REQUEST_DEADLINE_MS: u64 = 100;
 /// Default per-instance linear-memory cap enforced via a `StoreLimits` (ADR 000006). Matches
 /// the pooling engine's per-slot reservation so trusted and untrusted agree.
 const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 << 20;
+
+/// Per-instance cap on total table elements (review f000003 #2). `StoreLimits::memory_size`
+/// bounds linear memory but NOT `table.grow`; a guest growing a huge funcref table could eat
+/// host memory outside the linear-memory cap before the epoch deadline trips. This is generous
+/// for any reasonable filter and bounds the pathological case — cheap defense-in-depth.
+const MAX_TABLE_ELEMENTS: usize = 100_000;
 
 /// Options for `Host::load`. A struct (not a bare arg) because deny-by-default grows more
 /// load-time knobs onto it. Defaults to the safe side: `Untrusted` (fail-closed) with
@@ -146,6 +153,10 @@ pub enum RunError {
     /// A fresh instance could not be created — untrusted per-request instantiation, or the
     /// rebuild of a trusted instance after a prior trap. Fail-closed mapping: 502.
     Instantiate(anyhow::Error),
+    /// A trusted filter trapped on several consecutive requests, so the host is in a short
+    /// trap-cooldown: it returns this cheap fail-closed response instead of re-instantiating +
+    /// re-init'ing every request (circuit-breaker, review f000003 #5). Fail-closed mapping: 503.
+    Unavailable,
 }
 
 impl RunError {
@@ -166,6 +177,7 @@ impl RunError {
             RunError::Deadline => (504, "deadline", "filter deadline exceeded"),
             RunError::Trap(_) => (502, "trap", "filter trapped"),
             RunError::Instantiate(_) => (502, "instantiate", "filter instantiation failed"),
+            RunError::Unavailable => (503, "unavailable", "filter temporarily unavailable"),
         };
         HttpResponse {
             status,
@@ -184,6 +196,7 @@ impl std::fmt::Display for RunError {
             RunError::Deadline => write!(f, "filter exceeded its epoch deadline"),
             RunError::Trap(e) => write!(f, "filter trapped: {e}"),
             RunError::Instantiate(e) => write!(f, "filter instantiation failed: {e}"),
+            RunError::Unavailable => write!(f, "filter is in trap-cooldown (circuit open)"),
         }
     }
 }
@@ -249,11 +262,41 @@ pub struct SignedArtifact<'a> {
     pub component_bytes: &'a [u8],
     /// Raw DER signature over `component_bytes` (cosign `sign-blob`).
     pub component_signature: &'a [u8],
-    /// The SBOM document. Opaque in v0.1 — presence plus a valid signature is the bar;
-    /// content policy (CVE / license scanning) is deferred.
+    /// The SBOM as an in-toto-style statement whose `subject[].digest.sha256` binds it to
+    /// `component_bytes` (verified at load, review f000003 #1). The predicate (the SBOM body)
+    /// stays opaque in v0.1 — content policy (CVE / license scanning) is deferred.
     pub sbom: &'a [u8],
     /// Raw DER signature over `sbom`.
     pub sbom_signature: &'a [u8],
+}
+
+/// Verify the SBOM attests THIS component: parse it as an in-toto-style statement and require
+/// at least one `subject[].digest.sha256` to equal `sha256(component)`. Fail-closed on a
+/// malformed SBOM or a missing / mismatched subject (review f000003 #1). Without this, a
+/// validly-signed but UNRELATED SBOM could be paired with the component — harmless while the
+/// SBOM is opaque, a latent gap the moment its content becomes load-bearing (CVE / license).
+fn sbom_binds_component(sbom: &[u8], component: &[u8]) -> Result<()> {
+    let statement: serde_json::Value = serde_json::from_slice(sbom)
+        .map_err(|e| anyhow::anyhow!("SBOM is not a valid in-toto statement: {e}"))?;
+    let want = hex::encode(Sha256::digest(component));
+    let bound = statement
+        .get("subject")
+        .and_then(|s| s.as_array())
+        .is_some_and(|subjects| {
+            subjects.iter().any(|subject| {
+                subject
+                    .get("digest")
+                    .and_then(|d| d.get("sha256"))
+                    .and_then(|h| h.as_str())
+                    == Some(want.as_str())
+            })
+        });
+    anyhow::ensure!(
+        bound,
+        "SBOM does not attest this component: no subject digest matches sha256(component) \
+         (fail-closed; ADR 000006 / review f000003)"
+    );
+    Ok(())
 }
 
 /// A log line captured from the host-log capability (test visibility / future tracing).
@@ -309,6 +352,7 @@ impl HostState {
             now_ms: wall_now_ms(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(max_memory_bytes as usize)
+                .table_elements(MAX_TABLE_ELEMENTS)
                 .build(),
         }
     }
@@ -543,6 +587,9 @@ impl Host {
             self.trust.verifies(artifact.sbom_signature, artifact.sbom),
             "SBOM signature is not verified by any trusted key (fail-closed; ADR 000006)"
         );
+        // The SBOM must attest THIS component (its subject digest == sha256(component)), so a
+        // validly-signed but unrelated SBOM cannot be paired with it (review f000003 #1).
+        sbom_binds_component(artifact.sbom, artifact.component_bytes)?;
 
         let component_bytes = artifact.component_bytes;
         let engine = match opts.isolation {
@@ -570,7 +617,9 @@ impl Host {
         let trusted = match opts.isolation {
             Isolation::Untrusted => None,
             // create the persistent instance and run init exactly once
-            Isolation::Trusted => Some(Mutex::new(Some(inner.instantiate_initialized()?))),
+            Isolation::Trusted => Some(Mutex::new(TrustedSlot::new(
+                inner.instantiate_initialized()?,
+            ))),
         };
 
         Ok(LoadedFilter { inner, trusted })
@@ -609,20 +658,53 @@ impl LoadedInner {
         Ok(Instance { store, filter })
     }
 
-    /// Borrow the trusted instance, rebuilding it (re-instantiate + re-init) if a prior trap
-    /// discarded it. The slot is `None` only after a trap; at load it is `Some` (init-once).
-    /// This is the self-heal half of the trap-recovery decision (ADR 000006).
-    fn ensure_trusted<'a>(
+    /// Run one trusted-instance call through the circuit-breaker (review f000003 #5). While in
+    /// trap-cooldown, reject fast (`Unavailable`) without rebuilding. Otherwise (re)build the
+    /// instance if a prior trap discarded it (self-heal, ADR 000006), run `call` under the
+    /// per-request deadline, and record the outcome: reset on success; on trap discard the
+    /// instance and — after `TRUSTED_TRAP_BREAKER_THRESHOLD` consecutive traps — open a short
+    /// cooldown so a deterministically-trapping filter cannot force re-init every request.
+    fn run_trusted<T>(
         &self,
-        slot: &'a mut Option<Instance>,
-    ) -> std::result::Result<&'a mut Instance, RunError> {
-        if slot.is_none() {
-            *slot = Some(
+        slot: &mut TrustedSlot,
+        call: impl FnOnce(&Filter, &mut Store<HostState>) -> wasmtime::Result<T>,
+    ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
+        if wall_now_ms() < slot.cooldown_until_ms {
+            return Err(RunError::Unavailable);
+        }
+        if slot.instance.is_none() {
+            slot.instance = Some(
                 self.instantiate_initialized()
                     .map_err(RunError::Instantiate)?,
             );
         }
-        Ok(slot.as_mut().expect("rebuilt above"))
+        // Scope the instance borrow so the breaker bookkeeping below can mutate `slot`.
+        let outcome = {
+            let inst = slot.instance.as_mut().expect("rebuilt above");
+            inst.store.data_mut().begin_request();
+            inst.store.set_epoch_deadline(self.request_deadline_ms);
+            match call(&inst.filter, &mut inst.store) {
+                Ok(value) => Ok((value, std::mem::take(&mut inst.store.data_mut().logs))),
+                Err(e) => Err(e),
+            }
+        };
+        match outcome {
+            Ok(ok) => {
+                slot.consecutive_traps = 0;
+                slot.cooldown_until_ms = 0;
+                Ok(ok)
+            }
+            Err(e) => {
+                // A trap leaves linear memory undefined → discard the instance (self-heal on
+                // the next allowed call); after the threshold, open the cooldown.
+                slot.instance = None;
+                slot.consecutive_traps = slot.consecutive_traps.saturating_add(1);
+                if slot.consecutive_traps >= TRUSTED_TRAP_BREAKER_THRESHOLD {
+                    slot.cooldown_until_ms = wall_now_ms().saturating_add(TRUSTED_TRAP_COOLDOWN_MS);
+                }
+                Err(RunError::from_call(e))
+            }
+        }
     }
 }
 
@@ -632,16 +714,46 @@ struct Instance {
     filter: Filter,
 }
 
-/// A loaded filter, ready to run per request. Trusted filters hold one persistent
-/// `Instance` reused serially; untrusted filters instantiate fresh each request.
+/// Consecutive trusted-instance traps before the circuit-breaker opens a cooldown
+/// (review f000003 #5). The first few traps still self-heal (rebuild + retry); only a
+/// deterministically-trapping filter reaches the threshold.
+const TRUSTED_TRAP_BREAKER_THRESHOLD: u32 = 3;
+/// How long the breaker stays open once tripped: during it, trusted calls fail closed cheaply
+/// (`RunError::Unavailable`) without re-instantiating. After it, the next call retries once.
+const TRUSTED_TRAP_COOLDOWN_MS: u64 = 500;
+
+/// The trusted-filter slot behind the per-filter lock: the persistent instance plus the
+/// circuit-breaker state (review f000003 #5). `instance` is `None` only after a trap (rebuilt
+/// on the next allowed call); the counters bound re-init storms from a deterministically-
+/// trapping trusted filter.
+struct TrustedSlot {
+    instance: Option<Instance>,
+    consecutive_traps: u32,
+    cooldown_until_ms: u64,
+}
+
+impl TrustedSlot {
+    fn new(instance: Instance) -> Self {
+        Self {
+            instance: Some(instance),
+            consecutive_traps: 0,
+            cooldown_until_ms: 0,
+        }
+    }
+}
+
+/// A loaded filter, ready to run per request. Trusted filters hold one persistent `Instance`
+/// reused serially (in a `TrustedSlot` with circuit-breaker state); untrusted filters
+/// instantiate fresh each request.
 ///
-/// The trusted slot is `Option<Instance>` inside the lock: a trap leaves the guest's linear
-/// memory in an undefined state, so on trap the host discards the instance (`None`) and the
-/// next request rebuilds + re-inits it (self-heal, ADR 000006). The outer `Option` is the
-/// isolation discriminator — `None` means untrusted (fresh instance per request).
+/// Inside the lock the trusted slot keeps the instance plus the breaker counters: a trap
+/// leaves the guest's linear memory undefined, so the host discards the instance and the next
+/// allowed request rebuilds + re-inits it (self-heal, ADR 000006), with a cooldown bounding
+/// re-init storms (review f000003 #5). The outer `Option` is the isolation discriminator —
+/// `None` means untrusted (fresh instance per request).
 pub struct LoadedFilter {
     inner: LoadedInner,
-    trusted: Option<Mutex<Option<Instance>>>,
+    trusted: Option<Mutex<TrustedSlot>>,
 }
 
 impl LoadedFilter {
@@ -657,25 +769,12 @@ impl LoadedFilter {
         req: &HttpRequest,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
-            // trusted: reuse the persistent instance, only resetting per-request state.
+            // trusted: reuse the persistent instance via the circuit-breaker.
             Some(cell) => {
                 let mut guard = cell.lock();
-                let inst = self.inner.ensure_trusted(&mut guard)?;
-                // NB: `inst` borrows `*guard`; its last use ends before any `*guard = None`.
-                inst.store.data_mut().begin_request();
-                inst.store
-                    .set_epoch_deadline(self.inner.request_deadline_ms);
-                match inst.filter.call_on_request(&mut inst.store, req) {
-                    Ok(decision) => {
-                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                        Ok((decision, logs))
-                    }
-                    Err(e) => {
-                        // discard the now-undefined instance; the next request rebuilds it.
-                        *guard = None;
-                        Err(RunError::from_call(e))
-                    }
-                }
+                self.inner.run_trusted(&mut guard, |filter, store| {
+                    filter.call_on_request(store, req)
+                })
             }
             // untrusted: fresh instance + init every request (the isolation trade).
             None => {
@@ -704,21 +803,9 @@ impl LoadedFilter {
         match &self.trusted {
             Some(cell) => {
                 let mut guard = cell.lock();
-                let inst = self.inner.ensure_trusted(&mut guard)?;
-                // NB: `inst` borrows `*guard`; its last use ends before any `*guard = None`.
-                inst.store.data_mut().begin_request();
-                inst.store
-                    .set_epoch_deadline(self.inner.request_deadline_ms);
-                match inst.filter.call_on_response(&mut inst.store, resp) {
-                    Ok(decision) => {
-                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                        Ok((decision, logs))
-                    }
-                    Err(e) => {
-                        *guard = None;
-                        Err(RunError::from_call(e))
-                    }
-                }
+                self.inner.run_trusted(&mut guard, |filter, store| {
+                    filter.call_on_response(store, resp)
+                })
             }
             None => {
                 let mut inst = self
@@ -795,6 +882,19 @@ pub mod test_support {
     /// real `plecto:filter` component in their own tests.
     pub fn filter_hello_component() -> Vec<u8> {
         std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
+    }
+
+    /// A minimal in-toto-style SBOM statement that binds `component`: its `subject` digest is
+    /// `sha256(component)`, satisfying the load gate's SBOM↔component binding (review f000003
+    /// #1). The predicate is empty (content policy is deferred). Test / dev helper — real
+    /// attestations come from `cosign attest`.
+    pub fn bound_sbom(component: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(component));
+        format!(
+            r#"{{"_type":"https://in-toto.io/Statement/v1","subject":[{{"name":"filter","digest":{{"sha256":"{digest}"}}}}],"predicateType":"https://cyclonedx.org/bom","predicate":{{}}}}"#
+        )
+        .into_bytes()
     }
 }
 

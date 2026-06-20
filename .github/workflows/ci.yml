@@ -1,0 +1,106 @@
+# Plecto CI — local CI parity (tdd-workflow Phase 5): fmt / clippy / test / build,
+# plus a wasm-guest lint and a (non-blocking) supply-chain scan.
+#
+# Layout note: the cargo workspace lives in `plecto/`. The example filter
+# `plecto/crates/filter-hello` is a SEPARATE workspace (its own `target/`) built
+# for `wasm32-unknown-unknown`; `plecto/crates/host/build.rs` compiles it and
+# componentizes it via `wit-component` (ADR 000010). So every compiling job must
+# install the `wasm32-unknown-unknown` target BEFORE any host build/test, or the
+# host build script fails.
+#
+# Hardening follow-up (Plecto supply-chain stance, ADR 000006 / OWASP A08):
+# pin these third-party actions to full commit SHAs once we vendor a review.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (saves CI on rapid pushes).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: plecto
+
+jobs:
+  # Fast feedback: formatting only — no compilation, no cache, no wasm target.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+      # filter-hello is a separate workspace, formatted on its own.
+      - run: cargo fmt --all -- --check
+        working-directory: plecto/crates/filter-hello
+
+  # Main gate: clippy -> test -> build, sharing one compile cache.
+  # `cargo test`/`build` transitively compile + componentize the guest via build.rs.
+  build:
+    name: clippy + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown # REQUIRED: build.rs builds the guest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plecto
+          cache-on-failure: true
+          # Cache both the workspace target/ and the excluded guest's own target/.
+          workspaces: |
+            plecto
+            plecto/crates/filter-hello
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all
+      - run: cargo build --release
+
+  # Lint the excluded WASM guest against its real target.
+  guest-lint:
+    name: filter-hello (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plecto/crates/filter-hello
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plecto-guest
+          workspaces: plecto/crates/filter-hello
+      - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+  # Supply-chain scan (RustSec advisories + crate bans). Non-blocking for now:
+  # a freshly-published advisory should not block an unrelated change. Tighten to
+  # gating once a curated deny.toml lands (ADR 000006 / OWASP A08).
+  cargo-deny:
+    name: cargo-deny (advisories, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: plecto/Cargo.toml
+          command: check advisories bans

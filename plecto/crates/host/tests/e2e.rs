@@ -3,10 +3,38 @@
 //! the synthesised response, and the lifecycle effect ADR 000004 promises (init-once for
 //! trusted filters, fresh-per-request for untrusted ones).
 
-use plecto_host::{Header, Host, HttpRequest, LoadOptions, LogLine, RequestDecision, RunError};
+use plecto_host::test_support::TestSigner;
+use plecto_host::{
+    Header, Host, HttpRequest, LoadOptions, LoadedFilter, LogLine, RequestDecision, RunError,
+    SignedArtifact,
+};
 
 fn component_bytes() -> Vec<u8> {
     std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
+}
+
+/// A minimal SBOM fixture. v0.1 requires a *signed* SBOM to be present; its content is opaque
+/// (ADR 000006 — content policy deferred), so any non-empty document does.
+const SBOM: &[u8] = br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#;
+
+/// Sign filter-hello (and the SBOM) with a fresh ephemeral key, build a `Host` that trusts
+/// exactly that key, and load it. Returns the `Host` too: it owns the epoch ticker, so it must
+/// outlive the filter for deadlines to keep firing. This is the real provenance path (ADR
+/// 000006) — every load in these tests goes through signature verification.
+fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
+    let bytes = component_bytes();
+    let signer = TestSigner::new().unwrap();
+    let component_signature = signer.sign(&bytes).unwrap();
+    let sbom_signature = signer.sign(SBOM).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let artifact = SignedArtifact {
+        component_bytes: &bytes,
+        component_signature: &component_signature,
+        sbom: SBOM,
+        sbom_signature: &sbom_signature,
+    };
+    let filter = host.load("filter-hello", &artifact, opts).unwrap();
+    (host, filter)
 }
 
 fn request(headers: &[(&str, &str)]) -> HttpRequest {
@@ -50,10 +78,7 @@ fn local_state(logs: &[LogLine]) -> u32 {
 
 #[test]
 fn continues_when_request_is_not_blocked() {
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
 
     let (decision, logs) = filter.on_request(&request(&[])).unwrap();
 
@@ -66,10 +91,7 @@ fn continues_when_request_is_not_blocked() {
 
 #[test]
 fn short_circuits_when_block_header_present() {
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
 
     let (decision, _logs) = filter
         .on_request(&request(&[("x-plecto-block", "1")]))
@@ -93,10 +115,7 @@ fn short_circuits_when_block_header_present() {
 fn trusted_filter_runs_init_once_across_requests() {
     // Tenet 4 effect (ADR 000004 / 000011): a trusted filter's init runs exactly once;
     // the persistent instance is reused, so the host counter stays at 1.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::trusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::trusted());
 
     for _ in 0..3 {
         let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
@@ -108,10 +127,7 @@ fn trusted_filter_runs_init_once_across_requests() {
 fn untrusted_filter_reinitializes_each_request() {
     // The isolation trade (ADR 000011): a fresh instance per request re-runs init, so the
     // host counter climbs with each request.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
 
     let mut seen = Vec::new();
     for _ in 0..3 {
@@ -125,10 +141,7 @@ fn untrusted_filter_reinitializes_each_request() {
 fn rate_limit_short_circuits_after_capacity() {
     // Host-native token bucket (ADR 000005): capacity 2 → first two pass, third is denied
     // with a synthesised 429. State lives host-side, so it persists across requests.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::trusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::trusted());
 
     let limited = request(&[("x-plecto-ratelimit", "1")]);
 
@@ -163,10 +176,7 @@ fn rate_limit_counting_is_host_native_across_fresh_untrusted_instances() {
     // it would reset each request and the bucket would never drain; because it is host-native,
     // the same capacity-2 bucket still drains across those fresh instances and the third
     // request is denied 429.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
 
     let limited = request(&[("x-plecto-ratelimit", "1")]);
 
@@ -202,14 +212,7 @@ fn runaway_filter_is_interrupted_by_epoch_deadline() {
     // A filter stuck in an infinite loop must be trapped by the epoch deadline and surfaced
     // as a typed, fail-closed `RunError::Deadline` — it must NOT hang the calling thread.
     // (If epoch interruption were absent this test would never return.)
-    let host = Host::new().unwrap();
-    let filter = host
-        .load(
-            "filter-hello",
-            &component_bytes(),
-            LoadOptions::untrusted().with_request_deadline_ms(50),
-        )
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted().with_request_deadline_ms(50));
 
     let result = filter.on_request(&request(&[("x-plecto-spin", "1")]));
     assert!(
@@ -223,14 +226,7 @@ fn trusted_filter_recovers_after_trap() {
     // Trap recovery (ADR 000006): a trusted PERSISTENT instance whose call traps is discarded
     // and rebuilt (re-instantiate + re-init) on the next request — it self-heals instead of
     // staying broken. A trap leaves linear memory undefined, so reuse is not safe.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load(
-            "filter-hello",
-            &component_bytes(),
-            LoadOptions::trusted().with_request_deadline_ms(50),
-        )
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::trusted().with_request_deadline_ms(50));
 
     let trapped = filter.on_request(&request(&[("x-plecto-spin", "1")]));
     assert!(
@@ -251,14 +247,7 @@ fn memory_limit_traps_runaway_allocation() {
     // A filter allocating past its Store memory cap must trap (the guest allocator aborts on
     // the denied linear-memory grow) and surface as a fail-closed error. Critically, the HOST
     // process must survive — the cap bounds the guest, it does not OOM the host.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load(
-            "filter-hello",
-            &component_bytes(),
-            LoadOptions::untrusted().with_max_memory_bytes(16 << 20),
-        )
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted().with_max_memory_bytes(16 << 20));
 
     let result = filter.on_request(&request(&[("x-plecto-balloon", "1")]));
     assert!(
@@ -280,10 +269,7 @@ fn untrusted_guest_memory_is_fresh_each_request() {
     // `local-state` is guest LINEAR-MEMORY state (a function-local static), NOT host KV. Under
     // `untrusted`, every request gets a fresh instance with fresh memory, so it must stay 1 —
     // no carry-over, no stale-heap leak between requests (the zeroization property).
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::untrusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
 
     for _ in 0..3 {
         let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
@@ -301,10 +287,7 @@ fn trusted_guest_memory_persists_across_requests() {
     // (reused) instance is NOT zeroized between requests — same trust domain (ADR 000011) — so
     // its guest-local state climbs 1→2→3. Statelessness is honored by trust here, not enforced;
     // only `untrusted`'s fresh-per-request memory enforces it structurally.
-    let host = Host::new().unwrap();
-    let filter = host
-        .load("filter-hello", &component_bytes(), LoadOptions::trusted())
-        .unwrap();
+    let (_host, filter) = signed_load(LoadOptions::trusted());
 
     let mut seen = Vec::new();
     for _ in 0..3 {

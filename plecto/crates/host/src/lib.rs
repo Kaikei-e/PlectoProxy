@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
+use sigstore::crypto::{CosignVerificationKey, Signature};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store, StoreLimits,
@@ -188,6 +189,72 @@ impl std::fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+/// The set of public keys the operator trusts to sign filters (ADR 000006 provenance). A
+/// filter loads only if a trusted key verifies BOTH its component signature and its SBOM
+/// signature (keyed cosign, offline — no Fulcio / Rekor / network). An **empty** policy
+/// trusts no one, so nothing loads: deny-by-default / fail-closed, with no "allow unsigned"
+/// escape hatch in the production API. The keys live on the `Host`, not on each `load` call,
+/// so the operator manages one trust root.
+///
+/// This gates *whether a filter may load at all*. It deliberately does NOT pick the filter's
+/// `Isolation` (trusted/untrusted lifecycle) — a valid signature from a third party's key is
+/// still untrusted code. Mapping signer identity to isolation is left to the declarative
+/// manifest (ADR 000007); here, isolation stays the caller's explicit `LoadOptions` choice.
+pub struct TrustPolicy {
+    keys: Vec<CosignVerificationKey>,
+}
+
+impl TrustPolicy {
+    /// Trust the given public keys (SPKI PEM). The key type is auto-detected — cosign's
+    /// default is ECDSA P-256; P-256 / Ed25519 / RSA cosign keys are all accepted.
+    pub fn from_pem_keys<I, B>(pems: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let keys = pems
+            .into_iter()
+            .map(|pem| {
+                CosignVerificationKey::try_from_pem(pem.as_ref())
+                    .map_err(|e| anyhow::anyhow!("invalid trusted public key (PEM): {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { keys })
+    }
+
+    /// An explicitly empty policy — trusts no one, so every load fails closed. Useful to
+    /// assert the fail-closed default.
+    pub fn empty() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    /// Does ANY trusted key verify this raw (DER) signature over `msg`? cosign ECDSA
+    /// signatures are ASN.1 DER; verification hashes `msg` internally (do not pre-hash).
+    fn verifies(&self, signature_der: &[u8], msg: &[u8]) -> bool {
+        self.keys.iter().any(|k| {
+            k.verify_signature(Signature::Raw(signature_der), msg)
+                .is_ok()
+        })
+    }
+}
+
+/// The material the host verifies before instantiating a filter (ADR 000006). The component
+/// bytes plus a keyed cosign signature over them, and a **mandatory** SBOM with its own
+/// signature. Signatures are RAW DER ECDSA bytes: decoding cosign's base64 `.sig` and
+/// fetching the artifact from an OCI registry is the ADR 000007 / `wkg` boundary, kept out
+/// of the host so ADR 000006 (verify) and ADR 000007 (distribute) stay decoupled.
+pub struct SignedArtifact<'a> {
+    /// The WASM component bytes.
+    pub component_bytes: &'a [u8],
+    /// Raw DER signature over `component_bytes` (cosign `sign-blob`).
+    pub component_signature: &'a [u8],
+    /// The SBOM document. Opaque in v0.1 — presence plus a valid signature is the bar;
+    /// content policy (CVE / license scanning) is deferred.
+    pub sbom: &'a [u8],
+    /// Raw DER signature over `sbom`.
+    pub sbom_signature: &'a [u8],
+}
 
 /// A log line captured from the host-log capability (test visibility / future tracing).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +446,8 @@ pub struct Host {
     /// is two engines, not one (confirmed wasmtime 45 behaviour).
     untrusted_engine: Engine,
     kv: Arc<dyn KvBackend>,
+    /// Public keys this host trusts to sign filters (ADR 000006). Verified at every `load`.
+    trust: TrustPolicy,
     /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
     _epoch_ticker: EpochTicker,
 }
@@ -414,13 +483,15 @@ fn build_engine(alloc: Allocation) -> Result<Engine> {
 }
 
 impl Host {
-    /// A host backed by an in-memory store (the default; process-lifetime state).
-    pub fn new() -> Result<Self> {
-        Self::with_backend(Arc::new(MemoryBackend::default()))
+    /// A host backed by an in-memory store (the default; process-lifetime state). `trust` is
+    /// the set of keys allowed to sign loadable filters (ADR 000006) — pass `TrustPolicy::empty()`
+    /// only if you intend that nothing can load.
+    pub fn new(trust: TrustPolicy) -> Result<Self> {
+        Self::with_backend(trust, Arc::new(MemoryBackend::default()))
     }
 
     /// A host backed by a caller-supplied store (e.g. `RedbBackend` for durability).
-    pub fn with_backend(kv: Arc<dyn KvBackend>) -> Result<Self> {
+    pub fn with_backend(trust: TrustPolicy, kv: Arc<dyn KvBackend>) -> Result<Self> {
         let trusted_engine = build_engine(Allocation::Pooling)?;
         let untrusted_engine = build_engine(Allocation::OnDemand)?;
         let _epoch_ticker =
@@ -429,6 +500,7 @@ impl Host {
             trusted_engine,
             untrusted_engine,
             kv,
+            trust,
             _epoch_ticker,
         })
     }
@@ -447,13 +519,32 @@ impl Host {
     pub fn load(
         &self,
         filter_id: &str,
-        component_bytes: &[u8],
+        artifact: &SignedArtifact<'_>,
         opts: LoadOptions,
     ) -> Result<LoadedFilter> {
         anyhow::ensure!(
             !filter_id.is_empty() && !filter_id.contains(KV_NS_DELIM),
             "filter id must be non-empty and must not contain the KV namespace delimiter"
         );
+
+        // --- provenance gate (ADR 000006): verify BEFORE instantiate, fail-closed. A
+        // --- missing / untrusted / tampered signature or a missing SBOM means we never
+        // --- touch the component bytes with wasmtime. Order is cheap-checks first.
+        anyhow::ensure!(
+            !artifact.sbom.is_empty(),
+            "a signed SBOM is required to load a filter (fail-closed; ADR 000006)"
+        );
+        anyhow::ensure!(
+            self.trust
+                .verifies(artifact.component_signature, artifact.component_bytes),
+            "component signature is not verified by any trusted key (fail-closed; ADR 000006)"
+        );
+        anyhow::ensure!(
+            self.trust.verifies(artifact.sbom_signature, artifact.sbom),
+            "SBOM signature is not verified by any trusted key (fail-closed; ADR 000006)"
+        );
+
+        let component_bytes = artifact.component_bytes;
         let engine = match opts.isolation {
             Isolation::Trusted => &self.trusted_engine,
             Isolation::Untrusted => &self.untrusted_engine,
@@ -644,6 +735,58 @@ impl LoadedFilter {
                     Err(e) => Err(RunError::from_call(e)),
                 }
             }
+        }
+    }
+}
+
+/// Test / dev signing support — **NOT production provenance**. Generates a fresh ephemeral
+/// ECDSA P-256 key (cosign's default scheme), signs blobs with it, and exposes the matching
+/// public-key PEM so a test can build a `TrustPolicy` and drive the real verify path
+/// end-to-end without the `cosign` CLI. The key is thrown away each time; this grants nothing
+/// a caller could not already do with sigstore directly. `#[doc(hidden)]` — integration tests
+/// need it `pub`, but it is not part of the supported surface.
+#[doc(hidden)]
+pub mod test_support {
+    use super::TrustPolicy;
+    use anyhow::{Result, anyhow};
+    use sigstore::crypto::SigningScheme;
+    use sigstore::crypto::signing_key::SigStoreSigner;
+
+    /// A throwaway signer holding one ephemeral keypair, so the same key can sign both the
+    /// component and the SBOM (and a matching `TrustPolicy` trusts exactly that key).
+    pub struct TestSigner {
+        signer: SigStoreSigner,
+        public_key_pem: String,
+    }
+
+    impl TestSigner {
+        pub fn new() -> Result<Self> {
+            let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
+                .create_signer()
+                .map_err(|e| anyhow!("create_signer: {e}"))?;
+            let public_key_pem = signer
+                .to_sigstore_keypair()
+                .map_err(|e| anyhow!("to_sigstore_keypair: {e}"))?
+                .public_key_to_pem()
+                .map_err(|e| anyhow!("public_key_to_pem: {e}"))?;
+            Ok(Self {
+                signer,
+                public_key_pem,
+            })
+        }
+
+        /// Raw DER ECDSA signature over `msg` (the shape `SignedArtifact` expects).
+        pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
+            self.signer.sign(msg).map_err(|e| anyhow!("sign: {e}"))
+        }
+
+        pub fn public_key_pem(&self) -> &str {
+            &self.public_key_pem
+        }
+
+        /// A `TrustPolicy` that trusts exactly this signer's key.
+        pub fn trust_policy(&self) -> Result<TrustPolicy> {
+            TrustPolicy::from_pem_keys([self.public_key_pem.as_bytes()])
         }
     }
 }

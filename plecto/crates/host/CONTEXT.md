@@ -1,25 +1,8 @@
-# Plecto — ドメイン用語集
+# Extension plane / host runtime — 用語集
 
-Plecto は、**相補関係にある二つの構成要素**（native-Rust の fast path / WASM の extension plane）を
-WIT 型契約で結ぶ、セルフホスト可能な L7 リバースプロキシ / API ゲートウェイ。本ファイルは用語集
-（glossary）であり、実装詳細・仕様・決定の置き場ではない。設計判断は `CLAUDE.md` と
-`docs/ADR/`、契約は `wit/` を参照。
-
-## アーキテクチャ全体
-
-**Fast path**:
-接続受付・TLS 終端・HTTP/1.1/2/3・ルーティング・LB・upstream 管理を担う native-Rust 側の構成要素。
-チェーンを駆動する側。
-_Avoid_: core, engine（曖昧）, data plane（多義）
-
-**Extension plane**:
-各リクエストの判断（認証・書換・rate limit・WAF・ポリシー）を担う WASM フィルタの実行基盤。
-fast path から WIT 契約越しに駆動される側。
-_Avoid_: plugin layer, middleware layer
-
-**Two halves（相補関係にある二つの構成要素）**:
-fast path と extension plane の対。相補関係にあり、両者を WIT 型契約で結ぶ。
-_Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）, より合わせる糸（比喩過多）
+WASM フィルタを安全に実行する wasmtime 埋め込みホスト（`plecto-host`）と、それが fast path に対して守る
+`plecto:filter` 型契約のコンテキスト。全体像と他コンテキストとの関係は [../../../CONTEXT-MAP.md](../../../CONTEXT-MAP.md)。
+本ファイルは用語集であり、実装詳細・仕様・決定の置き場ではない（設計判断は `CLAUDE.md` と `docs/ADR/`、契約は `wit/`）。
 
 ## 契約（`plecto:filter`）
 
@@ -88,19 +71,3 @@ _Avoid_: syscall, runtime API（曖昧）
 トークンバケットのレート制限を貸す能力。リフィルとカウントは**ホストネイティブ**に保ち
 （超ホット経路は WASM 境界を跨がない）、フィルタは「consult するか・どのキーで」を判断するだけ。
 _Avoid_: throttle, quota（別概念）
-
-## 配布・設定
-
-**Manifest（宣言的マニフェスト）**:
-フィルタを OCI digest で pin し、信頼鍵・チェーン順を宣言する単一の静的設定。「何がロードされているか」の
-source of truth。
-_Avoid_: config（曖昧）, descriptor
-
-**Content pin（digest 固定）**:
-フィルタを OCI content digest（sha256）で固定し、再現性とサプライチェーン整合を担保すること。署名
-（authenticity）とは別レイヤの integrity。
-_Avoid_: version tag（タグは非固定で再現性が壊れる）
-
-**Hot-reload（無停止リロード）**:
-新しいフィルタ集合を並行生成し、アトミックに切替え、旧集合を drain する設定差し替え。
-_Avoid_: restart, hot restart（プロセス再起動を含意）

@@ -22,12 +22,13 @@
 / (git root = GitHub: Kaikei-e/Plecto)
 ├── (founding design doc)      ← 設計の源泉（ドラフト・確定後に命名）
 ├── CLAUDE.md                  ← このファイル
-├── CONTEXT.md                 ← ドメイン用語集（glossary）
+├── CONTEXT-MAP.md             ← ドメイン用語集の地図（コンテキスト分割・全体横断語彙）
 ├── docs/ADR/                  ← Architecture Decision Records（NNNNNN.md, 6桁）
-├── plecto/                    ← Rust workspace（fast path / host / filter ランタイム）
+├── plecto/                    ← Rust workspace（fast path / host / control / filter ランタイム）
 │   ├── wit/                   ← plecto:filter ワールド（契約・contract-first）
 │   └── crates/
-│       ├── host/              ← wasmtime 埋め込みホスト（plecto-host）
+│       ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
+│       ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
 │       └── filter-hello/      ← 例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
 └── demo/                      ← wasm-bindgen デモ（PoC）
 ```

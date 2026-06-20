@@ -1,0 +1,70 @@
+// WIT-conformance test (Plecto's analogue of a consumer-driven contract test).
+// Loads a built WASM *component* into wasmtime and asserts it satisfies the `plecto:filter`
+// world and behaves per the contract the host depends on.
+//
+// Place under `tests/conformance/{{filter_name}}.rs`. Requires the filter to be pre-built to a
+// component (e.g. `cargo build --target wasm32-wasip2` + componentize, or `jco componentize`),
+// with its path passed via an env var so the path is parameterized, not hardcoded.
+
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine, Store};
+
+// Generated host bindings for the contract under test.
+// wasmtime::component::bindgen!({ world: "plecto:filter/filter", async: true });
+
+struct HostState {
+    // deny-by-default host-API surface lent to the filter (KV/counter/log/clock...).
+    // Only the capabilities the contract grants are wired here.
+}
+
+fn engine() -> Engine {
+    let mut cfg = Config::new();
+    cfg.wasm_component_model(true);
+    cfg.epoch_interruption(true); // metering parity with production
+    Engine::new(&cfg).expect("engine")
+}
+
+fn component_path() -> String {
+    std::env::var("PLECTO_FILTER_WASM")
+        .expect("set PLECTO_FILTER_WASM to the built component path")
+}
+
+#[tokio::test]
+async fn implements_the_filter_world() {
+    let engine = engine();
+    let component = Component::from_file(&engine, component_path())
+        .expect("component must load and match the plecto:filter world");
+
+    let mut linker = Linker::new(&engine);
+    // wire only the granted host-API imports here (deny-by-default):
+    // Filter::add_to_linker(&mut linker, |s: &mut HostState| s).unwrap();
+
+    let mut store = Store::new(&engine, HostState {});
+    store.set_epoch_deadline(1);
+
+    let _ = (&component, &linker, &mut store);
+    // let filter = Filter::instantiate_async(&mut store, &component, &linker).await.unwrap();
+    // (instantiation succeeding proves the export surface matches the world)
+}
+
+#[tokio::test]
+async fn on_request_returns_a_valid_decision() {
+    // Drive the per-request hook with a representative request and assert the decision is one of
+    // the contract's variants, and that the host-relevant behaviour holds:
+    //
+    // let d = filter.call_on_request(&mut store, &req).await.unwrap();
+    // match d {
+    //     Decision::Continue | Decision::Modified(_) | Decision::ShortCircuit(_) => {}
+    // }
+    //
+    // For an auth filter: a request without credentials MUST short-circuit (fail-closed).
+    // assert!(matches!(d, Decision::ShortCircuit(r) if r.status == 401));
+}
+
+#[tokio::test]
+async fn denied_capabilities_are_absent() {
+    // Negative test: a capability the contract does NOT grant must be unavailable.
+    // Instantiating with a Linker that omits ungranted imports must still succeed (the filter
+    // cannot import what it was never given), and any attempt to reach beyond the lent surface
+    // must trap rather than escape the sandbox.
+}

@@ -1,0 +1,15 @@
+[package]
+name = "filter-hello"
+version = "0.1.0"
+edition = "2024"
+
+# A WASM Component Model guest implementing `plecto:filter`. Built for
+# wasm32-wasip2 (crates/host/build.rs drives it). Declares its own [workspace]
+# so the native plecto/ workspace never absorbs it into a host-target build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[workspace]

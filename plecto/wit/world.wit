@@ -78,20 +78,70 @@ interface host-clock {
 }
 
 interface host-kv {
-    // host-held state (ADR 000004). Backed by an in-memory map in v0.1.0;
-    // the redb backend arrives with ADR 000004's runtime work.
+    // host-held mutable business state (ADR 000004 / 000011): the place a stateless
+    // filter keeps session / cache bytes. Backed by a pluggable `KvBackend` — an
+    // in-memory map by default, redb when a durable store is configured (ADR 000004).
+    // Keys are host-namespaced per filter identity (ADR 000011); a filter cannot
+    // reach another filter's keyspace.
     get: func(key: string) -> option<list<u8>>;
     set: func(key: string, value: list<u8>);
     delete: func(key: string);
 }
 
+// --- host-counter: atomic named counters (ADR 000004). Shape mirrors
+// --- wasi:keyvalue/atomics so polyglot filters meet a familiar contract.
+interface host-counter {
+    // Atomically add `delta` to the counter at `key` (host-namespaced per filter,
+    // ADR 000011) and return the NEW value. `delta` is signed, so decrement and
+    // reset-toward-zero are expressible in one call. An unset counter reads as 0.
+    increment: func(key: string, delta: s64) -> s64;
+
+    // Read the current value without mutating it (0 when unset).
+    get: func(key: string) -> s64;
+}
+
+// --- host-ratelimit: the token bucket stays HOST-NATIVE (ADR 000005). The hot-path
+// --- refill + counting never cross the WASM boundary; the filter only DECIDES to
+// --- consult the limiter and on what key. This is the fast-path/extension-plane
+// --- split applied to rate limiting.
+interface host-ratelimit {
+    // A token-bucket specification. In v0.1.0 the filter supplies it per call because
+    // Plecto has no declarative manifest yet (ADR 000007); once the manifest lands the
+    // spec moves host-side and `try-acquire` slims to (key, cost).
+    record bucket {
+        // maximum tokens the bucket can hold
+        capacity: u64,
+        // tokens added each refill interval
+        refill-tokens: u64,
+        // refill interval in milliseconds (host advances by whole intervals)
+        refill-interval-ms: u64,
+    }
+
+    // The outcome of a token-bucket acquire.
+    record acquire {
+        // whether `cost` tokens were granted
+        allowed: bool,
+        // tokens left in the bucket after this call
+        remaining: u64,
+        // when denied, ms until enough tokens refill to satisfy `cost` (0 when allowed)
+        retry-after-ms: u64,
+    }
+
+    // Try to take `cost` tokens from the bucket at `key` (host-namespaced per filter).
+    // Refill is computed against the per-request clock snapshot (host-clock), so the
+    // result is deterministic within a request. Fail-closed: a backend error denies.
+    try-acquire: func(key: string, cost: u64, spec: bucket) -> acquire;
+}
+
 world filter {
     use types.{http-request, http-response, request-decision, response-decision};
 
-    // granted capabilities (deny-by-default: only these are importable)
+    // granted capabilities (deny-by-default: only these are importable, ADR 000006)
     import host-log;
     import host-clock;
     import host-kv;
+    import host-counter;
+    import host-ratelimit;
 
     // heavy, once-per-instance initialisation (Tenet 4)
     export init: func();

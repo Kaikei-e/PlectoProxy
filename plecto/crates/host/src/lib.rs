@@ -19,11 +19,17 @@
 mod backend;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store};
+use wasmtime::{
+    Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store, StoreLimits,
+    StoreLimitsBuilder,
+};
 
 pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend};
 
@@ -59,18 +65,39 @@ pub enum Isolation {
     Untrusted,
 }
 
-/// Options for `Host::load`. A struct (not a bare arg) because deny-by-default will grow
-/// more load-time knobs onto it (capability set, epoch budget, memory limit). Defaults to
-/// the safe side: `Untrusted` (fail-closed).
+/// Generous default budget for the heavy once-per-instance `init` (Tenet 4): regex compile,
+/// schema build, config parse. Separate from — and much larger than — the per-request budget
+/// so a legitimately heavy init is not mistaken for a runaway (ADR 000006).
+const DEFAULT_INIT_DEADLINE_MS: u64 = 5_000;
+/// Tight default budget for the hot per-request hooks. This is a *safety* bound that traps
+/// runaway filters (infinite loops), not a latency SLA; header-only filters finish in well
+/// under a millisecond.
+const DEFAULT_REQUEST_DEADLINE_MS: u64 = 100;
+/// Default per-instance linear-memory cap enforced via a `StoreLimits` (ADR 000006). Matches
+/// the pooling engine's per-slot reservation so trusted and untrusted agree.
+const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 << 20;
+
+/// Options for `Host::load`. A struct (not a bare arg) because deny-by-default grows more
+/// load-time knobs onto it. Defaults to the safe side: `Untrusted` (fail-closed) with
+/// metering on (ADR 000006). A future declarative manifest (ADR 000007) injects these.
 #[derive(Debug, Clone, Copy)]
 pub struct LoadOptions {
     pub isolation: Isolation,
+    /// Epoch deadline (ms) for the once-per-instance `init` export.
+    pub init_deadline_ms: u64,
+    /// Epoch deadline (ms) for each per-request hook (`on-request` / `on-response`).
+    pub request_deadline_ms: u64,
+    /// Per-instance linear-memory cap (bytes), enforced by a `StoreLimits`.
+    pub max_memory_bytes: u64,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             isolation: Isolation::Untrusted,
+            init_deadline_ms: DEFAULT_INIT_DEADLINE_MS,
+            request_deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
         }
     }
 }
@@ -79,14 +106,88 @@ impl LoadOptions {
     pub fn trusted() -> Self {
         Self {
             isolation: Isolation::Trusted,
+            ..Self::default()
         }
     }
     pub fn untrusted() -> Self {
-        Self {
-            isolation: Isolation::Untrusted,
+        Self::default()
+    }
+    /// Override the per-request hook deadline (ms).
+    pub fn with_request_deadline_ms(mut self, ms: u64) -> Self {
+        self.request_deadline_ms = ms;
+        self
+    }
+    /// Override the `init` deadline (ms).
+    pub fn with_init_deadline_ms(mut self, ms: u64) -> Self {
+        self.init_deadline_ms = ms;
+        self
+    }
+    /// Override the per-instance linear-memory cap (bytes).
+    pub fn with_max_memory_bytes(mut self, bytes: u64) -> Self {
+        self.max_memory_bytes = bytes;
+        self
+    }
+}
+
+/// Why a per-request filter call did not produce a `decision`. Kept deliberately distinct
+/// from `RequestDecision`/`ResponseDecision` — those are the filter's *intentional* typed
+/// output; a `RunError` is the filter *failing*. The fast path MUST fail-closed on it:
+/// synthesise an error response and never forward to upstream (CLAUDE.md — no fail-open).
+/// Keeping the two apart also makes "deadline" vs "trap" an observable health signal.
+#[derive(Debug)]
+pub enum RunError {
+    /// The filter ran past its epoch deadline (ADR 000006 metering) and was interrupted.
+    /// Fail-closed mapping: 504.
+    Deadline,
+    /// The filter trapped (`unreachable`, a guest panic, or an allocation past the Store
+    /// memory limit that aborted the guest). Fail-closed mapping: 502.
+    Trap(anyhow::Error),
+    /// A fresh instance could not be created — untrusted per-request instantiation, or the
+    /// rebuild of a trusted instance after a prior trap. Fail-closed mapping: 502.
+    Instantiate(anyhow::Error),
+}
+
+impl RunError {
+    /// Classify the error from a guest call: an epoch interrupt is a `Deadline`, anything
+    /// else is a `Trap`. (`wasmtime 45` returns its own `wasmtime::Error`, distinct from
+    /// `anyhow::Error`; we convert into `anyhow::Error` for storage.)
+    fn from_call(e: wasmtime::Error) -> Self {
+        match e.downcast_ref::<wasmtime::Trap>() {
+            Some(wasmtime::Trap::Interrupt) => RunError::Deadline,
+            _ => RunError::Trap(anyhow::Error::from(e)),
+        }
+    }
+
+    /// A synthetic, fail-closed response for this fault (host helper; the fast path may send
+    /// it directly). Deadline → 504, every other fault → 502. Never a pass-through.
+    pub fn fail_closed_response(&self) -> HttpResponse {
+        let (status, fault, msg): (u16, &str, &str) = match self {
+            RunError::Deadline => (504, "deadline", "filter deadline exceeded"),
+            RunError::Trap(_) => (502, "trap", "filter trapped"),
+            RunError::Instantiate(_) => (502, "instantiate", "filter instantiation failed"),
+        };
+        HttpResponse {
+            status,
+            headers: vec![Header {
+                name: "x-plecto-fault".to_string(),
+                value: fault.to_string(),
+            }],
+            body: msg.as_bytes().to_vec(),
         }
     }
 }
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Deadline => write!(f, "filter exceeded its epoch deadline"),
+            RunError::Trap(e) => write!(f, "filter trapped: {e}"),
+            RunError::Instantiate(e) => write!(f, "filter instantiation failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
 
 /// A log line captured from the host-log capability (test visibility / future tracing).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,15 +227,22 @@ pub struct HostState {
     logs: Vec<LogLine>,
     /// Wall-clock ms captured once at request start: a stable per-request snapshot.
     now_ms: u64,
+    /// Linear-memory / table / instance caps for this Store (ADR 000006). Wired via
+    /// `Store::limiter`; a grow past the cap is denied, bounding mis-allocation and runaway
+    /// growth even on the untrusted on-demand engine (which has no pooling reservation).
+    limits: StoreLimits,
 }
 
 impl HostState {
-    fn new(kv: Arc<dyn KvBackend>, kv_prefix: String) -> Self {
+    fn new(kv: Arc<dyn KvBackend>, kv_prefix: String, max_memory_bytes: u64) -> Self {
         Self {
             kv,
             kv_prefix,
             logs: Vec::new(),
             now_ms: wall_now_ms(),
+            limits: StoreLimitsBuilder::new()
+                .memory_size(max_memory_bytes as usize)
+                .build(),
         }
     }
 
@@ -221,6 +329,46 @@ impl host_ratelimit::Host for HostState {
     }
 }
 
+/// Granularity of the epoch ticker. Deadlines are expressed in milliseconds and converted
+/// 1:1 to epoch increments, so the effective deadline resolution is one tick.
+const EPOCH_TICK: Duration = Duration::from_millis(1);
+
+/// Background thread that advances each engine's epoch counter so per-`Store` deadlines fire
+/// (ADR 000006 metering). Without it `set_epoch_deadline` never trips. Stops and joins on
+/// `Host` drop. One ticker per `Host`; it drives both engines (each has its own counter).
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn spawn(engines: Vec<Engine>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(EPOCH_TICK);
+                for e in &engines {
+                    e.increment_epoch();
+                }
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// The wasmtime host: two engines (one per isolation mode) plus the shared state backend.
 /// One per process/worker.
 pub struct Host {
@@ -231,6 +379,8 @@ pub struct Host {
     /// is two engines, not one (confirmed wasmtime 45 behaviour).
     untrusted_engine: Engine,
     kv: Arc<dyn KvBackend>,
+    /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
+    _epoch_ticker: EpochTicker,
 }
 
 enum Allocation {
@@ -241,6 +391,11 @@ enum Allocation {
 fn build_engine(alloc: Allocation) -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    // epoch interruption: the low-overhead deadline mechanism for the data plane (ADR 000006;
+    // epoch over fuel — lighter, no determinism requirement here). A background ticker
+    // advances the epoch; each Store sets a deadline before every guest call so a runaway
+    // filter traps instead of hanging the worker (fail-closed).
+    config.epoch_interruption(true);
     // Sync path: we deliberately do NOT enable async_support on wasmtime 45 (ADR 000010).
     // `memory_init_cow` stays at its default (enabled): every instance gets its own
     // copy-on-write heap image — the safe posture against CVE-2022-39393 (ADR 000006).
@@ -266,10 +421,15 @@ impl Host {
 
     /// A host backed by a caller-supplied store (e.g. `RedbBackend` for durability).
     pub fn with_backend(kv: Arc<dyn KvBackend>) -> Result<Self> {
+        let trusted_engine = build_engine(Allocation::Pooling)?;
+        let untrusted_engine = build_engine(Allocation::OnDemand)?;
+        let _epoch_ticker =
+            EpochTicker::spawn(vec![trusted_engine.clone(), untrusted_engine.clone()]);
         Ok(Self {
-            trusted_engine: build_engine(Allocation::Pooling)?,
-            untrusted_engine: build_engine(Allocation::OnDemand)?,
+            trusted_engine,
+            untrusted_engine,
             kv,
+            _epoch_ticker,
         })
     }
 
@@ -311,12 +471,15 @@ impl Host {
             kv_prefix: format!("{filter_id}{KV_NS_DELIM}"),
             pre,
             isolation: opts.isolation,
+            init_deadline_ms: opts.init_deadline_ms,
+            request_deadline_ms: opts.request_deadline_ms,
+            max_memory_bytes: opts.max_memory_bytes,
         };
 
         let trusted = match opts.isolation {
             Isolation::Untrusted => None,
             // create the persistent instance and run init exactly once
-            Isolation::Trusted => Some(Mutex::new(inner.instantiate_initialized()?)),
+            Isolation::Trusted => Some(Mutex::new(Some(inner.instantiate_initialized()?))),
         };
 
         Ok(LoadedFilter { inner, trusted })
@@ -330,18 +493,45 @@ struct LoadedInner {
     kv_prefix: String,
     pre: FilterPre<HostState>,
     isolation: Isolation,
+    init_deadline_ms: u64,
+    request_deadline_ms: u64,
+    max_memory_bytes: u64,
 }
 
 impl LoadedInner {
-    /// Instantiate a fresh instance and run `init` once.
+    /// Instantiate a fresh instance and run `init` once, under the `init` epoch deadline and
+    /// the Store memory limit (ADR 000006).
     fn instantiate_initialized(&self) -> Result<Instance> {
         let mut store = Store::new(
             &self.engine,
-            HostState::new(self.kv.clone(), self.kv_prefix.clone()),
+            HostState::new(
+                self.kv.clone(),
+                self.kv_prefix.clone(),
+                self.max_memory_bytes,
+            ),
         );
+        store.limiter(|s| &mut s.limits);
+        // `init` is heavy (Tenet 4) → the generous init budget, not the tight per-request one.
+        store.set_epoch_deadline(self.init_deadline_ms);
         let filter = self.pre.instantiate(&mut store)?;
         filter.call_init(&mut store)?;
         Ok(Instance { store, filter })
+    }
+
+    /// Borrow the trusted instance, rebuilding it (re-instantiate + re-init) if a prior trap
+    /// discarded it. The slot is `None` only after a trap; at load it is `Some` (init-once).
+    /// This is the self-heal half of the trap-recovery decision (ADR 000006).
+    fn ensure_trusted<'a>(
+        &self,
+        slot: &'a mut Option<Instance>,
+    ) -> std::result::Result<&'a mut Instance, RunError> {
+        if slot.is_none() {
+            *slot = Some(
+                self.instantiate_initialized()
+                    .map_err(RunError::Instantiate)?,
+            );
+        }
+        Ok(slot.as_mut().expect("rebuilt above"))
     }
 }
 
@@ -353,9 +543,14 @@ struct Instance {
 
 /// A loaded filter, ready to run per request. Trusted filters hold one persistent
 /// `Instance` reused serially; untrusted filters instantiate fresh each request.
+///
+/// The trusted slot is `Option<Instance>` inside the lock: a trap leaves the guest's linear
+/// memory in an undefined state, so on trap the host discards the instance (`None`) and the
+/// next request rebuilds + re-inits it (self-heal, ADR 000006). The outer `Option` is the
+/// isolation discriminator — `None` means untrusted (fresh instance per request).
 pub struct LoadedFilter {
     inner: LoadedInner,
-    trusted: Option<Mutex<Instance>>,
+    trusted: Option<Mutex<Option<Instance>>>,
 }
 
 impl LoadedFilter {
@@ -364,44 +559,90 @@ impl LoadedFilter {
     }
 
     /// Run the request-side hook. Returns the typed decision plus any log lines the filter
-    /// emitted (captured via the host-log capability).
-    pub fn on_request(&self, req: &HttpRequest) -> Result<(RequestDecision, Vec<LogLine>)> {
+    /// emitted (captured via the host-log capability), or a `RunError` the caller MUST
+    /// fail-closed on (deadline / trap / instantiation — never a pass-through to upstream).
+    pub fn on_request(
+        &self,
+        req: &HttpRequest,
+    ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
             // trusted: reuse the persistent instance, only resetting per-request state.
             Some(cell) => {
                 let mut guard = cell.lock();
-                let inst = &mut *guard;
+                let inst = self.inner.ensure_trusted(&mut guard)?;
+                // NB: `inst` borrows `*guard`; its last use ends before any `*guard = None`.
                 inst.store.data_mut().begin_request();
-                let decision = inst.filter.call_on_request(&mut inst.store, req)?;
-                let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                Ok((decision, logs))
+                inst.store
+                    .set_epoch_deadline(self.inner.request_deadline_ms);
+                match inst.filter.call_on_request(&mut inst.store, req) {
+                    Ok(decision) => {
+                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
+                        Ok((decision, logs))
+                    }
+                    Err(e) => {
+                        // discard the now-undefined instance; the next request rebuilds it.
+                        *guard = None;
+                        Err(RunError::from_call(e))
+                    }
+                }
             }
             // untrusted: fresh instance + init every request (the isolation trade).
             None => {
-                let mut inst = self.inner.instantiate_initialized()?;
-                let decision = inst.filter.call_on_request(&mut inst.store, req)?;
-                let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                Ok((decision, logs))
+                let mut inst = self
+                    .inner
+                    .instantiate_initialized()
+                    .map_err(RunError::Instantiate)?;
+                inst.store
+                    .set_epoch_deadline(self.inner.request_deadline_ms);
+                match inst.filter.call_on_request(&mut inst.store, req) {
+                    Ok(decision) => {
+                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
+                        Ok((decision, logs))
+                    }
+                    Err(e) => Err(RunError::from_call(e)),
+                }
             }
         }
     }
 
-    /// Run the response-side hook for one response.
-    pub fn on_response(&self, resp: &HttpResponse) -> Result<(ResponseDecision, Vec<LogLine>)> {
+    /// Run the response-side hook for one response. Same fail-closed contract as `on_request`.
+    pub fn on_response(
+        &self,
+        resp: &HttpResponse,
+    ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         match &self.trusted {
             Some(cell) => {
                 let mut guard = cell.lock();
-                let inst = &mut *guard;
+                let inst = self.inner.ensure_trusted(&mut guard)?;
+                // NB: `inst` borrows `*guard`; its last use ends before any `*guard = None`.
                 inst.store.data_mut().begin_request();
-                let decision = inst.filter.call_on_response(&mut inst.store, resp)?;
-                let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                Ok((decision, logs))
+                inst.store
+                    .set_epoch_deadline(self.inner.request_deadline_ms);
+                match inst.filter.call_on_response(&mut inst.store, resp) {
+                    Ok(decision) => {
+                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
+                        Ok((decision, logs))
+                    }
+                    Err(e) => {
+                        *guard = None;
+                        Err(RunError::from_call(e))
+                    }
+                }
             }
             None => {
-                let mut inst = self.inner.instantiate_initialized()?;
-                let decision = inst.filter.call_on_response(&mut inst.store, resp)?;
-                let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                Ok((decision, logs))
+                let mut inst = self
+                    .inner
+                    .instantiate_initialized()
+                    .map_err(RunError::Instantiate)?;
+                inst.store
+                    .set_epoch_deadline(self.inner.request_deadline_ms);
+                match inst.filter.call_on_response(&mut inst.store, resp) {
+                    Ok(decision) => {
+                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
+                        Ok((decision, logs))
+                    }
+                    Err(e) => Err(RunError::from_call(e)),
+                }
             }
         }
     }
@@ -417,7 +658,11 @@ mod tests {
     use host_log::Host as LogHost;
 
     fn state(prefix: &str) -> HostState {
-        HostState::new(Arc::new(MemoryBackend::default()), prefix.to_string())
+        HostState::new(
+            Arc::new(MemoryBackend::default()),
+            prefix.to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        )
     }
 
     #[test]
@@ -435,8 +680,16 @@ mod tests {
         // Two filters sharing one backing store must not see each other's keys
         // (capability isolation across a chain, ADR 000006 / 000011).
         let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
-        let mut a = HostState::new(shared.clone(), "filter-a\u{1f}".to_string());
-        let mut b = HostState::new(shared.clone(), "filter-b\u{1f}".to_string());
+        let mut a = HostState::new(
+            shared.clone(),
+            "filter-a\u{1f}".to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        );
+        let mut b = HostState::new(
+            shared.clone(),
+            "filter-b\u{1f}".to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        );
 
         KvHost::set(&mut a, "count".into(), b"1".to_vec());
         assert_eq!(
@@ -490,5 +743,27 @@ mod tests {
     fn clock_returns_nonzero_wall_time() {
         let mut s = state("test\u{1f}");
         assert!(ClockHost::now_ms(&mut s) > 0);
+    }
+
+    #[test]
+    fn run_error_maps_to_fail_closed_response() {
+        // The host's synthetic responses are fail-closed (5xx), never a pass-through, and
+        // distinguish a deadline (504) from any other trap (502) for observability (ADR 000006).
+        let deadline = RunError::Deadline.fail_closed_response();
+        assert_eq!(deadline.status, 504);
+        assert!(
+            deadline
+                .headers
+                .iter()
+                .any(|h| h.name == "x-plecto-fault" && h.value == "deadline")
+        );
+
+        let trap = RunError::Trap(anyhow::anyhow!("boom")).fail_closed_response();
+        assert_eq!(trap.status, 502);
+        assert!(
+            trap.headers
+                .iter()
+                .any(|h| h.name == "x-plecto-fault" && h.value == "trap")
+        );
     }
 }

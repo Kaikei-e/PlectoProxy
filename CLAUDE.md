@@ -22,10 +22,14 @@
 / (git root = GitHub: Kaikei-e/Plecto)
 ├── (founding design doc)      ← 設計の源泉（ドラフト・確定後に命名）
 ├── CLAUDE.md                  ← このファイル
-├── CONTEXT.md                 ← ドメイン用語集（lazily に作成）
+├── CONTEXT.md                 ← ドメイン用語集（glossary）
 ├── docs/ADR/                  ← Architecture Decision Records（NNNNNN.md, 6桁）
-├── plecto/                    ← Rust crate（fast path / host / filter ランタイム）
-└── demo/                      ← wasm-bindgen デモ
+├── plecto/                    ← Rust workspace（fast path / host / filter ランタイム）
+│   ├── wit/                   ← plecto:filter ワールド（契約・contract-first）
+│   └── crates/
+│       ├── host/              ← wasmtime 埋め込みホスト（plecto-host）
+│       └── filter-hello/      ← 例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
+└── demo/                      ← wasm-bindgen デモ（PoC）
 ```
 
 ## コア原則（迷ったらこの順で優先）
@@ -48,6 +52,9 @@ cargo test --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 # WASM フィルタ
+# 現行（無 WASI / header-only, ADR 000010）: wasm32-unknown-unknown でビルドし wit-component で component 化
+cargo build --target wasm32-unknown-unknown --release   # crates/host/build.rs が ComponentEncoder で component 化
+# 将来（body / stream<u8> / wasi:http 再利用, wasmtime 46 以降）: wasm32-wasip2 へ移行
 cargo build --target wasm32-wasip2 --release      # Rust filter（→ componentize）
 npx jco componentize <entry>.js --wit <world>.wit -o <out>.wasm   # JS filter
 ```

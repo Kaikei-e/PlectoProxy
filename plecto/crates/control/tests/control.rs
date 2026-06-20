@@ -8,9 +8,7 @@ use plecto_control::{
     ChainOutcome, Control, ControlError, Host, HttpRequest, Manifest, MemoryStore, ResolvedArtifact,
 };
 use plecto_host::Header;
-use plecto_host::test_support::{TestSigner, filter_hello_component};
-
-const SBOM: &[u8] = br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#;
+use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
 
 fn req(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
@@ -33,11 +31,12 @@ fn signed_filter_hello() -> (TestSigner, ResolvedArtifact) {
     let component = filter_hello_component();
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&component).unwrap();
-    let sbom_signature = signer.sign(SBOM).unwrap();
+    let sbom = bound_sbom(&component);
+    let sbom_signature = signer.sign(&sbom).unwrap();
     let artifact = ResolvedArtifact {
         component,
         component_signature,
-        sbom: SBOM.to_vec(),
+        sbom,
         sbom_signature,
     };
     (signer, artifact)

@@ -3,7 +3,7 @@
 //! the synthesised response, and the lifecycle effect ADR 000004 promises (init-once for
 //! trusted filters, fresh-per-request for untrusted ones).
 
-use plecto_host::test_support::TestSigner;
+use plecto_host::test_support::{TestSigner, bound_sbom};
 use plecto_host::{
     Header, Host, HttpRequest, LoadOptions, LoadedFilter, LogLine, RequestDecision, RunError,
     SignedArtifact,
@@ -13,24 +13,21 @@ fn component_bytes() -> Vec<u8> {
     std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
 }
 
-/// A minimal SBOM fixture. v0.1 requires a *signed* SBOM to be present; its content is opaque
-/// (ADR 000006 — content policy deferred), so any non-empty document does.
-const SBOM: &[u8] = br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#;
-
-/// Sign filter-hello (and the SBOM) with a fresh ephemeral key, build a `Host` that trusts
-/// exactly that key, and load it. Returns the `Host` too: it owns the epoch ticker, so it must
-/// outlive the filter for deadlines to keep firing. This is the real provenance path (ADR
-/// 000006) — every load in these tests goes through signature verification.
+/// Sign filter-hello (and a component-bound SBOM) with a fresh ephemeral key, build a `Host`
+/// that trusts exactly that key, and load it. Returns the `Host` too: it owns the epoch ticker,
+/// so it must outlive the filter for deadlines to keep firing. This is the real provenance path
+/// (ADR 000006) — every load here goes through signature + SBOM-binding verification.
 fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
     let bytes = component_bytes();
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&bytes).unwrap();
-    let sbom_signature = signer.sign(SBOM).unwrap();
+    let sbom = bound_sbom(&bytes);
+    let sbom_signature = signer.sign(&sbom).unwrap();
     let host = Host::new(signer.trust_policy().unwrap()).unwrap();
     let artifact = SignedArtifact {
         component_bytes: &bytes,
         component_signature: &component_signature,
-        sbom: SBOM,
+        sbom: &sbom,
         sbom_signature: &sbom_signature,
     };
     let filter = host.load("filter-hello", &artifact, opts).unwrap();
@@ -240,6 +237,29 @@ fn trusted_filter_recovers_after_trap() {
         .expect("trusted filter must self-heal after a trap");
     assert!(matches!(decision, RequestDecision::Continue));
     assert!(logs.iter().any(|l| l.message.contains("on-request")));
+}
+
+#[test]
+fn trusted_trap_storm_opens_circuit_breaker() {
+    // review f000003 #5: a trusted filter that traps deterministically must not force a
+    // rebuild + re-init every request forever. The first few traps self-heal (surface as
+    // Deadline); after the threshold the breaker opens and subsequent calls fail closed
+    // CHEAPLY (Unavailable) WITHOUT re-instantiating — even a benign request is rejected while
+    // the circuit is open.
+    let (_host, filter) = signed_load(LoadOptions::trusted().with_request_deadline_ms(50));
+    let spin = request(&[("x-plecto-spin", "1")]);
+
+    for _ in 0..3 {
+        assert!(
+            matches!(filter.on_request(&spin), Err(RunError::Deadline)),
+            "consecutive traps self-heal and surface as Deadline until the breaker opens"
+        );
+    }
+
+    assert!(
+        matches!(filter.on_request(&request(&[])), Err(RunError::Unavailable)),
+        "once the breaker is open, even a benign request fails closed cheaply (no rebuild)"
+    );
 }
 
 #[test]

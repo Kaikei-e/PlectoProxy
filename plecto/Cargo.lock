@@ -1580,8 +1580,11 @@ name = "plecto-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "parking_lot",
  "redb",
+ "serde_json",
+ "sha2 0.10.9",
  "sigstore",
  "tempfile",
  "tracing",

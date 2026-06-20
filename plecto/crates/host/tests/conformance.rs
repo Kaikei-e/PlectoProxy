@@ -8,25 +8,23 @@
 //! network / filesystem / sockets) remains structural — a filter can reach nothing it was not
 //! lent, and now cannot even load unless a trusted key signed it.
 
-use plecto_host::test_support::TestSigner;
+use plecto_host::test_support::{TestSigner, bound_sbom};
 use plecto_host::{
     Host, HttpResponse, Isolation, LoadOptions, ResponseDecision, SignedArtifact, TrustPolicy,
 };
-
-/// A minimal SBOM fixture. v0.1 requires a *signed* SBOM to be present; its content is opaque
-/// (ADR 000006 — content policy deferred), so any non-empty document does.
-const SBOM: &[u8] = br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#;
 
 fn component_bytes() -> Vec<u8> {
     std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
 }
 
 /// A freshly-signed filter-hello: the ephemeral signer (whose key a matching `TrustPolicy`
-/// trusts), the component bytes, and DER signatures over the component and the SBOM.
+/// trusts), the component bytes, an SBOM bound to that component, and DER signatures over
+/// both (review f000003 #1: the SBOM's subject digest is sha256(component)).
 struct Fixture {
     signer: TestSigner,
     bytes: Vec<u8>,
     component_signature: Vec<u8>,
+    sbom: Vec<u8>,
     sbom_signature: Vec<u8>,
 }
 
@@ -34,11 +32,13 @@ fn fixture() -> Fixture {
     let bytes = component_bytes();
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&bytes).unwrap();
-    let sbom_signature = signer.sign(SBOM).unwrap();
+    let sbom = bound_sbom(&bytes);
+    let sbom_signature = signer.sign(&sbom).unwrap();
     Fixture {
         signer,
         bytes,
         component_signature,
+        sbom,
         sbom_signature,
     }
 }
@@ -48,7 +48,7 @@ impl Fixture {
         SignedArtifact {
             component_bytes: &self.bytes,
             component_signature: &self.component_signature,
-            sbom: SBOM,
+            sbom: &self.sbom,
             sbom_signature: &self.sbom_signature,
         }
     }
@@ -133,7 +133,7 @@ fn load_rejects_tampered_component() {
     let artifact = SignedArtifact {
         component_bytes: &tampered,
         component_signature: &fx.component_signature,
-        sbom: SBOM,
+        sbom: &fx.sbom,
         sbom_signature: &fx.sbom_signature,
     };
     assert!(
@@ -170,12 +170,12 @@ fn load_rejects_bad_sbom_signature() {
     // The component signature is fine, but the SBOM signature is from the wrong key → reject.
     let fx = fixture();
     let other = TestSigner::new().unwrap();
-    let bad_sbom_sig = other.sign(SBOM).unwrap();
+    let bad_sbom_sig = other.sign(&fx.sbom).unwrap();
     let host = fx.host();
     let artifact = SignedArtifact {
         component_bytes: &fx.bytes,
         component_signature: &fx.component_signature,
-        sbom: SBOM,
+        sbom: &fx.sbom,
         sbom_signature: &bad_sbom_sig,
     };
     match host.load("filter-hello", &artifact, LoadOptions::untrusted()) {
@@ -183,6 +183,33 @@ fn load_rejects_bad_sbom_signature() {
         Err(e) => assert!(
             e.to_string().contains("SBOM signature"),
             "rejection reason should name the SBOM signature, got: {e}"
+        ),
+    }
+}
+
+#[test]
+fn load_rejects_sbom_for_other_component() {
+    // review f000003 #1: the SBOM is validly signed by a TRUSTED key, but it attests a
+    // DIFFERENT component (its subject digest != sha256(this component)). Mixing a legitimate
+    // component with a legitimate-but-unrelated SBOM must be rejected — fail-closed.
+    let fx = fixture();
+    let other_component = b"a different component".to_vec();
+    let other_sbom = bound_sbom(&other_component);
+    let other_sbom_sig = fx.signer.sign(&other_sbom).unwrap();
+    let artifact = SignedArtifact {
+        component_bytes: &fx.bytes,
+        component_signature: &fx.component_signature,
+        sbom: &other_sbom,
+        sbom_signature: &other_sbom_sig,
+    };
+    match fx
+        .host()
+        .load("filter-hello", &artifact, LoadOptions::untrusted())
+    {
+        Ok(_) => panic!("an SBOM attesting a different component must be rejected"),
+        Err(e) => assert!(
+            e.to_string().contains("does not attest this component"),
+            "rejection reason should name the binding failure, got: {e}"
         ),
     }
 }

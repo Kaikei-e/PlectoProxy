@@ -12,6 +12,12 @@ redb = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 sigstore = { workspace = true }
+# SBOM↔component binding (ADR 000006 hardening): parse the SBOM in-toto statement and
+# verify its subject digest is sha256(component), so a validly-signed but UNRELATED SBOM
+# cannot be paired with a component (review f000003 #1).
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 
 # build.rs builds the filter-hello guest (wasm32-unknown-unknown) and wraps the
 # core module into a Component Model component, hermetically (no external CLI).

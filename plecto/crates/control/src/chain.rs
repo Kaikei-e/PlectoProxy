@@ -20,10 +20,11 @@ pub enum ChainOutcome {
 
 pub(crate) fn dispatch_request(
     active: &ActiveConfig,
+    chain: &[String],
     mut request: HttpRequest,
     trace: &RequestTrace,
 ) -> ChainOutcome {
-    for id in &active.chain {
+    for id in chain {
         // `build_active` validates chain ⊆ filters, so this is always `Some`; staying total
         // (no indexing panic) honours the data-plane no-panic discipline (bp-rust).
         let Some(filter) = active.filters.get(id) else {
@@ -46,13 +47,14 @@ pub(crate) fn dispatch_request(
 
 pub(crate) fn dispatch_response(
     active: &ActiveConfig,
+    chain: &[String],
     mut response: HttpResponse,
     trace: &RequestTrace,
 ) -> HttpResponse {
     // The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
     // `response-decision` has no short-circuit, so the chain only continues or rewrites. The
     // same `trace` as the request side, so request + response spans share one trace (ADR 000009).
-    for id in active.chain.iter().rev() {
+    for id in chain.iter().rev() {
         let Some(filter) = active.filters.get(id) else {
             continue;
         };

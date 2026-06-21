@@ -25,8 +25,51 @@ pub struct Manifest {
     /// `[[filter]]` entries.
     #[serde(default, rename = "filter")]
     pub filters: Vec<FilterEntry>,
+    /// The default `[chain]` — driven by the chain-only `Control::on_request` convenience and
+    /// used by a route that names no filters of its own. The fast-path server uses `[[route]]`.
     #[serde(default)]
     pub chain: Chain,
+    /// `[[upstream]]` entries: named backends the fast-path server forwards to (ADR 000013).
+    #[serde(default, rename = "upstream")]
+    pub upstreams: Vec<Upstream>,
+    /// `[[route]]` entries: host + path-prefix → an (inline) chain and an upstream (ADR 000013).
+    /// Empty until the fast-path server is configured; matching is the server's job, declared here.
+    #[serde(default, rename = "route")]
+    pub routes: Vec<Route>,
+}
+
+/// A named upstream backend the fast-path server forwards a matched request to (ADR 000013).
+/// `address` is a plain `host:port` (no scheme); v0.1 forwards over plain HTTP/1.1, a single
+/// address per upstream — inter-instance load balancing is deferred.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upstream {
+    pub name: String,
+    /// `host:port` of the backend (e.g. `127.0.0.1:9000`). No scheme; plain HTTP in v0.1.
+    pub address: String,
+}
+
+/// One routing rule (ADR 000013): match a request by host (optional) + path prefix, run an
+/// inline chain of `filters`, and forward to `upstream`. `strip_prefix` is a **host-native**
+/// path rewrite applied to the *forwarded* request only (the chain still sees the original
+/// path) — the common reverse-proxy prefix-strip, without a `plecto:filter` contract change.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    /// Match only this authority (case-insensitive, port ignored). `None` matches any host.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Match requests whose path starts with this prefix (on a `/` boundary). Longest wins.
+    pub path_prefix: String,
+    /// This route's chain: filter ids run in order (may be empty for a pure pass-through route).
+    #[serde(default)]
+    pub filters: Vec<String>,
+    /// The `[[upstream]]` `name` to forward a passing request to.
+    pub upstream: String,
+    /// If set and the forwarded path starts with it, strip it before forwarding to the upstream
+    /// (host-native rewrite; the chain saw the original path). E.g. `/api` + `/api/x` → `/x`.
+    #[serde(default)]
+    pub strip_prefix: Option<String>,
 }
 
 /// Trust roots: paths (manifest-relative) to trusted signer public keys, PEM (ADR 000006).
@@ -229,6 +272,48 @@ filters = []
             v1.content_hash().unwrap(),
             v2.content_hash().unwrap(),
             "a chain change must flip the content hash"
+        );
+    }
+
+    #[test]
+    fn parses_routes_and_upstreams() {
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+
+[[upstream]]
+name = "api-svc"
+address = "127.0.0.1:9000"
+
+[[route]]
+host = "example.com"
+path_prefix = "/api"
+filters = ["auth"]
+upstream = "api-svc"
+strip_prefix = "/api"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(m.upstreams.len(), 1);
+        assert_eq!(m.upstreams[0].address, "127.0.0.1:9000");
+        assert_eq!(m.routes.len(), 1);
+        let r = &m.routes[0];
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert_eq!(r.path_prefix, "/api");
+        assert_eq!(r.filters, vec!["auth".to_string()]);
+        assert_eq!(r.upstream, "api-svc");
+        assert_eq!(r.strip_prefix.as_deref(), Some("/api"));
+        // a routing edit must flip the config version (routes ride the semantic hash)
+        let mut m2 = m.clone();
+        m2.routes[0].path_prefix = "/v2".to_string();
+        assert_ne!(
+            m.content_hash().unwrap(),
+            m2.content_hash().unwrap(),
+            "a route change must flip the content hash"
         );
     }
 

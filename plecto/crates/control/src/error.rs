@@ -62,4 +62,16 @@ pub enum ControlError {
 
     #[error("duplicate filter id {0:?} in manifest")]
     DuplicateFilterId(String),
+
+    #[error("duplicate upstream name {0:?} in manifest")]
+    DuplicateUpstream(String),
+
+    #[error("route (prefix {path_prefix:?}) references unknown upstream {upstream:?}")]
+    UnknownRouteUpstream {
+        path_prefix: String,
+        upstream: String,
+    },
+
+    #[error("route (prefix {path_prefix:?}) references unknown filter {filter:?}")]
+    UnknownRouteFilter { path_prefix: String, filter: String },
 }

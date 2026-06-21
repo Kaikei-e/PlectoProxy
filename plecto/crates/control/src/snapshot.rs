@@ -15,6 +15,7 @@ use plecto_host::{HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
 use crate::chain::{self, ChainOutcome};
+use crate::route::{self, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
 /// run `on_request` then (later) `on_response` against the *same* snapshot so a reload cannot
@@ -23,6 +24,11 @@ use crate::chain::{self, ChainOutcome};
 /// The snapshot also carries the request's [`RequestTrace`] (ADR 000009): both halves run
 /// under one trace context, so the request-side and response-side filter spans belong to the
 /// same trace. The host emits those spans to its sink as the chain runs.
+///
+/// `Clone` is cheap (an `Arc` clone + the trace ids) and yields the **same** pinned config and
+/// trace — the fast-path server clones one snapshot to run the request and response halves on
+/// separate `spawn_blocking` tasks while keeping them in one transaction (ADR 000013).
+#[derive(Clone)]
 pub struct ConfigSnapshot {
     config: Arc<ActiveConfig>,
     trace: RequestTrace,
@@ -33,15 +39,48 @@ impl ConfigSnapshot {
         Self { config, trace }
     }
 
-    /// Drive a request through the pinned chain (forward, or respond on short-circuit /
-    /// fail-closed).
+    /// Drive a request through the **default** `[chain]` (the chain-only convenience). The
+    /// fast-path server uses [`ConfigSnapshot::find_route`] + [`ConfigSnapshot::dispatch_request`].
     pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        chain::dispatch_request(&self.config, request, &self.trace)
+        chain::dispatch_request(&self.config, &self.config.chain, request, &self.trace)
     }
 
-    /// Drive a response back through the pinned chain in reverse.
+    /// Drive a response back through the default `[chain]` in reverse.
     pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
-        chain::dispatch_response(&self.config, response, &self.trace)
+        chain::dispatch_response(&self.config, &self.config.chain, response, &self.trace)
+    }
+
+    /// Match a request to a route by host + path prefix (ADR 000013), or `None` when no route
+    /// matches (the server responds 404). Pure config lookup — cheap and non-blocking, so it
+    /// runs on the async thread; only the returned route's chain dispatch is blocking work.
+    pub fn find_route(&self, authority: &str, path: &str) -> Option<RouteInfo> {
+        let index = route::select(&self.config.routes, authority, path)?;
+        let r = &self.config.routes[index];
+        Some(RouteInfo {
+            index,
+            upstream_address: r.upstream_address.clone(),
+            strip_prefix: r.strip_prefix.clone(),
+        })
+    }
+
+    /// Drive a request through a matched route's chain (request side). `route` is the index from
+    /// [`ConfigSnapshot::find_route`] on this same snapshot. Returns forward-or-respond just like
+    /// `on_request`. Out-of-range (a stale index from another snapshot) responds with a
+    /// fail-closed 404 rather than panicking (data-plane no-panic, bp-rust).
+    pub fn dispatch_request(&self, route: usize, request: HttpRequest) -> ChainOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_request(&self.config, &r.filters, request, &self.trace),
+            None => ChainOutcome::Respond(no_route_response()),
+        }
+    }
+
+    /// Drive a response back through a matched route's chain in reverse. Same `route` index as
+    /// the request side, on the same (cloned) snapshot, so both halves run one route's chain.
+    pub fn dispatch_response(&self, route: usize, response: HttpResponse) -> HttpResponse {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_response(&self.config, &r.filters, response, &self.trace),
+            None => response,
+        }
     }
 
     /// The `config version` (manifest content hash) this transaction is pinned to.
@@ -53,5 +92,19 @@ impl ConfigSnapshot {
     /// continues the same trace (ADR 000009 propagation).
     pub fn traceparent(&self) -> String {
         self.trace.to_traceparent()
+    }
+}
+
+/// A minimal fail-closed 404 for a `dispatch_*` called with a route index this snapshot does not
+/// have (only reachable by misuse — a stale index from a different snapshot). The fast-path
+/// server builds its own 404 for the ordinary "no route matched" case (`find_route` → `None`).
+fn no_route_response() -> HttpResponse {
+    HttpResponse {
+        status: 404,
+        headers: vec![plecto_host::Header {
+            name: "x-plecto-fault".to_string(),
+            value: "no-route".to_string(),
+        }],
+        body: b"no route".to_vec(),
     }
 }

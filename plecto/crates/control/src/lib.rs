@@ -20,6 +20,7 @@ pub mod oci;
 mod reload;
 mod route;
 mod snapshot;
+mod tls;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,11 +32,14 @@ use plecto_host::{LoadedFilter, SignedArtifact};
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::ChainOutcome;
 pub use error::ControlError;
-pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Route, Trust, Upstream};
+pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Route, TlsCert, Trust, Upstream};
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
 pub use route::RouteInfo;
+/// The rustls TLS server config the fast path terminates with (ADR 000014), re-exported so
+/// `plecto-server` names the same `rustls` type the control plane built.
+pub use rustls::ServerConfig as TlsServerConfig;
 pub use snapshot::ConfigSnapshot;
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
@@ -57,6 +61,9 @@ pub(crate) struct ActiveConfig {
     /// Compiled routing table (ADR 000013): empty unless the manifest declares `[[route]]`.
     /// The fast-path server matches against these; the chain-only `on_request` ignores them.
     pub(crate) routes: Vec<route::CompiledRoute>,
+    /// TLS server config built from `[[tls]]` (ADR 000014), or `None` for plain HTTP/1.1. Rides
+    /// the `ArcSwap` with the rest, so a reload swaps certs atomically (new conns get new certs).
+    pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) hash: String,
 }
 
@@ -73,6 +80,10 @@ pub struct Control {
     /// would change it is rejected (`TrustChangeRequiresRestart`) rather than silently dropped
     /// (f000004 #1): trust roots are fixed for the life of the `Host` / epoch ticker.
     trust: Trust,
+    /// Base directory the manifest's relative paths (filter `source`, TLS `cert_path`/`key_path`)
+    /// resolve against (ADR 000014). Captured at construction so a reload re-reads certs from the
+    /// same root. `"."` for the in-memory `load` core (tests use absolute cert paths).
+    base_dir: PathBuf,
 }
 
 impl Control {
@@ -83,7 +94,15 @@ impl Control {
     /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
     pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
         let (host, store) = build_host_and_store(manifest, base_dir)?;
-        Self::load(host, manifest, Box::new(store))
+        let active = build_active(&host, manifest, &store, base_dir)?;
+        Ok(Self {
+            host,
+            store: Box::new(store),
+            active: ArcSwap::from_pointee(active),
+            manifest_path: None,
+            trust: manifest.trust.clone(),
+            base_dir: base_dir.to_path_buf(),
+        })
     }
 
     /// Build from a pre-constructed `Host` (carrying its `TrustPolicy`) and an artifact store
@@ -96,13 +115,17 @@ impl Control {
         manifest: &Manifest,
         store: Box<dyn ArtifactStore>,
     ) -> Result<Self, ControlError> {
-        let active = build_active(&host, manifest, store.as_ref())?;
+        // The in-memory core has no manifest directory; relative paths resolve against the cwd.
+        // Tests that exercise `[[tls]]` use absolute cert paths, so this base does not bite them.
+        let base_dir = Path::new(".");
+        let active = build_active(&host, manifest, store.as_ref(), base_dir)?;
         Ok(Self {
             host,
             store,
             active: ArcSwap::from_pointee(active),
             manifest_path: None,
             trust: manifest.trust.clone(),
+            base_dir: base_dir.to_path_buf(),
         })
     }
 
@@ -115,13 +138,14 @@ impl Control {
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
         let (host, store) = build_host_and_store(&manifest, base_dir)?;
-        let active = build_active(&host, &manifest, &store)?;
+        let active = build_active(&host, &manifest, &store, base_dir)?;
         Ok(Self {
             host,
             store: Box::new(store),
             active: ArcSwap::from_pointee(active),
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
+            base_dir: base_dir.to_path_buf(),
         })
     }
 
@@ -134,14 +158,19 @@ impl Control {
         manifest_path: &Path,
         store: Box<dyn ArtifactStore>,
     ) -> Result<Self, ControlError> {
+        let base_dir = manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let manifest = read_manifest(manifest_path)?;
-        let active = build_active(&host, &manifest, store.as_ref())?;
+        let active = build_active(&host, &manifest, store.as_ref(), &base_dir)?;
         Ok(Self {
             host,
             store,
             active: ArcSwap::from_pointee(active),
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
+            base_dir,
         })
     }
 
@@ -151,7 +180,7 @@ impl Control {
     /// set stays live — reload is all-or-nothing. The trust policy is fixed at construction.
     pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
         self.ensure_trust_unchanged(manifest)?;
-        let active = build_active(&self.host, manifest, self.store.as_ref())?;
+        let active = build_active(&self.host, manifest, self.store.as_ref(), &self.base_dir)?;
         self.active.store(Arc::new(active));
         Ok(())
     }
@@ -191,7 +220,7 @@ impl Control {
             return Ok(ReloadOutcome::Unchanged);
         }
         // Build the new set fully before swapping; on failure the running set is untouched.
-        let active = build_active(&self.host, &manifest, self.store.as_ref())?;
+        let active = build_active(&self.host, &manifest, self.store.as_ref(), &self.base_dir)?;
         self.active.store(Arc::new(active));
         Ok(ReloadOutcome::Reloaded { hash: new_hash })
     }
@@ -200,6 +229,13 @@ impl Control {
     /// what is loaded right now, and the unit a future opt-in consensus layer would agree on.
     pub fn config_version(&self) -> String {
         self.active.load().hash.clone()
+    }
+
+    /// The active TLS server config (ADR 000014), or `None` for plain HTTP/1.1. The fast-path
+    /// server reads this per accepted connection, so a reload's new certs apply to new connections
+    /// while in-flight ones keep the cert they negotiated with.
+    pub fn tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.active.load().tls.clone()
     }
 
     /// Pin the active config for one request transaction (see [`ConfigSnapshot`]). The
@@ -267,6 +303,7 @@ fn build_active(
     host: &Host,
     manifest: &Manifest,
     store: &dyn ArtifactStore,
+    base_dir: &Path,
 ) -> Result<ActiveConfig, ControlError> {
     let mut filters: HashMap<String, Arc<LoadedFilter>> = HashMap::new();
     for entry in &manifest.filters {
@@ -331,10 +368,15 @@ fn build_active(
         });
     }
 
+    // TLS termination config (ADR 000014): build the rustls ServerConfig from `[[tls]]`. A bad
+    // cert is fail-closed here, so a failed reload never swaps in a TLS config that cannot serve.
+    let tls = tls::build_server_config(&manifest.tls, base_dir)?;
+
     Ok(ActiveConfig {
         filters,
         chain: manifest.chain.filters.clone(),
         routes,
+        tls,
         hash: manifest.content_hash()?,
     })
 }

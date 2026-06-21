@@ -18,6 +18,7 @@ mod error;
 mod manifest;
 pub mod oci;
 mod reload;
+mod route;
 mod snapshot;
 
 use std::collections::HashMap;
@@ -30,17 +31,18 @@ use plecto_host::{LoadedFilter, SignedArtifact};
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::ChainOutcome;
 pub use error::ControlError;
-pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Trust};
+pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Route, Trust, Upstream};
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
+pub use route::RouteInfo;
 pub use snapshot::ConfigSnapshot;
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
 // on `plecto-host` directly for the common path — including the ADR 000009 observability
 // types (build a `Host` with a sink, then drive snapshots that carry the trace context).
 pub use plecto_host::{
-    FanOutSink, FilterSpan, Host, HttpRequest, HttpResponse, InMemorySink, MetricsSink,
+    FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse, InMemorySink, MetricsSink,
     MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
 };
 
@@ -52,6 +54,9 @@ pub use plecto_host::{
 pub(crate) struct ActiveConfig {
     pub(crate) filters: HashMap<String, Arc<LoadedFilter>>,
     pub(crate) chain: Vec<String>,
+    /// Compiled routing table (ADR 000013): empty unless the manifest declares `[[route]]`.
+    /// The fast-path server matches against these; the chain-only `on_request` ignores them.
+    pub(crate) routes: Vec<route::CompiledRoute>,
     pub(crate) hash: String,
 }
 
@@ -288,9 +293,48 @@ fn build_active(
             return Err(ControlError::UnknownChainFilter(id.clone()));
         }
     }
+
+    // Routing table (ADR 000013): resolve each route's upstream to its address and validate its
+    // inline chain against the loaded set. Like the chain check, this is all-or-nothing — a bad
+    // route aborts the whole build, so a failed reload never swaps in a half-valid routing table.
+    let mut upstreams: HashMap<&str, &str> = HashMap::with_capacity(manifest.upstreams.len());
+    for up in &manifest.upstreams {
+        if upstreams
+            .insert(up.name.as_str(), up.address.as_str())
+            .is_some()
+        {
+            return Err(ControlError::DuplicateUpstream(up.name.clone()));
+        }
+    }
+    let mut routes = Vec::with_capacity(manifest.routes.len());
+    for r in &manifest.routes {
+        let Some(address) = upstreams.get(r.upstream.as_str()) else {
+            return Err(ControlError::UnknownRouteUpstream {
+                path_prefix: r.path_prefix.clone(),
+                upstream: r.upstream.clone(),
+            });
+        };
+        for f in &r.filters {
+            if !filters.contains_key(f) {
+                return Err(ControlError::UnknownRouteFilter {
+                    path_prefix: r.path_prefix.clone(),
+                    filter: f.clone(),
+                });
+            }
+        }
+        routes.push(route::CompiledRoute {
+            host: r.host.as_ref().map(|h| h.to_ascii_lowercase()),
+            path_prefix: r.path_prefix.clone(),
+            filters: r.filters.clone(),
+            upstream_address: address.to_string(),
+            strip_prefix: r.strip_prefix.clone(),
+        });
+    }
+
     Ok(ActiveConfig {
         filters,
         chain: manifest.chain.filters.clone(),
+        routes,
         hash: manifest.content_hash()?,
     })
 }

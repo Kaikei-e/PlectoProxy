@@ -1,0 +1,32 @@
+[package]
+name = "plecto-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The M2 fast path: a TCP/HTTP-1.1 listener that drives requests through the control plane's
+# routed filter chains and forwards to upstreams (ADR 000013). lib + bin.
+[lib]
+name = "plecto_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plecto"
+path = "src/main.rs"
+
+[dependencies]
+plecto-control = { path = "../control" }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# the host's test_support (TestSigner / bound_sbom / filter_hello_component) for E2E fixtures,
+# and a TOML writer for the on-disk manifest a test points the server at.
+plecto-host = { path = "../host" }
+tempfile = "3"

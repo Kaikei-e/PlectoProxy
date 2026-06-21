@@ -1,5 +1,5 @@
 # Plecto CI — local CI parity (tdd-workflow Phase 5): fmt / clippy / test / build,
-# plus a wasm-guest lint and a (non-blocking) supply-chain scan.
+# plus a wasm-guest lint and a blocking supply-chain scan.
 #
 # Layout note: the cargo workspace lives in `plecto/`. The example filter
 # `plecto/crates/filter-hello` is a SEPARATE workspace (its own `target/`) built
@@ -91,13 +91,14 @@ jobs:
           workspaces: plecto/crates/filter-hello
       - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 
-  # Supply-chain scan (RustSec advisories + crate bans). Non-blocking for now:
-  # a freshly-published advisory should not block an unrelated change. Tighten to
-  # gating once a curated deny.toml lands (ADR 000006 / OWASP A08).
+  # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).
+  # A security vulnerability, unmaintained crate, or yanked version fails CI — supply-chain
+  # integrity is a security gate, not a courtesy check. Policy is the curated `plecto/deny.toml`
+  # (advisories deny; transitive duplicate versions warn). Clear an advisory by fixing/replacing
+  # the crate, not by silencing it.
   cargo-deny:
-    name: cargo-deny (advisories, non-blocking)
+    name: cargo-deny (supply-chain)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2

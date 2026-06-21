@@ -1,0 +1,20 @@
+# cargo-deny supply-chain policy (ADR 000006 / OWASP A08). The CI `cargo-deny` job runs
+# `check advisories bans` against this workspace and is **blocking**: a RustSec advisory — a
+# security vulnerability, an unmaintained crate, or a yanked version — fails CI, so a known-bad
+# or abandoned dependency cannot land unnoticed.
+
+[advisories]
+version = 2
+# Yanked versions are treated as hard failures.
+yanked = "deny"
+# Deliberately empty: an advisory is cleared by FIXING or REPLACING the crate (as
+# rustls-pemfile → rustls-pki-types), not by silencing it here. Add an id only with a written
+# justification when an upstream fix is genuinely unavailable.
+ignore = []
+
+[bans]
+# Transitive duplicate versions are unavoidable in a tokio / hyper / wasmtime tree; surface them
+# as a warning, not a hard failure — the advisories gate above is what blocks. Wildcard version
+# requirements (`*`) are likewise a warning, not a block.
+multiple-versions = "warn"
+wildcards = "warn"

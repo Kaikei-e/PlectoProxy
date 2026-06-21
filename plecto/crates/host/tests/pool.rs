@@ -20,8 +20,8 @@ use std::thread;
 
 use plecto_host::test_support::{TestSigner, bound_sbom};
 use plecto_host::{
-    Header, Host, HttpRequest, LoadOptions, LoadedFilter, LogLine, RequestDecision, RunError,
-    SignedArtifact,
+    Header, Host, HttpRequest, LoadOptions, LoadedFilter, LogLine, RequestDecision, RequestTrace,
+    RunError, SignedArtifact,
 };
 
 fn component_bytes() -> Vec<u8> {
@@ -108,10 +108,10 @@ fn trusted_pool_serves_concurrent_requests() {
                     // align all threads so their checkouts contend in the same window
                     barrier.wait();
                     let (decision, _logs) = filter
-                        .on_request(&request(&[(
-                            "x-plecto-busy",
-                            &BUSY_OVERLAP_ITERS.to_string(),
-                        )]))
+                        .on_request(
+                            &request(&[("x-plecto-busy", &BUSY_OVERLAP_ITERS.to_string())]),
+                            &RequestTrace::root(),
+                        )
                         .expect("a concurrent trusted request must succeed");
                     assert!(
                         matches!(decision, RequestDecision::Continue),
@@ -123,7 +123,9 @@ fn trusted_pool_serves_concurrent_requests() {
     });
 
     // a final request observes how many instances the pool built: more than one ⇒ real concurrency.
-    let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
+    let (_decision, logs) = filter
+        .on_request(&request(&[]), &RequestTrace::root())
+        .unwrap();
     assert!(
         init_calls(&logs) >= 2,
         "under contention the pool must build >1 instance (init ran {} times)",
@@ -147,7 +149,10 @@ fn trusted_pool_saturation_is_fail_closed() {
         // holder: occupy the single instance for well over the checkout timeout.
         let holder = s.spawn(|| {
             filter
-                .on_request(&request(&[("x-plecto-busy", &BUSY_HOLD_ITERS.to_string())]))
+                .on_request(
+                    &request(&[("x-plecto-busy", &BUSY_HOLD_ITERS.to_string())]),
+                    &RequestTrace::root(),
+                )
                 .expect("the holder's own request still succeeds");
         });
 
@@ -156,7 +161,7 @@ fn trusted_pool_saturation_is_fail_closed() {
         thread::sleep(std::time::Duration::from_millis(60));
 
         // now the pool is saturated: this checkout waits 10ms then fails closed.
-        let contended = filter.on_request(&request(&[]));
+        let contended = filter.on_request(&request(&[]), &RequestTrace::root());
         assert!(
             matches!(contended, Err(RunError::Unavailable)),
             "a saturated trusted pool must fail closed with Unavailable, got {contended:?}"
@@ -167,7 +172,7 @@ fn trusted_pool_saturation_is_fail_closed() {
 
     // once the holder finishes, the pool is usable again (no permanent breakage).
     let (decision, _logs) = filter
-        .on_request(&request(&[]))
+        .on_request(&request(&[]), &RequestTrace::root())
         .expect("the pool recovers once the in-flight request returns");
     assert!(matches!(decision, RequestDecision::Continue));
 }
@@ -186,7 +191,9 @@ fn trusted_instance_recycled_after_max_requests() {
 
     let mut seen = Vec::new();
     for _ in 0..5 {
-        let (_decision, logs) = filter.on_request(&request(&[])).unwrap();
+        let (_decision, logs) = filter
+            .on_request(&request(&[]), &RequestTrace::root())
+            .unwrap();
         seen.push(init_calls(&logs));
     }
     // eager instance serves reqs 1-2, recycled; rebuild serves 3-4, recycled; rebuild serves 5.
@@ -215,7 +222,7 @@ fn trusted_pool_has_no_deadlock_under_churn() {
             s.spawn(|| {
                 for _ in 0..rounds {
                     let (decision, _logs) = filter
-                        .on_request(&request(&[]))
+                        .on_request(&request(&[]), &RequestTrace::root())
                         .expect("every churned request must complete");
                     assert!(matches!(decision, RequestDecision::Continue));
                 }

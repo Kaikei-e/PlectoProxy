@@ -78,3 +78,31 @@ _Avoid_: syscall, runtime API（曖昧）
 トークンバケットのレート制限を貸す能力。リフィルとカウントは**ホストネイティブ**に保ち
 （超ホット経路は WASM 境界を跨がない）、フィルタは「consult するか・どのキーで」を判断するだけ。
 _Avoid_: throttle, quota（別概念）
+
+## 可観測性（observability）
+
+**Filter span**:
+フィルタ 1 実行に対応する span。host が計時し、outcome（continue / modified / short-circuit / trap / deadline …）と
+フィルタの host-log 行（span event）を載せて起こす。OTel データモデル上の span。
+_Avoid_: trace（trace は span の集合で別粒度）, log line（点ではなく実行の span）
+
+**Request span / Trace context**:
+1 リクエスト transaction の親 span と、それを束ねる trace 文脈（trace-id + 親 span-id）。host が管理し、各 filter span の
+親になる。フィルタは自分の trace 文脈を持たず、host が境界を跨いで伝播する（W3C `traceparent` で in/out）。`ConfigSnapshot`
+が保持し、request 半と response 半で同一。
+_Avoid_: session（別概念）, correlation id（trace context はより構造的）
+
+**Telemetry sink**:
+host が filter span を出す先（sync・deny-by-default で既定は no-op）。OTLP/SDK へのネットワーク export はこの継ぎ目越しの
+named-deferred。`NoopSink` / `InMemorySink` / `MetricsSink` / `FanOutSink`。
+_Avoid_: exporter（OTel SDK の async `SpanExporter` を指す。Plecto の sink は sync の別物）, collector（外部の集約先）
+
+**Host-aggregated metrics**:
+span ストリームから host が in-process 集約する RED 系メトリクス（実行数・エラー・short-circuit・レイテンシ）。フィルタ向け
+metrics API は持たず、host が outcome と timing を知る立場で集約する。
+_Avoid_: filter metrics（フィルタが emit する含意。現段階は host 観測のみ）
+
+**wasi-otel（二段構え）**:
+可観測性の将来の*ゲスト契約*（WASI、OpenTelemetry API に密結合）。現段階は host 側集約が主で、wasi-otel ゲスト契約は
+成熟待ちの後段（named-deferred）。
+_Avoid_: WASI Observe（より汎用な別 proposal）, OTel SDK（ホスト側実装の一手段）

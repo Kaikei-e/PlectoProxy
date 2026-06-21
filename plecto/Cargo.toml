@@ -4,7 +4,7 @@
 # wasm32-wasip2 (see crates/host/build.rs).
 [workspace]
 resolver = "3"
-members = ["crates/host", "crates/control"]
+members = ["crates/host", "crates/control", "crates/server"]
 exclude = ["crates/filter-hello"]
 
 [workspace.package]
@@ -55,3 +55,17 @@ hex = "0.4"
 # oci-spec: spec-correct OCI image-layout types; we own the std::fs layout + sha256 verify
 # (offline local artifact, no registry/tokio/openssl — ADR 000007 boundary with wkg).
 oci-spec = { version = "0.10", default-features = false, features = ["image"] }
+
+# --- plecto-server (ADR 000013): the M2 fast-path data path. The FIRST tokio users in the
+# --- workspace — the host + control halves stay sync; only the network edge is async. ---
+# tokio: the async runtime for the fast path. The sync filter chain runs on spawn_blocking
+# (the M1 trusted pool handles instance reuse), so wasmtime's !Send Store never crosses .await.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal"] }
+# hyper 1.x: HTTP/1.1 server (downstream) + client (upstream). h2 / h3 (quinn) come later.
+hyper = { version = "1", features = ["http1", "server", "client"] }
+# hyper-util: TokioIo adapter + the pooling legacy client (upstream connection reuse for free).
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+# http-body-util: body combinators (Full for synthesised responses, BoxBody to unify the
+# short-circuit body and the streamed upstream body, BodyExt for map_err/boxed).
+http-body-util = "0.1"
+bytes = "1"

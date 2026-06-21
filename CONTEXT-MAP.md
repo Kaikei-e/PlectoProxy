@@ -27,12 +27,15 @@ _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）,
   能力境界（host-API）。wasmtime 埋め込みホスト（`plecto-host`）。
 - [Control](./plecto/crates/control/CONTEXT.md) — 宣言的マニフェスト・無停止 reload・単一ノード／分散 opt-in・
   config version（`plecto-control`）。
-- **Fast path** — 接続／TLS／HTTP／routing／LB／upstream。**未実装（クレート未作成）**。fast-path server に
-  着手した時点で `plecto/crates/<fastpath>/CONTEXT.md` を起こす。
+- [Fast path](./plecto/crates/server/CONTEXT.md) — 接続／HTTP／routing／upstream 転送（`plecto-server`、ADR 000013）。
+  M2 slice 1 着地（HTTP/1.1 平文・host＋path-prefix routing・host-native prefix strip・単一 upstream）。
+  TLS／HTTP2,3／インスタンス間 LB は後続スライス。
 
 ## Relationships
 
 - **Fast path → Extension plane**: fast path が各リクエストを `plecto:filter` 契約越しに filter chain へ駆動する。
 - **Control → Extension plane**: マニフェストが filter を OCI digest で pin し、chain 順と trust root を宣言する。
   reload が filter set + chain をアトミックに差し替える。trust root は構築時固定で、reload では変えない。
-- **Control → Fast path**（将来）: route 照合・named chain は fast-path server 到来時に Control が司る。
+- **Control → Fast path**: マニフェストが route（host＋path-prefix）→ chain＋upstream を宣言し、Control が route 照合と
+  route 毎の chain dispatch を提供する。Fast path は per-request に snapshot を取り、route を選んで chain を駆動する
+  （ADR 000013）。

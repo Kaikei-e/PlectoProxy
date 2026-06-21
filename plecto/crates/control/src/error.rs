@@ -74,4 +74,14 @@ pub enum ControlError {
 
     #[error("route (prefix {path_prefix:?}) references unknown filter {filter:?}")]
     UnknownRouteFilter { path_prefix: String, filter: String },
+
+    /// A TLS cert/key file could not be read, parsed, or built into a usable certificate
+    /// (ADR 000014). Fail-closed: a bad cert aborts the build, so reload never swaps in a TLS
+    /// config that cannot serve. `host` is the SNI the entry was for (`None` = default cert).
+    #[error("TLS cert for {host:?} ({path:?}): {reason}")]
+    TlsCert {
+        host: Option<String>,
+        path: String,
+        reason: String,
+    },
 }

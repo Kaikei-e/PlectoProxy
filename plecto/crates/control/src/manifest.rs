@@ -36,6 +36,27 @@ pub struct Manifest {
     /// Empty until the fast-path server is configured; matching is the server's job, declared here.
     #[serde(default, rename = "route")]
     pub routes: Vec<Route>,
+    /// `[[tls]]` entries: server certificates for TLS termination (ADR 000014). Empty = plain
+    /// HTTP/1.1 (the fast path serves TLS only when at least one cert is declared).
+    #[serde(default, rename = "tls")]
+    pub tls: Vec<TlsCert>,
+}
+
+/// One TLS server certificate (ADR 000014). The fast path terminates TLS with rustls and selects
+/// a cert by SNI: `host` names the SNI this cert serves (case-insensitive); `None` is the default
+/// cert presented when no SNI matches. `cert_path` / `key_path` are manifest-relative PEM files
+/// (a cert chain and its private key). Only the **paths** ride the manifest content hash, so a
+/// path change reloads but an in-place file edit does not (ADR 000014).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsCert {
+    /// SNI host this cert serves (case-insensitive). `None` = the default cert.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Manifest-relative path to the PEM cert chain.
+    pub cert_path: String,
+    /// Manifest-relative path to the PEM private key.
+    pub key_path: String,
 }
 
 /// A named upstream backend the fast-path server forwards a matched request to (ADR 000013).

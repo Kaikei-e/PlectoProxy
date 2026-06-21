@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use rustls::ServerConfig;
 use rustls::crypto::ring;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -103,7 +104,8 @@ fn read_certs(
 ) -> Result<Vec<CertificateDer<'static>>, ControlError> {
     let bytes = std::fs::read(base_dir.join(&entry.cert_path))
         .map_err(|e| tls_err_path(entry, &entry.cert_path, &format!("read failed: {e}")))?;
-    rustls_pemfile::certs(&mut bytes.as_slice())
+    // PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained, RUSTSEC-2025-0134).
+    CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| tls_err_path(entry, &entry.cert_path, &format!("bad cert PEM: {e}")))
 }
@@ -111,9 +113,10 @@ fn read_certs(
 fn read_key(entry: &TlsCert, base_dir: &Path) -> Result<PrivateKeyDer<'static>, ControlError> {
     let bytes = std::fs::read(base_dir.join(&entry.key_path))
         .map_err(|e| tls_err_path(entry, &entry.key_path, &format!("read failed: {e}")))?;
-    rustls_pemfile::private_key(&mut bytes.as_slice())
-        .map_err(|e| tls_err_path(entry, &entry.key_path, &format!("bad key PEM: {e}")))?
-        .ok_or_else(|| tls_err_path(entry, &entry.key_path, "no private key in key_path PEM"))
+    // `from_pem_slice` returns the first private key, or a typed error if there is none / it is
+    // malformed — so the previous "no key" branch folds into the error path.
+    PrivateKeyDer::from_pem_slice(&bytes)
+        .map_err(|e| tls_err_path(entry, &entry.key_path, &format!("bad key PEM: {e}")))
 }
 
 fn tls_err(entry: &TlsCert, reason: &str) -> ControlError {

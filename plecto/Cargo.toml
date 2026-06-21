@@ -74,9 +74,9 @@ bytes = "1"
 # --- default-features=false drops the aws-lc-rs default (no cmake / C toolchain), keeping the
 # --- build light and pure-Rust-leaning (no openssl), consistent with the rest of the stack. ---
 # rustls (sync): control builds the ServerConfig (SNI cert resolver, ALPN) so a bad cert fails
-# the build fail-closed and reload swaps it atomically. No tokio here — control stays sync.
+# the build fail-closed and reload swaps it atomically. No tokio here — control stays sync. PEM
+# cert/key parsing uses rustls-pki-types' `pem` module (re-exported by rustls), NOT the separate
+# rustls-pemfile crate, which is unmaintained (RUSTSEC-2025-0134).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-# rustls-pemfile: parse the PEM cert chain + private key the manifest points at.
-rustls-pemfile = "2"
 # tokio-rustls: the async TLS acceptor the server wraps each accepted TCP stream with.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

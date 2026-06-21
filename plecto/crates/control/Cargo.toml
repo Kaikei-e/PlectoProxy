@@ -28,11 +28,11 @@ tracing = { workspace = true }
 # the operator's explicit "push a new static manifest" trigger (ADR 000008: static config, no
 # xDS dynamic push). The trait keeps the loop fake-testable; this is the thin unix adapter.
 signal-hook = "0.3"
-# rustls (sync) + rustls-pemfile: build the TLS ServerConfig from the manifest's `[[tls]]` certs
-# (SNI resolver, ALPN) at load/reload, so a bad cert fails closed and reload is atomic (ADR 000014).
-# No tokio — control stays sync; the async acceptor lives in plecto-server.
+# rustls (sync): build the TLS ServerConfig from the manifest's `[[tls]]` certs (SNI resolver,
+# ALPN) at load/reload, so a bad cert fails closed and reload is atomic (ADR 000014). PEM parsing
+# uses rustls-pki-types' `pem` module (re-exported by rustls). No tokio — control stays sync; the
+# async acceptor lives in plecto-server.
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 # unique temp dirs for OCI-layout fixtures and trusted-key PEM files

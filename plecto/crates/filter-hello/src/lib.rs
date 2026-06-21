@@ -75,6 +75,30 @@ impl Guest for FilterHello {
             core::hint::black_box(&big);
         }
 
+        // A BOUNDED busy loop (no trap): burn `x-plecto-busy` iterations of cheap work, then
+        // continue normally. Unlike `x-plecto-spin` (which runs forever and must hit the epoch
+        // deadline), this returns on its own — so the host's pool keeps this instance CHECKED
+        // OUT for the duration. The trusted-pool tests use it to hold an instance long enough
+        // to observe saturation (fail-closed under contention) and real concurrency (the pool
+        // builds a second instance while the first is busy), deterministically and without a
+        // guest sleep capability (none is lent). Iteration count comes from the header so a
+        // test can tune the hold; keep the per-request deadline generous when using it.
+        if let Some(h) = req
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("x-plecto-busy"))
+        {
+            let iters: u64 = h.value.parse().unwrap_or(0);
+            let mut acc: u64 = 0;
+            let mut i: u64 = 0;
+            while i < iters {
+                acc = acc.wrapping_add(i);
+                core::hint::black_box(acc);
+                i += 1;
+            }
+            core::hint::black_box(acc);
+        }
+
         // Ask the host to rewrite the request and continue (chain-dispatch edit application,
         // ADR 000007). The next filter / upstream sees the added header.
         if has_header(&req, "x-plecto-addheader") {

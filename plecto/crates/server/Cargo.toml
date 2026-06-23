@@ -27,6 +27,11 @@ tracing = { workspace = true }
 # tokio-rustls: wrap each accepted TCP stream in a TLS handshake before handing it to hyper
 # (ADR 000014). The ServerConfig is built by control; this is just the async acceptor.
 tokio-rustls = { workspace = true }
+# quinn + h3 + h3-quinn: the independent QUIC/UDP listener that terminates HTTP/3 (ADR 000016).
+# The QUIC ServerConfig's rustls (TLS1.3, ALPN h3) is built by control, sharing the cert resolver.
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for E2E fixtures,

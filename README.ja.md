@@ -23,7 +23,7 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 速さが価値になる経路は native Rust のまま。あなたのリクエスト・ロジックはサンドボックス化された WASM コンポーネントとして走り、**ホストが明示的に貸した能力以外、何も触れない** — 規約ではなくサンドボックスがそれを強制する。
 
 > [!WARNING]
-> **現状: 初期開発段階。** 設計は確定済み（11 本の ADR）で、最初の縦スライス — `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・例フィルタ・テスト一式 — は green で CI に載っている。**データ経路（TLS/HTTP/ルーティング/upstream）はまだ未実装で、現時点で実トラフィックをプロキシできない。** 今は「読める・テストを回せる・フィルタを書ける基盤」である。[ロードマップ](#ロードマップ)参照。
+> **現状: 初期開発段階。** 設計は確定済み（17 本の ADR）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・**そして実 fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）**を終端し、TLS を終端し、host＋path-prefix で routing し、upstream へ転送する。テスト一式は green で CI に載っている。**インスタンス間ロードバランシングと upstream health が次のスライス。** 今は「読める・動かせる・フィルタを書ける基盤」である。[ロードマップ](#ロードマップ)参照。
 
 ## なぜ Plecto か
 
@@ -151,21 +151,23 @@ cargo test --all
 
 ### デモプロキシを動かす
 
-自己完結の example が**本番パス**を一通り組み上げる —— 例フィルタに署名し、オフライン OCI レイアウトに梱包し、TLS 証明書を生成し、manifest を書き、fast path を HTTPS で serve —— して、試すコマンドを表示する:
+自己完結の example（`examples/demo.rs`）が**本番パス**を一通り組み上げる —— 例フィルタに署名し、オフライン OCI レイアウトに梱包し、TLS 証明書を生成し、manifest を書き、fast path を TLS で serve（**HTTP/1.1 + HTTP/2 を TCP で、HTTP/3 を同一ポートの QUIC で**）—— して、試すコマンドを表示する:
 
 ```bash
 cd plecto
-cargo run -p plecto-server --example demo   # https://localhost:8443 で serve、Ctrl-C で停止
+cargo run -p plecto-server --example demo   # https://localhost:8443（+ :8443/udp h3）で serve、Ctrl-C で停止
 
 # 別シェルで（自己署名なので curl -k）:
 curl -k https://localhost:8443/api/hello                         # routing + /api strip + 転送
+curl -k --http2 https://localhost:8443/api/hello                 # 同じ route を HTTP/2 で（ALPN h2）
+curl -k --http3 https://localhost:8443/api/hello                 # 同じ route を HTTP/3 で（h3 対応 curl）
 curl -k -H 'x-plecto-block: 1' https://localhost:8443/api/hello  # フィルタが 403 で short-circuit
 for i in 1 2 3; do curl -k -s -o /dev/null -w '%{http_code} ' \
   -H 'x-plecto-ratelimit: 1' https://localhost:8443/api/hello; done   # 200 200 429（host-native rate limit）
 curl -k https://localhost:8443/nope                             # ルート無し → 404
 ```
 
-cosign 風の署名 ＋ SBOM 検証、TLS 終端（rustls）、host＋path-prefix routing と host-native prefix strip、フィルタチェーン（continue / modify / short-circuit / rate-limit）、response 側書換 —— を実 HTTPS で一気に通す。
+cosign 風の署名 ＋ SBOM 検証、TLS 終端（rustls）、host＋path-prefix routing と host-native prefix strip、フィルタチェーン（continue / modify / short-circuit / rate-limit）、response 側書換 —— を実 HTTP/1.1・HTTP/2・HTTP/3 で一気に通す。
 
 ## ロードマップ
 
@@ -175,8 +177,8 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
   `plecto:filter@0.1.0` 契約、フィルタをロード&実行する wasmtime ホスト、deny-by-default の能力境界（log / clock / kv）、例フィルタ、E2E/conformance/unit テスト、CI。— [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
 - **M1 — フィルタ runtime の堅牢化** ✅ *(着地)*
   trust 分岐ランタイム —— `InstancePre`、trusted は固定容量・遅延充填の**インスタンスプール**をリクエストごとに checkout 再利用（pooling エンジンが初めて活きる。飽和は有界待ち後 fail-closed、決定的に trap するフィルタには pool 全体の circuit breaker が開き、一定リクエスト数で instance を recycle して状態蓄積を bound）、untrusted = on-demand エンジンで per-request fresh（線形メモリは構造的に fresh ゆえゼロ化不要）、redb-backed host KV + アトミック counter + **ホストネイティブな token-bucket rate limit**、全 host-API キーをフィルタごとに名前空間化、ephemeral なホット経路は毎コミット fsync を省く、**epoch 計量 + メモリ/テーブル上限**を実装。trusted/untrusted の分岐は perf でなく init/zeroization の矛盾ゆえの**必然**。**M2 へ繰延**（fast-path server と不可分）: プールを tokio/quinn データ経路へ結線する sync↔async ブリッジと、状態 backend の sharding。— [ADR 4](docs/ADR/000004.md) · [5](docs/ADR/000005.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md) · [12](docs/ADR/000012.md)
-- **M2 — データ経路（fast path）** 🚧 *(slice 1–2 着地)*
-  **着地（slice 1）:** `plecto-server` crate —— tokio + hyper の **HTTP/1.1** listener。各リクエストを host＋path-prefix で route 照合し、その route の filter chain を `spawn_blocking` ブリッジ経由で M1 の trusted プールに載せて駆動（wasmtime の `!Send` Store は `.await` を跨がない）、host-native な prefix strip を適用し、route の upstream（hyper-util pooling client）へ転送、ボディは opaque にストリーム透過。*Plecto はこれで実際のリバースプロキシになった。* **着地（slice 2 — TLS）:** rustls（ring）の **TLS 終端**。証明書は manifest（`[[tls]]`、SNI 選択＋host-less default）で宣言し、control プレーンで構築するので bad cert は load 時 **fail-closed**・reload は証明書をアトミックに差し替え。ALPN は `http/1.1` を広告。*Plecto は HTTPS を終端する。* **保留（後続スライス）:** HTTP/2（h2 over ALPN）→ HTTP/3（quinn）、インスタンス間ロードバランシング & upstream health。— [ADR 12](docs/ADR/000012.md) · [13](docs/ADR/000013.md) · [14](docs/ADR/000014.md)
+- **M2 — データ経路（fast path）** 🚧 *(slice 1–4 着地)*
+  **着地（slice 1）:** `plecto-server` crate —— tokio + hyper の **HTTP/1.1** listener。各リクエストを host＋path-prefix で route 照合し、その route の filter chain を `spawn_blocking` ブリッジ経由で M1 の trusted プールに載せて駆動（wasmtime の `!Send` Store は `.await` を跨がない）、host-native な prefix strip を適用し、route の upstream（hyper-util pooling client）へ転送、ボディは opaque にストリーム透過。*Plecto はこれで実際のリバースプロキシになった。* **着地（slice 2 — TLS）:** rustls（ring）の **TLS 終端**。証明書は manifest（`[[tls]]`、SNI 選択＋host-less default）で宣言し、control プレーンで構築するので bad cert は load 時 **fail-closed**・reload は証明書をアトミックに差し替え。*Plecto は HTTPS を終端する。* **着地（slice 3 — HTTP/2）:** **h2 over TLS+ALPN**（ALPN は `h2`→`http/1.1` を広告、h2c は不採用）、1 接続あたり同時 100 ストリームに上限を設けて M1 プールを保護。**着地（slice 4 — HTTP/3）:** 同一ポートに独立した **quinn(QUIC) + h3** の UDP listener（TLS 1.3・ALPN `h3`・0-RTT 無効 RFC 8470）を張り、TCP クライアントには `Alt-Svc` で誘導。3 つの HTTP バージョンは transport 非依存の共通トランザクションコアを共有。*Plecto は HTTP/1.1・HTTP/2・HTTP/3 を話す。* **保留（次スライス）:** インスタンス間ロードバランシング & upstream health。— [ADR 12](docs/ADR/000012.md) · [13](docs/ADR/000013.md) · [14](docs/ADR/000014.md) · [15](docs/ADR/000015.md) · [16](docs/ADR/000016.md)
 - **M3 — async & ボディ** *(2段トリガ)*
   **Stage 1 — host が P3 を走らせられる:** wasmtime 46（Component Model async + WASI 0.3 を default 有効）へ更新。**Stage 2 — P3 ゲストを実用 DX で書ける:** `wasm32-wasip3` の Tier 2 化 / wit-bindgen async の成熟。ボディ作業（非同期ファースト契約・`stream<u8>` ボディ・`wasi:http` 型再利用・body-transform フィルタ）は **Stage 2** に紐づける（46 到来直後に始めると guest toolchain で詰まりうる）。body 非接触は**型レベル**（header/body を別 export）で表し、ゼロコピー bypass を契約から導く。stream splicing 自体は WASI 0.3.x で後続。— [ADR 3](docs/ADR/000003.md) · [5](docs/ADR/000005.md) · [10](docs/ADR/000010.md)
 - **M4 — provenance & 無停止リロード**
@@ -193,10 +195,11 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 ├── plecto/                    # Rust workspace（native 側）
 │   ├── wit/world.wit          # plecto:filter 契約（contract-first）
 │   ├── deny.toml              # cargo-deny サプライチェーン方針（CI ブロッキング）
+│   ├── examples/demo.rs       # 動かせる end-to-end デモ（cargo run -p plecto-server --example demo）
 │   └── crates/
 │       ├── host/              # wasmtime 埋め込み: Linker, InstancePre, host-API（+ CONTEXT.md）
-│       ├── control/           # control plane: manifest, OCI load, chain, reload, TLS（+ CONTEXT.md）
-│       ├── server/            # fast path: tokio/hyper listener, routing, upstream（+ CONTEXT.md, examples/demo.rs）
+│       ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC（+ CONTEXT.md）
+│       ├── server/            # fast path: HTTP/1.1·2（hyper）+ HTTP/3（quinn）, routing, upstream（+ CONTEXT.md）
 │       └── filter-hello/      # 例フィルタ（wasm32-unknown-unknown ゲスト）
 ├── docs/ADR/                  # Architecture Decision Records（000001–000017）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約

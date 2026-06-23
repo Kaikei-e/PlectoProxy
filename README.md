@@ -23,7 +23,7 @@ Plecto pairs **two complementary halves** through a typed [WIT](https://componen
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (11 ADRs) and the first vertical slice — the `plecto:filter` contract, a wasmtime host that loads and runs filters, an example filter, and a full test suite — is green and on CI. **The data path (TLS/HTTP/routing/upstream) is not built yet; Plecto cannot proxy live traffic today.** This is a foundation you can read, run the tests on, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (17 ADRs) and the foundation now runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, **and a real fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC)**, terminates TLS, routes by host + path prefix, and forwards to upstreams. The full test suite is green and on CI. **Inter-instance load balancing and upstream health are the next slice.** This is a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto?
 
@@ -151,21 +151,23 @@ The suite proves the slice end-to-end: a request flows through the host into a r
 
 ### Run the demo proxy
 
-A self-contained example wires the **production path** — it signs the example filter, bundles it as an offline OCI layout, generates a TLS cert, writes a manifest, and serves the fast path over HTTPS — then prints commands to try:
+A self-contained example (`examples/demo.rs`) wires the **production path** — it signs the example filter, bundles it as an offline OCI layout, generates a TLS cert, writes a manifest, and serves the fast path over TLS (**HTTP/1.1 + HTTP/2 over TCP, HTTP/3 over QUIC on the same port**) — then prints commands to try:
 
 ```bash
 cd plecto
-cargo run -p plecto-server --example demo   # serves https://localhost:8443, Ctrl-C to stop
+cargo run -p plecto-server --example demo   # serves https://localhost:8443 (+ :8443/udp h3), Ctrl-C to stop
 
 # in another shell (self-signed cert → curl -k):
 curl -k https://localhost:8443/api/hello                         # routed + /api stripped + forwarded
+curl -k --http2 https://localhost:8443/api/hello                 # same route over HTTP/2 (ALPN h2)
+curl -k --http3 https://localhost:8443/api/hello                 # same route over HTTP/3 (curl w/ h3)
 curl -k -H 'x-plecto-block: 1' https://localhost:8443/api/hello  # filter short-circuits 403
 for i in 1 2 3; do curl -k -s -o /dev/null -w '%{http_code} ' \
   -H 'x-plecto-ratelimit: 1' https://localhost:8443/api/hello; done   # 200 200 429 (host-native rate limit)
 curl -k https://localhost:8443/nope                             # no route → 404
 ```
 
-It exercises the whole chain: cosign-style signature + SBOM verification, TLS termination (rustls), host + path-prefix routing with a host-native prefix strip, the filter chain (continue / modify / short-circuit / rate-limit), and response-side rewriting — over real HTTPS.
+It exercises the whole chain: cosign-style signature + SBOM verification, TLS termination (rustls), host + path-prefix routing with a host-native prefix strip, the filter chain (continue / modify / short-circuit / rate-limit), and response-side rewriting — over real HTTP/1.1, HTTP/2 and HTTP/3.
 
 ## Roadmap
 
@@ -175,8 +177,8 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
   The `plecto:filter@0.1.0` contract, a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
 - **M1 — Filter runtime hardening** ✅ *(landed)*
   The trust-branched runtime — `InstancePre`; trusted filters reuse instances from a fixed-capacity, lazily-filled **pool** checked out per request (so the pooling engine finally earns its keep; saturation waits a bounded time then fails closed, a pool-wide circuit breaker trips on a deterministically-trapping filter, and an instance is recycled after N requests to bound state accumulation), untrusted = fresh-per-request on an on-demand engine (linear memory fresh by construction, so no zeroization needed); redb-backed host KV + atomic counters + **host-native token-bucket rate limiting**; every host-API key namespaced per filter; ephemeral hot-path state skips the per-commit fsync; **epoch metering + memory/table limits** are in place. The trusted/untrusted split is *forced* (not just perf) by the init/zeroization knot. **Deferred to M2** (coupled to the fast-path server): binding the pool to the tokio/quinn data path (sync↔async bridge) and state-backend sharding. — [ADR 4](docs/ADR/000004.md) · [5](docs/ADR/000005.md) · [6](docs/ADR/000006.md) · [11](docs/ADR/000011.md) · [12](docs/ADR/000012.md)
-- **M2 — The data path (fast path)** 🚧 *(slices 1–2 landed)*
-  **Landed (slice 1):** a `plecto-server` crate — a tokio + hyper **HTTP/1.1** listener that routes each request by host + path prefix, runs that route's filter chain via a `spawn_blocking` bridge to the M1 trusted pool (wasmtime's `!Send` Store never crosses `.await`), applies a host-native prefix strip, and forwards to the route's upstream (hyper-util pooling client), streaming bodies opaquely. *Plecto is now an actual reverse proxy.* **Landed (slice 2 — TLS):** rustls (ring) **TLS termination** with certificates declared in the manifest (`[[tls]]`, SNI selection + a host-less default), built in the control plane so a bad cert fails the load **closed** and reload swaps certs atomically; ALPN advertises `http/1.1`. *Plecto now terminates HTTPS.* **Pending (next slices):** HTTP/2 (h2 over ALPN) → HTTP/3 (quinn), inter-instance load balancing & upstream health. — [ADR 12](docs/ADR/000012.md) · [13](docs/ADR/000013.md) · [14](docs/ADR/000014.md)
+- **M2 — The data path (fast path)** 🚧 *(slices 1–4 landed)*
+  **Landed (slice 1):** a `plecto-server` crate — a tokio + hyper **HTTP/1.1** listener that routes each request by host + path prefix, runs that route's filter chain via a `spawn_blocking` bridge to the M1 trusted pool (wasmtime's `!Send` Store never crosses `.await`), applies a host-native prefix strip, and forwards to the route's upstream (hyper-util pooling client), streaming bodies opaquely. *Plecto is now an actual reverse proxy.* **Landed (slice 2 — TLS):** rustls (ring) **TLS termination** with certificates declared in the manifest (`[[tls]]`, SNI selection + a host-less default), built in the control plane so a bad cert fails the load **closed** and reload swaps certs atomically. *Plecto now terminates HTTPS.* **Landed (slice 3 — HTTP/2):** **h2 over TLS+ALPN** (ALPN advertises `h2` then `http/1.1`; no h2c), capped at 100 concurrent streams per connection to bound the M1 pool. **Landed (slice 4 — HTTP/3):** an independent **quinn(QUIC) + h3** UDP listener on the same port (TLS 1.3, ALPN `h3`, 0-RTT disabled per RFC 8470), advertised to TCP clients via `Alt-Svc`; all three HTTP versions share one transport-agnostic transaction core. *Plecto now speaks HTTP/1.1, HTTP/2 and HTTP/3.* **Pending (next slice):** inter-instance load balancing & upstream health. — [ADR 12](docs/ADR/000012.md) · [13](docs/ADR/000013.md) · [14](docs/ADR/000014.md) · [15](docs/ADR/000015.md) · [16](docs/ADR/000016.md)
 - **M3 — Async & bodies** *(two-stage trigger)*
   **Stage 1 — host can run P3:** upgrade to wasmtime 46 (Component Model async + WASI 0.3 on by default). **Stage 2 — P3 guests are practical to write:** `wasm32-wasip3` reaching Tier 2 / wit-bindgen async maturing. The body work (async-first contract, `stream<u8>` bodies, `wasi:http` type reuse, body-transform filters) is tied to **Stage 2** — starting it the moment wasmtime 46 lands risks stalling on guest tooling. Body-untouching is expressed at the **type level** (separate header/body exports) so zero-copy bypass follows from the contract; stream splicing itself lands later with WASI 0.3.x. — [ADR 3](docs/ADR/000003.md) · [5](docs/ADR/000005.md) · [10](docs/ADR/000010.md)
 - **M4 — Provenance & zero-downtime reload**
@@ -193,10 +195,11 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 ├── plecto/                    # Rust workspace (the native half)
 │   ├── wit/world.wit          # the plecto:filter contract (contract-first)
 │   ├── deny.toml              # cargo-deny supply-chain policy (CI-blocking)
+│   ├── examples/demo.rs       # runnable end-to-end demo (cargo run -p plecto-server --example demo)
 │   └── crates/
 │       ├── host/              # wasmtime embedding: Linker, InstancePre, host-API (+ CONTEXT.md)
-│       ├── control/           # control plane: manifest, OCI load, chain, reload, TLS (+ CONTEXT.md)
-│       ├── server/            # fast path: tokio/hyper listener, routing, upstream (+ CONTEXT.md, examples/demo.rs)
+│       ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC (+ CONTEXT.md)
+│       ├── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, upstream (+ CONTEXT.md)
 │       └── filter-hello/      # example filter (wasm32-unknown-unknown guest)
 ├── docs/ADR/                  # Architecture Decision Records (000001–000017)
 ├── CLAUDE.md                  # project conventions & design summary

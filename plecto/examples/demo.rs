@@ -6,7 +6,12 @@
 //! component, packages it as an offline OCI image-layout, generates a self-signed TLS cert, writes
 //! a declarative manifest, and builds the control plane with `Control::from_manifest_path` — the
 //! same entrypoint the `plecto` binary uses. Then it starts a tiny echo upstream and serves the
-//! fast path over **HTTPS**, routing `/api/*` through the signed filter to the upstream.
+//! fast path over TLS, routing `/api/*` through the signed filter to the upstream.
+//!
+//! Because the manifest has `[[tls]]`, a single port carries **all three HTTP versions**:
+//! HTTP/1.1 and HTTP/2 over TCP (ALPN-negotiated, ADR 000015) and HTTP/3 over QUIC on the same
+//! port number (UDP, ADR 000016). TCP responses advertise h3 via `Alt-Svc`, so an h3-capable
+//! client upgrades itself on the next request.
 //!
 //! The signing here uses the host's throwaway test signer (a fresh key each run) — convenient for
 //! a demo, NOT production provenance. Everything lives in a temp dir that is cleaned up on exit.
@@ -28,7 +33,8 @@ use plecto_control::{Control, ResolvedArtifact};
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
 use plecto_server::serve;
 
-/// Where the HTTPS proxy listens. Plain `127.0.0.1` so the demo never exposes a public port.
+/// Where the proxy listens. Plain `127.0.0.1` so the demo never exposes a public port. The same
+/// port number is bound on UDP for HTTP/3 (QUIC).
 const PROXY_ADDR: &str = "127.0.0.1:8443";
 
 #[tokio::main]
@@ -53,7 +59,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let digest = write_layout(&base.join("filters/hello"), &artifact)?;
 
-    // 3. a fresh self-signed TLS cert for `localhost` (ADR 000014).
+    // 3. a fresh self-signed TLS cert for `localhost` (ADR 000014). Shared by the TCP TLS
+    //    terminator and the QUIC listener (ADR 000016).
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     std::fs::create_dir_all(base.join("tls"))?;
     std::fs::write(base.join("tls/cert.pem"), cert.cert.pem())?;
@@ -67,10 +74,12 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(&manifest_path, manifest_toml(&digest, upstream))?;
 
     // 6. build the control plane through the real ops entrypoint (reads keys, OCI layout, certs;
-    //    verifies the signature + SBOM; loads the filter; builds the TLS config — all fail-closed).
+    //    verifies the signature + SBOM; loads the filter; builds the TLS + QUIC configs — all
+    //    fail-closed).
     let control = Arc::new(Control::from_manifest_path(&manifest_path)?);
 
-    // 7. serve the fast path. The manifest has `[[tls]]`, so this is HTTPS.
+    // 7. serve the fast path. The manifest has `[[tls]]`, so this serves HTTP/1.1 + HTTP/2 over TCP
+    //    and HTTP/3 over QUIC on the same port.
     let listener = TcpListener::bind(PROXY_ADDR).await?;
     let proxy = listener.local_addr()?;
     tokio::spawn(async move {
@@ -130,6 +139,7 @@ async fn spawn_upstream() -> anyhow::Result<SocketAddr> {
 fn manifest_toml(digest: &str, upstream: SocketAddr) -> String {
     format!(
         r#"# Plecto demo manifest (generated). Trust root, one signed filter, one route, TLS.
+# With `[[tls]]` present the fast path serves HTTP/1.1 + HTTP/2 over TCP and HTTP/3 over QUIC.
 [trust]
 keys = ["trust.pem"]
 
@@ -159,13 +169,18 @@ key_path = "tls/key.pem"
 fn print_banner(proxy: SocketAddr, upstream: SocketAddr, manifest: &std::path::Path) {
     let p = proxy.port();
     println!("\n  Plecto demo — a real reverse proxy (signed WASM filter + TLS + routing)\n");
-    println!("  HTTPS proxy : https://localhost:{p}   (self-signed cert — use curl -k)");
-    println!("  upstream    : http://{upstream}  (echoes what it received)");
-    println!("  manifest    : {}", manifest.display());
+    println!("  proxy    : https://localhost:{p}   (self-signed cert — use curl -k)");
+    println!("             HTTP/1.1 + HTTP/2 over TCP, HTTP/3 over QUIC on :{p}/udp");
+    println!("  upstream : http://{upstream}  (echoes what it received)");
+    println!("  manifest : {}", manifest.display());
     println!("\n  Try it (Ctrl-C to stop):\n");
     println!("    curl -k https://localhost:{p}/api/hello");
     println!("        -> routed; /api stripped; forwarded (upstream sees /hello);");
     println!("           the response gains x-plecto-respadded from the response-side chain");
+    println!("    curl -k --http2 https://localhost:{p}/api/hello");
+    println!("        -> same route over HTTP/2 (ALPN negotiates h2)");
+    println!("    curl -k --http3 https://localhost:{p}/api/hello   # curl built with HTTP/3");
+    println!("        -> same route over HTTP/3 (QUIC); see the Alt-Svc header on a TCP response");
     println!("    curl -k -H 'x-plecto-addheader: 1' https://localhost:{p}/api/hello");
     println!("        -> the filter rewrites the request; upstream echoes x-plecto-added: 1");
     println!("    curl -k -H 'x-plecto-block: 1' https://localhost:{p}/api/hello");

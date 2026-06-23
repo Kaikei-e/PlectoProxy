@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# The M2 fast path: a TCP/HTTP-1.1 listener that drives requests through the control plane's
-# routed filter chains and forwards to upstreams (ADR 000013). lib + bin.
+# The M2 fast path: a listener that drives requests through the control plane's routed filter
+# chains and forwards to upstreams — HTTP/1.1 + HTTP/2 over TCP and HTTP/3 over QUIC (ADR 000013 /
+# 000014 / 000015 / 000016). lib + bin + the runnable demo.
 [lib]
 name = "plecto_server"
 path = "src/lib.rs"
@@ -14,6 +15,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "plecto"
 path = "src/main.rs"
+
+# The runnable end-to-end demo lives at the workspace-level `examples/` dir (a sibling of `crates/`),
+# but is built as an example of this package so it can use plecto-server + its dev-dependencies.
+# Run with `cargo run -p plecto-server --example demo`.
+[[example]]
+name = "demo"
+path = "../../examples/demo.rs"
 
 [dependencies]
 plecto-control = { path = "../control" }

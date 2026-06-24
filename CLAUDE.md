@@ -14,8 +14,9 @@
   ポリシー）。任意言語で書き、`plecto:filter` WIT 契約で差し込み、無停止で差し替える。
 
 M0（`plecto:filter` 契約 + wasmtime ホスト）・M1（filter-runtime 堅牢化 + trusted インスタンスプール）・
-M2 slice 1–2（HTTP/1.1 fast path + routing + rustls TLS 終端）が着地済み。動かせるデモは
-`cargo run -p plecto-server --example demo`（旧 wasm-bindgen PoC は撤去）。設計が向かう先は
+M2 slice 1–5（HTTP/1.1·2·3 fast path + routing + rustls TLS 終端 + 複数 upstream の round-robin LB /
+active+passive health, ADR 000017）が着地済み。動かせるデモは `examples/<use-case>/`（ユースケース別、
+`cargo run -p plecto-server --example wasm-auth` など。旧 wasm-bindgen PoC は撤去）。設計が向かう先は
 **wasmtime 埋め込みホスト + Component Model フィルタ**で、作業はこの方向を主軸に置く。
 
 ## リポジトリ構成
@@ -33,8 +34,9 @@ M2 slice 1–2（HTTP/1.1 fast path + routing + rustls TLS 終端）が着地済
         ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
         ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
         ├── server/            ← fast path（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
-        │                        （`examples/demo.rs` = 動かせるデモ）
-        └── filter-hello/      ← 例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
+        │                        （`examples/<use-case>/` = 動かせるデモ群）
+        ├── filter-hello/      ← conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
+        └── filter-apikey/     ← 実用例フィルタ: API キー認証ゲート（同上, workspace 外）
 ```
 
 ## コア原則（迷ったらこの順で優先）

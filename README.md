@@ -149,25 +149,24 @@ cargo test --all
 
 The suite proves the slice end-to-end: a request flows through the host into a real filter component, the typed `decision` round-trips, and the filter reaches **only** the capabilities it was lent (the example component imports `plecto:filter/*` and nothing else — zero WASI, network, or filesystem access).
 
-### Run the demo proxy
+### Run the demos
 
-A self-contained example (`examples/demo.rs`) wires the **production path** — it signs the example filter, bundles it as an offline OCI layout, generates a TLS cert, writes a manifest, and serves the fast path over TLS (**HTTP/1.1 + HTTP/2 over TCP, HTTP/3 over QUIC on the same port**) — then prints commands to try:
+Five self-contained, use-case-focused examples live under `examples/<name>/`. Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup. Run one with:
 
 ```bash
 cd plecto
-cargo run -p plecto-server --example demo   # serves https://localhost:8443 (+ :8443/udp h3), Ctrl-C to stop
-
-# in another shell (self-signed cert → curl -k):
-curl -k https://localhost:8443/api/hello                         # routed + /api stripped + forwarded
-curl -k --http2 https://localhost:8443/api/hello                 # same route over HTTP/2 (ALPN h2)
-curl -k --http3 https://localhost:8443/api/hello                 # same route over HTTP/3 (curl w/ h3)
-curl -k -H 'x-plecto-block: 1' https://localhost:8443/api/hello  # filter short-circuits 403
-for i in 1 2 3; do curl -k -s -o /dev/null -w '%{http_code} ' \
-  -H 'x-plecto-ratelimit: 1' https://localhost:8443/api/hello; done   # 200 200 429 (host-native rate limit)
-curl -k https://localhost:8443/nope                             # no route → 404
+cargo run -p plecto-server --example <name>   # Ctrl-C to stop
 ```
 
-It exercises the whole chain: cosign-style signature + SBOM verification, TLS termination (rustls), host + path-prefix routing with a host-native prefix strip, the filter chain (continue / modify / short-circuit / rate-limit), and response-side rewriting — over real HTTP/1.1, HTTP/2 and HTTP/3.
+| `<name>` | What it shows |
+| --- | --- |
+| `wasm-auth` | **A real WASM filter doing real work** — a signed API-key auth component (`crates/filter-apikey`) that 401s without a valid key, stamps the caller's identity, and counts per-user requests in host KV. The point of Plecto. |
+| `load-balancing` | One upstream over three instances: round-robin across the healthy set, active health probes, ejection when an instance goes unhealthy, and 503 when none are left (ADR 000017). |
+| `filter-chain` | The filter chain over plain HTTP: continue / modify (header rewrite) / short-circuit 403 / host-native rate limit. |
+| `tls-http` | TLS termination with HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC) on one port, plus `Alt-Svc` h3 advertisement. |
+| `hot-reload` | Edit the manifest, `kill -HUP <pid>`, and watch the config swap atomically with zero downtime (a broken edit is fail-closed). |
+
+Read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
 
 ## Roadmap
 
@@ -195,12 +194,13 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 ├── plecto/                    # Rust workspace (the native half)
 │   ├── wit/world.wit          # the plecto:filter contract (contract-first)
 │   ├── deny.toml              # cargo-deny supply-chain policy (CI-blocking)
-│   ├── examples/demo.rs       # runnable end-to-end demo (cargo run -p plecto-server --example demo)
+│   ├── examples/<use-case>/   # five runnable demos (cargo run -p plecto-server --example <name>)
 │   └── crates/
 │       ├── host/              # wasmtime embedding: Linker, InstancePre, host-API (+ CONTEXT.md)
 │       ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC (+ CONTEXT.md)
-│       ├── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, upstream (+ CONTEXT.md)
-│       └── filter-hello/      # example filter (wasm32-unknown-unknown guest)
+│       ├── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, LB, upstream (+ CONTEXT.md)
+│       ├── filter-hello/      # conformance-fixture filter (wasm32-unknown-unknown guest)
+│       └── filter-apikey/     # real-world example filter: API-key auth gate (WASM component)
 ├── docs/ADR/                  # Architecture Decision Records (000001–000017)
 ├── CLAUDE.md                  # project conventions & design summary
 └── CONTEXT-MAP.md             # domain glossary map (split per context)

@@ -16,12 +16,29 @@ path = "src/lib.rs"
 name = "plecto"
 path = "src/main.rs"
 
-# The runnable end-to-end demo lives at the workspace-level `examples/` dir (a sibling of `crates/`),
-# but is built as an example of this package so it can use plecto-server + its dev-dependencies.
-# Run with `cargo run -p plecto-server --example demo`.
+# Runnable, use-case-focused demos live at the workspace-level `examples/` dir (a sibling of
+# `crates/`), each its own `examples/<name>/main.rs`, but built as examples of this package so they
+# can use plecto-server + its dev-dependencies. Run with `cargo run -p plecto-server --example <name>`.
 [[example]]
-name = "demo"
-path = "../../examples/demo.rs"
+name = "load-balancing"
+path = "../../examples/load-balancing/main.rs"
+
+[[example]]
+name = "tls-http"
+path = "../../examples/tls-http/main.rs"
+
+[[example]]
+name = "filter-chain"
+path = "../../examples/filter-chain/main.rs"
+
+# The real-world WASM filter showcase: a signed API-key auth component gating a route.
+[[example]]
+name = "wasm-auth"
+path = "../../examples/wasm-auth/main.rs"
+
+[[example]]
+name = "hot-reload"
+path = "../../examples/hot-reload/main.rs"
 
 [dependencies]
 plecto-control = { path = "../control" }

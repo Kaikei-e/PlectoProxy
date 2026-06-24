@@ -227,3 +227,38 @@ fn empty_trust_policy_loads_nothing() {
         "an empty trust policy must load nothing (deny-by-default)"
     );
 }
+
+// --- ADR 000011: the host-assigned filter id is the KV-namespace root; load validates it ---
+
+#[test]
+fn load_rejects_empty_filter_id() {
+    // An empty id would namespace to just the delimiter — a degenerate root. Rejected even for a
+    // perfectly-signed component (the provenance gate passing does not waive id validation).
+    let fx = fixture();
+    match fx.host().load("", &fx.artifact(), LoadOptions::untrusted()) {
+        Ok(_) => panic!("an empty filter id must be rejected"),
+        Err(e) => assert!(
+            e.to_string().contains("filter id"),
+            "rejection should name the filter id, got: {e}"
+        ),
+    }
+}
+
+#[test]
+fn load_rejects_filter_id_with_namespace_delimiter() {
+    // The KV key prefix is `{filter_id}\u{1f}`; a filter id that itself embeds that delimiter
+    // could forge the boundary between two filters' keyspaces (ADR 000011 capability isolation),
+    // so it is rejected at load — a filter can never choose an id that escapes its own namespace.
+    let fx = fixture();
+    let evil_id = format!("a{}b", '\u{1f}');
+    match fx
+        .host()
+        .load(&evil_id, &fx.artifact(), LoadOptions::untrusted())
+    {
+        Ok(_) => panic!("a filter id containing the KV namespace delimiter must be rejected"),
+        Err(e) => assert!(
+            e.to_string().contains("delimiter"),
+            "rejection should name the delimiter, got: {e}"
+        ),
+    }
+}

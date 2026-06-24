@@ -151,7 +151,9 @@ isolation = "trusted"
 
 [[upstream]]
 name = "demo-upstream"
-address = "{upstream}"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/"
 
 [[route]]
 path_prefix = "/api"

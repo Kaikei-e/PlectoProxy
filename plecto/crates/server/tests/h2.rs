@@ -88,7 +88,10 @@ isolation = "trusted"
 
 [[upstream]]
 name = "echo"
-address = "{upstream}"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
 
 [[route]]
 path_prefix = "/api"
@@ -190,6 +193,23 @@ async fn drive_h2(
     }
 }
 
+/// Drive an h2 request, retrying past the pessimistic-start 503 window (ADR 000017): instances
+/// begin unhealthy, so a forward is 503 until the upstream's first health probe lands.
+async fn drive_h2_ready(
+    proxy: SocketAddr,
+    root: CertificateDer<'static>,
+    alpn_offer: &[&[u8]],
+) -> H2Result {
+    for _ in 0..100 {
+        let r = drive_h2(proxy, root.clone(), alpn_offer).await;
+        if r.status != StatusCode::SERVICE_UNAVAILABLE {
+            return r;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("upstream never became healthy within the readiness window");
+}
+
 #[tokio::test]
 async fn negotiates_h2_then_routes_and_forwards() {
     let cert = make_cert();
@@ -198,7 +218,7 @@ async fn negotiates_h2_then_routes_and_forwards() {
     let proxy = spawn_proxy(Arc::new(control)).await;
 
     // A client that advertises ONLY h2.
-    let r = drive_h2(proxy, cert.cert_der.clone(), &[b"h2"]).await;
+    let r = drive_h2_ready(proxy, cert.cert_der.clone(), &[b"h2"]).await;
 
     assert_eq!(
         r.negotiated_alpn.as_deref(),
@@ -224,7 +244,7 @@ async fn prefers_h2_when_client_offers_both() {
     let proxy = spawn_proxy(Arc::new(control)).await;
 
     // A client offering BOTH: the server's preference order (h2 first, ADR 000015) must win.
-    let r = drive_h2(proxy, cert.cert_der.clone(), &[b"h2", b"http/1.1"]).await;
+    let r = drive_h2_ready(proxy, cert.cert_der.clone(), &[b"h2", b"http/1.1"]).await;
 
     assert_eq!(
         r.negotiated_alpn.as_deref(),

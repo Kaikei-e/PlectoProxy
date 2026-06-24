@@ -18,14 +18,42 @@ _Avoid_: rule（曖昧）, mapping（方向が出ない）
 _Avoid_: dispatch（chain 駆動と紛らわしい）
 
 **Upstream**:
-fast path が一致リクエストを転送する名前付きバックエンド（`host:port`）。v0.1 は plain HTTP/1.1・1 route に
-1 アドレス（インスタンス間 LB は後続）。
-_Avoid_: backend pool（プールは後続概念）, origin（CDN 文脈の語）
+fast path が一致リクエストを転送する名前付きバックエンド。1 つ以上の **upstream instance** から成り、fast path
+は転送時に healthy な instance を round-robin で 1 つ選ぶ（ADR 000017）。route は upstream を名前で指す。plain
+HTTP/1.1 で転送する（upstream TLS は後続）。
+_Avoid_: backend pool（pool ではなく instance 群で表す）, origin（CDN 文脈の語）
 
 **Prefix strip（host-native rewrite）**:
 route が宣言する path 書き換え。fast path が**転送直前**に適用し、chain は元 path を見たまま upstream は
 書き換え後を受ける。フィルタ駆動の path 書き換え（WIT `set-path`）とは別物で、契約変更を要さない。
 _Avoid_: filter rewrite（フィルタ駆動の書換は別レイヤ・後続）
+
+## ロードバランシング / health（ADR 000017）
+
+**Upstream instance**:
+upstream を構成する 1 つの `host:port`。active health check が healthy / unhealthy を切り替え、unhealthy な
+instance は分配集合から外れる（eject）。起動時は pessimistic（unhealthy）で始まり、最初の成功 probe で healthy に
+昇格する。
+_Avoid_: endpoint（Envoy 用語）, backend（曖昧）, wasmtime の instance（別 context・extension plane 側の語）
+
+**Active health check**:
+background タスクが各 upstream instance を health の probe path へ定期 probe し、連続成功 / 失敗が閾値に達したら
+healthy / unhealthy を切り替える先回り検知。落ちた instance を**実リクエストが踏む前に**避ける。
+_Avoid_: liveness probe（k8s 用語）, ping（多義）
+
+**Passive ejection**:
+実リクエストの転送失敗（接続失敗 / timeout）を active と**同じ health 状態**に反映し、instance を demote する補完
+信号。active が先回り検知、passive が取りこぼしを拾う。引き金になったリクエスト自体は救済しない（retry しない）。
+_Avoid_: outlier detection（独立サブシステムを含意。ここでは active と単一状態機を共有）
+
+**Round-robin LB**:
+healthy な upstream instance 集合を巡回選択する分配。eject された instance は集合から外れ、復帰（restore）で戻る。
+_Avoid_: balancing pool（曖昧）
+
+**No-healthy fail-closed**:
+ある upstream の全 instance が unhealthy のとき、upstream に流さず 503 を返す挙動。fail-closed テネットの upstream
+版（404 no-route / 502 upstream-error とは別の fault）。
+_Avoid_: circuit break（別概念）
 
 ## リクエスト処理
 

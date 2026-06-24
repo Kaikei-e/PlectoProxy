@@ -66,6 +66,16 @@ pub enum ControlError {
     #[error("duplicate upstream name {0:?} in manifest")]
     DuplicateUpstream(String),
 
+    /// An upstream declared no `addresses` (ADR 000017). An upstream must have at least one
+    /// instance to forward to; an empty list is fail-closed at build time, not at request time.
+    #[error("upstream {0:?} has no addresses")]
+    EmptyUpstreamAddresses(String),
+
+    /// The upstream registry's lock was poisoned (a thread panicked while holding it). Surfaced
+    /// rather than re-panicked so a reconcile fails closed (the running set stays live).
+    #[error("upstream registry lock poisoned")]
+    UpstreamRegistryPoisoned,
+
     #[error("route (prefix {path_prefix:?}) references unknown upstream {upstream:?}")]
     UnknownRouteUpstream {
         path_prefix: String,

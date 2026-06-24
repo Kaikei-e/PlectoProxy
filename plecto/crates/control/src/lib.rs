@@ -21,8 +21,9 @@ mod reload;
 mod route;
 mod snapshot;
 mod tls;
+mod upstream;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,7 +33,9 @@ use plecto_host::{LoadedFilter, SignedArtifact};
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::ChainOutcome;
 pub use error::ControlError;
-pub use manifest::{Chain, FilterEntry, IsolationKind, Manifest, Route, TlsCert, Trust, Upstream};
+pub use manifest::{
+    Chain, FilterEntry, HealthConfig, IsolationKind, Manifest, Route, TlsCert, Trust, Upstream,
+};
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
@@ -41,6 +44,7 @@ pub use route::RouteInfo;
 /// `plecto-server` names the same `rustls` type the control plane built.
 pub use rustls::ServerConfig as TlsServerConfig;
 pub use snapshot::ConfigSnapshot;
+pub use upstream::{UpstreamGroup, UpstreamInstance, UpstreamRegistry};
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend
 // on `plecto-host` directly for the common path — including the ADR 000009 observability
@@ -78,6 +82,11 @@ pub struct Control {
     host: Host,
     store: Box<dyn ArtifactStore>,
     active: ArcSwap<ActiveConfig>,
+    /// The upstream instances + their health state (ADR 000017). Lives OUTSIDE `active` so a
+    /// reload's `build_active` reconciles it in place — health state survives the swap. The
+    /// fast-path server reads it both via routing (`RouteInfo.upstream`, resolved at build time)
+    /// and via `upstream_groups` (the health-check supervisor).
+    upstreams: Arc<UpstreamRegistry>,
     manifest_path: Option<PathBuf>,
     /// The `[trust]` section the `Host` was built from, captured at construction. A reload that
     /// would change it is rejected (`TrustChangeRequiresRestart`) rather than silently dropped
@@ -97,11 +106,13 @@ impl Control {
     /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
     pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
         let (host, store) = build_host_and_store(manifest, base_dir)?;
-        let active = build_active(&host, manifest, &store, base_dir)?;
+        let upstreams = Arc::new(UpstreamRegistry::new());
+        let active = build_active(&host, manifest, &store, base_dir, &upstreams)?;
         Ok(Self {
             host,
             store: Box::new(store),
             active: ArcSwap::from_pointee(active),
+            upstreams,
             manifest_path: None,
             trust: manifest.trust.clone(),
             base_dir: base_dir.to_path_buf(),
@@ -121,11 +132,13 @@ impl Control {
         // The in-memory core has no manifest directory; relative paths resolve against the cwd.
         // Tests that exercise `[[tls]]` use absolute cert paths, so this base does not bite them.
         let base_dir = Path::new(".");
-        let active = build_active(&host, manifest, store.as_ref(), base_dir)?;
+        let upstreams = Arc::new(UpstreamRegistry::new());
+        let active = build_active(&host, manifest, store.as_ref(), base_dir, &upstreams)?;
         Ok(Self {
             host,
             store,
             active: ArcSwap::from_pointee(active),
+            upstreams,
             manifest_path: None,
             trust: manifest.trust.clone(),
             base_dir: base_dir.to_path_buf(),
@@ -141,11 +154,13 @@ impl Control {
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
         let (host, store) = build_host_and_store(&manifest, base_dir)?;
-        let active = build_active(&host, &manifest, &store, base_dir)?;
+        let upstreams = Arc::new(UpstreamRegistry::new());
+        let active = build_active(&host, &manifest, &store, base_dir, &upstreams)?;
         Ok(Self {
             host,
             store: Box::new(store),
             active: ArcSwap::from_pointee(active),
+            upstreams,
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
             base_dir: base_dir.to_path_buf(),
@@ -166,11 +181,13 @@ impl Control {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let manifest = read_manifest(manifest_path)?;
-        let active = build_active(&host, &manifest, store.as_ref(), &base_dir)?;
+        let upstreams = Arc::new(UpstreamRegistry::new());
+        let active = build_active(&host, &manifest, store.as_ref(), &base_dir, &upstreams)?;
         Ok(Self {
             host,
             store,
             active: ArcSwap::from_pointee(active),
+            upstreams,
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
             base_dir,
@@ -183,7 +200,13 @@ impl Control {
     /// set stays live — reload is all-or-nothing. The trust policy is fixed at construction.
     pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
         self.ensure_trust_unchanged(manifest)?;
-        let active = build_active(&self.host, manifest, self.store.as_ref(), &self.base_dir)?;
+        let active = build_active(
+            &self.host,
+            manifest,
+            self.store.as_ref(),
+            &self.base_dir,
+            &self.upstreams,
+        )?;
         self.active.store(Arc::new(active));
         Ok(())
     }
@@ -223,7 +246,13 @@ impl Control {
             return Ok(ReloadOutcome::Unchanged);
         }
         // Build the new set fully before swapping; on failure the running set is untouched.
-        let active = build_active(&self.host, &manifest, self.store.as_ref(), &self.base_dir)?;
+        let active = build_active(
+            &self.host,
+            &manifest,
+            self.store.as_ref(),
+            &self.base_dir,
+            &self.upstreams,
+        )?;
         self.active.store(Arc::new(active));
         Ok(ReloadOutcome::Reloaded { hash: new_hash })
     }
@@ -247,6 +276,13 @@ impl Control {
     /// whether to bind a QUIC listener and what to advertise via `Alt-Svc`.
     pub fn quic_tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
         self.active.load().quic_tls.clone()
+    }
+
+    /// A snapshot of the current upstream groups (ADR 000017), for the fast-path server's
+    /// health-check supervisor to probe. Reflects the latest reconcile, so a reload's added /
+    /// removed instances are picked up on the supervisor's next tick without restarting it.
+    pub fn upstream_groups(&self) -> Vec<Arc<UpstreamGroup>> {
+        self.upstreams.groups()
     }
 
     /// Pin the active config for one request transaction (see [`ConfigSnapshot`]). The
@@ -315,6 +351,7 @@ fn build_active(
     manifest: &Manifest,
     store: &dyn ArtifactStore,
     base_dir: &Path,
+    registry: &UpstreamRegistry,
 ) -> Result<ActiveConfig, ControlError> {
     let mut filters: HashMap<String, Arc<LoadedFilter>> = HashMap::new();
     for entry in &manifest.filters {
@@ -342,26 +379,19 @@ fn build_active(
         }
     }
 
-    // Routing table (ADR 000013): resolve each route's upstream to its address and validate its
-    // inline chain against the loaded set. Like the chain check, this is all-or-nothing — a bad
-    // route aborts the whole build, so a failed reload never swaps in a half-valid routing table.
-    let mut upstreams: HashMap<&str, &str> = HashMap::with_capacity(manifest.upstreams.len());
-    for up in &manifest.upstreams {
-        if upstreams
-            .insert(up.name.as_str(), up.address.as_str())
-            .is_some()
-        {
-            return Err(ControlError::DuplicateUpstream(up.name.clone()));
-        }
-    }
-    let mut routes = Vec::with_capacity(manifest.routes.len());
+    // Routing table (ADR 000013 / 000017). Validate every route reference (upstream name, filter
+    // ids) PURELY first — before the persistent upstream registry is mutated — so a manifest we'd
+    // reject never reconciles the registry (reload stays all-or-nothing; the running upstream
+    // health state is untouched on a failed reload).
+    let upstream_names: HashSet<&str> =
+        manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
     for r in &manifest.routes {
-        let Some(address) = upstreams.get(r.upstream.as_str()) else {
+        if !upstream_names.contains(r.upstream.as_str()) {
             return Err(ControlError::UnknownRouteUpstream {
                 path_prefix: r.path_prefix.clone(),
                 upstream: r.upstream.clone(),
             });
-        };
+        }
         for f in &r.filters {
             if !filters.contains_key(f) {
                 return Err(ControlError::UnknownRouteFilter {
@@ -370,22 +400,39 @@ fn build_active(
                 });
             }
         }
-        routes.push(route::CompiledRoute {
-            host: r.host.as_ref().map(|h| h.to_ascii_lowercase()),
-            path_prefix: r.path_prefix.clone(),
-            filters: r.filters.clone(),
-            upstream_address: address.to_string(),
-            strip_prefix: r.strip_prefix.clone(),
-        });
     }
 
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
     // from `[[tls]]`, sharing one SNI cert resolver. A bad cert is fail-closed here, so a failed
-    // reload never swaps in a TLS config that cannot serve.
+    // reload never swaps in a TLS config that cannot serve. Built before the registry is touched.
     let (tls, quic_tls) = match tls::build_server_configs(&manifest.tls, base_dir)? {
         Some(configs) => (Some(configs.tcp), Some(configs.quic)),
         None => (None, None),
     };
+
+    // Reconcile the upstream registry LAST among the fallible steps (ADR 000017): this validates
+    // duplicate names / empty address lists and preserves health for unchanged `(name, address)`
+    // instances across the reload. After it returns Ok the build is infallible, so a rejected
+    // reload never leaves the registry reconciled to a manifest whose `active` was not swapped in.
+    registry.reconcile(&manifest.upstreams)?;
+    let mut routes = Vec::with_capacity(manifest.routes.len());
+    for r in &manifest.routes {
+        // present: the name was validated above and reconcile built a group for each manifest
+        // upstream. Fall back to the error (unreachable) rather than panic (data-plane no-panic).
+        let Some(upstream) = registry.group(&r.upstream) else {
+            return Err(ControlError::UnknownRouteUpstream {
+                path_prefix: r.path_prefix.clone(),
+                upstream: r.upstream.clone(),
+            });
+        };
+        routes.push(route::CompiledRoute {
+            host: r.host.as_ref().map(|h| h.to_ascii_lowercase()),
+            path_prefix: r.path_prefix.clone(),
+            filters: r.filters.clone(),
+            upstream,
+            strip_prefix: r.strip_prefix.clone(),
+        });
+    }
 
     Ok(ActiveConfig {
         filters,

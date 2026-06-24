@@ -3,8 +3,14 @@
 //! — no I/O, no wasmtime — so it is unit-tested directly and runs on the async thread (the
 //! blocking work is the chain dispatch, not the match).
 
+use std::sync::Arc;
+
+use crate::upstream::UpstreamGroup;
+
 /// A route compiled from a manifest [`crate::Route`] into the live config: the upstream name is
-/// resolved to its address and the host is pre-normalised, so matching is allocation-free.
+/// resolved to its [`UpstreamGroup`] handle and the host is pre-normalised, so matching is
+/// allocation-free. The group is shared (`Arc`) with the upstream registry, so the actual instance
+/// is chosen — by round-robin over the healthy set — at forward time, not here (ADR 000017).
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledRoute {
     /// Lower-cased authority to match, or `None` for any host.
@@ -12,18 +18,19 @@ pub(crate) struct CompiledRoute {
     pub(crate) path_prefix: String,
     /// This route's inline chain (filter ids, in order).
     pub(crate) filters: Vec<String>,
-    /// Resolved `host:port` of the upstream this route forwards to.
-    pub(crate) upstream_address: String,
+    /// The upstream group this route forwards to; the fast path calls [`UpstreamGroup::pick`] on it.
+    pub(crate) upstream: Arc<UpstreamGroup>,
     pub(crate) strip_prefix: Option<String>,
 }
 
 /// What [`crate::ConfigSnapshot::find_route`] hands the fast-path server: which route matched
-/// (`index`, used to dispatch its chain) plus the data needed to forward — the upstream address
-/// and the optional prefix strip. Owned so it survives a move into `spawn_blocking`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (`index`, used to dispatch its chain) plus the data needed to forward — the upstream group (the
+/// server picks a healthy instance from it) and the optional prefix strip. Owned / `Arc`-shared so
+/// it survives a move into `spawn_blocking`.
+#[derive(Debug, Clone)]
 pub struct RouteInfo {
     pub index: usize,
-    pub upstream_address: String,
+    pub upstream: Arc<UpstreamGroup>,
     pub strip_prefix: Option<String>,
 }
 
@@ -105,13 +112,34 @@ pub(crate) fn rewrite_path(path: &str, strip: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{HealthConfig, Upstream};
+    use crate::upstream::UpstreamRegistry;
+
+    /// A throwaway upstream group named after `upstream` — these tests exercise `select` /
+    /// `rewrite_path`, which never touch the group's contents, only its identity.
+    fn group(upstream: &str) -> Arc<UpstreamGroup> {
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[Upstream {
+            name: upstream.to_string(),
+            addresses: vec!["127.0.0.1:9000".to_string()],
+            health: HealthConfig {
+                path: "/healthz".to_string(),
+                interval_ms: 1000,
+                timeout_ms: 500,
+                healthy_threshold: 1,
+                unhealthy_threshold: 1,
+            },
+        }])
+        .unwrap();
+        reg.group(upstream).unwrap()
+    }
 
     fn route(host: Option<&str>, prefix: &str, upstream: &str) -> CompiledRoute {
         CompiledRoute {
             host: host.map(|h| h.to_ascii_lowercase()),
             path_prefix: prefix.to_string(),
             filters: vec![],
-            upstream_address: upstream.to_string(),
+            upstream: group(upstream),
             strip_prefix: None,
         }
     }

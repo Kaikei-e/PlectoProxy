@@ -58,7 +58,7 @@ impl ConfigSnapshot {
         let r = &self.config.routes[index];
         Some(RouteInfo {
             index,
-            upstream_address: r.upstream_address.clone(),
+            upstream: r.upstream.clone(),
             strip_prefix: r.strip_prefix.clone(),
         })
     }

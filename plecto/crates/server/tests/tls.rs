@@ -82,7 +82,10 @@ isolation = "trusted"
 
 [[upstream]]
 name = "echo"
-address = "{upstream}"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
 
 [[route]]
 path_prefix = "/api"
@@ -184,7 +187,15 @@ async fn terminates_tls_then_routes_and_forwards() {
     let control = loaded_control(&manifest_toml(upstream, "{digest}", &tls_block)).unwrap();
     let proxy = spawn_proxy(Arc::new(control)).await;
 
-    let (status, alt_svc, body) = https_get(proxy, cert.cert_der.clone(), "/api/hello").await;
+    // readiness (ADR 000017): instances start pessimistic, so a forward is 503 until the first
+    // health probe passes; poll until it does, then assert the forwarded result.
+    let (status, alt_svc, body) = loop {
+        let r = https_get(proxy, cert.cert_der.clone(), "/api/hello").await;
+        if r.0 != StatusCode::SERVICE_UNAVAILABLE {
+            break r;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
 
     assert_eq!(
         status,

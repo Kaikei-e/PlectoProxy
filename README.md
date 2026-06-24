@@ -203,7 +203,7 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │       ├── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, LB, upstream (+ CONTEXT.md)
 │       ├── filter-hello/      # conformance-fixture filter (wasm32-unknown-unknown guest)
 │       └── filter-apikey/     # real-world example filter: API-key auth gate (WASM component)
-├── docs/ADR/                  # Architecture Decision Records (000001–000020)
+├── docs/ADR/                  # Architecture Decision Records (000001–000021)
 ├── CLAUDE.md                  # project conventions & design summary
 └── CONTEXT-MAP.md             # domain glossary map (split per context)
 ```

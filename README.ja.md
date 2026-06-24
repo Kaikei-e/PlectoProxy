@@ -203,7 +203,7 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │       ├── server/            # fast path: HTTP/1.1·2（hyper）+ HTTP/3（quinn）, routing, LB, upstream（+ CONTEXT.md）
 │       ├── filter-hello/      # conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト）
 │       └── filter-apikey/     # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
-├── docs/ADR/                  # Architecture Decision Records（000001–000020）
+├── docs/ADR/                  # Architecture Decision Records（000001–000021）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
 └── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）
 ```

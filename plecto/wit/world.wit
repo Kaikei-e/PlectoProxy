@@ -3,9 +3,11 @@
 //
 // v0.1.0 scope (ADR 000010): sync, header-only, Plecto's OWN http types.
 // stream<u8> bodies, async funcs, and wasi:http type reuse arrive in a later
-// increment, once wasmtime 46 ships Component Model async by default
-// (ADR 000003 / 000005). Until then this world is buildable+runnable on the
-// stable wasmtime 45 toolchain with no experimental flags.
+// increment. wasmtime 46 (shipped 2026-06-22) brings Component Model async +
+// WASI 0.3 by default (ADR 000003 / 000005); the committed direction is to
+// CONVERGE these types onto wasi:http (proxy / middleware) in M3 (ADR 000020).
+// Until that migration this world stays buildable+runnable on the stable
+// toolchain with no experimental flags.
 package plecto:filter@0.1.0;
 
 interface types {

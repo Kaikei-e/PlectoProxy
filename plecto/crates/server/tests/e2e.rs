@@ -93,7 +93,10 @@ isolation = "trusted"
 
 [[upstream]]
 name = "echo"
-address = "{upstream_addr}"
+addresses = ["{upstream_addr}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
 
 [[route]]
 path_prefix = "/api"
@@ -137,11 +140,25 @@ async fn get(
     )
 }
 
+/// Wait until the upstream's first health probe lands (ADR 000017): instances start pessimistic, so
+/// a forward returns 503 until a probe passes. Poll a forwarding path until it stops being 503.
+async fn wait_ready(client: &Client<HttpConnector, Empty<Bytes>>, proxy: SocketAddr) {
+    for _ in 0..100 {
+        let (status, _, _) = get(client, proxy, "/api/__ready", &[]).await;
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("upstream never became healthy within the readiness window");
+}
+
 #[tokio::test]
 async fn routes_runs_chain_strips_prefix_and_forwards() {
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(control_for(upstream)).await;
     let client = client();
+    wait_ready(&client, proxy).await;
 
     let (status, headers, body) = get(&client, proxy, "/api/hello", &[]).await;
 

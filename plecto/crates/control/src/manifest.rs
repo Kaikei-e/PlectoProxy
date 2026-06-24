@@ -59,15 +59,61 @@ pub struct TlsCert {
     pub key_path: String,
 }
 
-/// A named upstream backend the fast-path server forwards a matched request to (ADR 000013).
-/// `address` is a plain `host:port` (no scheme); v0.1 forwards over plain HTTP/1.1, a single
-/// address per upstream — inter-instance load balancing is deferred.
+/// A named upstream the fast-path server forwards a matched request to (ADR 000013 / 000017).
+/// One or more `addresses` (plain `host:port`, no scheme; forwarded over plain HTTP/1.1) are the
+/// upstream's instances; the fast path round-robins across the healthy ones. Every upstream
+/// carries an active-health-check policy (`health`) — required, because instances start
+/// pessimistic (unhealthy) and only a passing probe puts one into rotation (ADR 000017).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
-    /// `host:port` of the backend (e.g. `127.0.0.1:9000`). No scheme; plain HTTP in v0.1.
-    pub address: String,
+    /// `host:port` of each backend instance (e.g. `["127.0.0.1:9000", "127.0.0.1:9001"]`). No
+    /// scheme; plain HTTP/1.1. Must be non-empty (validated when the routing table is built).
+    pub addresses: Vec<String>,
+    /// Active-health-check policy for this upstream's instances (ADR 000017).
+    pub health: HealthConfig,
+}
+
+/// Active-health-check policy (ADR 000017). A background prober issues `GET {path}` to each
+/// instance every `interval_ms`; a 2xx within `timeout_ms` is a success, anything else (non-2xx,
+/// timeout, connect error) a failure. `unhealthy_threshold` consecutive failures eject a healthy
+/// instance from the rotation; `healthy_threshold` consecutive successes restore an ejected one.
+/// Instances start pessimistic (unhealthy); the FIRST successful probe alone promotes a
+/// never-yet-healthy instance (cold-start fast path), after which the full `healthy_threshold`
+/// governs re-entry. Only `path` is required; the rest default. `PartialEq` lets a reload detect a
+/// changed policy and re-probe the upstream's instances from scratch (ADR 000017 reconcile).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    /// The probe request path, e.g. `/healthz`.
+    pub path: String,
+    /// Probe period in milliseconds (default 2000).
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    /// Per-probe timeout in milliseconds (default 1000).
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Consecutive successes to restore an ejected instance (default 2). The first-ever promotion
+    /// of a never-yet-healthy instance needs only one success, regardless of this value.
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
+    /// Consecutive failures to eject a healthy instance (default 3).
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+}
+
+fn default_interval_ms() -> u64 {
+    2000
+}
+fn default_timeout_ms() -> u64 {
+    1000
+}
+fn default_healthy_threshold() -> u32 {
+    2
+}
+fn default_unhealthy_threshold() -> u32 {
+    3
 }
 
 /// One routing rule (ADR 000013): match a request by host (optional) + path prefix, run an
@@ -307,7 +353,9 @@ digest = "sha256:abc"
 
 [[upstream]]
 name = "api-svc"
-address = "127.0.0.1:9000"
+addresses = ["127.0.0.1:9000", "127.0.0.1:9001"]
+[upstream.health]
+path = "/healthz"
 
 [[route]]
 host = "example.com"
@@ -320,7 +368,16 @@ strip_prefix = "/api"
         .unwrap();
 
         assert_eq!(m.upstreams.len(), 1);
-        assert_eq!(m.upstreams[0].address, "127.0.0.1:9000");
+        assert_eq!(
+            m.upstreams[0].addresses,
+            vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()]
+        );
+        // health is required; the unspecified knobs take their defaults
+        assert_eq!(m.upstreams[0].health.path, "/healthz");
+        assert_eq!(m.upstreams[0].health.interval_ms, 2000);
+        assert_eq!(m.upstreams[0].health.timeout_ms, 1000);
+        assert_eq!(m.upstreams[0].health.healthy_threshold, 2);
+        assert_eq!(m.upstreams[0].health.unhealthy_threshold, 3);
         assert_eq!(m.routes.len(), 1);
         let r = &m.routes[0];
         assert_eq!(r.host.as_deref(), Some("example.com"));
@@ -336,6 +393,59 @@ strip_prefix = "/api"
             m2.content_hash().unwrap(),
             "a route change must flip the content hash"
         );
+    }
+
+    #[test]
+    fn upstream_requires_health() {
+        // health is mandatory for every upstream (ADR 000017): a missing `[upstream.health]`
+        // table is rejected, since instances start pessimistic and need a probe to enter rotation.
+        let parsed = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+"#,
+        );
+        assert!(
+            parsed.is_err(),
+            "an upstream without [upstream.health] is rejected"
+        );
+    }
+
+    #[test]
+    fn health_requires_path_but_defaults_the_rest() {
+        // `path` is required; thresholds/interval/timeout default.
+        let no_path = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+interval_ms = 500
+"#,
+        );
+        assert!(no_path.is_err(), "health without a probe path is rejected");
+
+        // explicit overrides ride through
+        let m = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/up"
+interval_ms = 250
+timeout_ms = 100
+healthy_threshold = 1
+unhealthy_threshold = 5
+"#,
+        )
+        .unwrap();
+        let h = &m.upstreams[0].health;
+        assert_eq!(h.interval_ms, 250);
+        assert_eq!(h.timeout_ms, 100);
+        assert_eq!(h.healthy_threshold, 1);
+        assert_eq!(h.unhealthy_threshold, 5);
     }
 
     #[test]

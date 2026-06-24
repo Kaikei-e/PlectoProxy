@@ -88,7 +88,10 @@ isolation = "trusted"
 
 [[upstream]]
 name = "echo"
-address = "{upstream}"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
 
 [[route]]
 path_prefix = "/api"
@@ -200,6 +203,19 @@ async fn drive_h3(proxy: SocketAddr, root: CertificateDer<'static>) -> H3Result 
     }
 }
 
+/// Drive an h3 request, retrying past the pessimistic-start 503 window (ADR 000017): instances
+/// begin unhealthy, so a forward is 503 until the upstream's first health probe lands.
+async fn drive_h3_ready(proxy: SocketAddr, root: CertificateDer<'static>) -> H3Result {
+    for _ in 0..100 {
+        let r = drive_h3(proxy, root.clone()).await;
+        if r.status != 503 {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("upstream never became healthy within the readiness window");
+}
+
 #[tokio::test]
 async fn terminates_h3_then_routes_and_forwards() {
     let cert = make_cert();
@@ -207,7 +223,7 @@ async fn terminates_h3_then_routes_and_forwards() {
     let control = loaded_control(&manifest_toml(upstream, "{digest}", &cert));
     let proxy = spawn_proxy(Arc::new(control)).await;
 
-    let r = drive_h3(proxy, cert.cert_der.clone()).await;
+    let r = drive_h3_ready(proxy, cert.cert_der.clone()).await;
 
     assert_eq!(r.status, 200, "the h3 request routes + forwards 200");
     assert_eq!(

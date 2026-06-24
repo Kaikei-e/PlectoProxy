@@ -155,3 +155,41 @@ filters = ["fh"]
         "the manifest-built control plane loads and runs the filter"
     );
 }
+
+#[test]
+fn oci_layout_with_unreadable_index_is_fail_closed() {
+    // A corrupted / incomplete OCI layout (here: a garbage index.json — the layout's entry point)
+    // must fail closed at resolve. Digest pinning and per-blob integrity are already covered; this
+    // pins the OTHER supply-chain failure mode — a layout the host simply cannot parse must never
+    // silently yield a filter.
+    let dir = tempdir().unwrap();
+    let (signer, artifact) = signed_artifact();
+    let layout = dir.path().join("fh");
+    let digest = write_layout(&layout, &artifact).unwrap();
+
+    // clobber the layout's entry point after a valid write.
+    std::fs::write(layout.join("index.json"), b"not an oci index at all").unwrap();
+
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let manifest = Manifest::from_toml(&manifest_toml(&digest)).unwrap();
+    match Control::load(host, &manifest, Box::new(OciLayoutStore::new(dir.path()))) {
+        Ok(_) => panic!("a layout with an unreadable index.json must fail closed"),
+        Err(e) => assert!(matches!(e, ControlError::Artifact { .. }), "got {e}"),
+    }
+}
+
+#[test]
+fn oci_layout_missing_source_directory_is_fail_closed() {
+    // The manifest pins a `source` that resolves to no layout on disk. Resolve must fail closed
+    // (the whole `build_active` aborts), never skip the filter and serve an unprotected chain.
+    let dir = tempdir().unwrap();
+    let (signer, _artifact) = signed_artifact();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    // a well-formed-looking pin, but `source = "fh"` (see `manifest_toml`) was never written here.
+    let digest = format!("sha256:{}", "0".repeat(64));
+    let manifest = Manifest::from_toml(&manifest_toml(&digest)).unwrap();
+    match Control::load(host, &manifest, Box::new(OciLayoutStore::new(dir.path()))) {
+        Ok(_) => panic!("a missing layout directory must fail closed"),
+        Err(e) => assert!(matches!(e, ControlError::Artifact { .. }), "got {e}"),
+    }
+}

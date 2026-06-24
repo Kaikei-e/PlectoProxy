@@ -1254,6 +1254,80 @@ mod tests {
     }
 
     #[test]
+    fn counter_is_namespaced_per_filter() {
+        // The counter primitive shares the backend keyspace with kv/ratelimit, so its per-filter
+        // isolation must hold too: one filter's `requests` counter must be invisible to another
+        // (cross-tenant leakage, CWE-200). Only the `_KV_` test covered this before.
+        let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
+        let mut a = HostState::new(
+            shared.clone(),
+            "filter-a\u{1f}".to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        );
+        let mut b = HostState::new(
+            shared.clone(),
+            "filter-b\u{1f}".to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        );
+
+        assert_eq!(CounterHost::increment(&mut a, "hits".into(), 5), 5);
+        assert_eq!(
+            CounterHost::get(&mut b, "hits".into()),
+            0,
+            "b must not observe a's counter"
+        );
+        assert_eq!(
+            CounterHost::increment(&mut b, "hits".into(), 1),
+            1,
+            "b's counter is independent of a's"
+        );
+        assert_eq!(
+            CounterHost::get(&mut a, "hits".into()),
+            5,
+            "a's counter is untouched by b"
+        );
+    }
+
+    #[test]
+    fn ratelimit_bucket_is_namespaced_per_filter() {
+        // A rate limiter is only a security control if one filter cannot drain — or be throttled
+        // by — another filter's bucket under the same key. The token bucket lives in the shared
+        // backend under a per-filter namespace; prove two filters' identical keys are independent.
+        use host_ratelimit::Host as RateLimitHost;
+        fn one_token_no_refill() -> host_ratelimit::Bucket {
+            host_ratelimit::Bucket {
+                capacity: 1,
+                refill_tokens: 0,
+                refill_interval_ms: 0,
+            }
+        }
+
+        let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
+        let mut a = HostState::new(
+            shared.clone(),
+            "filter-a\u{1f}".to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        );
+        let mut b = HostState::new(
+            shared.clone(),
+            "filter-b\u{1f}".to_string(),
+            DEFAULT_MAX_MEMORY_BYTES,
+        );
+
+        // a drains its single-token bucket on key "k".
+        assert!(RateLimitHost::try_acquire(&mut a, "k".into(), 1, one_token_no_refill()).allowed);
+        assert!(
+            !RateLimitHost::try_acquire(&mut a, "k".into(), 1, one_token_no_refill()).allowed,
+            "a's bucket is now empty"
+        );
+        // b's bucket under the SAME key is a different namespace → still full.
+        assert!(
+            RateLimitHost::try_acquire(&mut b, "k".into(), 1, one_token_no_refill()).allowed,
+            "b's limiter must not share a's drained bucket"
+        );
+    }
+
+    #[test]
     fn kv_and_counter_do_not_collide() {
         // Same logical key under different primitives must stay distinct (tag sub-namespace).
         let mut s = state("f\u{1f}");

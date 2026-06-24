@@ -149,25 +149,24 @@ cargo test --all
 
 テストはスライスを end-to-end で実証する: リクエストがホストを通って実フィルタ・コンポーネントへ流れ、型付き `decision` が往復し、フィルタは**貸与された能力だけ**に到達する（例コンポーネントは `plecto:filter/*` のみを import し、WASI・network・filesystem には一切アクセスしない）。
 
-### デモプロキシを動かす
+### デモを動かす
 
-自己完結の example（`examples/demo.rs`）が**本番パス**を一通り組み上げる —— 例フィルタに署名し、オフライン OCI レイアウトに梱包し、TLS 証明書を生成し、manifest を書き、fast path を TLS で serve（**HTTP/1.1 + HTTP/2 を TCP で、HTTP/3 を同一ポートの QUIC で**）—— して、試すコマンドを表示する:
+ユースケース別の自己完結 example が `examples/<name>/` に 5 つある。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。実行:
 
 ```bash
 cd plecto
-cargo run -p plecto-server --example demo   # https://localhost:8443（+ :8443/udp h3）で serve、Ctrl-C で停止
-
-# 別シェルで（自己署名なので curl -k）:
-curl -k https://localhost:8443/api/hello                         # routing + /api strip + 転送
-curl -k --http2 https://localhost:8443/api/hello                 # 同じ route を HTTP/2 で（ALPN h2）
-curl -k --http3 https://localhost:8443/api/hello                 # 同じ route を HTTP/3 で（h3 対応 curl）
-curl -k -H 'x-plecto-block: 1' https://localhost:8443/api/hello  # フィルタが 403 で short-circuit
-for i in 1 2 3; do curl -k -s -o /dev/null -w '%{http_code} ' \
-  -H 'x-plecto-ratelimit: 1' https://localhost:8443/api/hello; done   # 200 200 429（host-native rate limit）
-curl -k https://localhost:8443/nope                             # ルート無し → 404
+cargo run -p plecto-server --example <name>   # Ctrl-C で停止
 ```
 
-cosign 風の署名 ＋ SBOM 検証、TLS 終端（rustls）、host＋path-prefix routing と host-native prefix strip、フィルタチェーン（continue / modify / short-circuit / rate-limit）、response 側書換 —— を実 HTTP/1.1・HTTP/2・HTTP/3 で一気に通す。
+| `<name>` | 見せるもの |
+| --- | --- |
+| `wasm-auth` | **実用 WASM フィルタ** —— 署名済みの API キー認証コンポーネント（`crates/filter-apikey`）。鍵が無ければ 401、認証できれば呼び出し元の identity を付与し、per-user のリクエスト数を host KV で数える。Plecto の核。 |
+| `load-balancing` | 1 つの upstream を 3 instance に分散: healthy 集合の round-robin、active health probe、unhealthy 化での eject、全滅時の 503（ADR 000017）。 |
+| `filter-chain` | plain HTTP で filter chain: continue / modify（ヘッダ書換）/ short-circuit 403 / host-native rate limit。 |
+| `tls-http` | 同一ポートで TLS 終端＋HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）、`Alt-Svc` による h3 広告。 |
+| `hot-reload` | manifest を編集して `kill -HUP <pid>`、無停止で設定をアトミックに差し替え（壊れた編集は fail-closed）。 |
+
+まず読むなら `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
 
 ## ロードマップ
 
@@ -195,12 +194,13 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 ├── plecto/                    # Rust workspace（native 側）
 │   ├── wit/world.wit          # plecto:filter 契約（contract-first）
 │   ├── deny.toml              # cargo-deny サプライチェーン方針（CI ブロッキング）
-│   ├── examples/demo.rs       # 動かせる end-to-end デモ（cargo run -p plecto-server --example demo）
+│   ├── examples/<use-case>/   # 動かせるデモ 5 種（cargo run -p plecto-server --example <name>）
 │   └── crates/
 │       ├── host/              # wasmtime 埋め込み: Linker, InstancePre, host-API（+ CONTEXT.md）
 │       ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC（+ CONTEXT.md）
-│       ├── server/            # fast path: HTTP/1.1·2（hyper）+ HTTP/3（quinn）, routing, upstream（+ CONTEXT.md）
-│       └── filter-hello/      # 例フィルタ（wasm32-unknown-unknown ゲスト）
+│       ├── server/            # fast path: HTTP/1.1·2（hyper）+ HTTP/3（quinn）, routing, LB, upstream（+ CONTEXT.md）
+│       ├── filter-hello/      # conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト）
+│       └── filter-apikey/     # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
 ├── docs/ADR/                  # Architecture Decision Records（000001–000017）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
 └── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）

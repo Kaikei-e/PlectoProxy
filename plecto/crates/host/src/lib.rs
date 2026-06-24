@@ -1176,6 +1176,13 @@ pub mod test_support {
         std::fs::read(env!("FILTER_HELLO_COMPONENT")).expect("read filter-hello component")
     }
 
+    /// The compiled `filter-apikey` component bytes — the real-world example filter (an API-key
+    /// auth gate), built by this crate's `build.rs`. Exposed so the server's `wasm-auth` example
+    /// can sign and load it through the production path.
+    pub fn filter_apikey_component() -> Vec<u8> {
+        std::fs::read(env!("FILTER_APIKEY_COMPONENT")).expect("read filter-apikey component")
+    }
+
     /// A minimal in-toto-style SBOM statement that binds `component`: its `subject` digest is
     /// `sha256(component)`, satisfying the load gate's SBOM↔component binding (review f000003
     /// #1). The predicate is empty (content policy is deferred). Test / dev helper — real

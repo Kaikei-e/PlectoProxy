@@ -384,8 +384,18 @@ async fn proxy_core(
         ChainOutcome::Forward(req) => req,
     };
 
-    // --- pick a healthy upstream instance by round-robin; fail closed (503) if none (ADR 000017) ---
-    let Some(instance) = route.upstream.pick() else {
+    // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a retryable
+    // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
+    let upstream_path = route.rewrite_path(&forward.path);
+    let timeout = route.upstream.request_timeout();
+    // Only a bodyless request can be retried without buffering: the opaque streamed body
+    // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
+    let bodyless = body.size_hint().exact() == Some(0);
+    let mut real_body = Some(body);
+    let mut tries_left = route.upstream.max_retries();
+
+    // First pick by round-robin; fail closed (503) if no instance is healthy (ADR 000017).
+    let Some(mut instance) = route.upstream.pick() else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
             "no-healthy-upstream",
@@ -393,50 +403,78 @@ async fn proxy_core(
         ));
     };
 
-    // --- forward to the chosen instance, streaming the original request body opaquely ---
-    let upstream_path = route.rewrite_path(&forward.path);
-    let uri = format!("http://{}{}", instance.address(), upstream_path);
-    let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
-    copy_headers(builder.headers_mut(), &forward.headers);
-    // continue the trace into the upstream (ADR 000009 W3C propagation).
-    if let Some(h) = builder.headers_mut()
-        && let Ok(v) = HeaderValue::from_str(&snapshot.traceparent())
-    {
-        h.insert("traceparent", v);
-    }
-    // End-to-end timeout (ADR 000019 / review f000005 P2#4): bound time-to-response-headers, then
-    // stream the body without a deadline (so streaming responses are unaffected). `Duration::ZERO`
-    // means the operator opted out (long-poll / streaming upstream). Overrun fails closed with 504.
-    let upstream_req = builder.body(body)?;
-    let timeout = route.upstream.request_timeout();
-    let result = if timeout.is_zero() {
-        state.client.request(upstream_req).await
-    } else {
-        match tokio::time::timeout(timeout, state.client.request(upstream_req)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                // The upstream did not return response headers in time. Fail closed 504; leave
-                // health to the active prober (a single slow request is not, by itself, an eject —
-                // consistent with ADR 000017, whose re-examination condition (c) this realises).
+    let upstream_resp = loop {
+        // Build this attempt. A bodyless request re-sends an empty body to each instance; a bodied
+        // one moves its single streamed body and (since `may_retry` is false for it) is sent once.
+        let attempt_body = if bodyless {
+            empty_req()
+        } else {
+            real_body.take().unwrap_or_else(empty_req)
+        };
+        let uri = format!("http://{}{}", instance.address(), upstream_path);
+        let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
+        copy_headers(builder.headers_mut(), &forward.headers);
+        // continue the trace into the upstream (ADR 000009 W3C propagation).
+        if let Some(h) = builder.headers_mut()
+            && let Ok(v) = HeaderValue::from_str(&snapshot.traceparent())
+        {
+            h.insert("traceparent", v);
+        }
+        let upstream_req = builder.body(attempt_body)?;
+
+        // The timeout (ADR 000019) bounds time-to-response-headers; `Duration::ZERO` opts out. The
+        // body then streams without a deadline, so streaming responses are unaffected.
+        let send = state.client.request(upstream_req);
+        let outcome = if timeout.is_zero() {
+            Some(send.await)
+        } else {
+            tokio::time::timeout(timeout, send).await.ok()
+        };
+
+        match outcome {
+            Some(Ok(resp)) => break resp,
+            // The deadline elapsed before response headers. Not a health signal (ADR 000019) — leave
+            // liveness to the active prober. Retry onto a DIFFERENT instance if policy allows and one
+            // is available (idempotent-only, ADR 000023), else fail closed 504.
+            None => {
+                if may_retry(
+                    Failure::Timeout,
+                    forward.method.as_str(),
+                    bodyless,
+                    tries_left,
+                ) && let Some(next) = route.upstream.pick_excluding(&instance)
+                {
+                    tries_left -= 1;
+                    instance = next;
+                    continue;
+                }
                 return Ok(synth(
                     StatusCode::GATEWAY_TIMEOUT,
                     "upstream-timeout",
                     b"upstream timeout",
                 ));
             }
-        }
-    };
-    let upstream_resp = match result {
-        Ok(resp) => resp,
-        Err(e) => {
-            // passive ejection (ADR 000017): a real request that couldn't even connect demotes this
-            // instance so the rotation avoids it; the request itself still fails closed (the caller
-            // maps this to 502). A non-connect error (e.g. a mid-response transport fault) is not a
-            // liveness signal — only the active prober governs health in that case.
-            if e.is_connect() {
-                instance.record_passive_failure();
+            Some(Err(e)) => {
+                // A connect failure passively ejects (ADR 000017) and is safe to retry for ANY method
+                // (the upstream never received the request, ADR 000023). A non-connect transport
+                // fault is neither a health signal nor retried — only the active prober governs
+                // health then; the request fails closed (the caller maps the error to 502).
+                if e.is_connect() {
+                    instance.record_passive_failure();
+                    if may_retry(
+                        Failure::Connect,
+                        forward.method.as_str(),
+                        bodyless,
+                        tries_left,
+                    ) && let Some(next) = route.upstream.pick_excluding(&instance)
+                    {
+                        tries_left -= 1;
+                        instance = next;
+                        continue;
+                    }
+                }
+                return Err(e.into());
             }
-            return Err(e.into());
         }
     };
 

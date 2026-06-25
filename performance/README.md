@@ -4,6 +4,10 @@ A small, honest performance snapshot of Plecto's load-balancing fast path. The g
 **transparency about method**, not a leaderboard. Numbers here are an internal regression
 baseline; they are **not** a capacity guide and **not** a comparison against other proxies.
 
+> Reports: **this page** covers the load-balancing fast path (throughput, latency, resilience).
+> The cost of the WASM extension plane (filter overhead, instance pooling, short-circuit) is in
+> [`wasm-filters.md`](wasm-filters.md).
+
 ## TL;DR
 
 - Under a closed-loop ramp, a single Plecto instance served a steady **~15k requests/second**

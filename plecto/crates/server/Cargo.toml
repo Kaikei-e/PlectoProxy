@@ -36,6 +36,11 @@ path = "../../examples/filter-chain/main.rs"
 name = "wasm-auth"
 path = "../../examples/wasm-auth/main.rs"
 
+# Benchmark harness: baseline vs pooled vs on-demand filter on one backend (see performance/).
+[[example]]
+name = "wasm-bench"
+path = "../../examples/wasm-bench/main.rs"
+
 [[example]]
 name = "hot-reload"
 path = "../../examples/hot-reload/main.rs"

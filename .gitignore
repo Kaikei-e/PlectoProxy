@@ -4,6 +4,4 @@ plecto/crates/filter-hello/target
 plecto/crates/filter-apikey/target
 docs/feedback
 docs/plans
-demo/
-performance/plot.py
 performance/data/*.csv

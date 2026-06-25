@@ -97,30 +97,58 @@ fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
     named
 }
 
-/// Forwarding headers a client could spoof (RFC 7239 + the de-facto `X-Forwarded-*`). As an EDGE
-/// proxy Plecto strips these on ingress and sets its own (review f000005 P2#3), so an untrusted
-/// client cannot forge its source IP / scheme for an IP-based filter or the upstream.
+/// Forwarding / client-IP headers a client could spoof: RFC 7239 `Forwarded`, the de-facto
+/// `X-Forwarded-*`, and the de-facto client-IP family that many backends and CDNs trust (nginx's
+/// `X-Real-IP`, Akamai/Cloudflare `True-Client-IP`, `CF-Connecting-IP`, `Fastly-Client-IP`,
+/// `X-Client-IP`, `X-Cluster-Client-IP`). As an EDGE proxy Plecto strips this whole family on
+/// ingress and sets its own (review f000005 P2#3 / ADR 000018 + 000022), so an untrusted client
+/// cannot forge its source IP / scheme for an IP-based filter or the upstream — stripping `XFF`
+/// alone would leave a spoofed `X-Real-IP` to fool a backend that reads it instead.
 const FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-for",
     "x-forwarded-proto",
     "x-forwarded-host",
+    "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
 ];
 
-/// Edge-proxy client-IP propagation: drop any client-supplied forwarding headers, then set
-/// `X-Forwarded-For` (the real connection peer) and `X-Forwarded-Proto` (the wire scheme) afresh.
-/// The chain (so IP-based rate-limit / auth filters can trust them) and the upstream then see only
-/// Plecto's authoritative values, never the client's claim. A trusted-proxy *append* mode (Plecto
-/// behind another LB) is a manifest knob deferred to a later slice; overwrite is the safe default.
+/// Edge-proxy client-IP propagation: drop any client-supplied forwarding / client-IP headers
+/// (`FORWARDED_HEADERS`), then set `X-Forwarded-For` and `X-Real-IP` (the real connection peer) and
+/// `X-Forwarded-Proto` (the wire scheme) afresh. `X-Real-IP` is re-issued — not just stripped — so a
+/// backend reading the nginx convention rather than `XFF` still gets Plecto's authoritative peer
+/// (ADR 000022 widens ADR 000018's "issue For+Proto only"). The chain (so IP-based rate-limit / auth
+/// filters can trust them) and the upstream then see only Plecto's values, never the client's claim.
+/// A trusted-proxy *append* mode (Plecto behind another LB) is a manifest knob deferred to a later
+/// slice; overwrite is the safe default.
 fn set_forwarded(headers: &mut Vec<Header>, peer: IpAddr, scheme: &str) {
     headers.retain(|h| {
         !FORWARDED_HEADERS
             .iter()
             .any(|f| h.name.eq_ignore_ascii_case(f))
     });
+    // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 address
+    // (`::ffff:a.b.c.d`); normalise it to dotted IPv4 so backends/filters that all-list on the IPv4
+    // form match, and the value matches what nginx/Envoy would emit. A genuine IPv6 peer is kept
+    // verbatim (no brackets — XFF carries a bare address).
+    let client_ip = match peer {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        IpAddr::V4(v4) => v4.to_string(),
+    };
     headers.push(Header {
         name: "x-forwarded-for".to_string(),
-        value: peer.to_string(),
+        value: client_ip.clone(),
+    });
+    headers.push(Header {
+        name: "x-real-ip".to_string(),
+        value: client_ip,
     });
     headers.push(Header {
         name: "x-forwarded-proto".to_string(),
@@ -874,12 +902,16 @@ mod tests {
 
     #[test]
     fn set_forwarded_overwrites_spoofed_client_headers() {
-        // Edge model (review f000005 P2#3): a client-supplied X-Forwarded-For / Forwarded is
-        // STRIPPED and replaced by the real peer — never appended-to or trusted — so an untrusted
-        // client cannot forge its source IP. X-Forwarded-Proto reflects the wire scheme.
+        // Edge model (review f000005 P2#3 / ADR 000018 + 000022): the whole de-facto client-IP
+        // family — X-Forwarded-For / Forwarded / X-Real-IP / CDN headers — is STRIPPED and the
+        // peer's value re-issued, never appended-to or trusted, so an untrusted client cannot forge
+        // its source IP. X-Forwarded-For and X-Real-IP carry the real peer; X-Forwarded-Proto the
+        // wire scheme; a stripped CDN header (CF-Connecting-IP) is NOT re-issued.
         let mut headers = vec![
             header("X-Forwarded-For", "9.9.9.9"),
             header("forwarded", "for=10.0.0.1"),
+            header("X-Real-IP", "9.9.9.9"),
+            header("cf-connecting-ip", "8.8.8.8"),
             header("x-keep", "1"),
         ];
         set_forwarded(&mut headers, "203.0.113.5".parse().unwrap(), "https");
@@ -894,11 +926,27 @@ mod tests {
             vec!["203.0.113.5"],
             "the spoofed XFF is replaced by the real peer (one value, not appended)"
         );
+        let xrealip: Vec<&str> = headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case("x-real-ip"))
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(
+            xrealip,
+            vec!["203.0.113.5"],
+            "the spoofed X-Real-IP is replaced by the real peer (one value, re-issued)"
+        );
         assert!(
             !headers
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case("forwarded")),
             "a spoofed Forwarded header is stripped"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("cf-connecting-ip")),
+            "a spoofed CDN client-IP header is stripped and not re-issued"
         );
         assert_eq!(
             headers
@@ -911,6 +959,37 @@ mod tests {
         assert!(
             headers.iter().any(|h| h.name == "x-keep"),
             "an unrelated header is left intact"
+        );
+    }
+
+    #[test]
+    fn set_forwarded_normalises_ipv4_mapped_peer() {
+        // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 peer
+        // (`::ffff:a.b.c.d`); X-Forwarded-For / X-Real-IP must carry the dotted IPv4 form so a
+        // backend all-listing on the IPv4 address matches (ADR 000022).
+        let mut headers = vec![];
+        set_forwarded(&mut headers, "::ffff:203.0.113.5".parse().unwrap(), "https");
+        for name in ["x-forwarded-for", "x-real-ip"] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(name))
+                    .map(|h| h.value.as_str()),
+                Some("203.0.113.5"),
+                "an IPv4-mapped peer normalises to dotted IPv4 in {name}"
+            );
+        }
+
+        // A genuine IPv6 peer is preserved verbatim (no brackets in XFF).
+        let mut headers = vec![];
+        set_forwarded(&mut headers, "2001:db8::1".parse().unwrap(), "https");
+        assert_eq!(
+            headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
+                .map(|h| h.value.as_str()),
+            Some("2001:db8::1"),
+            "a real IPv6 peer is kept as-is"
         );
     }
 

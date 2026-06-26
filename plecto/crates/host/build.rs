@@ -13,7 +13,11 @@ use std::process::Command;
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let crates = manifest.parent().unwrap(); // plecto/crates
-    let wit = crates.parent().unwrap().join("wit"); // plecto/wit
+    let plecto = crates.parent().unwrap(); // plecto
+    let wit = plecto.join("wit"); // plecto/wit
+    // The example filter guests live OUTSIDE the workspace, under examples/filters/ (each its own
+    // workspace), built here for wasm32 and componentized.
+    let filters = plecto.join("examples").join("filters");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
@@ -23,14 +27,14 @@ fn main() {
     // filter-hello is the conformance fixture; filter-apikey is the real-world example (auth gate).
     build_component(
         &cargo,
-        &crates.join("filter-hello"),
+        &filters.join("filter-hello"),
         &out_dir,
         "filter_hello",
         "FILTER_HELLO_COMPONENT",
     );
     build_component(
         &cargo,
-        &crates.join("filter-apikey"),
+        &filters.join("filter-apikey"),
         &out_dir,
         "filter_apikey",
         "FILTER_APIKEY_COMPONENT",

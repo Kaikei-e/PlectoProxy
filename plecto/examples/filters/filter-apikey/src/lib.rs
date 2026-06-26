@@ -19,7 +19,7 @@
 #![allow(clippy::too_many_arguments)]
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../../wit",
     world: "filter",
 });
 

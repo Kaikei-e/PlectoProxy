@@ -10,7 +10,7 @@
 //!   * `/trusted/*`   — the signed `filter-apikey` component, **pooled** (init-once, reused)
 //!   * `/ondemand/*`  — the same component, **untrusted** (fresh instance per request)
 //!
-//! The API-key filter (`crates/filter-apikey`) reads `x-api-key`; a valid key
+//! The API-key filter (`examples/filters/filter-apikey`) reads `x-api-key`; a valid key
 //! (`alice-secret`/`bob-secret`) is stamped + forwarded (200), anything else is short-circuited
 //! 401 without touching the upstream. Driving these routes with a load generator yields the
 //! filter's per-request overhead, the value of instance pooling, and the cheapness of the

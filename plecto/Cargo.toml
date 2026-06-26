@@ -1,11 +1,10 @@
 # Plecto workspace — the native-Rust half (fast path / wasmtime host).
-# The wasm32-wasip2 guest (crates/filter-hello) is EXCLUDED so `cargo test --all`
-# never tries to build it for the host target; it is built separately for
-# wasm32-wasip2 (see crates/host/build.rs).
+# The example filter guests (examples/filters/*) are SEPARATE workspaces, built for
+# wasm32-unknown-unknown and componentized by crates/host/build.rs — never absorbed into
+# this host-target workspace (so `cargo test --all` never builds them for the host target).
 [workspace]
 resolver = "3"
 members = ["crates/host", "crates/control", "crates/server"]
-exclude = ["crates/filter-hello"]
 
 [workspace.package]
 version = "0.1.0"

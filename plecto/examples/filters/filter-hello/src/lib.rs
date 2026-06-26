@@ -152,7 +152,10 @@ impl Guest for FilterHello {
         // Short-circuit on a marker (exercises the SC path), otherwise transform (uppercase) and
         // continue — both before upstream is reached, so a short-circuit is always clean.
         host_log::log(host_log::Level::Info, "filter-hello: on-request-body");
-        if body.windows(9).any(|w| w.eq_ignore_ascii_case(b"deny-body")) {
+        if body
+            .windows(9)
+            .any(|w| w.eq_ignore_ascii_case(b"deny-body"))
+        {
             RequestBodyDecision::ShortCircuit(HttpResponse {
                 status: 403,
                 headers: vec![Header {

@@ -1,0 +1,143 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["plecto", "k6", "lb"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Plecto LB — k6 load test",
+  "uid": "plecto-lb-k6",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Requests / sec (http_reqs)",
+      "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 }, "unit": "reqps" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "http_reqs",
+          "resultFormat": "time_series",
+          "alias": "requests/s",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "sum", "params": [] }]],
+          "groupBy": [{ "type": "time", "params": ["1s"] }, { "type": "fill", "params": ["null"] }],
+          "tags": []
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "HTTP request duration percentiles (ms)",
+      "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 0, "showPoints": "never", "lineWidth": 2 }, "unit": "ms" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "http_req_duration", "resultFormat": "time_series", "alias": "p50",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "percentile", "params": [50] }]],
+          "groupBy": [{ "type": "time", "params": ["$__interval"] }, { "type": "fill", "params": ["null"] }], "tags": []
+        },
+        {
+          "refId": "B", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "http_req_duration", "resultFormat": "time_series", "alias": "p90",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "percentile", "params": [90] }]],
+          "groupBy": [{ "type": "time", "params": ["$__interval"] }, { "type": "fill", "params": ["null"] }], "tags": []
+        },
+        {
+          "refId": "C", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "http_req_duration", "resultFormat": "time_series", "alias": "p95",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "percentile", "params": [95] }]],
+          "groupBy": [{ "type": "time", "params": ["$__interval"] }, { "type": "fill", "params": ["null"] }], "tags": []
+        },
+        {
+          "refId": "D", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "http_req_duration", "resultFormat": "time_series", "alias": "p99",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "percentile", "params": [99] }]],
+          "groupBy": [{ "type": "time", "params": ["$__interval"] }, { "type": "fill", "params": ["null"] }], "tags": []
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Requests per upstream instance (served_by) — round-robin & ejection",
+      "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 20, "showPoints": "never", "lineWidth": 2, "stacking": { "mode": "normal" } }, "unit": "reqps" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["mean"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "served_by", "resultFormat": "time_series", "alias": "$tag_instance",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "sum", "params": [] }]],
+          "groupBy": [{ "type": "time", "params": ["1s"] }, { "type": "tag", "params": ["instance"] }, { "type": "fill", "params": ["0"] }],
+          "tags": []
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Failed requests / sec (http_req_failed) — fail-closed window",
+      "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60, "showPoints": "never", "lineWidth": 1 }, "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "red" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["sum", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "http_req_failed", "resultFormat": "time_series", "alias": "failed/s",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "sum", "params": [] }]],
+          "groupBy": [{ "type": "time", "params": ["1s"] }, { "type": "fill", "params": ["0"] }],
+          "tags": []
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Virtual Users (vus)",
+      "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 }, "unit": "short" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A", "datasource": { "type": "influxdb", "uid": "k6influxdb" },
+          "measurement": "vus", "resultFormat": "time_series", "alias": "VUs",
+          "select": [[{ "type": "field", "params": ["value"] }, { "type": "max", "params": [] }]],
+          "groupBy": [{ "type": "time", "params": ["1s"] }, { "type": "fill", "params": ["null"] }],
+          "tags": []
+        }
+      ]
+    }
+  ]
+}

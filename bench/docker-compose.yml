@@ -1,0 +1,35 @@
+# Local-only k6 visualization stack: InfluxDB v1 (k6 metrics store) + Grafana (dashboards).
+# Nothing here talks to any cloud/SaaS — all on localhost. Plecto + k6 run on the host.
+services:
+  influxdb:
+    image: influxdb:1.8
+    container_name: plecto-bench-influxdb
+    ports:
+      - "127.0.0.1:8086:8086"
+    environment:
+      - INFLUXDB_DB=k6
+      - INFLUXDB_HTTP_AUTH_ENABLED=false
+      - INFLUXDB_REPORTING_DISABLED=true   # no phone-home
+      # k6 ships one point per request; at >10k rps the 1s batch blows past the
+      # default 25 MB body cap and InfluxDB returns 413, dropping metrics. 0 = no cap.
+      - INFLUXDB_HTTP_MAX_BODY_SIZE=0
+    # No volume on purpose: each bench run starts from a clean series store.
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: plecto-bench-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      # Localhost-only stack: anonymous Admin already grants full view/edit, so no
+      # basic-auth login or admin password is set — nothing to leak when this is published.
+      - GF_USERS_DEFAULT_THEME=light
+      - GF_ANALYTICS_REPORTING_ENABLED=false       # no phone-home
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_NEWS_NEWS_FEED_ENABLED=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - influxdb

@@ -1,0 +1,22 @@
+# bench/ publishes the benchmark *method* for OSS transparency — the orchestration
+# scripts, the k6 scenarios, the Grafana provisioning, and docker-compose.yml.
+#
+# It never publishes the raw run artifacts, which carry local paths / machine details
+# and are large + regenerable. Keep the following out of git:
+
+# The downloaded third-party k6 binary (run-bench.sh fetches it on demand).
+/bin/
+
+# Raw k6 outputs: HTML reports + text logs contain absolute local paths (/home/<user>/…),
+# and the JSON summaries are regenerable working data (the curated numbers live in
+# performance/). The proxy startup logs echo demo keys + local detail.
+/results/
+/results-wasm/
+
+# Local results write-up with machine specs; the public report is performance/README.md.
+/RESULTS.md
+
+# Belt-and-suspenders: never commit these regardless of where they land under bench/.
+*.html
+*.log
+*.tar.gz

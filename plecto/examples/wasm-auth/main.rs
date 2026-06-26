@@ -3,12 +3,12 @@
 //! Run it:  `cargo run -p plecto-server --example wasm-auth`
 //!
 //! This is Plecto's thesis in one runnable file: the per-request *decision* — here, authentication —
-//! is a **sandboxed WASM Component Model filter** (`crates/filter-apikey`, compiled to a
+//! is a **sandboxed WASM Component Model filter** (`examples/filters/filter-apikey`, compiled to a
 //! `plecto:filter` component), not native proxy code. The fast path stays native; the policy is a
 //! component you can write in any language, hot-swap with zero downtime, and that can touch **only**
 //! the host-API it was lent (here `host-kv` / `host-counter` / `host-log` — no network, no FS).
 //!
-//! What the filter does (`crates/filter-apikey/src/lib.rs`):
+//! What the filter does (`examples/filters/filter-apikey/src/lib.rs`):
 //!   * `init` seeds a demo key→user map into host KV (filters are stateless; state lives in the host);
 //!   * `on-request` reads `x-api-key`, looks it up in KV, and returns a typed `decision`:
 //!       - missing/invalid key  -> `short-circuit` 401 (the upstream is never reached);
@@ -147,7 +147,7 @@ fn print_banner(proxy: SocketAddr) {
     let p = proxy.port();
     println!("\n  Plecto demo — a real WASM filter: API-key authentication\n");
     println!("  proxy : http://localhost:{p}   (plain HTTP/1.1)");
-    println!("  filter: crates/filter-apikey (a signed plecto:filter component)");
+    println!("  filter: examples/filters/filter-apikey (a signed plecto:filter component)");
     println!("  keys  : alice-secret -> alice,  bob-secret -> bob   (seeded into host KV at init)");
     println!("\n  Try it (Ctrl-C to stop):\n");
     println!("    # no key -> the filter short-circuits 401; the upstream is never reached:");

@@ -27,16 +27,17 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 ├── CLAUDE.md                  ← このファイル
 ├── CONTEXT-MAP.md             ← ドメイン用語集の地図（コンテキスト分割・全体横断語彙）
 ├── docs/ADR/                  ← Architecture Decision Records（NNNNNN.md, 6桁）
-└── plecto/                    ← Rust workspace（fast path / host / control / filter ランタイム）
+└── plecto/                    ← Rust workspace（fast path / host / control）
     ├── wit/                   ← plecto:filter ワールド（契約・contract-first）
     ├── deny.toml              ← cargo-deny サプライチェーン方針（CI ブロッキング）
-    └── crates/
-        ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
-        ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
-        ├── server/            ← fast path（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
-        │                        （`examples/<use-case>/` = 動かせるデモ群）
-        ├── filter-hello/      ← conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト, workspace 外）
-        └── filter-apikey/     ← 実用例フィルタ: API キー認証ゲート（同上, workspace 外）
+    ├── crates/
+    │   ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
+    │   ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
+    │   └── server/            ← fast path（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
+    └── examples/              ← 動かせるデモ（`<use-case>/` = cargo run -p plecto-server --example）と
+        └── filters/           ← 例フィルタ guest（独立 workspace・build.rs が component 化）
+            ├── filter-hello/  ← conformance 用フィクスチャ（wasm32-unknown-unknown ゲスト）
+            └── filter-apikey/ ← 実用例: API キー認証ゲート
 ```
 
 ## コア原則（迷ったらこの順で優先）

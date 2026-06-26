@@ -2,7 +2,7 @@
 # plus a wasm-guest lint and a blocking supply-chain scan.
 #
 # Layout note: the cargo workspace lives in `plecto/`. The example filter
-# `plecto/crates/filter-hello` is a SEPARATE workspace (its own `target/`) built
+# `plecto/examples/filters/filter-hello` is a SEPARATE workspace (its own `target/`) built
 # for `wasm32-unknown-unknown`; `plecto/crates/host/build.rs` compiles it and
 # componentizes it via `wit-component` (ADR 000010). So every compiling job must
 # install the `wasm32-unknown-unknown` target BEFORE any host build/test, or the
@@ -47,7 +47,7 @@ jobs:
       - run: cargo fmt --all -- --check
       # filter-hello is a separate workspace, formatted on its own.
       - run: cargo fmt --all -- --check
-        working-directory: plecto/crates/filter-hello
+        working-directory: plecto/examples/filters/filter-hello
 
   # Main gate: clippy -> test -> build, sharing one compile cache.
   # `cargo test`/`build` transitively compile + componentize the guest via build.rs.
@@ -75,7 +75,7 @@ jobs:
           # Cache both the workspace target/ and the excluded guest's own target/.
           workspaces: |
             plecto
-            plecto/crates/filter-hello
+            plecto/examples/filters/filter-hello
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
       - run: cargo build --release
@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: plecto/crates/filter-hello
+        working-directory: plecto/examples/filters/filter-hello
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -96,7 +96,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: plecto-guest
-          workspaces: plecto/crates/filter-hello
+          workspaces: plecto/examples/filters/filter-hello
       - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 
   # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).

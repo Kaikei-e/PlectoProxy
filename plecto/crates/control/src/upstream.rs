@@ -148,44 +148,52 @@ pub struct UpstreamGroup {
 
 impl UpstreamGroup {
     /// Pick the next healthy instance by round-robin, or `None` when every instance is unhealthy
-    /// (the fast path then fails closed with 503 — ADR 000017). Scans at most `instances.len()`
-    /// from the rotating cursor, so it is O(n) worst case and allocation-free.
+    /// (the fast path then fails closed with 503 — ADR 000017).
     pub fn pick(&self) -> Option<Arc<UpstreamInstance>> {
-        let n = self.instances.len();
-        if n == 0 {
-            return None;
-        }
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        for off in 0..n {
-            let i = start.wrapping_add(off) % n;
-            // `i < n` by construction, but use `get` to keep the data plane panic-free (bp-rust).
-            if let Some(inst) = self.instances.get(i)
-                && inst.is_healthy()
-            {
-                return Some(inst.clone());
-            }
-        }
-        None
+        self.pick_inner(None)
     }
 
     /// Pick the next healthy instance OTHER than `exclude` (round-robin), or `None` when `exclude`
     /// is the only healthy one. Used to retry a failed forward on a different instance (ADR 000023).
     pub fn pick_excluding(&self, exclude: &Arc<UpstreamInstance>) -> Option<Arc<UpstreamInstance>> {
-        let n = self.instances.len();
-        if n == 0 {
+        self.pick_inner(Some(exclude))
+    }
+
+    /// Round-robin over the *eligible set* — the instances that are healthy and, for a retry, not
+    /// `exclude`. The cursor advances over only that set, so an ejected (or excluded) instance's
+    /// slot is never absorbed by its neighbour: degraded distribution stays even instead of skewing
+    /// ~1:2 toward each dead instance's successor, which the old forward-scan produced (ADR 000024,
+    /// refining ADR 000017). Returns `None` only when nothing is eligible (the fast path then fails
+    /// closed — ADR 000017).
+    ///
+    /// Two allocation-free passes — count the eligible, then index into them — so the hot path still
+    /// only reads the lock-free `is_healthy` bit and never allocates. If an instance flips between
+    /// the passes we return the last eligible one seen rather than spuriously `None`.
+    fn pick_inner(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Arc<UpstreamInstance>> {
+        let is_eligible = |inst: &Arc<UpstreamInstance>| {
+            inst.is_healthy()
+                && match exclude {
+                    Some(ex) => !Arc::ptr_eq(inst, ex),
+                    None => true,
+                }
+        };
+        let eligible = self.instances.iter().filter(|&i| is_eligible(i)).count();
+        if eligible == 0 {
             return None;
         }
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        for off in 0..n {
-            let i = start.wrapping_add(off) % n;
-            if let Some(inst) = self.instances.get(i)
-                && inst.is_healthy()
-                && !Arc::ptr_eq(inst, exclude)
-            {
-                return Some(inst.clone());
+        let target = self.rr.fetch_add(1, Ordering::Relaxed) % eligible;
+        let mut seen = 0;
+        let mut last = None;
+        for inst in &self.instances {
+            if is_eligible(inst) {
+                last = Some(inst);
+                if seen == target {
+                    return Some(inst.clone());
+                }
+                seen += 1;
             }
         }
-        None
+        last.cloned()
     }
 
     /// The end-to-end timeout the fast path applies to a forward to this upstream (ADR 000019).
@@ -239,9 +247,10 @@ impl UpstreamRegistry {
             .map_err(|_| ControlError::UpstreamRegistryPoisoned)?;
         let mut next: HashMap<String, Arc<UpstreamGroup>> = HashMap::with_capacity(upstreams.len());
         for up in upstreams {
+            let prev_any = groups.get(&up.name);
             // reuse the prior group's instances only if the health policy is identical; a policy
             // change re-probes the upstream from pessimistic (so new thresholds actually apply).
-            let prev = groups.get(&up.name).filter(|g| g.health == up.health);
+            let prev = prev_any.filter(|g| g.health == up.health);
             let instances = up
                 .addresses
                 .iter()
@@ -252,6 +261,10 @@ impl UpstreamRegistry {
                         })
                 })
                 .collect();
+            // carry the round-robin cursor across the reload (independent of which instances or the
+            // health policy changed — it is only a rotation counter) so the first post-reload pick
+            // continues the rotation instead of restarting at the eligible set's head (ADR 000024).
+            let rr = prev_any.map(|g| g.rr.load(Ordering::Relaxed)).unwrap_or(0);
             next.insert(
                 up.name.clone(),
                 Arc::new(UpstreamGroup {
@@ -260,7 +273,7 @@ impl UpstreamRegistry {
                     instances,
                     request_timeout: Duration::from_millis(up.request_timeout_ms),
                     max_retries: up.max_retries,
-                    rr: AtomicUsize::new(0),
+                    rr: AtomicUsize::new(rr),
                 }),
             );
         }

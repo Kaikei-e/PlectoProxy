@@ -32,6 +32,10 @@ pub struct RouteInfo {
     pub index: usize,
     pub upstream: Arc<UpstreamGroup>,
     pub strip_prefix: Option<String>,
+    /// Whether this route has any filters. The fast path only buffers a request body for the
+    /// `on-request-body` hook (ADR 000025) when there is a filter to run; a filterless route keeps
+    /// the zero-copy streaming path.
+    pub has_filters: bool,
 }
 
 impl RouteInfo {

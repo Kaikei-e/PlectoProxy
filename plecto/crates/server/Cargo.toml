@@ -45,6 +45,11 @@ path = "../../examples/wasm-bench/main.rs"
 name = "hot-reload"
 path = "../../examples/hot-reload/main.rs"
 
+# Benchmark harness: host rate-limit (ADR 000026) + request-body hook (ADR 000025) on one filter.
+[[example]]
+name = "edge-bench"
+path = "../../examples/edge-bench/main.rs"
+
 [dependencies]
 plecto-control = { path = "../control" }
 tokio = { workspace = true }

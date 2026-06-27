@@ -36,8 +36,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::{
-    ChainOutcome, Control, Header, HealthConfig, HttpRequest, HttpResponse, RequestTrace,
-    UpstreamInstance,
+    ChainOutcome, Control, Header, HealthConfig, HttpRequest, HttpResponse, RequestBodyOutcome,
+    RequestTrace, UpstreamInstance,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::TcpListener;
@@ -76,6 +76,12 @@ const HOP_BY_HOP: &[&str] = &[
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
+
+/// The cap on a request body buffered for the `on-request-body` hook (ADR 000025). Buffer-then-
+/// decide must bound memory: an unbounded buffer is a trivial OOM DoS, so a body larger than this
+/// fails closed (413) rather than being read into RAM. A per-route override is a follow-up; the
+/// constant keeps v1 safe. Header-only / bodyless requests never reach this path.
+const MAX_REQUEST_BODY_BUFFER: usize = 16 << 20; // 16 MiB
 
 /// The set of header names DYNAMICALLY designated hop-by-hop by `Connection` (RFC 9110 §7.6.1):
 /// `Connection: X-Foo, close` marks `X-Foo` connection-specific, so a proxy must not forward it.
@@ -191,7 +197,7 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
 
     let state = Arc::new(ServerState {
         control,
-        client: Client::builder(TokioExecutor::new()).build_http(),
+        client: Client::builder(TokioExecutor::new()).build(upstream_connector()),
         alt_svc,
     });
 
@@ -393,6 +399,32 @@ async fn proxy_core(
     let bodyless = body.size_hint().exact() == Some(0);
     let mut real_body = Some(body);
     let mut tries_left = route.upstream.max_retries();
+
+    // --- request-side body hook (ADR 000025): for a filtered route carrying a body, buffer it
+    // (bounded), run the chain's `on-request-body`, and forward the possibly-transformed body — or
+    // short-circuit before upstream. Header-only routes and bodyless requests skip this, keeping the
+    // zero-copy streaming path. The chain runs on the blocking pool (sync wasmtime, !Send Store),
+    // like the header chain. (v1 buffers; a header-only zero-copy bypass is a follow-up.)
+    if route.has_filters
+        && !bodyless
+        && let Some(b) = real_body.take()
+    {
+        // Over the cap (or a body read fault) fails closed — never an unbounded buffer.
+        let Some(buffered) = buffer_request_body(b, MAX_REQUEST_BODY_BUFFER).await else {
+            return Ok(synth(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body-too-large",
+                b"request body too large",
+            ));
+        };
+        let snap_body = snapshot.clone();
+        match tokio::task::spawn_blocking(move || snap_body.dispatch_request_body(idx, buffered))
+            .await?
+        {
+            RequestBodyOutcome::Respond(resp) => return Ok(http_response(resp)),
+            RequestBodyOutcome::Forward(edited) => real_body = Some(req_full(edited)),
+        }
+    }
 
     // First pick by round-robin; fail closed (503) if no instance is healthy (ADR 000017).
     let Some(mut instance) = route.upstream.pick() else {
@@ -624,6 +656,43 @@ fn empty_req() -> ReqBody {
         .boxed()
 }
 
+/// Buffer a request body for the `on-request-body` hook (ADR 000025), capped at `max` bytes.
+/// Streams frame-by-frame so an over-cap body is rejected without first reading it all into memory;
+/// returns `None` on over-cap OR a body read fault, so the caller fails closed (413) rather than
+/// holding an unbounded buffer (data-plane no-panic / DoS-aware, bp-rust).
+async fn buffer_request_body(mut body: ReqBody, max: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.ok()?;
+        if let Ok(data) = frame.into_data() {
+            if buf.len() + data.len() > max {
+                return None;
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Some(buf)
+}
+
+/// An upstream HTTP connector with `TCP_NODELAY` set. A proxy must disable Nagle on its upstream
+/// sockets: with Nagle on, a streamed request body sent in several writes stalls ~40 ms on the
+/// peer's delayed-ACK timer (surfaced by the body benchmark as a p99 cliff on large streamed
+/// bodies). Disabling Nagle on proxy/upstream sockets is standard practice across mature L7 proxies.
+/// Both the forwarding client and the health prober use it.
+fn upstream_connector() -> HttpConnector {
+    let mut c = HttpConnector::new();
+    c.set_nodelay(true);
+    c
+}
+
+/// A buffered request body (post `on-request-body` hook, ADR 000025) boxed into `ReqBody` — the
+/// transformed body the fast path forwards in place of the original stream.
+fn req_full(bytes: Vec<u8>) -> ReqBody {
+    Full::new(Bytes::from(bytes))
+        .map_err(|e: Infallible| -> BoxError { match e {} })
+        .boxed()
+}
+
 // ===== HTTP/3 (ADR 000016) =====
 //
 // An independent QUIC/UDP listener terminates HTTP/3, then feeds each request into the SAME
@@ -788,7 +857,7 @@ impl Body for H3ReqBody {
 async fn serve_health_checks(control: Arc<Control>) {
     // a dedicated plain-HTTP/1.1 client for probes (empty body), separate from the request path.
     let client: Client<HttpConnector, Empty<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
+        Client::builder(TokioExecutor::new()).build(upstream_connector());
     // per-(upstream, address) last-probe instant, so each instance is probed on ITS interval even
     // though one task drives them all. An instance not yet in the map is probed now (cold start).
     let mut last: HashMap<(String, String), Instant> = HashMap::new();

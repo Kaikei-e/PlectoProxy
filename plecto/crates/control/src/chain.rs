@@ -3,8 +3,8 @@
 //! Fail-closed — a trapped / timed-out filter (`RunError`) never falls through to upstream.
 
 use plecto_host::{
-    Header, HttpRequest, HttpResponse, RequestDecision, RequestEdit, RequestTrace,
-    ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestDecision, RequestEdit,
+    RequestTrace, ResponseDecision, ResponseEdit,
 };
 
 use crate::ActiveConfig;
@@ -16,6 +16,16 @@ pub enum ChainOutcome {
     Respond(HttpResponse),
     /// The chain passed: forward this (possibly edited) request upstream.
     Forward(HttpRequest),
+}
+
+/// The result of driving a buffered request body through the chain's `on-request-body` hooks
+/// (ADR 000025).
+pub enum RequestBodyOutcome {
+    /// Respond now without reaching upstream: a body filter short-circuited, or the chain failed
+    /// closed on a trap / deadline.
+    Respond(HttpResponse),
+    /// The chain passed: forward this (possibly transformed) body upstream.
+    Forward(Vec<u8>),
 }
 
 pub(crate) fn dispatch_request(
@@ -43,6 +53,32 @@ pub(crate) fn dispatch_request(
         }
     }
     ChainOutcome::Forward(request)
+}
+
+/// Drive a buffered request body through the chain's `on-request-body` hooks in order (ADR 000025),
+/// threading the possibly-transformed body from one filter to the next. A short-circuit (or a
+/// fail-closed trap / deadline) stops the chain before upstream. The host already buffered the body;
+/// this only sequences the decisions.
+pub(crate) fn dispatch_request_body(
+    active: &ActiveConfig,
+    chain: &[String],
+    mut body: Vec<u8>,
+    trace: &RequestTrace,
+) -> RequestBodyOutcome {
+    for id in chain {
+        let Some(filter) = active.filters.get(id) else {
+            continue;
+        };
+        match filter.on_request_body(&body, trace) {
+            Ok((RequestBodyDecision::Continue(next), _logs)) => body = next,
+            Ok((RequestBodyDecision::ShortCircuit(response), _logs)) => {
+                return RequestBodyOutcome::Respond(response);
+            }
+            // fail-closed: a trapped / timed-out body filter must not reach upstream.
+            Err(err) => return RequestBodyOutcome::Respond(err.fail_closed_response()),
+        }
+    }
+    RequestBodyOutcome::Forward(body)
 }
 
 pub(crate) fn dispatch_response(

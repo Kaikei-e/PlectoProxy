@@ -31,7 +31,7 @@ use arc_swap::ArcSwap;
 use plecto_host::{LoadedFilter, SignedArtifact};
 
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
-pub use chain::ChainOutcome;
+pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use error::ControlError;
 pub use manifest::{
     Chain, FilterEntry, HealthConfig, IsolationKind, Manifest, Route, TlsCert, Trust, Upstream,

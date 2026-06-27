@@ -8,8 +8,9 @@
 //!     (ADR 000011 / Tenet 4).
 //!   - on-request:
 //!       * log how many times init has run so far (reads the `init-calls` counter);
-//!       * if `x-plecto-ratelimit` is present, consult a tiny host-native token bucket
-//!         and short-circuit 429 when empty (ADR 000005);
+//!       * if `x-plecto-ratelimit` is present, consult a host-native token bucket keyed by the
+//!         header VALUE (distinct callers → independent buckets) and short-circuit 429 when
+//!         empty (ADR 000005 / 000026);
 //!       * if `x-plecto-block` is present, short-circuit 403;
 //!       * otherwise continue.
 //!   - on-response: continue.
@@ -34,6 +35,13 @@ fn has_header(req: &HttpRequest, name: &str) -> bool {
     req.headers
         .iter()
         .any(|h| h.name.eq_ignore_ascii_case(name))
+}
+
+fn header_value<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
+    req.headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str())
 }
 
 impl Guest for FilterHello {
@@ -111,10 +119,13 @@ impl Guest for FilterHello {
             });
         }
 
-        if has_header(&req, "x-plecto-ratelimit") {
+        if let Some(rl) = header_value(&req, "x-plecto-ratelimit") {
+            // The header VALUE selects the bucket key (e.g. a tenant / client id), so distinct
+            // callers get independent buckets; an empty value falls back to a shared "default".
             // The bucket spec is host-configured in the manifest (ADR 000026); the filter only
             // decides to consult the limiter and on what key. No spec to pass (and none to forge).
-            let outcome = host_ratelimit::try_acquire("default", 1);
+            let key = if rl.is_empty() { "default" } else { rl };
+            let outcome = host_ratelimit::try_acquire(key, 1);
             if !outcome.allowed {
                 return RequestDecision::ShortCircuit(HttpResponse {
                     status: 429,

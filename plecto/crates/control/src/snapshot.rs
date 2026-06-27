@@ -14,7 +14,7 @@ use std::sync::Arc;
 use plecto_host::{HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
-use crate::chain::{self, ChainOutcome};
+use crate::chain::{self, ChainOutcome, RequestBodyOutcome};
 use crate::route::{self, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
@@ -60,6 +60,7 @@ impl ConfigSnapshot {
             index,
             upstream: r.upstream.clone(),
             strip_prefix: r.strip_prefix.clone(),
+            has_filters: !r.filters.is_empty(),
         })
     }
 
@@ -71,6 +72,16 @@ impl ConfigSnapshot {
         match self.config.routes.get(route) {
             Some(r) => chain::dispatch_request(&self.config, &r.filters, request, &self.trace),
             None => ChainOutcome::Respond(no_route_response()),
+        }
+    }
+
+    /// Drive a buffered request body through a matched route's `on-request-body` chain (ADR 000025).
+    /// Same `route` index as the request side, on the same snapshot. The server calls this only for a
+    /// route with filters and a non-empty body; a stale index forwards the body unchanged.
+    pub fn dispatch_request_body(&self, route: usize, body: Vec<u8>) -> RequestBodyOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_request_body(&self.config, &r.filters, body, &self.trace),
+            None => RequestBodyOutcome::Forward(body),
         }
     }
 

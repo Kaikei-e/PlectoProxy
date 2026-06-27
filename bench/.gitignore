@@ -1,15 +1,15 @@
-# bench/ publishes the benchmark *method* for OSS transparency — the orchestration
-# scripts, the k6 scenarios, the Grafana provisioning, and docker-compose.yml.
+# bench/ publishes the benchmark *method* for OSS transparency — the runbook (perf/run-perf.sh),
+# the k6 scenarios, the python drivers, the Grafana provisioning, and docker-compose.yml.
 #
-# It never publishes the raw run artifacts, which carry local paths / machine details
-# and are large + regenerable. Keep the following out of git:
+# It never publishes the raw run artifacts, which carry local paths / machine details and are large
+# + regenerable. The curated numbers live in performance/ (CSVs + README). Keep these out of git:
 
-# The downloaded third-party k6 binary (run-bench.sh fetches it on demand).
+# Any locally-cached generator binary (run-perf.sh uses k6 on PATH + oha from ~/.cargo/bin; nothing
+# is fetched into bench/, but ignore a /bin/ if one is created manually).
 /bin/
 
-# Raw k6 outputs: HTML reports + text logs contain absolute local paths (/home/<user>/…),
-# and the JSON summaries are regenerable working data (the curated numbers live in
-# performance/). The proxy startup logs echo demo keys + local detail.
+# Raw run outputs: HTML reports + text logs contain absolute local paths (/home/<user>/…), and JSON
+# summaries are regenerable working data. Proxy startup logs echo demo keys + local detail.
 /results/
 /results-wasm/
 

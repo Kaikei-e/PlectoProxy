@@ -23,7 +23,7 @@ Plecto pairs **two complementary halves** through a typed [WIT](https://componen
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (24 ADRs) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, routes by host + path prefix, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** (round-robin + active/passive health, per-upstream timeout, request-level retry). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (25 ADRs) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, routes by host + path prefix, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** (round-robin + active/passive health, per-upstream timeout, request-level retry). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto?
 
@@ -113,7 +113,7 @@ world filter {
 }
 ```
 
-> v0.1.0 is intentionally **sync + header-only**. The host-side async migration (M3 Stage 1, [ADR 000021](docs/ADR/000021.md)) has **landed**: hooks run on wasmtime fibers via `call_async`, bridged to the sync API with `block_on`. `stream<u8>` bodies, async hooks, and `wasi:http` type reuse follow in Stage 2 once the P3 guest toolchain settles — see [ADR 000003](docs/ADR/000003.md) / [ADR 000010](docs/ADR/000010.md) / [ADR 000020](docs/ADR/000020.md).
+> v0.1.0 started **sync + header-only**; the request-side **body hook** has now landed — `on-request-body` (buffer-then-decide; the body is a buffered `list<u8>` in v1, [ADR 000025](docs/ADR/000025.md)) — so a filter can transform or short-circuit on the body, not just headers. The host-side async migration (M3 Stage 1, [ADR 000021](docs/ADR/000021.md)) is in. Still ahead in Stage 2: wiring the body hook through the fast path, `stream<u8>` true-streaming, and `wasi:http` type reuse once the P3 guest toolchain settles — see [ADR 000003](docs/ADR/000003.md) / [ADR 000020](docs/ADR/000020.md).
 
 ## Writing a filter
 
@@ -193,8 +193,8 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
   OCI-artifact filter distribution (offline image-layout, digest-pinned) + cosign signature verification + SBOM↔component binding, and content-hash-reconciled hot reload from a declarative manifest (atomic `ArcSwap`, all-or-nothing, SIGHUP-driven). What remains is a *remote* registry fetch path (the `wkg` boundary, out-of-band by design). — [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
 - **M5 — Observability & opt-in distribution** 🚧 *(span/metrics core landed; export deferred)*
   **Landed:** host-propagated W3C trace context (inbound `traceparent` continued through the proxy), one span per filter execution over the OpenTelemetry data model, and a sync `TelemetrySink` (in-memory + host-aggregated RED metrics). **Deferred:** OTLP network export (`wasi-otel` / SDK exporter, named-deferred to stay no-tokio) and opt-in `foca`/`openraft` config consensus. — [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
-- **M3 — Async & bodies** 🚧 *(Stage 1 landed; Stage 2 gated)*
-  The frontier, since M4/M5 are largely done. **Stage 1 (landed):** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0) (2026-06-22) made WASI 0.3 + Component Model async default-on; the host now runs guest hooks via `call_async` on wasmtime fibers, bridged to its still-sync public API with `block_on`, so the `spawn_blocking` data path is untouched (conformance + unit green on 46). **Stage 2 (gated):** `run_pooled`'s fiber rework, the server's `spawn_blocking` removal, and the production `stream<u8>` body contract stay frozen until the P3 guest toolchain (`wasm32-wasip3` Tier-2, wit-bindgen async) settles. [ADR 20](docs/ADR/000020.md) sets the direction — converge `plecto:filter` onto `wasi:http` types, deny-by-default kept independent.
+- **M3 — Async & bodies** 🚧 *(Stage 1 landed; Stage 2 started)*
+  The frontier, since M4/M5 are largely done. **Stage 1 (landed):** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0) (2026-06-22) made WASI 0.3 + Component Model async default-on; the host runs guest hooks via `call_async` on wasmtime fibers, bridged to its still-sync public API with `block_on`. **Stage 2 (started):** the request-side **body hook** has landed — `on-request-body` (buffer-then-decide; body as a buffered `list<u8>` in v1) through the contract + host, conformance-green ([ADR 25](docs/ADR/000025.md)). Next is wiring it through the fast path; then `stream<u8>` true-streaming and `wasi:http` convergence, which stay gated on the P3 guest toolchain (`wasm32-wasip3` Tier-2, wit-bindgen async). [ADR 20](docs/ADR/000020.md) keeps the convergence direction — deny-by-default independent of the type vocabulary.
 - **M6 — Polyglot SDKs & reference filters**
   Go / JS / Python filter templates and reference auth / rate-limit / WAF filters.
 
@@ -214,7 +214,7 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs)
 │           ├── filter-hello/  # conformance-fixture filter (wasm32-unknown-unknown guest)
 │           └── filter-apikey/ # real-world example filter: API-key auth gate (WASM component)
-├── docs/ADR/                  # Architecture Decision Records (000001–000024)
+├── docs/ADR/                  # Architecture Decision Records (000001–000025)
 ├── CLAUDE.md                  # project conventions & design summary
 └── CONTEXT-MAP.md             # domain glossary map (split per context)
 ```

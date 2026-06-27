@@ -23,7 +23,7 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 速度が要となる経路は native Rust のまま。リクエストのロジックはサンドボックス化された WASM コンポーネントとして走り、**ホストが明示的に貸した能力以外には何も触れられない** —— それを強制するのは規約ではなくサンドボックスである。
 
 > [!WARNING]
-> **現状: 初期開発段階。** 設計は確定済み（24 本の ADR）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・そして **fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS** を終端し、host＋path-prefix で routing し、クライアント IP を edge モデルで伝播し、**healthy な upstream instance へロードバランシングする**（round-robin ＋ active/passive health・per-upstream timeout・request-level retry）。テスト一式は green で CI に載っている —— 読める・動かせる・フィルタを書ける基盤である。[ロードマップ](#ロードマップ)参照。
+> **現状: 初期開発段階。** 設計は確定済み（25 本の ADR）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・そして **fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS** を終端し、host＋path-prefix で routing し、クライアント IP を edge モデルで伝播し、**healthy な upstream instance へロードバランシングする**（round-robin ＋ active/passive health・per-upstream timeout・request-level retry）。テスト一式は green で CI に載っている —— 読める・動かせる・フィルタを書ける基盤である。[ロードマップ](#ロードマップ)参照。
 
 ## なぜ Plecto か
 
@@ -113,7 +113,7 @@ world filter {
 }
 ```
 
-> v0.1.0 は意図的に **sync・header-only**。ホスト側 async 移行（M3 Stage 1、[ADR 000021](docs/ADR/000021.md)）は **着地済み**: フックは `call_async` で wasmtime fiber 上に走り、`block_on` で sync API に橋渡しされる。`stream<u8>` ボディ・async フック・`wasi:http` 型再利用は P3 ゲスト toolchain が枯れてから Stage 2 で続く — [ADR 000003](docs/ADR/000003.md) / [ADR 000010](docs/ADR/000010.md) / [ADR 000020](docs/ADR/000020.md) 参照。
+> v0.1.0 は当初 **sync・header-only** だったが、**request 側の body hook が着地した** —— `on-request-body`（buffer-then-decide。v1 では body を buffer 済みの `list<u8>` で受け取る、[ADR 000025](docs/ADR/000025.md)）。これでフィルタはヘッダだけでなく body も変換・short-circuit できる。ホスト側の async 移行（M3 Stage 1、[ADR 000021](docs/ADR/000021.md)）も入っている。Stage 2 の残りは、この body hook を fast path に通す配線・`stream<u8>` の真ストリーミング・`wasi:http` 型の再利用で、いずれも P3 ゲスト toolchain が枯れ次第進める — [ADR 000003](docs/ADR/000003.md) / [ADR 000020](docs/ADR/000020.md) 参照。
 
 ## フィルタを書く
 
@@ -193,8 +193,8 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
   OCI artifact によるフィルタ配布（オフライン image-layout・digest ピン）+ cosign 署名検証 + SBOM↔component バインド、宣言的マニフェストの content hash で整合する無停止リロード（`ArcSwap` 原子適用・all-or-nothing・SIGHUP 駆動）。残るのは*リモート*レジストリ取得経路（`wkg` 境界・設計上 out-of-band）。— [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
 - **M5 — 可観測性 & オプトイン分散** 🚧 *(span/metrics の中核は着地・export は deferred)*
   **着地:** ホスト伝播の W3C トレース文脈（受信 `traceparent` をプロキシ越しに継続）、フィルタ実行ごとの span（OpenTelemetry データモデル）、sync な `TelemetrySink`（in-memory + ホスト集計の RED メトリクス）。**deferred:** OTLP ネットワーク export（`wasi-otel` / SDK exporter — no-tokio 維持のため named-deferred）とオプトインの `foca`/`openraft` 設定合意。— [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
-- **M3 — async & ボディ** 🚧 *(Stage 1 着地・Stage 2 はゲート)*
-  M4・M5 がほぼ片付いたので、ここが次の主戦場になる。**Stage 1（着地）:** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0)（2026-06-22）が WASI 0.3 と Component Model async を既定で有効にした。host は guest のフックを `call_async` で wasmtime の fiber 上に走らせ、まだ sync の公開 API へ `block_on` で橋渡ししている。おかげで `spawn_blocking` の経路には手を付けずに済んでいる（conformance と unit は 46 で green）。**Stage 2（ゲート）:** `run_pooled` の fiber 化、server 側の `spawn_blocking` 撤去、production の `stream<u8>` ボディ契約は、P3 ゲストの toolchain（`wasm32-wasip3` の Tier-2 化、wit-bindgen async）が枯れるまで凍結する。方向は [ADR 20](docs/ADR/000020.md) で確定済み —— `plecto:filter` を `wasi:http` 型へ収斂させつつ、deny-by-default は型語彙と切り離して保つ。
+- **M3 — async & ボディ** 🚧 *(Stage 1 着地・Stage 2 着手)*
+  M4・M5 がほぼ片付いたので、ここが次の主戦場。**Stage 1（着地）:** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0)（2026-06-22）が WASI 0.3 と Component Model async を既定で有効にし、host は guest のフックを `call_async` で wasmtime の fiber 上に走らせ、まだ sync の公開 API へ `block_on` で橋渡ししている。**Stage 2（着手）:** **request 側の body hook が着地** —— `on-request-body`（buffer-then-decide。v1 は body を buffer 済みの `list<u8>` で受ける）を契約と host に入れ、conformance まで green にした（[ADR 25](docs/ADR/000025.md)）。次はこれを fast path に通す配線。その先の `stream<u8>` 真ストリーミングと `wasi:http` 収斂は、P3 ゲストの toolchain（`wasm32-wasip3` の Tier-2 化・wit-bindgen async）待ちで gated のまま。方向は [ADR 20](docs/ADR/000020.md) のとおり —— 収斂しても deny-by-default は型語彙と切り離して保つ。
 - **M6 — polyglot SDK & リファレンスフィルタ**
   Go / JS / Python のフィルタテンプレート、リファレンスの auth / rate-limit / WAF フィルタ。
 
@@ -214,14 +214,14 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │       └── filters/           # 例 plecto:filter guest（独立 workspace・build.rs が component 化）
 │           ├── filter-hello/  # conformance 用の例フィルタ（wasm32-unknown-unknown ゲスト）
 │           └── filter-apikey/ # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
-├── docs/ADR/                  # Architecture Decision Records（000001–000024）
+├── docs/ADR/                  # Architecture Decision Records（000001–000025）
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
 └── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）
 ```
 
 ## 設計判断（ADR）
 
-Plecto は重要な設計判断をすべて ADR に、Fork 形式（*判断 / 根拠 / 再検討条件*）で記録している。24 本すべては [`docs/ADR/`](docs/ADR/) にあり、起点は [ADR 000001](docs/ADR/000001.md)（相補的な二つの構成要素）。各 ADR は土台にした判断へ相互リンクしている。
+Plecto は重要な設計判断をすべて ADR に、Fork 形式（*判断 / 根拠 / 再検討条件*）で記録している。25 本すべては [`docs/ADR/`](docs/ADR/) にあり、起点は [ADR 000001](docs/ADR/000001.md)（相補的な二つの構成要素）。各 ADR は土台にした判断へ相互リンクしている。
 
 ## コントリビュート
 

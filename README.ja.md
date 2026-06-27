@@ -54,32 +54,67 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 
 ## アーキテクチャ
 
+Plecto は速い **native の高速道路** ＋ **あなた自身のコードが走る検問所** という構成。高速道路（native
+Rust）が接続受付・TLS 終端・HTTP・ルーティング・LB を担う。検問所が **extension plane**：各リクエストは
+あなたの *フィルタ*——小さな sandbox 化された WASM プログラム——に渡され、それが **リクエストを検査して
+3つの判断のいずれかを返す**。ポリシーはこの判断に宿る。
+
 ```mermaid
 flowchart LR
     client(["クライアント"])
-    upstream(["upstream"])
+    upstream(["upstream サービス"])
 
-    subgraph fast["fast path — native Rust（速度が要）"]
+    subgraph fast["fast path · native Rust"]
         direction TB
-        net["接続受付 · TLS 終端<br/>HTTP/1.1 · HTTP/2 · HTTP/3"]
-        route["routing · load balancing<br/>upstream プール · hot-reload"]
-        net --> route
+        edge["接続受付 · TLS · HTTP/1·2·3"]
+        route["route 照合 · load balance"]
+        edge --> route
     end
 
-    subgraph ext["extension plane — WASM Component Model フィルタ（あなたのロジック）"]
+    subgraph ext["extension plane · あなたのフィルタ（sandbox WASM）"]
         direction TB
-        filter["各フィルタ: init（重い・一度） + on-request / on-response（ホット）<br/>型付き decision を返す — continue · modified · short-circuit<br/>deny-by-default: 貸与された host-API だけに触れる"]
+        inspect["各リクエストを検査<br/>ヘッダ、必要なら body も"]
+        decide{"判断"}
+        inspect --> decide
     end
 
-    state[("host 保持の状態<br/>redb — KV · rate-limit · cache")]
+    state[("host 保持の状態とサービス<br/>rate-limit · KV · counter · log · clock")]
 
-    client -->|リクエスト| fast
-    fast -->|"転送 — prefix-strip · X-Forwarded · timeout · retry"| upstream
-    fast <-->|"plecto:filter 契約（WIT） — request chain から response chain（逆順）"| ext
-    ext -->|"host-API — KV · counter · rate-limit · log · clock"| state
+    client -->|"1 · リクエスト"| edge
+    route -->|"2 · filter chain を実行"| inspect
+    decide -->|"3 · continue / modify → 転送"| upstream
+    decide -.->|"3 · reject＝その場で応答<br/>401 / 403 / 429 — upstream に届かない"| client
+    upstream -->|"4 · レスポンス（戻りで filter が改変可）"| client
+    decide <-->|"貸与された capability のみ呼べる"| state
 ```
 
-**判断の指針:** ユーザー固有のロジック・ポリシー・WAF・認証・書換 → WASM フィルタ。TLS・ルーティング・LB・コネクションプール・グローバルカウンタ → native Rust。WASM 税（データコピー＋ホストコール）はリクエスト判断ロジックにのみ課し、速い経路には課さない。
+3つの判断がメンタルモデルの全て：**continue**（素通し）・**modify**（ヘッダ/body を書換えて通す）・
+**reject**（*その場で* クライアントへ応答する `401/403/429`＝**upstream に届かない**ので、悪性トラフィックは
+edge で落ちる）。フィルタは **stateless**：覚えておくべきもの（カウンタ・rate-limit bucket・キャッシュ）は
+host 側にあり、**明示的に貸与された host サービスだけ**を呼べる（deny-by-default）。
+
+フィルタは署名済み WASM component で、**同じ** component を「どれだけ信頼するか」で2通りに走らせられる——
+これが性能の最大レバー：
+
+```mermaid
+flowchart TB
+    wasm["フィルタ＝署名済み WASM component 1つ<br/>（任意の言語で書ける）"]
+    verify["署名検証してからロード<br/>署名不正 → 拒否（fail-closed）"]
+    profile{"どれだけ信頼する？"}
+
+    pooled["trusted → pooled<br/>一度だけ構築・インスタンス再利用<br/>速いホット経路（~2 µs / req）"]
+    fresh["untrusted → リクエスト毎に fresh<br/>毎回作り直し＋ゼロ化<br/>強い隔離（~13倍遅い）"]
+
+    guards["全インスタンス常時:<br/>時間上限 · メモリ上限<br/>trap / timeout で fail-closed"]
+
+    wasm --> verify --> profile
+    profile -->|trusted| pooled
+    profile -->|untrusted| fresh
+    pooled --> guards
+    fresh --> guards
+```
+
+**判断の指針:** ユーザー固有のロジック・ポリシー・WAF・認証・書換 → WASM フィルタ。TLS・ルーティング・LB・コネクションプール・グローバルカウンタ → native Rust。WASM 税（データコピー＋ホストコール）はリクエスト判断ロジックにのみ課し、速い経路には課さない——pooled フィルタで **~2 µs/req** と実測（[performance](performance/README.md)）。
 
 ## フィルタ契約
 

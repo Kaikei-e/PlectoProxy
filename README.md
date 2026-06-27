@@ -54,32 +54,69 @@ See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alterna
 
 ## Architecture
 
+Plecto is a fast **native highway** plus a **checkpoint where your own code runs**. The highway
+(native Rust) accepts connections, terminates TLS, speaks HTTP, routes and load-balances. The
+checkpoint is the **extension plane**: every request is handed to your *filter* — a small sandboxed
+WASM program — which **inspects it and returns one of three decisions**. That decision is where the
+policy lives.
+
 ```mermaid
 flowchart LR
     client(["Client"])
-    upstream(["Upstream"])
+    upstream(["Upstream service"])
 
-    subgraph fast["Fast path — native Rust (speed-critical)"]
+    subgraph fast["Fast path · native Rust"]
         direction TB
-        net["accept · TLS termination<br/>HTTP/1.1 · HTTP/2 · HTTP/3"]
-        route["routing · load balancing<br/>upstream pool · hot-reload"]
-        net --> route
+        edge["accept · TLS · HTTP/1·2·3"]
+        route["route match · load balance"]
+        edge --> route
     end
 
-    subgraph ext["Extension plane — WASM Component Model filters (your logic)"]
+    subgraph ext["Extension plane · your filter, sandboxed WASM"]
         direction TB
-        filter["per filter: init (heavy, once) + on-request / on-response (hot)<br/>returns a typed decision — continue · modified · short-circuit<br/>deny-by-default: touches ONLY the host-API it was lent"]
+        inspect["inspect each request<br/>headers, and the body if it asks"]
+        decide{"decide"}
+        inspect --> decide
     end
 
-    state[("Host-held state<br/>redb — KV · rate-limit · cache")]
+    state[("Host-held state and services<br/>rate-limit · KV · counter · log · clock")]
 
-    client -->|request| fast
-    fast -->|"forward — prefix-strip · X-Forwarded · timeout · retry"| upstream
-    fast <-->|"plecto:filter contract (WIT) — request chain then response chain (reverse)"| ext
-    ext -->|"host-API — KV · counter · rate-limit · log · clock"| state
+    client -->|"1 · request"| edge
+    route -->|"2 · run the filter chain"| inspect
+    decide -->|"3 · continue / modify, then forward"| upstream
+    decide -.->|"3 · reject and answer now<br/>401 / 403 / 429 — upstream never reached"| client
+    upstream -->|"4 · response — filters may edit on the way back"| client
+    decide <-->|"borrows only the capabilities it was lent"| state
 ```
 
-**Rule of thumb:** user-specific logic / policy / WAF / auth / rewrite → a WASM filter; TLS / routing / LB / connection pools / global counters → native Rust. The WASM "tax" (data copy + host-call overhead) is charged only to request-decision logic, never to the speed path.
+The three decisions are the whole mental model: **continue** (pass through), **modify** (rewrite a
+header/body, then pass), or **reject** (answer the client *now* — a `401/403/429` that **never
+reaches the upstream**, so bad traffic is shed at the edge). The filter is **stateless**: anything it
+needs to remember (a counter, a rate-limit bucket, a cached value) lives in the host, and it can call
+**only** the host services it was explicitly lent — nothing else (deny-by-default).
+
+A filter is just a signed WASM component, and the **same** component can run two ways depending on
+how much you trust it — which is the single biggest performance lever:
+
+```mermaid
+flowchart TB
+    wasm["A filter is one signed WASM component<br/>(write it in any language)"]
+    verify["verify the signature, then load<br/>bad signature → refused (fail-closed)"]
+    profile{"how much is it trusted?"}
+
+    pooled["trusted → pooled<br/>built once, instances reused<br/>fast hot path (~2 µs / request)"]
+    fresh["untrusted → fresh per request<br/>rebuilt and wiped each time<br/>stronger isolation (~13× slower)"]
+
+    guards["always on, every instance:<br/>time limit · memory limit<br/>fail-closed on trap or timeout"]
+
+    wasm --> verify --> profile
+    profile -->|trusted| pooled
+    profile -->|untrusted| fresh
+    pooled --> guards
+    fresh --> guards
+```
+
+**Rule of thumb:** user-specific logic / policy / WAF / auth / rewrite → a WASM filter; TLS / routing / LB / connection pools / global counters → native Rust. The WASM "tax" (data copy + host-call overhead) is charged only to request-decision logic, never to the speed path — measured at **~2 µs/request** for a pooled filter ([performance](performance/README.md)).
 
 ## The filter contract
 

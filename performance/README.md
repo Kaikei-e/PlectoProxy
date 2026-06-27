@@ -38,30 +38,30 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 **Load-balancing fast path** (plaintext HTTP/1.1, 3 upstreams, trivial 0 ms backend; k6):
 
-- Closed-loop throughput peaks at **~130k req/s** (50 VUs) with **p99 ≈ 1.0 ms** and zero failures;
-  it degrades **gracefully** — still **~105k at 800 VUs** (p99 21 ms) with **0 failures and no
+- Closed-loop throughput peaks at **~133k req/s** (50 VUs) with **p99 ≈ 1.0 ms** and zero failures;
+  it degrades **gracefully** — still **~107k at 800 VUs** (p99 21 ms) with **0 failures and no
   latency cliff**.
-- An open-loop arrival rate set to 70 % of the closed-loop peak (**~91k/s**) already **saturates the
-  co-resident generator**: ~81k/s achieved, **12 % dropped**, p99 450 ms — that divergence *is* the
+- An open-loop arrival rate set to 70 % of the closed-loop peak (**~93k/s**) already **saturates the
+  co-resident generator**: ~61k/s achieved, **16 % dropped**, p99 256 ms — that divergence *is* the
   saturation signal, and is why the open-loop tail, not the closed-loop p99, is treated as
   authoritative.
 - Round-robin across three upstreams is **even to within one request** (33.3 % each).
 - **Resilience is as designed**: ejecting one upstream drops its share to zero in ~1 s and the
   survivors absorb the load with **no client-visible errors**; a *total* outage **fails closed
   with HTTP 503** and the pool **recovers within ~1 s** of health returning.
-- TLS termination (ALPN **h2**) costs about **29 % throughput and +0.24 ms p99** here — a realistic
+- TLS termination (ALPN **h2**) costs about **29 % throughput and +0.26 ms p99** here — a realistic
   termination cost (see [TLS](#tls-termination)).
-- A **kept-alive** connection serves **~145k req/s**; forcing a **TCP handshake per request** costs
-  **~37 % throughput and +0.5 ms p99** — connection reuse is load-bearing (see
+- A **kept-alive** connection serves **~147k req/s**; forcing a **TCP handshake per request** costs
+  **~33 % throughput and +0.6 ms p99** — connection reuse is load-bearing (see
   [churn](#connection-churn)).
 
 **WASM extension plane** (the cost of running a decision as a sandboxed component; oha / k6):
 
-- A **pooled** filter (init-once, instances reused) adds **~2.1 µs of CPU per request** on the hot
-  path and **+0.16 ms p99** versus a no-filter native baseline (~24 % of throughput at this run's
-  ~146k req/s). The **µs/req is the portable figure**; the percentage shrinks as the rest of the
+- A **pooled** filter (init-once, instances reused) adds **~1.9 µs of CPU per request** on the hot
+  path and **+0.14 ms p99** versus a no-filter native baseline (~21 % of throughput at this run's
+  ~145k req/s). The **µs/req is the portable figure**; the percentage shrinks as the rest of the
   request gets heavier.
-- The **same** filter run **fresh-per-request** falls to ~8.4k req/s vs ~111k pooled — a **~13×
+- The **same** filter run **fresh-per-request** falls to ~9.1k req/s vs ~114k pooled — a **~12×
   difference**, the cost of re-paying `init` on every request.
 - A rejected request (**HTTP 401 short-circuit**) is decided in **~0.3 ms and never reaches the
   backend** — bad traffic is shed **~60× faster** than good traffic is forwarded through a 15 ms
@@ -69,19 +69,20 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 **Host-enforced rate limiting** (token bucket, spec host-configured in the manifest; k6):
 
-- The limiter adds **~1.3 µs/req** (+0.09 ms p99, ~14 % throughput) over a no-filter baseline when
-  it never denies — the cost of consulting the host-native bucket on the hot path.
+- The limiter adds **~1.6 µs/req** (+0.13 ms p99, ~16 % throughput) over a no-filter baseline when
+  it never denies — the cost of consulting the host-native bucket (and its multi-tenant quota check)
+  on the hot path.
 - Offered **5× over the configured rate**, the **allowed throughput converges to the bucket's refill
   rate** (≈ 1.0k/s for a 1000-token/s bucket) and **79 % is shed as 429** — decided at the edge in
   **~0.7 ms**, never reaching the backend.
-- Buckets are **per key**: a hot key offered 8× its limit is throttled to its refill rate while a
+- Buckets are **per key**: a hot key offered 4× its limit is throttled to its refill rate while a
   light key on the **same filter passes untouched (0 % shed)** — no cross-key starvation.
 
 **Request-body hook** (buffer-then-decide, ADR 000025; k6):
 
-- The hook costs **~34 % throughput at 1 KB** bodies and scales with payload (buffer + transform):
+- The hook costs **~31 % throughput at 1 KB** bodies and scales with payload (buffer + transform):
   **~55 % at 100 KB**, **~67 % at 1 MB**, versus the streaming passthrough that never buffers.
-  Buffering 1 MB bodies at 50 concurrency holds **~294 MB RSS** — which is why the buffer is bounded
+  Buffering 1 MB bodies at 50 concurrency holds **~317 MB RSS** — which is why the buffer is bounded
   (16 MiB cap, fail-closed 413).
 
 ## Scope & honesty notes
@@ -90,8 +91,8 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   co-resident. Absolute throughput is contended and clock-variable; treat figures as relative /
   regression signals.
 - **Generator-bound where noted.** The closed-loop sweep tops out near the *generator's* ceiling on
-  its cores, not the proxy's: the same fast path serves a single route at ~146k–149k req/s under the
-  lighter oha (see WASM baseline / TLS plain), above the k6 sweep's ~130k. The sweep curve's *shape*
+  its cores, not the proxy's: the same fast path serves a single route at ~143k–147k req/s under the
+  lighter oha (see WASM baseline / TLS plain), above the k6 sweep's ~133k. The sweep curve's *shape*
   is the signal, not its absolute peak.
 - **Trivial upstreams** (tiny static responses, 0 ms latency by default) deliberately isolate
   **proxy + LB + filter overhead** rather than backend work. A 15 ms synthetic backend is used
@@ -120,11 +121,11 @@ request only after the previous response. Rising concurrency walks the load curv
 
 | VUs | req/s | p50 | p95 | p99 | p99.9 | failed |
 | --- | --- | --- | --- | --- | --- | --- |
-| 50  | **129,787** | 0.31 ms | 0.57 ms | 1.01 ms | 2.41 ms | 0% |
-| 100 | 125,386 | 0.68 ms | 1.24 ms | 2.24 ms | 4.94 ms | 0% |
-| 200 | 118,609 | 1.42 ms | 2.70 ms | 5.05 ms | 10.16 ms | 0% |
-| 400 | 108,705 | 2.93 ms | 6.35 ms | 11.33 ms | 21.36 ms | 0% |
-| 800 | 105,099 | 5.66 ms | 12.98 ms | 20.68 ms | 30.80 ms | 0% |
+| 50  | **132,790** | 0.30 ms | 0.57 ms | 1.03 ms | 2.40 ms | 0% |
+| 100 | 124,011 | 0.68 ms | 1.25 ms | 2.33 ms | 5.16 ms | 0% |
+| 200 | 122,453 | 1.38 ms | 2.65 ms | 4.90 ms | 9.89 ms | 0% |
+| 400 | 110,166 | 2.81 ms | 6.40 ms | 10.99 ms | 19.48 ms | 0% |
+| 800 | 107,411 | 5.35 ms | 12.69 ms | 21.46 ms | 33.63 ms | 0% |
 
 Throughput peaks near **50 VUs** (the k6 generator's ceiling on its cores) and declines
 **gracefully** as concurrency climbs — latency rises in proportion with **no failures and no cliff
@@ -138,11 +139,11 @@ queueing surfaces in the tail instead of being hidden — the *coordinated-omiss
 
 | Model | target | achieved | p50 | p95 | p99 | p99.9 | dropped | failed |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| open-loop, 0 ms backend | 90,850/s | 80,815/s | 31.2 ms | 230 ms | 450 ms | 589 ms | 12.3% | 0% |
+| open-loop, 0 ms backend | 92,953/s | 60,782/s | 0.63 ms | 174 ms | 256 ms | 423 ms | 16.2% | 0.5% |
 
 The target is **70 % of the closed-loop peak** — but the closed-loop peak is the *generator's*
-ceiling, and open-loop generation saturates **below** it. So 91k/s offered already drowns the
-generator: ~81k achieved, **12 % dropped**, p99 450 ms. That divergence is the saturation signal,
+ceiling, and open-loop generation saturates **below** it. So 93k/s offered already drowns the
+generator: ~61k achieved, **16 % dropped**, p99 256 ms. That divergence is the saturation signal,
 and is why we treat the open-loop tail, not the optimistic closed-loop p99, as authoritative. A
 sustainable open-loop rate sits lower; pin one with `OPENLOOP_RATE` to read a clean tail.
 
@@ -180,16 +181,16 @@ multiplexing). `plain (h1)` is the plaintext baseline.
 
 | Variant | req/s | p50 | p99 | isolates |
 | --- | --- | --- | --- | --- |
-| plain (h1)               | 148,950 | 0.32 ms | 0.65 ms | baseline |
-| TLS h1, keep-alive       | 118,322 | 0.40 ms | 0.84 ms | record-layer AES-GCM = Δ vs plain |
-| TLS h1, handshake/req    | 29,175  | 1.52 ms | 4.45 ms | full handshake (ECDHE + signature) per request |
-| TLS (h2)                 | 106,075 | 0.45 ms | 0.89 ms | h2 multiplexing over TLS |
+| plain (h1)               | 143,317 | 0.33 ms | 0.66 ms | baseline |
+| TLS h1, keep-alive       | 118,743 | 0.40 ms | 0.77 ms | record-layer AES-GCM = Δ vs plain |
+| TLS h1, handshake/req    | 30,231  | 1.45 ms | 4.59 ms | full handshake (ECDHE + signature) per request |
+| TLS (h2)                 | 101,290 | 0.47 ms | 0.91 ms | h2 multiplexing over TLS |
 
 The decomposition is the point. **Record-layer crypto is cheap** — amortised over a kept-alive
-connection, TLS h1 costs ~20 % throughput and only **+0.18 ms p99** vs plaintext, because AES-GCM
+connection, TLS h1 costs ~17 % throughput and only **+0.11 ms p99** vs plaintext, because AES-GCM
 runs on AES-NI hardware. **The handshake dominates** — forcing a fresh ECDHE handshake on *every*
-request collapses throughput to ~29k/s (~5× lower) and adds ~1.2 ms median. And **h2 is clean**
-(106k/s, p99 0.89 ms): ALPN-negotiated HTTP/2 over TLS costs ~29 % throughput and +0.24 ms p99 vs
+request collapses throughput to ~30k/s (~4.7× lower) and adds ~1.1 ms median. And **h2 is clean**
+(101k/s, p99 0.91 ms): ALPN-negotiated HTTP/2 over TLS costs ~29 % throughput and +0.26 ms p99 vs
 plaintext — a realistic termination cost. A client that funnels many VUs over a handful of
 multiplexed connections can make h2 *look* far worse (head-of-line queueing, not server work);
 measuring with a connection-per-concurrency client removes that artifact.
@@ -203,10 +204,10 @@ The cost of *establishing* a connection vs reusing one, on the same plaintext si
 
 | Variant | req/s | p50 | p99 |
 | --- | --- | --- | --- |
-| keep-alive       | 145,106 | 0.33 ms | 0.76 ms |
-| cold (TCP/req)   | 91,781  | 0.50 ms | 1.29 ms |
+| keep-alive       | 147,265 | 0.32 ms | 0.65 ms |
+| cold (TCP/req)   | 97,958  | 0.46 ms | 1.27 ms |
 
-A TCP handshake per request costs **~37 % throughput and +0.53 ms p99** even on loopback (where the
+A TCP handshake per request costs **~33 % throughput and +0.62 ms p99** even on loopback (where the
 handshake is nearly free) — over a real network the gap widens with RTT. Connection reuse is
 load-bearing; this is the plaintext analogue of the TLS handshake-per-request row above.
 
@@ -245,28 +246,28 @@ missing/invalid key. It is cosign-signed and loaded through the production verif
 
 | Route | req/s | p50 | p95 | p99 | CPU/req |
 | --- | --- | --- | --- | --- | --- |
-| baseline (no filter) | 145,908 | 0.33 ms | 0.49 ms | 0.68 ms | 6.85 µs |
-| pooled WASM filter | 111,333 | 0.43 ms | 0.67 ms | 0.83 ms | 8.98 µs |
-| on-demand WASM filter | 8,359 | 4.37 ms | 17.44 ms | 22.88 ms | ~120 µs |
+| baseline (no filter) | 145,400 | 0.33 ms | 0.49 ms | 0.66 ms | 6.88 µs |
+| pooled WASM filter | 114,486 | 0.42 ms | 0.63 ms | 0.80 ms | 8.74 µs |
+| on-demand WASM filter | 9,124 | 4.21 ms | 14.80 ms | 21.75 ms | ~110 µs |
 
-The **pooled** filter — Plecto's default for trusted components — adds **~2.1 µs of CPU per
-request** (6.85 → 8.98 µs/req) and **+0.16 ms p99** over the native baseline. At this run's ~146k
-req/s that is **~24 % of throughput**; at a heavier per-request cost it is a far smaller fraction.
+The **pooled** filter — Plecto's default for trusted components — adds **~1.9 µs of CPU per
+request** (6.88 → 8.74 µs/req) and **+0.14 ms p99** over the native baseline. At this run's ~145k
+req/s that is **~21 % of throughput**; at a heavier per-request cost it is a far smaller fraction.
 **The µs/req is the invariant to track for regressions, not the percentage.** The *same* filter run
-**on-demand** (fresh, re-initialised every request) collapses to ~8.4k req/s — **~13× less
-throughput** — because it re-pays `init` (~120 µs) on every request. That gap *is* the value of
+**on-demand** (fresh, re-initialised every request) collapses to ~9.1k req/s — **~12× less
+throughput** — because it re-pays `init` (~100 µs) on every request. That gap *is* the value of
 pooling.
 
 ## Short-circuit: rejecting bad traffic at the edge
 
 ![Accept vs reject latency](img/wasm_shortcircuit.webp)
 
-> W2 — fixed 2000 req/s, 15 ms backend, ~90 % valid / ~10 % bad keys (k6). 107,959 accepted, 12,043 rejected.
+> W2 — fixed 2000 req/s, 15 ms backend, ~90 % valid / ~10 % bad keys (k6). 108,036 accepted, 11,964 rejected.
 
 | Path | p50 | p95 | p99 |
 | --- | --- | --- | --- |
-| accept (200, forwarded) | 16.33 ms | 17.12 ms | 17.48 ms |
-| reject (401, short-circuited) | 0.27 ms | 0.44 ms | 0.66 ms |
+| accept (200, forwarded) | 16.29 ms | 17.10 ms | 17.46 ms |
+| reject (401, short-circuited) | 0.25 ms | 0.44 ms | 0.62 ms |
 
 Accepted requests cost the 15 ms backend plus the small pooled-filter + proxy overhead. Rejected
 requests are decided **at the edge in ~0.3 ms** and never reach the upstream: bad traffic is shed
@@ -290,11 +291,13 @@ only decides *whether* to consult the limiter and *on what key*. Driven through 
 
 | Route | req/s | p50 | p99 | CPU/req |
 | --- | --- | --- | --- | --- |
-| /baseline (no filter) | 121,582 | 0.34 ms | 1.15 ms | 8.22 µs |
-| /ratelimit (bucket) | 105,070 | 0.40 ms | 1.24 ms | 9.52 µs |
+| /baseline (no filter) | 118,587 | 0.35 ms | 1.10 ms | 8.43 µs |
+| /ratelimit (bucket) | 99,478 | 0.43 ms | 1.23 ms | 10.05 µs |
 
-Consulting the host bucket on every request adds **~1.3 µs/req** (+0.09 ms p99, ~14 % throughput).
-That is the limiter's hot-path tax with no rejections — the floor cost of the mechanism.
+Consulting the host bucket on every request adds **~1.6 µs/req** (+0.13 ms p99, ~16 % throughput).
+That is the limiter's hot-path tax with no rejections — the floor cost of the mechanism, including
+the per-call host-state quota check (ADR 000027) that keeps a multi-tenant filter's bucket count
+bounded.
 
 ### Enforcement — does it actually hold the rate?
 
@@ -305,11 +308,11 @@ That is the limiter's hot-path tax with no rejections — the floor cost of the 
 
 | offered | allowed (200) | shed (429) | accept p99 | 429 p99 |
 | --- | --- | --- | --- | --- |
-| 5,000/s | **1,033/s** | 79.3% | 7.61 ms | 0.74 ms |
+| 5,000/s | **1,033/s** | 79.3% | 2.65 ms | 0.62 ms |
 
 Offered 5× over the limit, the **allowed throughput converges to the bucket's refill rate**
 (≈ 1.0k/s — the configured 1000 tok/s plus the burst amortised over the run). The excess **79 % is
-shed as 429**, each decided at the edge in **~0.7 ms** without touching the backend. Open-loop
+shed as 429**, each decided at the edge in **~0.6 ms** without touching the backend. Open-loop
 (`constant-arrival-rate`) keeps offering regardless of the 429s, so the enforcement is measured
 honestly, not hidden by a self-throttling client.
 
@@ -344,17 +347,17 @@ marker. A bodyless request and a filter-less route keep the zero-copy streaming 
 
 | size | route | req/s | throughput | p99 |
 | --- | --- | --- | --- | --- |
-| 1 KB   | /baseline | 128,059 | 131 MB/s | 1.23 ms |
-| 1 KB   | /body     | 84,339  | 86 MB/s | 1.39 ms |
-| 100 KB | /baseline | 40,754  | 4173 MB/s | 4.47 ms |
-| 100 KB | /body     | 18,384  | 1882 MB/s | 5.69 ms |
-| 1 MB   | /baseline | 5,884   | 6169 MB/s | 33.4 ms |
-| 1 MB   | /body     | 1,955   | 2050 MB/s | 43.4 ms |
+| 1 KB   | /baseline | 121,998 | 125 MB/s | 1.26 ms |
+| 1 KB   | /body     | 84,043  | 86 MB/s | 1.41 ms |
+| 100 KB | /baseline | 41,075  | 4206 MB/s | 4.29 ms |
+| 100 KB | /body     | 18,408  | 1885 MB/s | 5.73 ms |
+| 1 MB   | /baseline | 5,688   | 5964 MB/s | 32.8 ms |
+| 1 MB   | /body     | 1,877   | 1968 MB/s | 45.2 ms |
 
-The hook's cost grows with payload: **~34 % throughput at 1 KB** (the buffer + WASM transform
+The hook's cost grows with payload: **~31 % throughput at 1 KB** (the buffer + WASM transform
 dominate the small request), **~55 % at 100 KB**, **~67 % at 1 MB** (a full-body copy + uppercase per
 request). The streaming passthrough has no per-body CPU and scales with raw I/O. Buffering also costs
-memory: holding 1 MB bodies at 50 concurrency drove **~294 MB RSS**, which is why the buffer is bounded
+memory: holding 1 MB bodies at 50 concurrency drove **~317 MB RSS**, which is why the buffer is bounded
 and a request over the cap fails closed (413) rather than being read into RAM. The export-presence
 zero-copy bypass for header-only filters is a follow-up — v1 buffers whenever a filtered route has a body.
 
@@ -364,8 +367,8 @@ Idle resident set and the marginal cost of an open connection (`examples/wasm-be
 
 | Metric | Value |
 | --- | --- |
-| idle RSS | ~33 MB |
-| RSS holding ~1,000 idle keep-alive connections | ~54 MB |
+| idle RSS | ~31 MB |
+| RSS holding ~1,000 idle keep-alive connections | ~52 MB |
 | marginal bytes / connection | ~21 KB |
 
 ---

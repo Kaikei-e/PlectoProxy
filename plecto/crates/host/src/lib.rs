@@ -23,6 +23,12 @@
 
 mod backend;
 mod observe;
+// Experimental streaming body filter (direction_0003 gates 1+2), OFF by default. A descendant of the
+// crate root, so it reuses the private `EpochTicker` metering; the shipped path is untouched.
+#[cfg(feature = "streaming-body")]
+mod streaming;
+#[cfg(feature = "streaming-body")]
+pub use streaming::{StreamingDecision, StreamingLimits, run_streaming_body};
 
 use std::collections::HashMap;
 use std::sync::Arc;

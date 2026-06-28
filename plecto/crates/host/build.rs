@@ -39,6 +39,61 @@ fn main() {
         "filter_apikey",
         "FILTER_APIKEY_COMPONENT",
     );
+
+    // Experimental streaming body filter (feature `streaming-body`, OFF by default): build the
+    // filter-streaming guest for wasm32-wasip2, which emits a Component directly (no wit-component
+    // wrap). Only when the feature is on, so the default build never touches wasm32-wasip2.
+    if std::env::var("CARGO_FEATURE_STREAMING_BODY").is_ok() {
+        build_wasip2_component(
+            &cargo,
+            &filters.join("filter-streaming"),
+            "filter_streaming",
+            "FILTER_STREAMING_COMPONENT",
+        );
+    }
+}
+
+/// Build one guest crate for `wasm32-wasip2`, which already emits a Component Model component (the
+/// target links with `wasm-component-ld`), and emit `cargo:rustc-env=<env_var>=<path>`. Used for the
+/// async `stream<u8>` streaming guest, which — unlike the no-WASI header-only filters — imports WASI.
+fn build_wasip2_component(cargo: &str, guest: &Path, stem: &str, env_var: &str) {
+    println!("cargo:rerun-if-changed={}", guest.join("src").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest.join("Cargo.toml").display()
+    );
+
+    let target_dir = guest.join("target");
+    let status = Command::new(cargo)
+        .current_dir(guest)
+        .env_remove("CARGO_TARGET_DIR")
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "--release",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn cargo to build {}: {e}", guest.display()));
+    if !status.success() {
+        panic!(
+            "building {} for wasm32-wasip2 failed.\n\
+             The streaming-body feature needs the wasm32-wasip2 target:\n    \
+             rustup target add wasm32-wasip2",
+            guest.display()
+        );
+    }
+
+    // wasm32-wasip2 emits a component directly — no wit-component wrapping.
+    let component = target_dir.join(format!("wasm32-wasip2/release/{stem}.wasm"));
+    assert!(
+        component.exists(),
+        "guest component not found at {}",
+        component.display()
+    );
+    println!("cargo:rustc-env={env_var}={}", component.display());
 }
 
 /// Build one guest crate for `wasm32-unknown-unknown`, wrap the core module into a Component (no

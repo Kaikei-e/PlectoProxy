@@ -70,17 +70,22 @@ jobs:
         with:
           toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
           components: clippy
-          targets: wasm32-unknown-unknown # REQUIRED: build.rs builds the guest
+          # wasm32-unknown-unknown: build.rs builds the header-only guests. wasm32-wasip2: the
+          # `--all-features` clippy + the streaming-body test build the async stream<u8> guest.
+          targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: plecto
           cache-on-failure: true
-          # Cache both the workspace target/ and the excluded guest's own target/.
+          # Cache the workspace target/ and the excluded guests' own target/.
           workspaces: |
             plecto
             plecto/examples/filters/filter-hello
+            plecto/examples/filters/filter-streaming
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
+      # Experimental streaming body filter (OFF by default): exercise it so it cannot bit-rot.
+      - run: cargo test -p plecto-host --features streaming-body
       - run: cargo build --release
 
   # Lint the excluded WASM guest against its real target.

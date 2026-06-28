@@ -1,0 +1,18 @@
+# An experimental STREAMING `plecto:filter-streaming` guest. Unlike filter-hello/filter-apikey
+# (header-only, wasm32-unknown-unknown), this consumes the request body as an async `stream<u8>` and
+# builds for wasm32-wasip2 — it is the fixture for plecto-host's feature-gated `streaming-body`
+# runtime (direction_0003 gates 1+2), NOT part of the default build. Declares its own [workspace] so
+# the native plecto/ workspace never absorbs it.
+[package]
+name = "filter-streaming"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[workspace]

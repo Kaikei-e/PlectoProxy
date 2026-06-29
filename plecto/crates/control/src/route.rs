@@ -194,7 +194,7 @@ pub(crate) fn rewrite_path(path: &str, strip: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{HealthConfig, Upstream};
+    use crate::manifest::{CircuitBreaker, HealthConfig, Upstream};
     use crate::upstream::UpstreamRegistry;
 
     /// A throwaway upstream group named after `upstream` — these tests exercise `select` /
@@ -213,6 +213,7 @@ mod tests {
             },
             request_timeout_ms: 30_000,
             max_retries: 1,
+            circuit_breaker: CircuitBreaker::default(),
         }])
         .unwrap();
         reg.group(upstream).unwrap()

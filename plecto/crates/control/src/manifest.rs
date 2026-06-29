@@ -110,6 +110,27 @@ pub struct Upstream {
     /// ADR 000013, can't be replayed). Default 1; **`0` disables** retry.
     #[serde(default = "default_max_retries")]
     pub max_retries: u64,
+    /// Per-upstream circuit breaker (ADR 000028): bounds the load the fast path puts on this
+    /// upstream. Distinct from health — `health` ejects *failing* instances, this caps concurrent
+    /// work on *healthy* ones so a saturated backend sheds load fast instead of queueing unbounded.
+    /// Absent = unlimited (the default).
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreaker,
+}
+
+/// Per-upstream circuit-breaker thresholds (ADR 000028). Overload protection that is deliberately
+/// SEPARATE from outlier detection / health (ADR 000017): health answers "is this instance up?",
+/// the breaker answers "is this upstream saturated?". A request rejected by the breaker is the
+/// upstream shedding load, not an instance failing — so it never demotes an instance.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreaker {
+    /// Max concurrent in-flight requests the fast path will forward to this upstream at once. At the
+    /// cap a new request fails closed with **503** (`x-plecto-fault: circuit-open`) rather than
+    /// piling onto the backend. `0` = unlimited (the default). Counts one slot per request across
+    /// the whole retry sequence, released when the upstream response headers arrive (or it fails).
+    #[serde(default)]
+    pub max_requests: u32,
 }
 
 /// Active-health-check policy (ADR 000017). A background prober issues `GET {path}` to each
@@ -379,6 +400,40 @@ access_log = true
             with.content_hash().unwrap(),
             "observability config must not affect the semantic content hash"
         );
+    }
+
+    #[test]
+    fn upstream_circuit_breaker_defaults_unlimited_and_parses() {
+        // Absent `[upstream.circuit_breaker]` → unlimited (max_requests 0), the safe default.
+        let m = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "a"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.upstreams[0].circuit_breaker.max_requests, 0,
+            "an absent breaker is unlimited"
+        );
+
+        // Present → the cap is read.
+        let m2 = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "a"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+[upstream.circuit_breaker]
+max_requests = 64
+"#,
+        )
+        .unwrap();
+        assert_eq!(m2.upstreams[0].circuit_breaker.max_requests, 64);
     }
 
     #[test]

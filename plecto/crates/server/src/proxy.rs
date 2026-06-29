@@ -220,6 +220,23 @@ async fn proxy_core_inner(
         }
     }
 
+    // Circuit breaker (ADR 000028): take an in-flight slot under this upstream's `max_requests` cap
+    // before forwarding. At the cap, shed load with a fast-fail 503 rather than queueing work onto a
+    // saturated backend. One slot per request, held across the retry loop and released by RAII on
+    // every return path; an unlimited breaker (the default) is a zero-cost no-op permit. The breaker
+    // is overload protection, NOT a health signal — a shed request never demotes an instance.
+    let _permit = match route.upstream.try_acquire() {
+        Some(permit) => permit,
+        None => {
+            state.metrics.inc_circuit_open();
+            return Ok(synth(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "circuit-open",
+                b"upstream overloaded",
+            ));
+        }
+    };
+
     // First pick by round-robin; fail closed (503) if no instance is healthy (ADR 000017).
     let Some(mut instance) = route.upstream.pick() else {
         return Ok(synth(

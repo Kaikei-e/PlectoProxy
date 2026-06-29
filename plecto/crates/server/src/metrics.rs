@@ -60,6 +60,8 @@ pub(crate) struct ServerMetrics {
     in_flight: AtomicI64,
     /// Upstream retries onto another instance (ADR 000023).
     retries: AtomicU64,
+    /// Requests shed by an upstream circuit breaker (ADR 000028) — a fast-fail 503 at the cap.
+    circuit_open: AtomicU64,
     duration: Histogram,
 }
 
@@ -69,6 +71,7 @@ impl ServerMetrics {
             status_class: std::array::from_fn(|_| AtomicU64::new(0)),
             in_flight: AtomicI64::new(0),
             retries: AtomicU64::new(0),
+            circuit_open: AtomicU64::new(0),
             duration: Histogram::new(),
         }
     }
@@ -83,6 +86,10 @@ impl ServerMetrics {
 
     pub(crate) fn inc_retries(&self) {
         self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_circuit_open(&self) {
+        self.circuit_open.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one completed request: tally its status class and observe its total duration. The
@@ -147,6 +154,16 @@ impl ServerMetrics {
         out.push(format!(
             "plecto_upstream_retries_total {}",
             self.retries.load(Ordering::Relaxed)
+        ));
+
+        out.push(
+            "# HELP plecto_circuit_open_total Requests shed by an upstream circuit breaker (ADR 000028)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_circuit_open_total counter".to_string());
+        out.push(format!(
+            "plecto_circuit_open_total {}",
+            self.circuit_open.load(Ordering::Relaxed)
         ));
 
         // --- extension plane: host-aggregated filter-execution metrics (ADR 000009) ---

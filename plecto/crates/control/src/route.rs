@@ -1,27 +1,44 @@
-//! Host-native routing (ADR 000013): match a request to a route by host + path prefix, then
-//! the fast-path server runs that route's chain and forwards to its upstream. Pure config logic
-//! — no I/O, no wasmtime — so it is unit-tested directly and runs on the async thread (the
-//! blocking work is the chain dispatch, not the match).
+//! Host-native routing (ADR 000013 / 000034): match a request to a route by its `[route.match]`
+//! dimensions (host, path prefix, method, headers, query), then the fast-path server runs that
+//! route's chain and forwards to its weighted backends. Pure config logic — no I/O, no wasmtime —
+//! so it is unit-tested directly and runs on the async thread (the blocking work is the chain
+//! dispatch, not the match). Matching is allocation-free: the compiled dimensions are pre-normalised
+//! at build, and per request we only scan and compare borrowed slices.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use plecto_host::Header;
+
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
+use crate::weighted::WeightedBackends;
 
-/// A route compiled from a manifest [`crate::Route`] into the live config: the upstream name is
-/// resolved to its [`UpstreamGroup`] handle and the host is pre-normalised, so matching is
-/// allocation-free. The group is shared (`Arc`) with the upstream registry, so the actual instance
-/// is chosen — by round-robin over the healthy set — at forward time, not here (ADR 000017).
+/// A route compiled from a manifest [`crate::Route`] into the live config: the match dimensions are
+/// pre-normalised (host + header names lower-cased, method upper-cased), and the forwarding target —
+/// a single upstream or a weighted split — is resolved to a [`WeightedBackends`] whose groups are
+/// shared (`Arc`) with the upstream registry, so the actual instance is chosen by round-robin over
+/// the healthy set at forward time, not here (ADR 000017 / 000024).
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledRoute {
     /// Lower-cased authority to match, or `None` for any host.
     pub(crate) host: Option<String>,
     pub(crate) path_prefix: String,
+    /// Upper-cased HTTP method to match (exact), or `None` for any method (ADR 000034).
+    pub(crate) method: Option<String>,
+    /// Header matches (ADR 000034): `(lower-cased name, exact value)`, ANDed. Name is compared
+    /// case-insensitively, value byte-/string-exact. A `Vec` (not a map) since it is iterated, small,
+    /// and order-stable.
+    pub(crate) headers: Vec<(String, String)>,
+    /// Query-parameter matches (ADR 000034): `(name, exact value)`, ANDed. Name is case-sensitive
+    /// (Gateway-API semantics, asymmetric with headers).
+    pub(crate) query: Vec<(String, String)>,
     /// This route's inline chain (filter ids, in order).
     pub(crate) filters: Vec<String>,
-    /// The upstream group this route forwards to; the fast path calls [`UpstreamGroup::pick`] on it.
-    pub(crate) upstream: Arc<UpstreamGroup>,
+    /// The route's forwarding target: a weighted set of upstream groups (a single `upstream` is a
+    /// one-element set). The fast path picks a group via [`WeightedBackends::pick`], then the group
+    /// picks a healthy instance. `Arc`-shared so the split cursor persists across a config generation.
+    pub(crate) backends: Arc<WeightedBackends>,
     pub(crate) strip_prefix: Option<String>,
     /// This route's native rate limiter (ADR 000033), or `None` for unlimited (the default). Shared
     /// (`Arc`) so every request on the route consults the same token buckets within a config
@@ -29,14 +46,23 @@ pub(crate) struct CompiledRoute {
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
 }
 
+/// The request attributes route matching reads (ADR 000034), borrowed so matching stays
+/// allocation-free. `path` may carry `?query`; the query is split out only inside `select`.
+pub(crate) struct RequestParts<'a> {
+    pub(crate) authority: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) method: &'a str,
+    pub(crate) headers: &'a [Header],
+}
+
 /// What [`crate::ConfigSnapshot::find_route`] hands the fast-path server: which route matched
-/// (`index`, used to dispatch its chain) plus the data needed to forward — the upstream group (the
-/// server picks a healthy instance from it) and the optional prefix strip. Owned / `Arc`-shared so
-/// it survives a move into `spawn_blocking`.
+/// (`index`, used to dispatch its chain) plus the data needed to forward — the weighted backends
+/// (the server picks a group, then a healthy instance from it) and the optional prefix strip. Owned
+/// / `Arc`-shared so it survives a move into `spawn_blocking`.
 #[derive(Debug, Clone)]
 pub struct RouteInfo {
     pub index: usize,
-    pub upstream: Arc<UpstreamGroup>,
+    pub(crate) backends: Arc<WeightedBackends>,
     pub strip_prefix: Option<String>,
     /// Whether this route has any filters. The fast path only buffers a request body for the
     /// `on-request-body` hook (ADR 000025) when there is a filter to run; a filterless route keeps
@@ -48,6 +74,14 @@ pub struct RouteInfo {
 }
 
 impl RouteInfo {
+    /// Pick the upstream group to forward this request to from the route's weighted traffic split
+    /// (ADR 000034): the next backend in the split order that has an eligible instance (renormalize
+    /// over healthy), or `None` when no backend is eligible (the fast path then fails closed 503,
+    /// the same no-healthy fault as a single upstream). Lock-free.
+    pub fn pick_upstream(&self) -> Option<Arc<UpstreamGroup>> {
+        self.backends.pick()
+    }
+
     /// Apply this route's host-native prefix strip to the path the fast-path server forwards to
     /// the upstream. The chain already ran against the original path; this only affects what the
     /// upstream sees. No rule (or a non-matching path) leaves the path unchanged.
@@ -172,23 +206,85 @@ fn path_under_prefix(prefix: &str, path: &str) -> bool {
     path.as_bytes().get(prefix.len()) == Some(&b'/')
 }
 
-/// Select the best route for `(authority, path)`: among all that match host + path prefix, the
-/// longest prefix wins; ties prefer a host-constrained route over a wildcard one, then the
-/// earliest in manifest order. Returns the winner's index, or `None` (no route → the server
-/// responds 404).
-pub(crate) fn select(routes: &[CompiledRoute], authority: &str, path: &str) -> Option<usize> {
-    let host = normalize_host(authority);
+/// Does the request match every dimension this route specifies (ADR 000034)? All specified
+/// dimensions are ANDed; an unspecified one is a wildcard. `host` is pre-normalised, `query` is the
+/// already-split query string. Header name is matched case-insensitively and value exact; query name
+/// is case-sensitive. Byte-/string-exact comparison never panics on untrusted input (no-panic tenet).
+fn route_matches(
+    r: &CompiledRoute,
+    host: &str,
+    path: &str,
+    method: &str,
+    headers: &[Header],
+    query: &str,
+) -> bool {
+    if let Some(h) = &r.host
+        && h != host
+    {
+        return false;
+    }
+    if !path_under_prefix(&r.path_prefix, path) {
+        return false;
+    }
+    if let Some(m) = &r.method
+        && method != m
+    {
+        return false;
+    }
+    for (name, value) in &r.headers {
+        if !headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(name) && h.value == *value)
+        {
+            return false;
+        }
+    }
+    for (name, value) in &r.query {
+        if !query_param_matches(query, name, value) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does the query string contain `name=value` exactly (ADR 000034)? Case-sensitive name. The FIRST
+/// occurrence of `name` decides (Gateway-API: a repeated key matches its first value); a malformed
+/// pair (no `=`) is skipped; an absent name is no-match.
+fn query_param_matches(query: &str, name: &str, value: &str) -> bool {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == name
+        {
+            return v == value;
+        }
+    }
+    false
+}
+
+/// Select the best route for `req` (ADR 000013 / 000034): among all routes whose every specified
+/// match dimension is satisfied, the most specific wins, ordered by host-constrained > longest
+/// `path_prefix` > `method` present > more header matches > more query matches, with the earliest
+/// manifest index the final stable tie-break (Gateway-API v1.5.0 precedence, adapted). Returns the
+/// winner's index, or `None` (no route → the server responds 404).
+pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts) -> Option<usize> {
+    let host = normalize_host(req.authority);
+    let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
     routes
         .iter()
         .enumerate()
-        .filter(|(_, r)| match &r.host {
-            Some(h) => *h == host,
-            None => true,
+        .filter(|(_, r)| route_matches(r, &host, req.path, req.method, req.headers, query))
+        // Specificity key, most-significant first. `max_by_key` keeps the LAST max on ties, so the
+        // final `usize::MAX - i` (earliest index largest) makes the earliest manifest route win.
+        .max_by_key(|(i, r)| {
+            (
+                r.host.is_some(),
+                r.path_prefix.len(),
+                r.method.is_some(),
+                r.headers.len(),
+                r.query.len(),
+                usize::MAX - i,
+            )
         })
-        .filter(|(_, r)| path_under_prefix(&r.path_prefix, path))
-        // best = longest prefix, then host-constrained, then earliest index. `max_by_key` keeps
-        // the LAST max on ties, so negate the index to prefer the earliest.
-        .max_by_key(|(i, r)| (r.path_prefix.len(), r.host.is_some(), usize::MAX - i))
         .map(|(i, _)| i)
 }
 
@@ -241,14 +337,39 @@ mod tests {
         reg.group(upstream).unwrap()
     }
 
+    /// A single-upstream weighted set for a route under test.
+    fn backends(upstream: &str) -> Arc<WeightedBackends> {
+        Arc::new(WeightedBackends::new(vec![(group(upstream), 1)]).unwrap())
+    }
+
     fn route(host: Option<&str>, prefix: &str, upstream: &str) -> CompiledRoute {
         CompiledRoute {
             host: host.map(|h| h.to_ascii_lowercase()),
             path_prefix: prefix.to_string(),
+            method: None,
+            headers: vec![],
+            query: vec![],
             filters: vec![],
-            upstream: group(upstream),
+            backends: backends(upstream),
             strip_prefix: None,
             rate_limit: None,
+        }
+    }
+
+    fn header(name: &str, value: &str) -> Header {
+        Header {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// A GET request with no headers, for the path/host-only tests.
+    fn parts<'a>(authority: &'a str, path: &'a str) -> RequestParts<'a> {
+        RequestParts {
+            authority,
+            path,
+            method: "GET",
+            headers: &[],
         }
     }
 
@@ -259,17 +380,21 @@ mod tests {
             route(None, "/api", "api"),
             route(None, "/api/v2", "v2"),
         ];
-        assert_eq!(select(&routes, "h", "/api/v2/x"), Some(2));
-        assert_eq!(select(&routes, "h", "/api/users"), Some(1));
-        assert_eq!(select(&routes, "h", "/other"), Some(0));
+        assert_eq!(select(&routes, &parts("h", "/api/v2/x")), Some(2));
+        assert_eq!(select(&routes, &parts("h", "/api/users")), Some(1));
+        assert_eq!(select(&routes, &parts("h", "/other")), Some(0));
     }
 
     #[test]
     fn prefix_matches_on_boundary_only() {
         let routes = vec![route(None, "/api", "api")];
-        assert_eq!(select(&routes, "h", "/api"), Some(0));
-        assert_eq!(select(&routes, "h", "/api/x"), Some(0));
-        assert_eq!(select(&routes, "h", "/apix"), None, "no boundary match");
+        assert_eq!(select(&routes, &parts("h", "/api")), Some(0));
+        assert_eq!(select(&routes, &parts("h", "/api/x")), Some(0));
+        assert_eq!(
+            select(&routes, &parts("h", "/apix")),
+            None,
+            "no boundary match"
+        );
     }
 
     #[test]
@@ -278,17 +403,17 @@ mod tests {
         // prefix followed by `?`/`#` must still match — `/search?q=foo` is under `/search` exactly
         // like `/search` and `/search/x` are. The earlier code treated `?` as path text and 404'd.
         let routes = vec![route(None, "/search", "s")];
-        assert_eq!(select(&routes, "h", "/search"), Some(0));
+        assert_eq!(select(&routes, &parts("h", "/search")), Some(0));
         assert_eq!(
-            select(&routes, "h", "/search?q=foo"),
+            select(&routes, &parts("h", "/search?q=foo")),
             Some(0),
             "a bare prefix followed by a query must match"
         );
-        assert_eq!(select(&routes, "h", "/search/x?q=foo"), Some(0));
-        assert_eq!(select(&routes, "h", "/search#frag"), Some(0));
+        assert_eq!(select(&routes, &parts("h", "/search/x?q=foo")), Some(0));
+        assert_eq!(select(&routes, &parts("h", "/search#frag")), Some(0));
         // the boundary is still a real boundary: `/searching` is not under `/search`.
         assert_eq!(
-            select(&routes, "h", "/searching?q=foo"),
+            select(&routes, &parts("h", "/searching?q=foo")),
             None,
             "a longer word is not a boundary match even with a query"
         );
@@ -301,17 +426,125 @@ mod tests {
             route(Some("example.com"), "/api", "vhost"),
         ];
         // request to example.com (with a port) prefers the host-constrained route
-        assert_eq!(select(&routes, "example.com:8443", "/api/x"), Some(1));
+        assert_eq!(
+            select(&routes, &parts("example.com:8443", "/api/x")),
+            Some(1)
+        );
         // a different host falls back to the wildcard
-        assert_eq!(select(&routes, "other.test", "/api/x"), Some(0));
+        assert_eq!(select(&routes, &parts("other.test", "/api/x")), Some(0));
     }
 
     #[test]
     fn no_match_returns_none() {
         let routes = vec![route(Some("a.test"), "/api", "u")];
-        assert_eq!(select(&routes, "b.test", "/api"), None);
+        assert_eq!(select(&routes, &parts("b.test", "/api")), None);
         let empty: Vec<CompiledRoute> = vec![];
-        assert_eq!(select(&empty, "a", "/"), None);
+        assert_eq!(select(&empty, &parts("a", "/")), None);
+    }
+
+    #[test]
+    fn method_match_filters_and_outranks_a_bare_path() {
+        // Two routes on the same path: one bare, one method-constrained. A POST takes the
+        // method-constrained route (more specific); a GET falls to the bare one (ADR 000034).
+        let mut post = route(None, "/api", "writes");
+        post.method = Some("POST".to_string());
+        let routes = vec![route(None, "/api", "reads"), post];
+
+        let mut p = parts("h", "/api/x");
+        p.method = "POST";
+        assert_eq!(select(&routes, &p), Some(1), "POST takes the method route");
+        p.method = "GET";
+        assert_eq!(select(&routes, &p), Some(0), "GET falls to the bare route");
+    }
+
+    #[test]
+    fn header_match_is_case_insensitive_name_exact_value_and_anded() {
+        // A header-constrained route matches only when the request carries every named header with
+        // the exact value; the header NAME is case-insensitive, the VALUE exact (ADR 000034).
+        let mut v2 = route(None, "/api", "v2");
+        v2.headers = vec![("x-api-version".to_string(), "2".to_string())];
+        let routes = vec![route(None, "/api", "v1"), v2];
+
+        let hdrs = [header("X-Api-Version", "2")];
+        let mut p = parts("h", "/api");
+        p.headers = &hdrs;
+        assert_eq!(
+            select(&routes, &p),
+            Some(1),
+            "a case-different header name still matches, and outranks the bare route"
+        );
+
+        let wrong = [header("x-api-version", "3")];
+        p.headers = &wrong;
+        assert_eq!(
+            select(&routes, &p),
+            Some(0),
+            "a different value does not match"
+        );
+
+        p.headers = &[];
+        assert_eq!(select(&routes, &p), Some(0), "absent header → bare route");
+    }
+
+    #[test]
+    fn query_match_is_case_sensitive_name_first_value_and_handles_malformed() {
+        // Query name is case-sensitive (asymmetric with headers); the first occurrence's value
+        // decides; a malformed (`=`-less) parameter is skipped (ADR 000034).
+        let mut beta = route(None, "/api", "beta");
+        beta.query = vec![("flag".to_string(), "on".to_string())];
+        let routes = vec![route(None, "/api", "stable"), beta];
+
+        assert_eq!(
+            select(&routes, &parts("h", "/api?flag=on")),
+            Some(1),
+            "exact query value matches"
+        );
+        assert_eq!(
+            select(&routes, &parts("h", "/api?flag=off")),
+            Some(0),
+            "wrong value → bare route"
+        );
+        assert_eq!(
+            select(&routes, &parts("h", "/api?Flag=on")),
+            Some(0),
+            "query name is case-sensitive"
+        );
+        assert_eq!(
+            select(&routes, &parts("h", "/api?flag=on&flag=off")),
+            Some(1),
+            "the first occurrence of a repeated key decides"
+        );
+        assert_eq!(
+            select(&routes, &parts("h", "/api?flag&x=1")),
+            Some(0),
+            "a malformed (=-less) parameter is skipped, so the constraint is unmet"
+        );
+    }
+
+    #[test]
+    fn precedence_orders_method_above_header_count() {
+        // Gateway-API precedence (ADR 000034 1b): method-present outranks a larger header count.
+        // Route A: 2 header matches, no method. Route B: 1 header match + a method. A POST that
+        // satisfies BOTH must take B (method beats header count), not A.
+        let mut a = route(None, "/api", "a");
+        a.headers = vec![
+            ("h1".to_string(), "1".to_string()),
+            ("h2".to_string(), "2".to_string()),
+        ];
+        let mut b = route(None, "/api", "b");
+        b.headers = vec![("h1".to_string(), "1".to_string())];
+        b.method = Some("POST".to_string());
+        let routes = vec![a, b];
+
+        let hdrs = [header("h1", "1"), header("h2", "2")];
+        let mut p = parts("h", "/api");
+        p.method = "POST";
+        p.headers = &hdrs;
+        assert_eq!(
+            select(&routes, &p),
+            Some(1),
+            "method-present outranks the larger header count"
+        );
     }
 
     #[test]
@@ -420,11 +653,11 @@ mod tests {
         let norm = normalize_path(raw).expect("normalizes to a clean path");
         assert_eq!(norm, "/public/admin");
         assert_eq!(
-            select(&routes, "h", &norm),
+            select(&routes, &parts("h", &norm)),
             Some(1),
             "the normalized path selects the stricter, filtered route"
         );
         // (the un-normalized path would have selected the laxer route 0 — the bug.)
-        assert_eq!(select(&routes, "h", raw), Some(0));
+        assert_eq!(select(&routes, &parts("h", raw)), Some(0));
     }
 }

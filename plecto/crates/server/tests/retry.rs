@@ -105,8 +105,9 @@ path = "/healthz"
 interval_ms = 30
 
 [[route]]
-path_prefix = "/"
 upstream = "u"
+[route.match]
+path_prefix = "/"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();

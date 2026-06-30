@@ -112,8 +112,9 @@ interval_ms = 50
 max_requests = 1
 
 [[route]]
-path_prefix = "/"
 upstream = "u"
+[route.match]
+path_prefix = "/"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();

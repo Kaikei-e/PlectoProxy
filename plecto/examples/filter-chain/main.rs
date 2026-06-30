@@ -138,10 +138,11 @@ addresses = ["{upstream}"]
 path = "/"
 
 [[route]]
-path_prefix = "/api"
 filters = ["hello"]
 upstream = "app"
 strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
 "#
     )
 }

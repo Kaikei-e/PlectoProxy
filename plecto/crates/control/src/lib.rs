@@ -23,6 +23,7 @@ mod route;
 mod snapshot;
 mod tls;
 mod upstream;
+mod weighted;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -433,16 +434,32 @@ fn build_active(
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
     for r in &manifest.routes {
-        if !upstream_names.contains(r.upstream.as_str()) {
-            return Err(ControlError::UnknownRouteUpstream {
-                path_prefix: r.path_prefix.clone(),
-                upstream: r.upstream.clone(),
-            });
+        // The route's forwarding targets: the single `upstream` shorthand or weighted `backends`
+        // (ADR 000034). Both-set / neither-set is fail-closed here.
+        let targets = r.targets().map_err(|reason| ControlError::InvalidRoute {
+            path_prefix: r.matcher.path_prefix.clone(),
+            reason: reason.to_string(),
+        })?;
+        for (name, _) in &targets {
+            if !upstream_names.contains(name) {
+                return Err(ControlError::UnknownRouteUpstream {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    upstream: (*name).to_string(),
+                });
+            }
         }
+        // Validate the weighted split (empty / all-zero / over-cap weight / oversized reduced table)
+        // PURELY here, before the registry reconcile, so a bad split is rejected without mutating the
+        // persistent upstream health state (reload stays all-or-nothing).
+        let weights: Vec<u32> = targets.iter().map(|(_, w)| *w).collect();
+        weighted::validate_split(&weights).map_err(|reason| ControlError::InvalidRoute {
+            path_prefix: r.matcher.path_prefix.clone(),
+            reason,
+        })?;
         for f in &r.filters {
             if !filters.contains_key(f) {
                 return Err(ControlError::UnknownRouteFilter {
-                    path_prefix: r.path_prefix.clone(),
+                    path_prefix: r.matcher.path_prefix.clone(),
                     filter: f.clone(),
                 });
             }
@@ -453,13 +470,13 @@ fn build_active(
         if let Some(rl) = &r.rate_limit {
             if rl.rate == 0 {
                 return Err(ControlError::InvalidRouteRateLimit {
-                    path_prefix: r.path_prefix.clone(),
+                    path_prefix: r.matcher.path_prefix.clone(),
                     reason: "rate must be non-zero".to_string(),
                 });
             }
             if rl.burst == 0 {
                 return Err(ControlError::InvalidRouteRateLimit {
-                    path_prefix: r.path_prefix.clone(),
+                    path_prefix: r.matcher.path_prefix.clone(),
                     reason: "burst must be non-zero".to_string(),
                 });
             }
@@ -487,19 +504,51 @@ fn build_active(
     registry.reconcile(&manifest.upstreams)?;
     let mut routes = Vec::with_capacity(manifest.routes.len());
     for r in &manifest.routes {
-        // present: the name was validated above and reconcile built a group for each manifest
-        // upstream. Fall back to the error (unreachable) rather than panic (data-plane no-panic).
-        let Some(upstream) = registry.group(&r.upstream) else {
-            return Err(ControlError::UnknownRouteUpstream {
-                path_prefix: r.path_prefix.clone(),
-                upstream: r.upstream.clone(),
-            });
-        };
+        // Resolve the route's forwarding targets (validated above) to their upstream groups, then
+        // compile the weighted split (ADR 000034). A single `upstream` becomes a one-element set.
+        let targets = r.targets().map_err(|reason| ControlError::InvalidRoute {
+            path_prefix: r.matcher.path_prefix.clone(),
+            reason: reason.to_string(),
+        })?;
+        let mut resolved = Vec::with_capacity(targets.len());
+        for (name, weight) in targets {
+            // present: the name was validated above and reconcile built a group for each manifest
+            // upstream. Fall back to the error (unreachable) rather than panic (data-plane no-panic).
+            let Some(group) = registry.group(name) else {
+                return Err(ControlError::UnknownRouteUpstream {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    upstream: name.to_string(),
+                });
+            };
+            resolved.push((group, weight));
+        }
+        let backends = weighted::WeightedBackends::new(resolved).map_err(|reason| {
+            ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason,
+            }
+        })?;
         routes.push(route::CompiledRoute {
-            host: r.host.as_ref().map(|h| h.to_ascii_lowercase()),
-            path_prefix: r.path_prefix.clone(),
+            // Pre-normalise the compiled match dimensions so per-request matching is allocation-free
+            // (ADR 000034): host + header names lower-cased (case-insensitive), method upper-cased
+            // (exact upper-case token), query names kept as-is (case-sensitive).
+            host: r.matcher.host.as_ref().map(|h| h.to_ascii_lowercase()),
+            path_prefix: r.matcher.path_prefix.clone(),
+            method: r.matcher.method.as_ref().map(|m| m.to_ascii_uppercase()),
+            headers: r
+                .matcher
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                .collect(),
+            query: r
+                .matcher
+                .query
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             filters: r.filters.clone(),
-            upstream,
+            backends: Arc::new(backends),
             strip_prefix: r.strip_prefix.clone(),
             // Build the native limiter (ADR 000033) — `rate`/`burst` were validated non-zero above.
             // A fresh limiter per build means a reload resets the node-local buckets (ephemeral).

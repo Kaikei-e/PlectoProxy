@@ -122,8 +122,9 @@ base_ejection_time_ms = 60000
 max_ejection_percent = 50
 
 [[route]]
-path_prefix = "/"
 upstream = "u"
+[route.match]
+path_prefix = "/"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();

@@ -135,10 +135,11 @@ addresses = ["{upstream}"]
 path = "/"
 
 [[route]]
-path_prefix = "/api"
 filters = ["apikey"]
 upstream = "protected"
 strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
 "#
     )
 }

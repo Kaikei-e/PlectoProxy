@@ -194,7 +194,9 @@ async fn proxy_core_inner(
     // One snapshot pins config + trace for the whole transaction (a concurrent reload cannot
     // desync the request and response halves); cloning it is a cheap Arc + trace-id clone.
     let snapshot = state.control.snapshot_with_trace(trace);
-    let Some(route) = snapshot.find_route(&http_req.authority, &http_req.path) else {
+    // Match against the full request — host, path, method, headers, query (ADR 000034); the most
+    // specific route wins. `http_req` carries the forwarded-header-corrected inbound request.
+    let Some(route) = snapshot.find_route(&http_req) else {
         return Ok(synth(StatusCode::NOT_FOUND, "no-route", b"no route"));
     };
     let idx = route.index;
@@ -226,19 +228,32 @@ async fn proxy_core_inner(
         ChainOutcome::Forward(req) => req,
     };
 
+    // Weighted traffic split (ADR 000034): pick which backend upstream group to forward to, in the
+    // route's weighted proportion, skipping any backend with no eligible instance (renormalize over
+    // healthy). `None` = no backend has a healthy instance → fail closed 503 (the no-healthy fault,
+    // ADR 000017 / 000024). The chosen group then drives the existing instance LB / retry / breaker /
+    // health below; a single-upstream route is a one-element split, so this is uniform.
+    let Some(group) = route.pick_upstream() else {
+        return Ok(synth(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no-healthy-upstream",
+            b"no healthy upstream",
+        ));
+    };
+
     // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a retryable
     // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
     let upstream_path = route.rewrite_path(&forward.path);
-    let timeout = route.upstream.request_timeout();
+    let timeout = group.request_timeout();
     // Overall request deadline across all attempts + backoff (ADR 000031); `None` = no overall bound
     // (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries consume it.
-    let overall = route.upstream.overall_timeout();
+    let overall = group.overall_timeout();
     let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
     // Only a bodyless request can be retried without buffering: the opaque streamed body
     // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
     let bodyless = body.size_hint().exact() == Some(0);
     let mut real_body = Some(body);
-    let mut tries_left = route.upstream.max_retries();
+    let mut tries_left = group.max_retries();
     // 0-based retry attempt index, for the jittered exponential backoff between attempts (ADR 000030).
     let mut attempt: u32 = 0;
 
@@ -291,7 +306,7 @@ async fn proxy_core_inner(
     // saturated backend. One slot per request, held across the retry loop and released by RAII on
     // every return path; an unlimited breaker (the default) is a zero-cost no-op permit. The breaker
     // is overload protection, NOT a health signal — a shed request never demotes an instance.
-    let _permit = match route.upstream.try_acquire() {
+    let _permit = match group.try_acquire() {
         Some(permit) => permit,
         None => {
             state.metrics.inc_circuit_open();
@@ -304,7 +319,7 @@ async fn proxy_core_inner(
     };
 
     // First pick by round-robin; fail closed (503) if no instance is healthy (ADR 000017).
-    let Some(mut instance) = route.upstream.pick() else {
+    let Some(mut instance) = group.pick() else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
             "no-healthy-upstream",
@@ -377,7 +392,7 @@ async fn proxy_core_inner(
                 // misbehaviour signal (a retried-around 5xx still counts); any other status resets its
                 // streak. A circuit-breaker shed / per-try timeout is NOT recorded here (other axes).
                 let gateway_failure = is_retriable_5xx(resp.status());
-                if route.upstream.record_outcome(&instance, gateway_failure) {
+                if group.record_outcome(&instance, gateway_failure) {
                     state.metrics.inc_outlier_ejection();
                 }
                 // retry-on-5xx (ADR 000030): a retriable gateway 5xx from an idempotent, bodyless
@@ -389,7 +404,7 @@ async fn proxy_core_inner(
                         bodyless,
                         tries_left,
                     )
-                    && let Some(next) = route.upstream.pick_excluding(&instance)
+                    && let Some(next) = group.pick_excluding(&instance)
                 {
                     state.metrics.inc_retries();
                     backoff(attempt).await;
@@ -420,7 +435,7 @@ async fn proxy_core_inner(
                     forward.method.as_str(),
                     bodyless,
                     tries_left,
-                ) && let Some(next) = route.upstream.pick_excluding(&instance)
+                ) && let Some(next) = group.pick_excluding(&instance)
                 {
                     state.metrics.inc_retries();
                     backoff(attempt).await;
@@ -447,7 +462,7 @@ async fn proxy_core_inner(
                         forward.method.as_str(),
                         bodyless,
                         tries_left,
-                    ) && let Some(next) = route.upstream.pick_excluding(&instance)
+                    ) && let Some(next) = group.pick_excluding(&instance)
                     {
                         state.metrics.inc_retries();
                         backoff(attempt).await;

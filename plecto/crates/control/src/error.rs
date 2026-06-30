@@ -91,6 +91,13 @@ pub enum ControlError {
     #[error("route (prefix {path_prefix:?}) references unknown filter {filter:?}")]
     UnknownRouteFilter { path_prefix: String, filter: String },
 
+    /// A route's forwarding target or weighted traffic split (ADR 000034) was malformed: both or
+    /// neither of `upstream` / `backends` set, an empty `backends`, every weight zero, a weight
+    /// over the cap, or a reduced split table too large. Rejected fail-closed at build, before the
+    /// upstream registry reconciles, so a bad split never mutates persistent state.
+    #[error("route (prefix {path_prefix:?}) has an invalid traffic split: {reason}")]
+    InvalidRoute { path_prefix: String, reason: String },
+
     /// A route's native rate limit (ADR 000033) had an out-of-range value (`rate` or `burst` of
     /// zero — a bucket that can never serve a token). Rejected fail-closed at build, like the
     /// per-filter rate-limit validation, so a config typo cannot reach the limiter arithmetic.

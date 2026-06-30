@@ -8,20 +8,42 @@
 ## ルーティング
 
 **Route**:
-1 本の routing 規則。match 基準（host ＋ path prefix）に当たったリクエストを、その route の inline chain で
-処理し、指定の upstream へ転送する。fast path はリクエストごとに route を 1 本だけ選ぶ。
+1 本の routing 規則。**match 基準**（match dimension の AND）に当たったリクエストを、その route の inline chain で
+処理し、その転送先（単一 upstream または weighted backends）へ転送する。fast path はリクエストごとに route を
+1 本だけ選ぶ。chain / strip_prefix / rate limit は route 単位で、転送先が weighted でも全 backend に共通に掛かる。
 _Avoid_: rule（曖昧）, mapping（方向が出ない）
 
-**Route selection（最長一致）**:
-リクエストの host と path から route を選ぶ照合。host が一致（または無指定）し path prefix が `/` 境界で
-前方一致する route のうち、**最長 prefix** を選ぶ。一致なしは 404。
-_Avoid_: dispatch（chain 駆動と紛らわしい）
+**Match dimension（照合軸）**:
+route が当たるか否かを決める request 属性の一軸。host・path prefix・HTTP method・header（exact）・query
+parameter（exact）。指定された軸はすべて満たす必要がある（AND）。host は case/port 非依存、header 名は
+case-insensitive・値は byte-exact、query 名は case-sensitive・値は exact。指定のない軸は任意（wildcard）。
+_Avoid_: matcher（機構名）, condition（曖昧）, predicate（実装語）
+
+**Route selection（specificity 順）**:
+当たった route が複数あるとき、より specific な 1 本を決定的に選ぶ照合。優先順は host 指定 > 最長 path prefix >
+method 指定あり > header 一致数 > query 一致数、最後の同点は manifest 出現順で割る。一致なしは 404。
+_Avoid_: dispatch（chain 駆動と紛らわしい）, 最長一致（path だけでなく多軸の specificity になった）
 
 **Upstream**:
 fast path が一致リクエストを転送する名前付きバックエンド。1 つ以上の **upstream instance** から成り、fast path
 は転送時に healthy な instance を round-robin で 1 つ選ぶ（ADR 000017）。route は upstream を名前で指す。plain
 HTTP/1.1 で転送する（upstream TLS は後続）。
 _Avoid_: backend pool（pool ではなく instance 群で表す）, origin（CDN 文脈の語）
+
+**Weighted backends（traffic split / canary）**:
+1 本の route が単一 upstream の代わりに持てる、`{upstream, weight}` の重み付き集合。fast path は route 一致後に
+weight 比でどの upstream group へ送るかを選び（その group 内の instance 選択は通常の round-robin LB）、新旧版を
+同一 match 条件で重み付きに同時へ流す canary の正準プリミティブになる。`weight 0` は drain（流さない）。単一
+upstream は 1 要素の weighted backends と等価（shorthand）。
+_Avoid_: 重み付き LB（instance 間 LB と紛らわしい。ここは group 選択の一段上）, A/B（意味が狭い）
+
+**Weighted apportionment split（決定的分配）**:
+weighted backends から group を選ぶ決定的な分配。配分法（apportionment / error-diffusion の最大剰余規則）で
+weight 比を満たしつつ各 group を均等にインタリーブし（バーストを作らない）、eligible instance を持たない
+group は分配集合から外して残りで再正規化する（renormalize over healthy）。全 group が ineligible なら 503
+（fail-closed）。round-robin LB の group 選択版にあたる。
+_Avoid_: weighted random（非決定・バースト有りの別方式）, smooth weighted round-robin（同義だが特定プロキシ実装名）,
+hash split（consistent hashing は別軸）
 
 **Prefix strip（host-native rewrite）**:
 route が宣言する path 書き換え。fast path が**転送直前**に適用し、chain は元 path を見たまま upstream は

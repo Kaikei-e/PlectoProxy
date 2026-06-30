@@ -136,8 +136,9 @@ unhealthy_threshold = 2    # ~1s to eject after going unhealthy
 
 # A filter-less route: forward everything under / to the pool (no chain, no prefix strip).
 [[route]]
-path_prefix = "/"
 upstream = "pool"
+[route.match]
+path_prefix = "/"
 "#
     )
 }

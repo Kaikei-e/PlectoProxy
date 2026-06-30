@@ -39,6 +39,7 @@ _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）,
 - **Fast path → Extension plane**: fast path が各リクエストを `plecto:filter` 契約越しに filter chain へ駆動する。
 - **Control → Extension plane**: マニフェストが filter を OCI digest で pin し、chain 順と trust root を宣言する。
   reload が filter set + chain をアトミックに差し替える。trust root は構築時固定で、reload では変えない。
-- **Control → Fast path**: マニフェストが route（host＋path-prefix）→ chain＋upstream を宣言し、Control が route 照合と
-  route 毎の chain dispatch を提供する。Fast path は per-request に snapshot を取り、route を選んで chain を駆動する
-  （ADR 000013）。
+- **Control → Fast path**: マニフェストが route（match 軸 host/path/method/headers/query → chain ＋ 転送先）を宣言し、
+  Control が specificity 順の route 照合と route 毎の chain dispatch を提供する。転送先は単一 upstream または
+  weighted backends（traffic split / canary）。Fast path は per-request に snapshot を取り、route を選んで chain を
+  駆動する（ADR 000013 / 000034）。

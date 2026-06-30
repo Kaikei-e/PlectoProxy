@@ -107,10 +107,11 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
-path_prefix = "/api"
 filters = ["apikey"]
 upstream = "protected"
 strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();

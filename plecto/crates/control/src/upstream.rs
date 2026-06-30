@@ -275,6 +275,18 @@ impl UpstreamGroup {
         last.cloned()
     }
 
+    /// Whether this upstream has at least one eligible instance (healthy and not outlier-ejected).
+    /// A cursor-free, allocation-free probe the weighted traffic split (ADR 000034) uses to skip a
+    /// backend whose group can serve nothing (renormalize over healthy). Same eligibility as
+    /// `pick_inner` minus the retry `exclude`; a `false` here means a `pick` would return `None`.
+    pub fn has_eligible(&self) -> bool {
+        let check_outlier = self.outlier_enabled();
+        let now_ms = if check_outlier { now_millis() } else { 0 };
+        self.instances
+            .iter()
+            .any(|inst| inst.is_healthy() && (!check_outlier || !inst.is_outlier_ejected(now_ms)))
+    }
+
     /// The PER-TRY timeout the fast path applies to one forward attempt (ADR 000019, per-try by ADR
     /// 000031). `Duration::ZERO` means no per-try bound (e.g. a streaming / long-poll backend);
     /// otherwise one attempt is bounded and overrun fails closed 504.

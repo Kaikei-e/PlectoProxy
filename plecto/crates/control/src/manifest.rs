@@ -3,6 +3,8 @@
 //! order. TOML (mirrors Cargo; ADR 000008 static config). Routes are deferred until the
 //! fast-path server exists; v0.1 has a single chain.
 
+use std::collections::BTreeMap;
+
 use plecto_host::LoadOptions;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -239,23 +241,32 @@ fn default_unhealthy_threshold() -> u32 {
     3
 }
 
-/// One routing rule (ADR 000013): match a request by host (optional) + path prefix, run an
-/// inline chain of `filters`, and forward to `upstream`. `strip_prefix` is a **host-native**
-/// path rewrite applied to the *forwarded* request only (the chain still sees the original
-/// path) — the common reverse-proxy prefix-strip, without a `plecto:filter` contract change.
+/// One routing rule (ADR 000013 / 000034): match a request by the `[route.match]` dimensions, run
+/// an inline chain of `filters`, and forward to a single `upstream` (shorthand) or a weighted set of
+/// `backends` (traffic split / canary). `strip_prefix` is a **host-native** path rewrite applied to
+/// the *forwarded* request only (the chain still sees the original path) — the common reverse-proxy
+/// prefix-strip, without a `plecto:filter` contract change. `filters` / `strip_prefix` / `rate_limit`
+/// are per-route: they apply identically across every backend (ADR 000034 keeps a backend a pure
+/// `{upstream, weight}` pair; a route needing different policy per target uses a separate route).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
-    /// Match only this authority (case-insensitive, port ignored). `None` matches any host.
-    #[serde(default)]
-    pub host: Option<String>,
-    /// Match requests whose path starts with this prefix (on a `/` boundary). Longest wins.
-    pub path_prefix: String,
+    /// The match dimensions (`[route.match]`): host / path_prefix / method / headers / query (ADR
+    /// 000034). At least `path_prefix` is required; all other dimensions are optional and ANDed.
+    #[serde(rename = "match")]
+    pub matcher: RouteMatch,
     /// This route's chain: filter ids run in order (may be empty for a pure pass-through route).
     #[serde(default)]
     pub filters: Vec<String>,
-    /// The `[[upstream]]` `name` to forward a passing request to.
-    pub upstream: String,
+    /// Single-upstream shorthand: the `[[upstream]]` `name` to forward a passing request to.
+    /// Mutually exclusive with `backends` (exactly one is required; validated at build). A single
+    /// `upstream` is normalised to a one-element weighted set (weight 1) at compile time.
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// Weighted traffic split (ADR 000034): forward to these `{upstream, weight}` backends in
+    /// proportion to their weights (canary). Mutually exclusive with `upstream`. Empty unless used.
+    #[serde(default)]
+    pub backends: Vec<Backend>,
     /// If set and the forwarded path starts with it, strip it before forwarding to the upstream
     /// (host-native rewrite; the chain saw the original path). E.g. `/api` + `/api/x` → `/x`.
     #[serde(default)]
@@ -266,6 +277,75 @@ pub struct Route {
     /// (or per client-IP), needs no WASM filter, and never crosses the WASM boundary.
     #[serde(default)]
     pub rate_limit: Option<RouteRateLimit>,
+}
+
+/// The match dimensions of a route (`[route.match]`, ADR 000034), modelled on Gateway-API v1.5.0
+/// HTTPRoute matching. A request matches when EVERY specified dimension matches (AND); an
+/// unspecified dimension is a wildcard. Among matching routes the most specific wins (see
+/// `route::select`): host-constrained > longest `path_prefix` > `method` present > more header
+/// matches > more query matches, with manifest order the final stable tie-break.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteMatch {
+    /// Match only this authority (case-insensitive, port ignored). `None` matches any host.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Match requests whose path starts with this prefix (on a `/` boundary). Longest wins.
+    pub path_prefix: String,
+    /// Match only this HTTP method (exact, upper-case token, e.g. `"POST"`). `None` matches any.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Header matches: every entry must be present with an exact value. Header NAME is matched
+    /// case-insensitively (lower-cased here at parse-ish time); the VALUE is matched byte-exact.
+    /// `BTreeMap` (not `HashMap`) to keep the manifest's deterministic-serialisation invariant.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Query-parameter matches: every entry must be present with an exact value. Parameter NAME is
+    /// case-sensitive (Gateway-API semantics, asymmetric with headers); the VALUE is matched exact.
+    #[serde(default)]
+    pub query: BTreeMap<String, String>,
+}
+
+/// One weighted backend of a route's traffic split (`[[route.backends]]`, ADR 000034): the
+/// `[[upstream]]` `name` and its integer `weight`. The proportion a backend receives is
+/// `weight / Σweights` (Gateway-API semantics). `weight` defaults to 1, caps at 1_000_000 (Σ
+/// overflow guard), and `0` drains the backend (no traffic). Validated at build (ADR 000034 5b).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backend {
+    /// The `[[upstream]]` `name` this backend forwards to.
+    pub upstream: String,
+    /// This backend's integer weight in the split (default 1, max 1_000_000, `0` = drain).
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+/// Upper bound on a single backend weight (Gateway-API `Maximum=1000000`). Caps the summed weight
+/// so the weighted-split accumulator and the precomputed table stay bounded (ADR 000034 5b).
+pub(crate) const MAX_BACKEND_WEIGHT: u32 = 1_000_000;
+
+impl Route {
+    /// This route's forwarding targets as `(upstream_name, weight)` pairs (ADR 000034): the single
+    /// `upstream` shorthand normalised to one weight-1 backend, or the explicit weighted `backends`.
+    /// EXACTLY ONE of the two must be set — both or neither is a config error (returned as a reason
+    /// the caller wraps with the route's context). Borrows the names from `self` (no allocation).
+    pub(crate) fn targets(&self) -> Result<Vec<(&str, u32)>, &'static str> {
+        match (self.upstream.as_deref(), self.backends.as_slice()) {
+            (Some(_), [_, ..]) => {
+                Err("a route sets both `upstream` and `backends`; set exactly one")
+            }
+            (None, []) => Err("a route sets neither `upstream` nor `backends`; set exactly one"),
+            (Some(name), []) => Ok(vec![(name, 1)]),
+            (None, backends) => Ok(backends
+                .iter()
+                .map(|b| (b.upstream.as_str(), b.weight))
+                .collect()),
+        }
+    }
 }
 
 /// Native per-route rate-limit spec (ADR 000033), declared as `[route.rate_limit]`. A coarse
@@ -535,8 +615,9 @@ max_requests = 64
         let m = Manifest::from_toml(
             r#"
 [[route]]
-path_prefix = "/"
 upstream = "a"
+[route.match]
+path_prefix = "/"
 "#,
         )
         .unwrap();
@@ -549,8 +630,9 @@ upstream = "a"
         let m2 = Manifest::from_toml(
             r#"
 [[route]]
-path_prefix = "/"
 upstream = "a"
+[route.match]
+path_prefix = "/"
 [route.rate_limit]
 rate = 100
 burst = 200
@@ -566,8 +648,9 @@ burst = 200
         let m3 = Manifest::from_toml(
             r#"
 [[route]]
-path_prefix = "/"
 upstream = "a"
+[route.match]
+path_prefix = "/"
 [route.rate_limit]
 rate = 5
 burst = 5
@@ -702,11 +785,12 @@ addresses = ["127.0.0.1:9000", "127.0.0.1:9001"]
 path = "/healthz"
 
 [[route]]
-host = "example.com"
-path_prefix = "/api"
 filters = ["auth"]
 upstream = "api-svc"
 strip_prefix = "/api"
+[route.match]
+host = "example.com"
+path_prefix = "/api"
 "#,
         )
         .unwrap();
@@ -724,14 +808,15 @@ strip_prefix = "/api"
         assert_eq!(m.upstreams[0].health.unhealthy_threshold, 3);
         assert_eq!(m.routes.len(), 1);
         let r = &m.routes[0];
-        assert_eq!(r.host.as_deref(), Some("example.com"));
-        assert_eq!(r.path_prefix, "/api");
+        assert_eq!(r.matcher.host.as_deref(), Some("example.com"));
+        assert_eq!(r.matcher.path_prefix, "/api");
         assert_eq!(r.filters, vec!["auth".to_string()]);
-        assert_eq!(r.upstream, "api-svc");
+        assert_eq!(r.upstream.as_deref(), Some("api-svc"));
+        assert!(r.backends.is_empty(), "single upstream uses the shorthand");
         assert_eq!(r.strip_prefix.as_deref(), Some("/api"));
         // a routing edit must flip the config version (routes ride the semantic hash)
         let mut m2 = m.clone();
-        m2.routes[0].path_prefix = "/v2".to_string();
+        m2.routes[0].matcher.path_prefix = "/v2".to_string();
         assert_ne!(
             m.content_hash().unwrap(),
             m2.content_hash().unwrap(),

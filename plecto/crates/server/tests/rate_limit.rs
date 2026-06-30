@@ -134,8 +134,9 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
-path_prefix = "/"
 upstream = "u"
+[route.match]
+path_prefix = "/"
 [route.rate_limit]
 rate = 1
 burst = 1
@@ -212,8 +213,9 @@ addresses = ["127.0.0.1:9000"]
 path = "/healthz"
 
 [[route]]
-path_prefix = "/"
 upstream = "u"
+[route.match]
+path_prefix = "/"
 [route.rate_limit]
 rate = {rate}
 burst = {burst}

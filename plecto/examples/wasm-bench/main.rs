@@ -155,22 +155,25 @@ addresses = ["{upstream}"]
 path = "/"
 
 [[route]]
-path_prefix = "/baseline"
 filters = []
 upstream = "backend"
 strip_prefix = "/baseline"
+[route.match]
+path_prefix = "/baseline"
 
 [[route]]
-path_prefix = "/trusted"
 filters = ["apikey"]
 upstream = "backend"
 strip_prefix = "/trusted"
+[route.match]
+path_prefix = "/trusted"
 
 [[route]]
-path_prefix = "/ondemand"
 filters = ["apikey_od"]
 upstream = "backend"
 strip_prefix = "/ondemand"
+[route.match]
+path_prefix = "/ondemand"
 "#
     )
 }

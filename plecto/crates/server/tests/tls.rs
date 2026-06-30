@@ -88,10 +88,11 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
-path_prefix = "/api"
 filters = ["fh"]
 upstream = "echo"
 strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
 {tls_block}
 "#
     )

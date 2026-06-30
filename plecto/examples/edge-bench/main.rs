@@ -182,22 +182,25 @@ addresses = ["{upstream}"]
 path = "/"
 
 [[route]]
-path_prefix = "/baseline"
 filters = []
 upstream = "backend"
 strip_prefix = "/baseline"
+[route.match]
+path_prefix = "/baseline"
 
 [[route]]
-path_prefix = "/ratelimit"
 filters = ["hello"]
 upstream = "backend"
 strip_prefix = "/ratelimit"
+[route.match]
+path_prefix = "/ratelimit"
 
 [[route]]
-path_prefix = "/body"
 filters = ["hello"]
 upstream = "backend"
 strip_prefix = "/body"
+[route.match]
+path_prefix = "/body"
 "#
     )
 }

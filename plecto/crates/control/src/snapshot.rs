@@ -50,15 +50,23 @@ impl ConfigSnapshot {
         chain::dispatch_response(&self.config, &self.config.chain, response, &self.trace)
     }
 
-    /// Match a request to a route by host + path prefix (ADR 000013), or `None` when no route
-    /// matches (the server responds 404). Pure config lookup — cheap and non-blocking, so it
-    /// runs on the async thread; only the returned route's chain dispatch is blocking work.
-    pub fn find_route(&self, authority: &str, path: &str) -> Option<RouteInfo> {
-        let index = route::select(&self.config.routes, authority, path)?;
+    /// Match a request to a route by its `[route.match]` dimensions — host, path prefix, method,
+    /// headers, query (ADR 000013 / 000034) — or `None` when no route matches (the server responds
+    /// 404). The most specific match wins (see [`route::select`]). Pure config lookup — cheap and
+    /// non-blocking, so it runs on the async thread; only the returned route's chain dispatch is
+    /// blocking work. Reads only borrowed request fields, so matching is allocation-free.
+    pub fn find_route(&self, request: &HttpRequest) -> Option<RouteInfo> {
+        let parts = route::RequestParts {
+            authority: &request.authority,
+            path: &request.path,
+            method: &request.method,
+            headers: &request.headers,
+        };
+        let index = route::select(&self.config.routes, &parts)?;
         let r = &self.config.routes[index];
         Some(RouteInfo {
             index,
-            upstream: r.upstream.clone(),
+            backends: r.backends.clone(),
             strip_prefix: r.strip_prefix.clone(),
             has_filters: !r.filters.is_empty(),
             rate_limit: r.rate_limit.clone(),

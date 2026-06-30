@@ -30,8 +30,9 @@ path = "/healthz"                 # only `path` is required; interval/timeout/th
 
 # Route: match a path prefix, run the filter chain, forward to the upstream.
 [[route]]
-path_prefix = "/"
 filters = ["my-filter"]
 upstream = "app"
-# host = "example.com"            # optional: match only this authority
 # strip_prefix = "/api"          # optional: strip a prefix before forwarding (chain sees the original)
+[route.match]
+path_prefix = "/"
+# host = "example.com"            # optional: match only this authority

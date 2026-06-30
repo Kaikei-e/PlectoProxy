@@ -79,8 +79,9 @@ interval_ms = 50
 timeout_ms = 200
 
 [[route]]
-path_prefix = "/api"
 upstream = "slow"
+[route.match]
+path_prefix = "/api"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();
@@ -114,8 +115,9 @@ interval_ms = 50
 timeout_ms = 200
 
 [[route]]
-path_prefix = "/api"
 upstream = "pool"
+[route.match]
+path_prefix = "/api"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();

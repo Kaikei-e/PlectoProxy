@@ -141,10 +141,11 @@ addresses = ["{upstream}"]
 path = "/"
 
 [[route]]
-path_prefix = "/api"
 filters = ["hello"]
 upstream = "app"
 strip_prefix = "/api"      # <- try changing this to "/" and SIGHUP; watch the echoed path change
+[route.match]
+path_prefix = "/api"
 "#
     )
 }

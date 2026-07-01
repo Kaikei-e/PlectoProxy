@@ -78,12 +78,16 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 - Buckets are **per key**: a hot key offered 4× its limit is throttled to its refill rate while a
   light key on the **same filter passes untouched (0 % shed)** — no cross-key starvation.
 
-**Request-body hook** (buffer-then-decide, ADR 000025; k6):
+**Request-body hook** (buffer-then-decide, ADR 000025; export-presence zero-copy bypass, ADR 000038; k6):
 
-- The hook costs **~31 % throughput at 1 KB** bodies and scales with payload (buffer + transform):
-  **~55 % at 100 KB**, **~67 % at 1 MB**, versus the streaming passthrough that never buffers.
-  Buffering 1 MB bodies at 50 concurrency holds **~317 MB RSS** — which is why the buffer is bounded
-  (16 MiB cap, fail-closed 413).
+- A filter that **reads** the body (`/body`, filter-hello) costs **~29 % throughput at 1 KB** and
+  scales with payload: **~55 % at 100 KB**, **~67 % at 1 MB**, versus the streaming passthrough. A
+  **header-only filter** (`/body-headeronly` — no `on-request-body` export) now **streams the body
+  through** and lands within **~0–12 % of `/baseline` at every size**: it pays no body tax (ADR 000038).
+- RSS at 1 MB × 50 VUs (`MALLOC_ARENA_MAX=4`, the shipped default): **~109 MB `/baseline` · ~171 MB
+  `/body` · ~116 MB `/body-headeronly`**. The arena cap roughly halves the buffered path (an uncapped
+  glibc held ~317 MB); the header-only bypass keeps it at baseline. The buffer stays bounded (16 MiB
+  cap, fail-closed 413).
 
 ## Scope & honesty notes
 
@@ -155,7 +159,7 @@ request only after the previous response. Rising concurrency walks the load curv
 | --- | --- | --- | --- | --- | --- | --- |
 | 50  | **132,790** | 0.30 ms | 0.57 ms | 1.03 ms | 2.40 ms | 0% |
 | 100 | 124,011 | 0.68 ms | 1.25 ms | 2.33 ms | 5.16 ms | 0% |
-| 200 | 122,453 | 1.38 ms | 2.65 ms | 4.90 ms | 9.89 ms | 0% |
+| 200 | 122,453 | 1.39 ms | 2.65 ms | 4.90 ms | 9.89 ms | 0% |
 | 400 | 110,166 | 2.81 ms | 6.40 ms | 10.99 ms | 19.48 ms | 0% |
 | 800 | 107,411 | 5.35 ms | 12.69 ms | 21.46 ms | 33.63 ms | 0% |
 
@@ -405,28 +409,39 @@ The request-side **body hook** (`on-request-body`, ADR 000025) follows a *buffer
 for a filtered route carrying a body, the host buffers it (bounded — 16 MiB cap, fail-closed 413),
 runs the filter's `on-request-body`, and forwards the possibly-transformed body — or short-circuits
 before upstream. `filter-hello` uppercases the body (a real transform) or 403s on a `deny-body`
-marker. A bodyless request and a filter-less route keep the zero-copy streaming path.
+marker. A bodyless request, a filter-less route, and — since ADR 000038 — a route whose filters are
+**all header-only** (none exports `on-request-body`) keep the zero-copy streaming path: the host
+decides from the component's exports whether any filter reads the body, and buffers only then.
 
 ![Request body hook](img/body.webp)
 
-> B — 50 VUs, POST a `SIZE`-byte body to `/body` (buffer + transform) vs `/baseline` (streaming
-> passthrough), at 1 KB / 100 KB / 1 MB (k6).
+> B — 50 VUs, POST a `SIZE`-byte body at 1 KB / 100 KB / 1 MB (k6), to `/body` (filter-hello buffers +
+> transforms), `/body-headeronly` (a header-only filter — body streams through, ADR 000038), and
+> `/baseline` (no filter). `MALLOC_ARENA_MAX=4`, the shipped allocator default (ADR 000038).
 
 | size | route | req/s | throughput | p99 |
 | --- | --- | --- | --- | --- |
-| 1 KB   | /baseline | 121,998 | 125 MB/s | 1.26 ms |
-| 1 KB   | /body     | 84,043  | 86 MB/s | 1.41 ms |
-| 100 KB | /baseline | 41,075  | 4206 MB/s | 4.29 ms |
-| 100 KB | /body     | 18,408  | 1885 MB/s | 5.73 ms |
-| 1 MB   | /baseline | 5,688   | 5964 MB/s | 32.8 ms |
-| 1 MB   | /body     | 1,877   | 1968 MB/s | 45.2 ms |
+| 1 KB   | /baseline        | 111,233 | 114 MB/s  | 1.37 ms |
+| 1 KB   | /body            | 79,211  | 81 MB/s   | 1.51 ms |
+| 1 KB   | /body-headeronly | 98,132  | 100 MB/s  | 1.33 ms |
+| 100 KB | /baseline        | 41,446  | 4244 MB/s | 4.54 ms |
+| 100 KB | /body            | 18,674  | 1912 MB/s | 5.57 ms |
+| 100 KB | /body-headeronly | 40,658  | 4163 MB/s | 4.50 ms |
+| 1 MB   | /baseline        | 5,922   | 6210 MB/s | 33.1 ms |
+| 1 MB   | /body            | 1,986   | 2082 MB/s | 41.2 ms |
+| 1 MB   | /body-headeronly | 6,034   | 6327 MB/s | 33.2 ms |
 
-The hook's cost grows with payload: **~31 % throughput at 1 KB** (the buffer + WASM transform
-dominate the small request), **~55 % at 100 KB**, **~67 % at 1 MB** (a full-body copy + uppercase per
-request). The streaming passthrough has no per-body CPU and scales with raw I/O. Buffering also costs
-memory: holding 1 MB bodies at 50 concurrency drove **~317 MB RSS**, which is why the buffer is bounded
-and a request over the cap fails closed (413) rather than being read into RAM. The export-presence
-zero-copy bypass for header-only filters is a follow-up — v1 buffers whenever a filtered route has a body.
+A filter that **reads** the body pays for it, growing with payload: **~29 % throughput at 1 KB** (the
+buffer + WASM transform dominate the small request), **~55 % at 100 KB**, **~67 % at 1 MB** (a
+full-body copy + uppercase per request). A **header-only filter takes the zero-copy bypass** and lands
+within **~0–12 % of `/baseline` at every size** (ADR 000038) — the body never enters guest memory. RSS
+at 1 MB × 50 VUs (fresh proxy per route, `MALLOC_ARENA_MAX=4`): **~109 MB `/baseline` · ~171 MB
+`/body` · ~116 MB `/body-headeronly`** (`data/body_rss.csv`). Two levers cut what an uncapped glibc
+once held (~317 MB): the arena cap roughly halves the buffered path, and the export-presence bypass
+keeps a header-only route at baseline. The buffer stays bounded (16 MiB cap, fail-closed 413) for the
+filters that do read the body. The remaining buffered-path copy is the target of a future `stream<u8>`
+increment (ADR 000020); a per-request time-series / allocator-sweep decomposition lives in
+`bench/perf/mem_matrix.py`.
 
 ## Footprint
 

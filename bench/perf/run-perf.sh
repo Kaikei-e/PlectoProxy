@@ -297,15 +297,18 @@ with open(sys.argv[2],"w",newline="") as o:
   echo "--- fairness ---"; cat "$DATA/ratelimit_fairness.csv"
 }
 
-# ---------------------------------------------------------------- Phase 7 request body (ADR 000025)
+# ---------------------------------------------------------------- Phase 7 request body (ADR 000025 / 000038)
 phase_body(){
-  log "Phase 7 — request-body hook overhead + payload sweep -> body.csv"
-  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" || return 1
+  log "Phase 7 — request-body hook: payload sweep + zero-copy bypass + arena cap (ADR 000038) -> body.csv"
+  # As-shipped allocator default (Fix 1): cap glibc arenas the way the `plecto` bin does at startup
+  # (glibc reads MALLOC_ARENA_MAX at process start; equivalent to the in-process mallopt(M_ARENA_MAX,4)).
+  # Routes: baseline (no filter) / body (filter-hello, reads the body → buffers) / body-headeronly
+  # (filter-quickstart, header-only → the body streams through, ADR 000038 zero-copy bypass).
+  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" MALLOC_ARENA_MAX=4 || return 1
   local tmp; tmp="$(mktemp -d)"
-  local rss=""
   { echo "size,route,rps,req_mbps,p50,p99"
     for size in 1024 102400 1048576; do
-      for rt in baseline body; do
+      for rt in baseline body body-headeronly; do
         gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e ROUTE_PATH="/$rt" \
           -e SIZE=$size -e VUS=50 -e DUR=20s -e OUT="$tmp/b_${size}_$rt.json" \
           "$BENCH/k6-wasm/body-transform.js" >/dev/null 2>&1
@@ -314,13 +317,28 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d["p50"],d["p99"]))
 ' "$tmp/b_${size}_$rt.json"
-        # Sample the proxy's RSS right after the largest /body run to size the buffer-then-decide cost.
-        [[ "$size" == 1048576 && "$rt" == body ]] && rss="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
       done
     done; } > "$DATA/body.csv"
   stop_proxy
   cat "$DATA/body.csv"
-  [[ -n "$rss" ]] && echo "VmRSS during 1MB /body (50 VUs): ${rss} kB"
+
+  # RSS at 1 MB × 50 VUs, sampled mid-load — a FRESH proxy per route so a prior route's grown linear
+  # memory / arena state can't contaminate the next (the single-long-lived-proxy flaw that the
+  # mem_matrix investigation fixed). Combined proxy+in-process-upstream, MALLOC_ARENA_MAX=4 (shipped).
+  # For the time-series peak/settled decomposition + allocator sweep see bench/perf/mem_matrix.py.
+  { echo "route,rss_kb"
+    for rt in baseline body body-headeronly; do
+      launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" MALLOC_ARENA_MAX=4 >/dev/null || return 1
+      gen "$K6" run -q -e BASE="http://$EDGE_ADDR" -e ROUTE_PATH="/$rt" -e SIZE=1048576 -e VUS=50 \
+        -e DUR=15s -e OUT="$tmp/rss_$rt.json" "$BENCH/k6-wasm/body-transform.js" >/dev/null 2>&1 &
+      local kpid=$!
+      sleep 12
+      echo "$rt,$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
+      wait $kpid 2>/dev/null
+      stop_proxy
+    done; } > "$DATA/body_rss.csv"
+  echo "--- RSS at 1MB x 50 VUs (fresh proxy per route, MALLOC_ARENA_MAX=4) ---"
+  cat "$DATA/body_rss.csv"
 }
 
 # ---------------------------------------------------------------- Phase 8 connection churn

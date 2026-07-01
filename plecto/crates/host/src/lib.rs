@@ -1722,6 +1722,7 @@ impl LoadedFilter {
 /// a caller could not already do with sigstore directly. `#[doc(hidden)]` — integration tests
 /// need it `pub`, but it is not part of the supported surface.
 #[doc(hidden)]
+#[cfg(feature = "test-support")]
 pub mod test_support {
     use super::TrustPolicy;
     use anyhow::{Result, anyhow};

@@ -58,6 +58,10 @@ signal-hook = "0.3"
 rustls = { workspace = true }
 
 [dev-dependencies]
+# this crate's own integration tests load real fixture components via plecto-host's test_support
+# (filter_hello_component / TestSigner / bound_sbom) — needs the feature that build.rs's fixture
+# compilation and the `test_support` module are gated behind (OFF by default in `[dependencies]`).
+plecto-host = { path = "../host", features = ["test-support"] }
 # unique temp dirs for OCI-layout fixtures and trusted-key PEM files
 tempfile = "3"
 # rcgen: a fresh self-signed cert to unit-test the TCP/QUIC ServerConfig builder (ADR 000014/000016).

@@ -338,6 +338,7 @@ mod tests {
                 timeout_ms: 500,
                 healthy_threshold: 1,
                 unhealthy_threshold: 1,
+                port: None,
             },
             request_timeout_ms: 30_000,
             max_retries: 1,

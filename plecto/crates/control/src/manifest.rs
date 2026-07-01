@@ -432,10 +432,11 @@ pub struct CircuitBreaker {
 }
 
 /// Active-health-check policy (ADR 000017). A background prober issues `GET {path}` to each
-/// instance every `interval_ms`; a 2xx within `timeout_ms` is a success, anything else (non-2xx,
-/// timeout, connect error) a failure. `unhealthy_threshold` consecutive failures eject a healthy
-/// instance from the rotation; `healthy_threshold` consecutive successes restore an ejected one.
-/// Instances start pessimistic (unhealthy); the FIRST successful probe alone promotes a
+/// instance every `interval_ms` — on the instance's own traffic port, unless `port` names a
+/// dedicated health-check port — and a 2xx within `timeout_ms` is a success, anything else
+/// (non-2xx, timeout, connect error) a failure. `unhealthy_threshold` consecutive failures eject a
+/// healthy instance from the rotation; `healthy_threshold` consecutive successes restore an ejected
+/// one. Instances start pessimistic (unhealthy); the FIRST successful probe alone promotes a
 /// never-yet-healthy instance (cold-start fast path), after which the full `healthy_threshold`
 /// governs re-entry. Only `path` is required; the rest default. `PartialEq` lets a reload detect a
 /// changed policy and re-probe the upstream's instances from scratch (ADR 000017 reconcile).
@@ -457,6 +458,11 @@ pub struct HealthConfig {
     /// Consecutive failures to eject a healthy instance (default 3).
     #[serde(default = "default_unhealthy_threshold")]
     pub unhealthy_threshold: u32,
+    /// Dedicated port the probe connects to, distinct from the instance's traffic port (e.g. a
+    /// separate metrics/health listener on the same host). `None` (default) probes the traffic port
+    /// itself, the pre-existing behaviour.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 fn default_request_timeout_ms() -> u64 {
@@ -1265,6 +1271,36 @@ unhealthy_threshold = 5
         assert_eq!(h.timeout_ms, 100);
         assert_eq!(h.healthy_threshold, 1);
         assert_eq!(h.unhealthy_threshold, 5);
+    }
+
+    #[test]
+    fn health_port_defaults_to_none_but_can_override_the_probe_port() {
+        // absent `port` = probe the instance's own traffic port (pre-existing behaviour).
+        let default_port = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+        assert_eq!(default_port.upstreams[0].health.port, None);
+
+        // an explicit `port` names a dedicated health-check listener.
+        let overridden = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+port = 9100
+"#,
+        )
+        .unwrap();
+        assert_eq!(overridden.upstreams[0].health.port, Some(9100));
     }
 
     #[test]

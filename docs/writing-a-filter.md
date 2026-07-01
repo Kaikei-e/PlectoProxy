@@ -138,6 +138,7 @@ interval_ms = 2000                    # optional (default 2000)
 timeout_ms = 1000                     # optional (default 1000)
 healthy_threshold = 2                 # optional (default 2)
 unhealthy_threshold = 3               # optional (default 3)
+port = 9100                           # optional (default: probe the instance's own traffic port)
 ```
 
 Every upstream **requires** a `[upstream.health]` block with at least `path`, because instances start

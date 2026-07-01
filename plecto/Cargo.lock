@@ -2218,6 +2218,7 @@ dependencies = [
  "ipnet",
  "opentelemetry",
  "parking_lot",
+ "plecto-host",
  "pollster",
  "redb",
  "rustls",

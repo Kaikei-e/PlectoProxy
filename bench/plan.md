@@ -59,8 +59,9 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
 ## 実行
 
 ```bash
-# 前提: release example を build（run-perf.sh は build しない）
-cd plecto && cargo build --release -p plecto-server \
+# 前提: release example を build（run-perf.sh は build しない）。wasm-bench/edge-bench は plecto/ 外
+# （bench/harnesses/）を指すので --features bench-harnesses が要る。
+cd plecto && cargo build --release -p plecto-server --features bench-harnesses \
   --example load-balancing --example wasm-bench --example tls-http --example edge-bench
 
 # 1 phase か all。proxy を core 集合へ、generator を互いに素な集合へ pin して performance/data/*.csv を出力。

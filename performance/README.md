@@ -529,8 +529,9 @@ honestly left absent until that tooling is in place — the server support is ve
 The tracked, in-repo subjects and the runbook that produces every CSV here:
 
 ```bash
-# Build the release examples first (the runbook does not build).
-cargo build --release -p plecto-server \
+# Build the release examples first (the runbook does not build). wasm-bench/edge-bench live
+# outside plecto/ (bench/harnesses/), so they need --features bench-harnesses.
+cargo build --release -p plecto-server --features bench-harnesses \
   --example load-balancing --example wasm-bench --example tls-http --example edge-bench
 
 # One phase, or `all`. Pins the proxy to a core set and generators to a disjoint set; writes
@@ -547,9 +548,9 @@ INFLUX=1 bash bench/perf/run-perf.sh all     # http://localhost:3000/d/plecto-lb
 
 # The underlying examples (default ports overridable with PLECTO_PROXY_ADDR):
 cargo run --release -p plecto-server --example load-balancing   # LB fast path
-BACKEND_LATENCY_MS=0 cargo run --release -p plecto-server --example wasm-bench   # WASM plane
+BACKEND_LATENCY_MS=0 cargo run --release -p plecto-server --features bench-harnesses --example wasm-bench   # WASM plane
 cargo run --release -p plecto-server --example tls-http          # TLS termination
-cargo run --release -p plecto-server --example edge-bench        # rate-limit + body hook
+cargo run --release -p plecto-server --features bench-harnesses --example edge-bench        # rate-limit + body hook
 ```
 
 The k6 scenarios live in `bench/k6/` and `bench/k6-wasm/`; the round-robin counter and the

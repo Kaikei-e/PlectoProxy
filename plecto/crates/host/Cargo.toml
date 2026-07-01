@@ -16,6 +16,13 @@ publish.workspace = true
 bench = false
 
 [features]
+# Gates `test_support` (the fixture loaders: filter-hello/apikey/quickstart/noop components,
+# TestSigner, bound_sbom) and build.rs's compilation of those guest components. OFF by default, so
+# a plain production build of this crate — or of `plecto-control`/`plecto-server`, which depend on
+# it as a normal (non-dev) dependency — never needs `wasm32-unknown-unknown` or the guest sources
+# under `examples/filters/` / `bench/filters/`. This crate's own `[dev-dependencies]` turn it on for
+# `cargo test`/`--examples`/`cargo bench`; dependent crates do the same in their own dev-dependencies.
+test-support = []
 # Experimental streaming body filter (direction_0003 gates 1+2). OFF by default: the shipped
 # plecto:filter@0.1.0 path and the default build are untouched. When on, it pulls a minimally-sliced
 # WASI (wasi:http/proxy interfaces — no fs/sockets/env) and drives an async `stream<u8>` body filter
@@ -98,6 +105,10 @@ opentelemetry = { workspace = true }
 wit-component = "0.252"
 
 [dev-dependencies]
+# Self dev-dependency: turns on `test-support` for THIS crate's own tests/benches/examples only.
+# Cargo permits a crate to dev-depend on itself to activate a feature just for `cargo test`
+# (resolver "3" keeps the feature from leaking into a plain `cargo build` of a dependent crate).
+plecto-host = { path = ".", features = ["test-support"] }
 # unique on-disk paths for the redb backend's unit tests
 tempfile = "3"
 # criterion: in-process WASM micro-benchmarks (cold load, per-request pooled vs fresh instance).

@@ -49,7 +49,11 @@ path = "../../examples/wasm-auth/main.rs"
 # Benchmark harness: baseline vs pooled vs on-demand filter on one backend (see performance/).
 [[example]]
 name = "wasm-bench"
-# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md).
+# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md),
+# OUTSIDE this `plecto/` workspace directory. `required-features` keeps a plain `cargo build
+# --examples` / `--all-targets` (e.g. against a standalone `plecto/` checkout, where bench/ does
+# not exist) from needing that path — only an explicit `--features bench-harnesses` does.
+required-features = ["bench-harnesses"]
 path = "../../../bench/harnesses/wasm-bench/main.rs"
 
 [[example]]
@@ -59,16 +63,25 @@ path = "../../examples/hot-reload/main.rs"
 # Benchmark harness: host rate-limit (ADR 000026) + request-body hook (ADR 000025) on one filter.
 [[example]]
 name = "edge-bench"
-# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md).
+# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md),
+# OUTSIDE this `plecto/` workspace directory (see the `wasm-bench` entry above for why this is gated).
+required-features = ["bench-harnesses"]
 path = "../../../bench/harnesses/edge-bench/main.rs"
 
 # Standalone upstream for the memory matrix (mem-matrix.sh): runs the backend in its own process so
 # the proxy's RSS is measured alone (not co-mingled with the in-process upstream's buffers).
 [[example]]
 name = "upstream"
+required-features = ["bench-harnesses"]
 path = "../../../bench/harnesses/upstream/main.rs"
 
 [features]
+# Gates the `wasm-bench` / `edge-bench` / `upstream` benchmark-harness examples (`required-features`
+# on each), whose `path` points outside this `plecto/` workspace directory into the repo-root-level
+# `bench/`. OFF by default, so `cargo build --examples` / `--all-targets` never needs that sibling
+# directory to exist — only an explicit `--features bench-harnesses` builds them (see
+# performance/README.md for the full reproduction command).
+bench-harnesses = []
 # Marker feature for the `edge-bench` harness: swaps in jemalloc's global allocator so the memory
 # matrix can attribute hypothesis (C) — glibc arena retention — by comparing against the default
 # glibc build and `MALLOC_ARENA_MAX=1`. No effect on the lib or the default build; tikv-jemallocator
@@ -101,8 +114,10 @@ h3-quinn = { workspace = true }
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for E2E fixtures,
-# and a TOML writer for the on-disk manifest a test points the server at.
-plecto-host = { path = "../host" }
+# and a TOML writer for the on-disk manifest a test points the server at. `test-support` gates
+# test_support itself and build.rs's fixture compilation (OFF by default in `[dependencies]`, so a
+# plain production build of plecto-server never needs wasm32-unknown-unknown).
+plecto-host = { path = "../host", features = ["test-support"] }
 tempfile = "3"
 # rcgen: generate a fresh self-signed cert for the TLS E2E (ring backend, no aws-lc-rs/cmake).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

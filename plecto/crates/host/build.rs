@@ -6,6 +6,12 @@
 //! (no WASI adapter needed — the component imports ONLY granted plecto
 //! capabilities). The body / stream<u8> / wasi:http increment moves to
 //! `wasm32-wasip2` once wasmtime 46 ships.
+//!
+//! The fixture builds below run ONLY behind the `test-support` feature (this crate's own
+//! `[dev-dependencies]` turn it on for `cargo test`/`--examples`/`cargo bench`; dependent crates do
+//! the same in their own dev-dependencies). A plain production build of this crate — or of
+//! `plecto-control`/`plecto-server`, which depend on it as a normal dependency — never needs the
+//! `wasm32-unknown-unknown` target or the guest sources under `examples/filters/` / `bench/filters/`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,39 +31,45 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", wit.display());
 
-    // Each guest crate → a componentized `plecto:filter`, exposed to `test_support` via an env var.
-    // filter-hello is the conformance fixture; filter-apikey is the real-world example (auth gate).
-    build_component(
-        &cargo,
-        &filters.join("filter-hello"),
-        &out_dir,
-        "filter_hello",
-        "FILTER_HELLO_COMPONENT",
-    );
-    build_component(
-        &cargo,
-        &filters.join("filter-apikey"),
-        &out_dir,
-        "filter_apikey",
-        "FILTER_APIKEY_COMPONENT",
-    );
-    // filter-quickstart is the minimal starter filter behind the `quickstart` example.
-    build_component(
-        &cargo,
-        &filters.join("filter-quickstart"),
-        &out_dir,
-        "filter_quickstart",
-        "FILTER_QUICKSTART_COMPONENT",
-    );
-    // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API calls).
-    // It is benchmark-only, so it lives under bench/filters/, not examples/.
-    build_component(
-        &cargo,
-        &bench_filters.join("filter-noop"),
-        &out_dir,
-        "filter_noop",
-        "FILTER_NOOP_COMPONENT",
-    );
+    // Fixture guests (test_support's env!() consts): built ONLY when `test-support` is on, so a
+    // plain production build of this crate (or of a dependent crate's default build) never touches
+    // wasm32-unknown-unknown or these guest sources (some of which live outside `plecto/`).
+    if std::env::var("CARGO_FEATURE_TEST_SUPPORT").is_ok() {
+        // Each guest crate → a componentized `plecto:filter`, exposed to `test_support` via an env
+        // var. filter-hello is the conformance fixture; filter-apikey is the real-world example
+        // (auth gate).
+        build_component(
+            &cargo,
+            &filters.join("filter-hello"),
+            &out_dir,
+            "filter_hello",
+            "FILTER_HELLO_COMPONENT",
+        );
+        build_component(
+            &cargo,
+            &filters.join("filter-apikey"),
+            &out_dir,
+            "filter_apikey",
+            "FILTER_APIKEY_COMPONENT",
+        );
+        // filter-quickstart is the minimal starter filter behind the `quickstart` example.
+        build_component(
+            &cargo,
+            &filters.join("filter-quickstart"),
+            &out_dir,
+            "filter_quickstart",
+            "FILTER_QUICKSTART_COMPONENT",
+        );
+        // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API
+        // calls). It is benchmark-only, so it lives under bench/filters/, not examples/.
+        build_component(
+            &cargo,
+            &bench_filters.join("filter-noop"),
+            &out_dir,
+            "filter_noop",
+            "FILTER_NOOP_COMPONENT",
+        );
+    }
 
     // Experimental streaming body filter (feature `streaming-body`, OFF by default): build the
     // filter-streaming guest for wasm32-wasip2, which emits a Component directly (no wit-component

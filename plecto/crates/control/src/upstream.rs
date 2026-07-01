@@ -168,22 +168,23 @@ impl UpstreamInstance {
             c.ever_healthy = true;
             c.consecutive_ok = 0;
             self.healthy.store(true, Ordering::Release);
+            tracing::info!(address = %self.address, "upstream instance became healthy");
         }
     }
 
     /// Record a failed active probe (non-2xx, timeout, or connect error).
     pub fn record_probe_failure(&self) {
-        self.record_failure();
+        self.record_failure("active probe");
     }
 
     /// Record a *passive* failure — a real forwarded request that could not even connect to this
     /// instance (ADR 000017). It demotes exactly like a probe failure, but can only ever demote: an
     /// ejected instance receives no traffic, so only the active prober restores it.
     pub fn record_passive_failure(&self) {
-        self.record_failure();
+        self.record_failure("passive request");
     }
 
-    fn record_failure(&self) {
+    fn record_failure(&self, source: &'static str) {
         let Ok(mut c) = self.counters.lock() else {
             return;
         };
@@ -192,6 +193,11 @@ impl UpstreamInstance {
         if self.healthy.load(Ordering::Acquire) && c.consecutive_fail >= self.unhealthy_threshold {
             c.consecutive_fail = 0;
             self.healthy.store(false, Ordering::Release);
+            tracing::warn!(
+                address = %self.address,
+                source,
+                "upstream instance became unhealthy"
+            );
         }
     }
 }
@@ -779,6 +785,7 @@ mod tests {
             timeout_ms: 50,
             healthy_threshold,
             unhealthy_threshold,
+            port: None,
         }
     }
 

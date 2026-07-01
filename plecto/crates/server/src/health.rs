@@ -8,6 +8,7 @@
 //! RTT. Probes run on plain HTTP/1.1 (upstream TLS is deferred); each runs on its own task so a slow
 //! or timing-out probe never stalls the others.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,7 +71,11 @@ async fn probe_once(
     health: &HealthConfig,
     inst: &UpstreamInstance,
 ) {
-    let uri = format!("http://{}{}", inst.address(), health.path);
+    let uri = format!(
+        "http://{}{}",
+        probe_address(inst.address(), health.port),
+        health.path
+    );
     let req = match Request::builder()
         .method("GET")
         .uri(&uri)
@@ -86,5 +91,47 @@ async fn probe_once(
     match tokio::time::timeout(timeout, client.request(req)).await {
         Ok(Ok(resp)) if resp.status().is_success() => inst.record_probe_success(),
         _ => inst.record_probe_failure(),
+    }
+}
+
+/// `address` (`host:port`) with its port swapped for a dedicated health-check `port`, when the
+/// upstream's health policy names one — a separate metrics/health listener distinct from the
+/// traffic port. `None` (the common case) or an address with no `:port` suffix to replace (never
+/// happens for a validated manifest, but this is the data-plane path — no panics) both fall back to
+/// the instance's own address unchanged.
+fn probe_address(address: &str, port: Option<u16>) -> Cow<'_, str> {
+    match (port, address.rsplit_once(':')) {
+        (Some(port), Some((host, _))) => Cow::Owned(format!("{host}:{port}")),
+        _ => Cow::Borrowed(address),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_address;
+
+    #[test]
+    fn no_override_keeps_the_traffic_address() {
+        assert_eq!(probe_address("127.0.0.1:9000", None), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn override_swaps_only_the_port() {
+        assert_eq!(
+            probe_address("127.0.0.1:9000", Some(9100)),
+            "127.0.0.1:9100"
+        );
+        assert_eq!(
+            probe_address("upstream.example:9000", Some(9100)),
+            "upstream.example:9100"
+        );
+    }
+
+    #[test]
+    fn malformed_address_falls_back_unchanged_rather_than_panicking() {
+        assert_eq!(
+            probe_address("not-a-host-port", Some(9100)),
+            "not-a-host-port"
+        );
     }
 }

@@ -86,6 +86,7 @@ webpki-roots = { version = "0.26", optional = true }
 # executor suffices. The server-side spawn_blocking removal (true async) is Stage 2.
 pollster = "0.4"
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 redb = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }

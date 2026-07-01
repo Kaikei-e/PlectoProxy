@@ -380,20 +380,24 @@ impl LoadOptions {
 /// output; a `RunError` is the filter *failing*. The fast path MUST fail-closed on it:
 /// synthesise an error response and never forward to upstream (CLAUDE.md — no fail-open).
 /// Keeping the two apart also makes "deadline" vs "trap" an observable health signal.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RunError {
     /// The filter ran past its epoch deadline (ADR 000006 metering) and was interrupted.
     /// Fail-closed mapping: 504.
+    #[error("filter exceeded its epoch deadline")]
     Deadline,
     /// The filter trapped (`unreachable`, a guest panic, or an allocation past the Store
     /// memory limit that aborted the guest). Fail-closed mapping: 502.
+    #[error("filter trapped: {0}")]
     Trap(anyhow::Error),
     /// A fresh instance could not be created — untrusted per-request instantiation, or the
     /// rebuild of a trusted instance after a prior trap. Fail-closed mapping: 502.
+    #[error("filter instantiation failed: {0}")]
     Instantiate(anyhow::Error),
     /// A trusted filter trapped on several consecutive requests, so the host is in a short
     /// trap-cooldown: it returns this cheap fail-closed response instead of re-instantiating +
     /// re-init'ing every request (circuit-breaker, review f000003 #5). Fail-closed mapping: 503.
+    #[error("filter is in trap-cooldown (circuit open)")]
     Unavailable,
 }
 
@@ -427,19 +431,6 @@ impl RunError {
         }
     }
 }
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunError::Deadline => write!(f, "filter exceeded its epoch deadline"),
-            RunError::Trap(e) => write!(f, "filter trapped: {e}"),
-            RunError::Instantiate(e) => write!(f, "filter instantiation failed: {e}"),
-            RunError::Unavailable => write!(f, "filter is in trap-cooldown (circuit open)"),
-        }
-    }
-}
-
-impl std::error::Error for RunError {}
 
 /// The set of public keys the operator trusts to sign filters (ADR 000006 provenance). A
 /// filter loads only if a trusted key verifies BOTH its component signature and its SBOM
@@ -508,14 +499,48 @@ pub struct SignedArtifact<'a> {
     pub sbom_signature: &'a [u8],
 }
 
+/// Why [`Host::load`] rejected a filter (bp-rust: typed library errors, not ad hoc
+/// `anyhow::ensure!`). Every variant is a fail-closed rejection at the provenance/id gate, before
+/// wasmtime ever touches the component bytes — except [`LoadError::Instantiate`] /
+/// [`LoadError::Wasmtime`], which surface a failure from wasmtime itself (linking / type-checking
+/// / the eager trusted-instance build). `Host::load`'s public signature stays `anyhow::Result`
+/// (unchanged, so `plecto-control::ControlError::Load`'s existing `anyhow::Error` passthrough
+/// keeps working); callers that want the concrete variant can `downcast_ref::<LoadError>()`.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("filter id must be non-empty")]
+    EmptyFilterId,
+    #[error("filter id must not contain the KV namespace delimiter")]
+    FilterIdContainsDelimiter,
+    #[error("a signed SBOM is required to load a filter (fail-closed; ADR 000006)")]
+    MissingSbom,
+    #[error("component signature is not verified by any trusted key (fail-closed; ADR 000006)")]
+    UnverifiedComponentSignature,
+    #[error("SBOM signature is not verified by any trusted key (fail-closed; ADR 000006)")]
+    UnverifiedSbomSignature,
+    #[error("SBOM is not a valid in-toto statement: {0}")]
+    MalformedSbom(#[source] serde_json::Error),
+    #[error(
+        "SBOM does not attest this component: no subject digest matches sha256(component) \
+         (fail-closed; ADR 000006 / review f000003)"
+    )]
+    SbomNotBound,
+    /// The eager trusted-instance build (`Host::load`'s `Isolation::Trusted` path) failed —
+    /// carries the same error `RunError::Instantiate` would for a later rebuild.
+    #[error("filter instantiation failed: {0}")]
+    Instantiate(anyhow::Error),
+    #[error(transparent)]
+    Wasmtime(#[from] wasmtime::Error),
+}
+
 /// Verify the SBOM attests THIS component: parse it as an in-toto-style statement and require
 /// at least one `subject[].digest.sha256` to equal `sha256(component)`. Fail-closed on a
 /// malformed SBOM or a missing / mismatched subject (review f000003 #1). Without this, a
 /// validly-signed but UNRELATED SBOM could be paired with the component — harmless while the
 /// SBOM is opaque, a latent gap the moment its content becomes load-bearing (CVE / license).
-fn sbom_binds_component(sbom: &[u8], component: &[u8]) -> Result<()> {
-    let statement: serde_json::Value = serde_json::from_slice(sbom)
-        .map_err(|e| anyhow::anyhow!("SBOM is not a valid in-toto statement: {e}"))?;
+fn sbom_binds_component(sbom: &[u8], component: &[u8]) -> std::result::Result<(), LoadError> {
+    let statement: serde_json::Value =
+        serde_json::from_slice(sbom).map_err(LoadError::MalformedSbom)?;
     let want = hex::encode(Sha256::digest(component));
     let bound = statement
         .get("subject")
@@ -529,12 +554,11 @@ fn sbom_binds_component(sbom: &[u8], component: &[u8]) -> Result<()> {
                     == Some(want.as_str())
             })
         });
-    anyhow::ensure!(
-        bound,
-        "SBOM does not attest this component: no subject digest matches sha256(component) \
-         (fail-closed; ADR 000006 / review f000003)"
-    );
-    Ok(())
+    if bound {
+        Ok(())
+    } else {
+        Err(LoadError::SbomNotBound)
+    }
 }
 
 /// A log line captured from the host-log capability (test visibility / future tracing).
@@ -766,7 +790,7 @@ impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
 /// exit / terminal-*), each inert under the empty `WasiCtx`. Adds NO filesystem and NO sockets, so
 /// those capabilities stay denied (security audit F-002; mirrors the streaming path).
 #[cfg(feature = "outbound-http")]
-fn add_cli_runtime(linker: &mut Linker<HostState>) -> Result<()> {
+fn add_cli_runtime(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     use wasmtime_wasi::cli::{WasiCli, WasiCliView};
     use wasmtime_wasi::p2::bindings::cli;
     let getter = <HostState as WasiCliView>::cli;
@@ -1088,27 +1112,42 @@ impl Host {
         artifact: &SignedArtifact<'_>,
         opts: LoadOptions,
     ) -> Result<LoadedFilter> {
-        anyhow::ensure!(
-            !filter_id.is_empty() && !filter_id.contains(KV_NS_DELIM),
-            "filter id must be non-empty and must not contain the KV namespace delimiter"
-        );
+        self.load_inner(filter_id, artifact, opts)
+            .map_err(anyhow::Error::from)
+    }
+
+    /// The typed-error inner of [`Host::load`] (bp-rust: library code uses `thiserror`, not ad hoc
+    /// `anyhow::ensure!`). `load` stays `anyhow::Result` at the public boundary — unchanged, so it
+    /// keeps matching `plecto-control::ControlError::Load`'s existing `anyhow::Error` passthrough —
+    /// but every rejection here is a concrete, `downcast_ref`-able [`LoadError`] variant.
+    fn load_inner(
+        &self,
+        filter_id: &str,
+        artifact: &SignedArtifact<'_>,
+        opts: LoadOptions,
+    ) -> std::result::Result<LoadedFilter, LoadError> {
+        if filter_id.is_empty() {
+            return Err(LoadError::EmptyFilterId);
+        }
+        if filter_id.contains(KV_NS_DELIM) {
+            return Err(LoadError::FilterIdContainsDelimiter);
+        }
 
         // --- provenance gate (ADR 000006): verify BEFORE instantiate, fail-closed. A
         // --- missing / untrusted / tampered signature or a missing SBOM means we never
         // --- touch the component bytes with wasmtime. Order is cheap-checks first.
-        anyhow::ensure!(
-            !artifact.sbom.is_empty(),
-            "a signed SBOM is required to load a filter (fail-closed; ADR 000006)"
-        );
-        anyhow::ensure!(
-            self.trust
-                .verifies(artifact.component_signature, artifact.component_bytes),
-            "component signature is not verified by any trusted key (fail-closed; ADR 000006)"
-        );
-        anyhow::ensure!(
-            self.trust.verifies(artifact.sbom_signature, artifact.sbom),
-            "SBOM signature is not verified by any trusted key (fail-closed; ADR 000006)"
-        );
+        if artifact.sbom.is_empty() {
+            return Err(LoadError::MissingSbom);
+        }
+        if !self
+            .trust
+            .verifies(artifact.component_signature, artifact.component_bytes)
+        {
+            return Err(LoadError::UnverifiedComponentSignature);
+        }
+        if !self.trust.verifies(artifact.sbom_signature, artifact.sbom) {
+            return Err(LoadError::UnverifiedSbomSignature);
+        }
         // The SBOM must attest THIS component (its subject digest == sha256(component)), so a
         // validly-signed but unrelated SBOM cannot be paired with it (review f000003 #1).
         sbom_binds_component(artifact.sbom, artifact.component_bytes)?;
@@ -1172,7 +1211,9 @@ impl Host {
                 // Eager-build ONE instance now so a broken `init` surfaces at load (not on the
                 // first request) and a single-threaded caller then reuses it (init-once holds).
                 // The rest of the pool fills lazily, only when concurrency demands it (ADR 000012).
-                let first = runtime.instantiate_initialized()?;
+                let first = runtime
+                    .instantiate_initialized()
+                    .map_err(LoadError::Instantiate)?;
                 Some(TrustedPool::new(
                     cap,
                     Duration::from_millis(opts.checkout_timeout_ms),

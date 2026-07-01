@@ -149,29 +149,20 @@ impl PlectoHttpHooks {
 
         let handle = wasmtime_wasi::runtime::spawn(async move {
             let _permit = permit; // held for the whole call, bounding concurrency
-            let outcome = timeout(total, async move {
-                let addrs = resolver.resolve(&host, port).await.map_err(|_| dns_err())?;
-                let Some(&first_addr) = addrs.first() else {
-                    return Err(dns_err());
-                };
-                // Verify EVERY resolved address; a legitimate endpoint resolves only to allowed
-                // space. A mix (e.g. a rebinding A-record set) is rejected wholesale.
-                for addr in &addrs {
-                    if policy.classify(addr.ip()) != AddrVerdict::Allowed {
-                        return Err(ErrorCode::DestinationIpProhibited);
-                    }
-                }
-                connect_and_send(
-                    first_addr,
+            let outcome = timeout(
+                total,
+                resolve_and_connect(
+                    &resolver,
                     &host,
+                    port,
+                    &policy,
                     use_tls,
                     connect_timeout,
                     max_body,
                     total,
                     request,
-                )
-                .await
-            })
+                ),
+            )
             .await;
             let inner = outcome.unwrap_or(Err(ErrorCode::ConnectionTimeout));
             Ok::<_, wasmtime::Error>(inner)
@@ -179,6 +170,50 @@ impl PlectoHttpHooks {
 
         HostFutureIncomingResponse::pending(handle)
     }
+}
+
+/// Pure: does EVERY resolved address classify as allowed? A legitimate endpoint resolves only to
+/// allowed space; a mix (e.g. a rebinding A-record set) is rejected wholesale (DNS-rebinding
+/// TOCTOU guard). No I/O — directly unit-testable against a hand-built address list.
+fn all_addresses_allowed(addrs: &[SocketAddr], policy: &OutboundPolicy) -> bool {
+    addrs
+        .iter()
+        .all(|addr| policy.classify(addr.ip()) == AddrVerdict::Allowed)
+}
+
+/// Resolve `host`, verify every resolved address against `policy`, then connect to the first one
+/// pinned by that resolution (never re-resolving between check and connect). Named so `dispatch`'s
+/// spawned closure is a single call, and so this sequence is itself a seam a future test could
+/// exercise directly (bypassing `send_request`/`dispatch`'s wasmtime-http plumbing).
+#[allow(clippy::too_many_arguments)]
+async fn resolve_and_connect(
+    resolver: &Resolver,
+    host: &str,
+    port: u16,
+    policy: &OutboundPolicy,
+    use_tls: bool,
+    connect_timeout: Duration,
+    max_response_bytes: u64,
+    between_bytes_timeout: Duration,
+    request: Request<HyperOutgoingBody>,
+) -> Result<IncomingResponse, ErrorCode> {
+    let addrs = resolver.resolve(host, port).await.map_err(|_| dns_err())?;
+    let Some(&first_addr) = addrs.first() else {
+        return Err(dns_err());
+    };
+    if !all_addresses_allowed(&addrs, policy) {
+        return Err(ErrorCode::DestinationIpProhibited);
+    }
+    connect_and_send(
+        first_addr,
+        host,
+        use_tls,
+        connect_timeout,
+        max_response_bytes,
+        between_bytes_timeout,
+        request,
+    )
+    .await
 }
 
 /// A resolved-error future the guest observes immediately (fail-closed).
@@ -412,6 +447,50 @@ mod tests {
 
     fn req(uri: &str) -> Request<HyperOutgoingBody> {
         Request::builder().uri(uri).body(empty_out_body()).unwrap()
+    }
+
+    #[test]
+    fn all_addresses_allowed_rejects_a_mix_of_allowed_and_blocked() {
+        let policy = test_policy(vec![]); // allow_private empty: no private/loopback range opted in
+        struct Case {
+            name: &'static str,
+            addrs: Vec<IpAddr>,
+            want: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "empty (vacuous truth)",
+                addrs: vec![],
+                want: true,
+            },
+            Case {
+                name: "all public",
+                addrs: vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()],
+                want: true,
+            },
+            Case {
+                name: "one loopback among public — rejected wholesale",
+                addrs: vec![
+                    "93.184.216.34".parse().unwrap(),
+                    "127.0.0.1".parse().unwrap(),
+                ],
+                want: false,
+            },
+            Case {
+                name: "link-local metadata address",
+                addrs: vec!["169.254.169.254".parse().unwrap()],
+                want: false,
+            },
+        ];
+        for case in cases {
+            let addrs: Vec<SocketAddr> = case
+                .addrs
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, 80))
+                .collect();
+            let got = all_addresses_allowed(&addrs, &policy);
+            assert_eq!(got, case.want, "case: {}", case.name);
+        }
     }
 
     fn ready_code(fut: HostFutureIncomingResponse) -> ErrorCode {

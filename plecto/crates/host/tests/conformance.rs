@@ -273,7 +273,10 @@ fn load_rejects_empty_filter_id() {
                 "rejection should name the filter id, got: {e}"
             );
             assert!(
-                matches!(e.downcast_ref::<LoadError>(), Some(LoadError::EmptyFilterId)),
+                matches!(
+                    e.downcast_ref::<LoadError>(),
+                    Some(LoadError::EmptyFilterId)
+                ),
                 "expected LoadError::EmptyFilterId, got: {e:?}"
             );
         }

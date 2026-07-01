@@ -144,11 +144,55 @@ pub fn run_streaming_body(
             .await
     }))??;
 
-    Ok(match decision {
+    Ok(map_decision(decision))
+}
+
+/// Lower the guest's typed decision to the host-visible `StreamingDecision` (pure — no wasmtime
+/// involvement, so it is unit-testable without an engine, component, or Store).
+fn map_decision(decision: RequestBodyDecision) -> StreamingDecision {
+    match decision {
         RequestBodyDecision::Continue => StreamingDecision::Continue,
         RequestBodyDecision::ShortCircuit(resp) => StreamingDecision::ShortCircuit {
             status: resp.status,
             body: resp.body,
         },
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bindings::plecto::filter_streaming::types::HttpResponse as GuestResponse;
+
+    #[test]
+    fn map_decision_lowers_guest_variants() {
+        struct Case {
+            name: &'static str,
+            guest: RequestBodyDecision,
+            want: StreamingDecision,
+        }
+        let cases = vec![
+            Case {
+                name: "continue",
+                guest: RequestBodyDecision::Continue,
+                want: StreamingDecision::Continue,
+            },
+            Case {
+                name: "short-circuit",
+                guest: RequestBodyDecision::ShortCircuit(GuestResponse {
+                    status: 403,
+                    headers: Vec::new(),
+                    body: b"denied".to_vec(),
+                }),
+                want: StreamingDecision::ShortCircuit {
+                    status: 403,
+                    body: b"denied".to_vec(),
+                },
+            },
+        ];
+        for case in cases {
+            let got = map_decision(case.guest);
+            assert_eq!(got, case.want, "case: {}", case.name);
+        }
+    }
 }

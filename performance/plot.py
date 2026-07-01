@@ -310,7 +310,7 @@ def body_hook() -> None:
     rows = _read(DATA / "body.csv")
     sizes = sorted({int(r["size"]) for r in rows})
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.4, 4.2))
-    for route, color in (("baseline", C_C), ("body", C_B)):
+    for route, color in (("baseline", C_C), ("body", C_B), ("body-headeronly", C_A)):
         sel = {int(r["size"]): r for r in rows if r["route"].lstrip("/") == route}
         if not sel:
             continue
@@ -331,8 +331,8 @@ def body_hook() -> None:
     ax2.set_ylabel("p99 latency (ms)")
     ax2.set_yscale("log")
     ax2.set_title("Tail latency")
-    fig.suptitle("Request-body hook (buffer→transform) vs streaming passthrough, by payload size",
-                 fontsize=11)
+    fig.suptitle("Request-body hook: buffer→transform (/body) vs header-only zero-copy bypass "
+                 "(/body-headeronly, ADR 000038) vs streaming (/baseline)", fontsize=10)
     fig.tight_layout()
     _save(fig, "body.webp")
 

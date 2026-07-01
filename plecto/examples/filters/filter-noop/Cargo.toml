@@ -1,0 +1,18 @@
+[package]
+name = "filter-noop"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# The leanest possible `plecto:filter` guest: it makes NO host-API calls and returns `continue` on
+# every hook. It is the benchmark's "pure WASM no-op" rung (the WASM cost ladder), isolating the
+# irreducible extension-plane dispatch cost from any work a real filter does. Built for
+# wasm32-unknown-unknown and componentized by crates/host/build.rs (ADR 000010), like filter-hello.
+# Declares its own [workspace] so the native plecto/ workspace never absorbs it.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[workspace]

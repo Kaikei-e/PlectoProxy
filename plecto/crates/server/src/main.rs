@@ -41,5 +41,6 @@ async fn run() -> anyhow::Result<()> {
     let control = Arc::new(Control::from_manifest_path(Path::new(&manifest))?);
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, version = %control.config_version(), "plecto fast path listening");
-    serve(control, listener).await
+    serve(control, listener).await?;
+    Ok(())
 }

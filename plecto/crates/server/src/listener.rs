@@ -3,15 +3,12 @@
 //! 000015); the per-request handling (route → chain → forward) is shared with all transports via
 //! `proxy_core`.
 
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::body::Incoming;
 use hyper::header::HeaderValue;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::Control;
@@ -19,15 +16,14 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
-use crate::body::{MAX_INFLIGHT_BODY_BUFFERS, box_incoming};
+use crate::body::MAX_INFLIGHT_BODY_BUFFERS;
+use crate::dispatch::handle;
+use crate::error::ServerError;
 use crate::h3::{build_h3_endpoint, serve_h3};
 use crate::health::serve_health_checks;
 use crate::metrics::ServerMetrics;
-use crate::proxy::proxy_core;
-use crate::respond::{fault, synth};
-use crate::{
-    MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, ResponseBody, ServerState, admin, upstream_connector,
-};
+use crate::upstream_client::HyperUpstreamClient;
+use crate::{MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, ServerState, admin, upstream_connector};
 
 /// Explicit cap on inbound request header lines. hyper's http1 default (~100) is documented
 /// as not API-stable, so pin it — as `MAX_CONCURRENT_STREAMS` already does for h2.
@@ -42,8 +38,16 @@ const INBOUND_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// negotiates `h2` (ADR 000015). A per-connection error is logged, not fatal. Bind with
 /// `TcpListener::bind` (the caller picks the addr, so a test can use an ephemeral `127.0.0.1:0`
 /// and read `local_addr`).
+///
+/// Public boundary stays `anyhow::Result` (bp-rust: typed errors are a library-internal
+/// convention, not a public-API commitment) — the internal `ServerError` is `pub(crate)`, so a
+/// caller in another crate could not even name it. `serve_inner` does the typed work.
 pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Result<()> {
-    let tcp_addr = listener.local_addr()?;
+    serve_inner(control, listener).await.map_err(Into::into)
+}
+
+async fn serve_inner(control: Arc<Control>, listener: TcpListener) -> Result<(), ServerError> {
+    let tcp_addr = listener.local_addr().map_err(ServerError::Bind)?;
 
     // HTTP/3 (ADR 000016): when QUIC TLS is configured (i.e. there is `[[tls]]`), bind an
     // independent QUIC/UDP listener on the SAME port number as the TCP one and advertise it via
@@ -55,7 +59,9 @@ pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Resu
 
     let state = Arc::new(ServerState {
         control,
-        client: Client::builder(TokioExecutor::new()).build(upstream_connector()),
+        client: HyperUpstreamClient::new(
+            Client::builder(TokioExecutor::new()).build(upstream_connector()),
+        ),
         alt_svc,
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
@@ -169,32 +175,4 @@ async fn serve_conn<I>(
     if let Err(e) = result {
         tracing::debug!(error = %e, "connection closed with error");
     }
-}
-
-/// The hyper service entry: never fails the connection (a proxy synthesises an error response
-/// instead of dropping the socket), so the request handling's errors are mapped to a 502. `scheme`
-/// is the connection's wire scheme (`"https"` if TLS-terminated, else `"http"`), surfaced to the
-/// chain (ADR 000015).
-async fn handle(
-    state: Arc<ServerState>,
-    scheme: &'static str,
-    peer: SocketAddr,
-    req: Request<Incoming>,
-) -> Result<Response<ResponseBody>, Infallible> {
-    // adapt the hyper inbound body (HTTP/1.1 + HTTP/2) into the transport-agnostic `ReqBody`.
-    let (parts, incoming) = req.into_parts();
-    let mut resp =
-        match proxy_core(state.clone(), scheme, peer, parts, box_incoming(incoming)).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!(error = %e, "fast-path error");
-                synth(StatusCode::BAD_GATEWAY, &fault::UPSTREAM, b"upstream error")
-            }
-        };
-    // Advertise HTTP/3 on TCP responses (ADR 000016); h3 responses are not tagged (already h3).
-    if let Some(av) = &state.alt_svc {
-        resp.headers_mut()
-            .insert(hyper::header::ALT_SVC, av.clone());
-    }
-    Ok(resp)
 }

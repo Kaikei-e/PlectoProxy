@@ -37,6 +37,9 @@
 mod access_log;
 mod admin;
 mod body;
+mod dispatch;
+mod error;
+mod forward;
 mod h3;
 mod headers;
 mod health;
@@ -44,18 +47,20 @@ mod listener;
 mod metrics;
 mod proxy;
 mod respond;
+mod retry;
+mod upstream_client;
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use hyper::header::HeaderValue;
-use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use plecto_control::Control;
 use tokio::sync::Semaphore;
 
 use crate::metrics::ServerMetrics;
+use crate::upstream_client::HyperUpstreamClient;
 
 pub use listener::serve;
 
@@ -109,10 +114,6 @@ pub(crate) type ResponseBody = BoxBody<Bytes, BoxError>;
 /// body streams straight through opaquely (header-only contract, ADR 000010) regardless of source.
 pub(crate) type ReqBody = BoxBody<Bytes, BoxError>;
 
-/// The pooling upstream client (hyper-util legacy): connection reuse to each upstream for free.
-/// Plain HTTP/1.1 to the upstream; the inbound body (any transport) is boxed into `ReqBody`.
-pub(crate) type UpstreamClient = Client<HttpConnector, ReqBody>;
-
 /// Global cap on concurrently-served connections across all transports (CWE-770). A permit
 /// is acquired BEFORE each accept, so at saturation the listener stops pulling new connections off
 /// the OS backlog (natural backpressure) instead of spawning per-connection tasks unboundedly.
@@ -131,7 +132,7 @@ pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 100;
 /// bound, and added to TCP (HTTP/1.1 + HTTP/2) responses to steer capable clients to h3.
 pub(crate) struct ServerState {
     control: Arc<Control>,
-    client: UpstreamClient,
+    client: HyperUpstreamClient,
     alt_svc: Option<HeaderValue>,
     /// Global connection cap across TCP + QUIC: a permit is held for each connection's
     /// lifetime, so the server never serves more than `MAX_CONNECTIONS` at once.

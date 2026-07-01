@@ -2254,6 +2254,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "tempfile",
+ "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",

@@ -1,98 +1,28 @@
 //! The transport-agnostic transaction core: route → chain (request side) → forward → chain
 //! (response side). HTTP/1.1, HTTP/2 and HTTP/3 all funnel through `proxy_core`; only the body
 //! adapters differ. Bounded retry onto another instance (ADR 000023, hardened with jittered
-//! backoff + retriable-5xx retry in ADR 000030) and the `on-request-body` hook (ADR 000025) live here.
+//! backoff + retriable-5xx retry in ADR 000030) and the `on-request-body` hook (ADR 000025) live in
+//! `forward`/`retry`; this module wires routing, rate-limiting, and the chain around that call.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use hyper::body::Body;
-use hyper::header::HeaderValue;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Response, StatusCode};
 use plecto_control::{
     ChainOutcome, HashInput, HashKeySource, HttpResponse, RateLimitDecision, RequestBodyOutcome,
     RequestTrace,
 };
 
 use crate::body::{
-    INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body, empty_req, req_full,
+    INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body, req_full,
 };
-use crate::headers::{copy_headers_preserving, headers_to_vec, set_forwarded, to_http_request};
+use crate::error::ServerError;
+use crate::forward::{ForwardOutcome, ForwardRequest, forward_with_retry};
+use crate::headers::{headers_to_vec, set_forwarded, to_http_request};
 use crate::respond::{fault, http_response, stream_response, synth, synth_retry_after};
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
-
-/// A retryable upstream failure (ADR 000023). A timeout may already have been acted on by the
-/// upstream; a connect failure never reached it.
-#[derive(Clone, Copy)]
-enum Failure {
-    Timeout,
-    Connect,
-}
-
-/// RFC 9110 §9.2.2 idempotent methods — safe to retry on a timeout. Matched case-sensitively
-/// (standard methods are uppercase tokens); any other token is treated as non-idempotent.
-fn is_idempotent(method: &str) -> bool {
-    matches!(
-        method,
-        "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
-    )
-}
-
-/// Whether a failed forward MAY be retried on another instance (ADR 000023) — independent of whether
-/// a different instance is actually available (the caller checks that). A retry needs remaining
-/// budget and a replayable (bodyless) body; a timeout additionally needs an idempotent method, while
-/// a connect failure is safe for any method (the upstream never received the request).
-fn may_retry(failure: Failure, method: &str, bodyless: bool, tries_left: u64) -> bool {
-    bodyless
-        && tries_left > 0
-        && match failure {
-            Failure::Timeout => is_idempotent(method),
-            Failure::Connect => true,
-        }
-}
-
-/// The retriable gateway-class upstream statuses (ADR 000030): 502 / 503 / 504. A 5xx means the
-/// upstream RECEIVED and processed the request, so retrying it is safe only for an idempotent method
-/// (like a timeout) — and it never demotes the instance (5xx-driven ejection is outlier detection,
-/// ADR 000032, a separate axis).
-fn is_retriable_5xx(status: StatusCode) -> bool {
-    // 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout — the gateway-error class.
-    matches!(status.as_u16(), 502..=504)
-}
-
-/// Full-jitter exponential backoff base / cap in milliseconds (ADR 000030). Projected
-/// Envoy-reference defaults, not tuned by measurement: a retry waits a uniform-random delay in
-/// `[0, min(cap, base · 2^attempt)]`, so concurrent clients' retries spread out instead of
-/// thundering onto a recovering upstream in lockstep.
-const RETRY_BACKOFF_BASE_MS: u64 = 25;
-const RETRY_BACKOFF_CAP_MS: u64 = 250;
-
-/// Sleep a full-jitter exponential backoff before retry `attempt` (0-based, ADR 000030). The ceiling
-/// doubles per attempt up to the cap; the actual wait is uniform in `[0, ceiling]`.
-async fn backoff(attempt: u32) {
-    let ceiling = RETRY_BACKOFF_BASE_MS
-        .saturating_mul(1u64 << attempt.min(16))
-        .min(RETRY_BACKOFF_CAP_MS);
-    let delay = jitter(ceiling);
-    if delay > 0 {
-        tokio::time::sleep(Duration::from_millis(delay)).await;
-    }
-}
-
-/// A uniform-ish pseudo-random value in `[0, ceiling]` for retry jitter. Non-cryptographic (retry
-/// timing is not a secret) — seeded from the wall-clock sub-second, which differs per call so
-/// concurrent requests pick different waits. `ceiling == 0` yields 0 (no wait).
-fn jitter(ceiling_ms: u64) -> u64 {
-    if ceiling_ms == 0 {
-        return 0;
-    }
-    let entropy = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos()))
-        .unwrap_or(0);
-    entropy % (ceiling_ms + 1)
-}
 
 /// The transport-agnostic transaction core (Stage A observability wrapper, ADR 000009). Every
 /// transport funnels through here, so it is the one place to tally per-request metrics and emit the
@@ -104,7 +34,7 @@ pub(crate) async fn proxy_core(
     peer: SocketAddr,
     parts: hyper::http::request::Parts,
     body: ReqBody,
-) -> anyhow::Result<Response<ResponseBody>> {
+) -> Result<Response<ResponseBody>, ServerError> {
     let start = Instant::now();
     state.metrics.inc_in_flight();
 
@@ -135,7 +65,7 @@ pub(crate) async fn proxy_core(
     state.metrics.dec_in_flight();
     let status = match &result {
         Ok(resp) => resp.status().as_u16(),
-        // an inner error is mapped to 502 by the caller (`handle`), so record it as such here.
+        // an inner error is mapped to 502 by the caller (`dispatch::handle`), so record it as such.
         Err(_) => StatusCode::BAD_GATEWAY.as_u16(),
     };
     let elapsed = start.elapsed();
@@ -155,7 +85,7 @@ async fn proxy_core_inner(
     peer: SocketAddr,
     parts: hyper::http::request::Parts,
     body: ReqBody,
-) -> anyhow::Result<Response<ResponseBody>> {
+) -> Result<Response<ResponseBody>, ServerError> {
     let mut http_req = to_http_request(&parts, scheme);
 
     // Normalize the request path once at ingress (CWE-22 Path Traversal / CWE-436
@@ -267,9 +197,6 @@ async fn proxy_core_inner(
     // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
     let bodyless = body.size_hint().exact() == Some(0);
     let mut real_body = Some(body);
-    let mut tries_left = group.max_retries();
-    // 0-based retry attempt index, for the jittered exponential backoff between attempts (ADR 000030).
-    let mut attempt: u32 = 0;
 
     // --- request-side body hook (ADR 000025): buffer the body (bounded) ONLY when a filter on the
     // route actually reads it — i.e. exports `on-request-body` (`reads_body`, ADR 000038). A route
@@ -336,7 +263,7 @@ async fn proxy_core_inner(
     // maglev (by `hash_key`). Fail closed (503) if no instance is eligible (ADR 000017). The `Pick`
     // carries the least-request load guard (a no-op otherwise) and is held across the retry loop, so
     // an instance's active-request count is decremented on every exit and on each retry hand-off.
-    let Some(mut pick) = group.pick(hash_key) else {
+    let Some(pick) = group.pick(hash_key) else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
             &fault::NO_HEALTHY_UPSTREAM,
@@ -344,154 +271,45 @@ async fn proxy_core_inner(
         ));
     };
 
-    let upstream_resp = loop {
-        // Overall request deadline (ADR 000031): the whole transaction — every attempt plus the
-        // backoff between them — is bounded. If it elapsed across retries, fail closed 504
-        // `request-timeout` before another attempt; this attempt's effective timeout is the tighter
-        // of the per-try bound and the remaining overall budget.
-        let per_try = match overall_deadline {
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Ok(synth(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        &fault::REQUEST_TIMEOUT,
-                        b"request timeout",
-                    ));
-                }
-                let remaining = deadline - now;
-                if timeout.is_zero() {
-                    remaining
-                } else {
-                    timeout.min(remaining)
-                }
-            }
-            None => timeout,
-        };
-
-        // Build this attempt. A bodyless request re-sends an empty body to each instance; a bodied
-        // one moves its single streamed body and (since `may_retry` is false for it) is sent once.
-        let attempt_body = if bodyless {
-            empty_req()
-        } else {
-            real_body.take().unwrap_or_else(empty_req)
-        };
-        let uri = format!("http://{}{}", pick.address(), upstream_path);
-        let mut builder = Request::builder().method(forward.method.as_str()).uri(uri);
-        // Forward the chain's headers, restoring byte-equivalence for any the filters left untouched
-        // (P3#6): the contract's `string` values are lossy, but the original inbound bytes are still
-        // here in `parts.headers`, so a pass-through header reaches the upstream byte-for-byte.
-        copy_headers_preserving(builder.headers_mut(), &forward.headers, &parts.headers);
-        // continue the trace into the upstream (ADR 000009 W3C propagation).
-        if let Some(h) = builder.headers_mut()
-            && let Ok(v) = HeaderValue::from_str(&snapshot.traceparent())
-        {
-            h.insert("traceparent", v);
+    let forward_req = ForwardRequest {
+        method: forward.method.as_str(),
+        chain_headers: &forward.headers,
+        original_headers: &parts.headers,
+        upstream_path: &upstream_path,
+        traceparent: &snapshot.traceparent(),
+    };
+    let upstream_resp = match forward_with_retry(
+        &state.client,
+        &state.metrics,
+        &group,
+        pick,
+        hash_key,
+        forward_req,
+        bodyless,
+        real_body,
+        timeout,
+        overall_deadline,
+        group.max_retries(),
+    )
+    .await
+    {
+        ForwardOutcome::Response(resp) => resp,
+        ForwardOutcome::OverallTimeout => {
+            return Ok(synth(
+                StatusCode::GATEWAY_TIMEOUT,
+                &fault::REQUEST_TIMEOUT,
+                b"request timeout",
+            ));
         }
-        let upstream_req = builder.body(attempt_body)?;
-
-        // The timeout (ADR 000019) bounds time-to-response-headers; `Duration::ZERO` opts out. The
-        // body then streams without a deadline, so streaming responses are unaffected.
-        let send = state.client.request(upstream_req);
-        let outcome = if per_try.is_zero() {
-            Some(send.await)
-        } else {
-            tokio::time::timeout(per_try, send).await.ok()
-        };
-
-        match outcome {
-            // A retriable gateway-class 5xx (502/503/504) from an idempotent, bodyless request is
-            // retried onto a DIFFERENT instance after backoff (ADR 000030): the upstream processed
-            // it, so idempotent-only, like a timeout. It is NOT a health signal (5xx-driven ejection
-            // is outlier detection, ADR 000032). Otherwise the response is taken as-is.
-            Some(Ok(resp)) => {
-                // Feed outlier detection (ADR 000032): a gateway-class 5xx the instance RETURNED is a
-                // misbehaviour signal (a retried-around 5xx still counts); any other status resets its
-                // streak. A circuit-breaker shed / per-try timeout is NOT recorded here (other axes).
-                let gateway_failure = is_retriable_5xx(resp.status());
-                if group.record_outcome(pick.instance(), gateway_failure) {
-                    state.metrics.inc_outlier_ejection();
-                }
-                // retry-on-5xx (ADR 000030): a retriable gateway 5xx from an idempotent, bodyless
-                // request is retried onto a DIFFERENT instance after backoff. Otherwise take it as-is.
-                if gateway_failure
-                    && may_retry(
-                        Failure::Timeout,
-                        forward.method.as_str(),
-                        bodyless,
-                        tries_left,
-                    )
-                    && let Some(next) = group.pick_excluding(pick.instance(), hash_key)
-                {
-                    state.metrics.inc_retries();
-                    backoff(attempt).await;
-                    attempt += 1;
-                    tries_left -= 1;
-                    pick = next;
-                    continue;
-                }
-                break resp;
-            }
-            // The deadline elapsed before response headers. Not a health signal (ADR 000019) — leave
-            // liveness to the active prober. Retry onto a DIFFERENT instance if policy allows and one
-            // is available (idempotent-only, ADR 000023), else fail closed 504.
-            None => {
-                // If the OVERALL deadline ended the transaction → 504 `request-timeout`, no retry
-                // (ADR 000031). Otherwise it was the per-try timeout (ADR 000019), retryable below.
-                if let Some(deadline) = overall_deadline
-                    && Instant::now() >= deadline
-                {
-                    return Ok(synth(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        &fault::REQUEST_TIMEOUT,
-                        b"request timeout",
-                    ));
-                }
-                if may_retry(
-                    Failure::Timeout,
-                    forward.method.as_str(),
-                    bodyless,
-                    tries_left,
-                ) && let Some(next) = group.pick_excluding(pick.instance(), hash_key)
-                {
-                    state.metrics.inc_retries();
-                    backoff(attempt).await;
-                    attempt += 1;
-                    tries_left -= 1;
-                    pick = next;
-                    continue;
-                }
-                return Ok(synth(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    &fault::UPSTREAM_TIMEOUT,
-                    b"upstream timeout",
-                ));
-            }
-            Some(Err(e)) => {
-                // A connect failure passively ejects (ADR 000017) and is safe to retry for ANY method
-                // (the upstream never received the request, ADR 000023). A non-connect transport
-                // fault is neither a health signal nor retried — only the active prober governs
-                // health then; the request fails closed (the caller maps the error to 502).
-                if e.is_connect() {
-                    pick.record_passive_failure();
-                    if may_retry(
-                        Failure::Connect,
-                        forward.method.as_str(),
-                        bodyless,
-                        tries_left,
-                    ) && let Some(next) = group.pick_excluding(pick.instance(), hash_key)
-                    {
-                        state.metrics.inc_retries();
-                        backoff(attempt).await;
-                        attempt += 1;
-                        tries_left -= 1;
-                        pick = next;
-                        continue;
-                    }
-                }
-                return Err(e.into());
-            }
+        ForwardOutcome::PerTryTimeout => {
+            return Ok(synth(
+                StatusCode::GATEWAY_TIMEOUT,
+                &fault::UPSTREAM_TIMEOUT,
+                b"upstream timeout",
+            ));
         }
+        ForwardOutcome::SendFailed(e) => return Err(e.into()),
+        ForwardOutcome::BuildFailed(e) => return Err(e.into()),
     };
 
     // --- response side: the route's chain in reverse (status / headers only) ---
@@ -518,68 +336,5 @@ async fn proxy_core_inner(
         ))
     } else {
         Ok(http_response(edited))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retriable_5xx_is_the_gateway_class_only() {
-        // ADR 000030: only 502/503/504 (gateway-error class) are retriable; a 500/501 (the origin's
-        // own bug) and non-5xx are taken as-is, so a retry never replays a 500-producing request.
-        for s in [502u16, 503, 504] {
-            assert!(
-                is_retriable_5xx(StatusCode::from_u16(s).unwrap()),
-                "{s} is retriable"
-            );
-        }
-        for s in [500u16, 501, 505, 200, 404, 429] {
-            assert!(
-                !is_retriable_5xx(StatusCode::from_u16(s).unwrap()),
-                "{s} is not retriable"
-            );
-        }
-    }
-
-    #[test]
-    fn jitter_stays_within_the_ceiling() {
-        // Full-jitter (ADR 000030) must never exceed its ceiling; a zero ceiling never waits.
-        assert_eq!(jitter(0), 0, "a zero ceiling yields no wait");
-        for ceiling in [1u64, 25, 250, 1000] {
-            for _ in 0..1000 {
-                assert!(
-                    jitter(ceiling) <= ceiling,
-                    "jitter must stay within ceiling {ceiling}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn idempotent_methods_per_rfc_9110() {
-        for m in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"] {
-            assert!(is_idempotent(m), "{m} is idempotent (RFC 9110 §9.2.2)");
-        }
-        for m in ["POST", "PATCH", "CONNECT", "get", ""] {
-            assert!(!is_idempotent(m), "{m} is not idempotent");
-        }
-    }
-
-    #[test]
-    fn may_retry_gates_on_failure_method_body_and_budget() {
-        // A timeout retries only for an idempotent method (the upstream may have acted).
-        assert!(may_retry(Failure::Timeout, "GET", true, 1));
-        assert!(!may_retry(Failure::Timeout, "POST", true, 1));
-        // A connect failure never reached the upstream → safe for ANY method.
-        assert!(may_retry(Failure::Connect, "POST", true, 1));
-        assert!(may_retry(Failure::Connect, "GET", true, 1));
-        // A bodied request can't be replayed (no buffering) → never retried, either failure.
-        assert!(!may_retry(Failure::Timeout, "GET", false, 1));
-        assert!(!may_retry(Failure::Connect, "POST", false, 1));
-        // Exhausted budget → no retry.
-        assert!(!may_retry(Failure::Timeout, "GET", true, 0));
-        assert!(!may_retry(Failure::Connect, "GET", true, 0));
     }
 }

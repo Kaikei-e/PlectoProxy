@@ -99,6 +99,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 # tracing-subscriber: the binary's JSON log + access-log formatter (ADR 000009 Stage A). Used only
 # by `main.rs` (the lib never installs a subscriber); minimal features keep the footprint small.

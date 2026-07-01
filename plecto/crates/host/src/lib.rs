@@ -1148,15 +1148,12 @@ impl Host {
         // so it streams straight through instead of buffering (fail-closed: presence ⇒ buffer).
         let body_export = component.get_export_index(None, "on-request-body");
 
-        let inner = LoadedInner {
+        let runtime = WasmtimeRuntime {
             engine: engine.clone(),
             kv: self.kv.clone(),
             kv_prefix: format!("{filter_id}{KV_NS_DELIM}"),
-            filter_id: filter_id.to_string(),
-            sink: self.sink.clone(),
             pre,
             body_export,
-            isolation: opts.isolation,
             init_deadline_ms: opts.init_deadline_ms,
             request_deadline_ms: opts.request_deadline_ms,
             max_memory_bytes: opts.max_memory_bytes,
@@ -1175,7 +1172,7 @@ impl Host {
                 // Eager-build ONE instance now so a broken `init` surfaces at load (not on the
                 // first request) and a single-threaded caller then reuses it (init-once holds).
                 // The rest of the pool fills lazily, only when concurrency demands it (ADR 000012).
-                let first = inner.instantiate_initialized()?;
+                let first = runtime.instantiate_initialized()?;
                 Some(TrustedPool::new(
                     cap,
                     Duration::from_millis(opts.checkout_timeout_ms),
@@ -1185,25 +1182,47 @@ impl Host {
             }
         };
 
+        let inner = LoadedInner {
+            runtime,
+            filter_id: filter_id.to_string(),
+            sink: self.sink.clone(),
+            isolation: opts.isolation,
+        };
+
         Ok(LoadedFilter { inner, trusted })
     }
 }
 
-/// Shared, isolation-independent load result.
-struct LoadedInner {
+/// The seam between pool / lifecycle-dispatch DECISION logic (`LoadedInner`, below) and the actual
+/// instance mechanics. Production has exactly one implementation (`WasmtimeRuntime`); tests
+/// substitute a fake to exercise checkout / recycle / circuit-breaker / lifecycle dispatch without
+/// compiling or instantiating any real wasm component. A generic parameter bounded by this trait
+/// (not `Box<dyn FilterRuntime>`) is how callers plug it in — static dispatch, no vtable.
+trait FilterRuntime: Send + Sync {
+    /// A live instance ready to run hooks — opaque to the pool/executor logic below.
+    type Instance: Send;
+    /// Instantiate a fresh instance and run its once-per-instance `init` under the init deadline.
+    fn instantiate_initialized(&self) -> Result<Self::Instance>;
+    /// Reset an instance's per-request state before reuse (pooled path only — a freshly
+    /// instantiated instance from `instantiate_initialized` is already in this state).
+    fn begin_request(&self, instance: &mut Self::Instance);
+    /// Set the per-request epoch deadline before a hook call.
+    fn set_request_deadline(&self, instance: &mut Self::Instance);
+    /// Drain this instance's per-request host-log lines after a call.
+    fn take_logs(&self, instance: &mut Self::Instance) -> Vec<LogLine>;
+}
+
+/// The production `FilterRuntime`: everything needed to instantiate and drive a real wasmtime
+/// component instance for one loaded filter.
+struct WasmtimeRuntime {
     engine: Engine,
     kv: Arc<dyn KvBackend>,
     kv_prefix: String,
-    /// The filter id (span name + telemetry attribute, ADR 000009).
-    filter_id: String,
-    /// Where this filter's per-execution spans go (cloned from the `Host` at load).
-    sink: Arc<dyn TelemetrySink>,
     pre: FilterPre<HostState>,
     /// Export index of the guest's `on-request-body` hook (world `filter-body`), or `None` for a
     /// header-only filter. `Some` is the ONLY signal that makes the fast path buffer the body
     /// (ADR 000038 / ADR 000005 mechanism 2); absence keeps the body on the zero-copy stream path.
     body_export: Option<ComponentExportIndex>,
-    isolation: Isolation,
     init_deadline_ms: u64,
     request_deadline_ms: u64,
     max_memory_bytes: u64,
@@ -1219,7 +1238,7 @@ struct LoadedInner {
     rt: Option<Arc<tokio::runtime::Runtime>>,
 }
 
-impl LoadedInner {
+impl WasmtimeRuntime {
     /// Drive a guest call to completion. A filter without outbound uses the no-reactor `pollster`
     /// (its host-API imports never block); an outbound-using filter uses the tokio runtime so its
     /// `wasi:http` socket I/O is serviced and bounded by `tokio::time::timeout` (ADR 000036).
@@ -1239,7 +1258,7 @@ impl LoadedInner {
     /// here for a body-reading filter (`body_export` is `Some`).
     fn call_body_hook(
         &self,
-        inst: &mut Instance,
+        inst: &mut WasmtimeInstance,
         idx: &ComponentExportIndex,
         body: &[u8],
     ) -> wasmtime::Result<RequestBodyDecision> {
@@ -1261,10 +1280,14 @@ impl LoadedInner {
             None => outbound_http::PlectoHttpHooks::deny_all(),
         }
     }
+}
+
+impl FilterRuntime for WasmtimeRuntime {
+    type Instance = WasmtimeInstance;
 
     /// Instantiate a fresh instance and run `init` once, under the `init` epoch deadline and
     /// the Store memory limit (ADR 000006).
-    fn instantiate_initialized(&self) -> Result<Instance> {
+    fn instantiate_initialized(&self) -> Result<WasmtimeInstance> {
         let mut store = Store::new(
             &self.engine,
             HostState::new(
@@ -1287,23 +1310,61 @@ impl LoadedInner {
         let instance = self.drive(self.pre.instance_pre().instantiate_async(&mut store))?;
         let filter = Filter::new(&mut store, &instance)?;
         self.drive(filter.call_init(&mut store))?;
-        Ok(Instance {
+        Ok(WasmtimeInstance {
             store,
             filter,
             instance,
         })
     }
 
+    fn begin_request(&self, instance: &mut WasmtimeInstance) {
+        instance.store.data_mut().begin_request();
+    }
+
+    fn set_request_deadline(&self, instance: &mut WasmtimeInstance) {
+        instance.store.set_epoch_deadline(self.request_deadline_ms);
+    }
+
+    fn take_logs(&self, instance: &mut WasmtimeInstance) -> Vec<LogLine> {
+        std::mem::take(&mut instance.store.data_mut().logs)
+    }
+}
+
+/// A live, initialized filter instance (its `Store` plus the bound component instance).
+struct WasmtimeInstance {
+    store: Store<HostState>,
+    filter: Filter,
+    /// The raw component instance, kept so the optional `on-request-body` export (world
+    /// `filter-body`, not part of the base `filter` bindgen) can be looked up and called by index.
+    instance: wasmtime::component::Instance,
+}
+
+/// Shared, isolation-independent load result. Generic over the `FilterRuntime` seam so the pool /
+/// lifecycle-dispatch logic here is unit-testable against a fake runtime — production always
+/// resolves `R = WasmtimeRuntime` (`LoadedFilter` is a concrete, non-generic struct built that way).
+struct LoadedInner<R: FilterRuntime> {
+    runtime: R,
+    /// The filter id (span name + telemetry attribute, ADR 000009).
+    filter_id: String,
+    /// Where this filter's per-execution spans go (cloned from the `Host` at load).
+    sink: Arc<dyn TelemetrySink>,
+    isolation: Isolation,
+}
+
+impl<R: FilterRuntime> LoadedInner<R> {
     /// Check out a trusted instance from the pool (ADR 000012): reuse an idle one, lazily build
     /// a fresh one while under `cap`, or — when every instance is checked out — wait up to the
     /// pool's `checkout_timeout` for one to free and then fail **closed** (`Unavailable`).
     /// Also fails closed fast while the pool-wide breaker's cooldown is open. wasmtime's pooling
     /// allocator has no internal wait queue, so this bounded wait is the host-side backpressure
     /// its docs call for.
-    fn checkout(&self, pool: &TrustedPool) -> std::result::Result<PooledInstance, RunError> {
+    fn checkout(
+        &self,
+        pool: &TrustedPool<R::Instance>,
+    ) -> std::result::Result<PooledInstance<R::Instance>, RunError> {
         // The decision made under the lock; acted on (build / return) after releasing it.
-        enum Step {
-            Use(PooledInstance),
+        enum Step<I> {
+            Use(PooledInstance<I>),
             Build,
             Retry,
         }
@@ -1331,7 +1392,7 @@ impl LoadedInner {
             };
             match step {
                 Step::Use(p) => return Ok(p),
-                Step::Build => match self.instantiate_initialized() {
+                Step::Build => match self.runtime.instantiate_initialized() {
                     Ok(instance) => {
                         return Ok(PooledInstance {
                             instance,
@@ -1353,6 +1414,27 @@ impl LoadedInner {
         }
     }
 
+    /// The untrusted lifecycle: instantiate fresh + init, run one call, map errors, take logs.
+    /// Exactly mirrors `run_pooled`'s post-call bookkeeping — the only difference between the two
+    /// lifecycles is whether the instance comes from the pool or is built fresh right here.
+    fn run_fresh<T>(
+        &self,
+        call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+    ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
+        let mut inst = self
+            .runtime
+            .instantiate_initialized()
+            .map_err(RunError::Instantiate)?;
+        self.runtime.set_request_deadline(&mut inst);
+        match call(&mut inst) {
+            Ok(value) => {
+                let logs = self.runtime.take_logs(&mut inst);
+                Ok((value, logs))
+            }
+            Err(e) => Err(RunError::from_call(e)),
+        }
+    }
+
     /// Run one request through the trusted pool (ADR 000012): check out an instance, run `call`
     /// under the per-request deadline, then check it back in — returning it to `idle`, recycling
     /// it once it has served `max_requests_per_instance` (so init re-runs, bounding linear-memory
@@ -1362,21 +1444,18 @@ impl LoadedInner {
     /// instance's memory is undefined, so the discard is per-instance.
     fn run_pooled<T>(
         &self,
-        pool: &TrustedPool,
-        call: impl FnOnce(&mut Instance) -> wasmtime::Result<T>,
+        pool: &TrustedPool<R::Instance>,
+        call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
     ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
         let mut pooled = self.checkout(pool)?;
 
-        pooled.instance.store.data_mut().begin_request();
-        pooled
-            .instance
-            .store
-            .set_epoch_deadline(self.request_deadline_ms);
+        self.runtime.begin_request(&mut pooled.instance);
+        self.runtime.set_request_deadline(&mut pooled.instance);
         let result = call(&mut pooled.instance);
 
         match result {
             Ok(value) => {
-                let logs = std::mem::take(&mut pooled.instance.store.data_mut().logs);
+                let logs = self.runtime.take_logs(&mut pooled.instance);
                 pooled.served = pooled.served.saturating_add(1);
                 if pooled.served >= pool.max_requests_per_instance {
                     // Recycle: drop the Store (returning the slot + freeing memory) BEFORE the
@@ -1411,15 +1490,22 @@ impl LoadedInner {
             }
         }
     }
-}
 
-/// A live, initialized filter instance (its `Store` plus the bound component instance).
-struct Instance {
-    store: Store<HostState>,
-    filter: Filter,
-    /// The raw component instance, kept so the optional `on-request-body` export (world
-    /// `filter-body`, not part of the base `filter` bindgen) can be looked up and called by index.
-    instance: wasmtime::component::Instance,
+    /// Shared executor for on_request / on_request_body / on_response: the ONLY difference
+    /// between the three call sites is `call` itself. `trusted: Option<&TrustedPool<_>>` IS the
+    /// lifecycle decision already (an `Option`, exhaustively matched below) — no separate
+    /// `Lifecycle` enum is introduced, since that would just restate the `Option` with no new
+    /// information.
+    fn run_hook<T>(
+        &self,
+        trusted: Option<&TrustedPool<R::Instance>>,
+        call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+    ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
+        match trusted {
+            Some(pool) => self.run_pooled(pool, call),
+            None => self.run_fresh(call),
+        }
+    }
 }
 
 /// Consecutive trusted-pool traps before the circuit-breaker opens a cooldown (review f000003
@@ -1431,9 +1517,10 @@ const TRUSTED_TRAP_BREAKER_THRESHOLD: u32 = 3;
 const TRUSTED_TRAP_COOLDOWN_MS: u64 = 500;
 
 /// An instance in the trusted pool, plus how many requests it has served since it was last
-/// (re)initialized — the counter that drives recycling (ADR 000012 / §6.6).
-struct PooledInstance {
-    instance: Instance,
+/// (re)initialized — the counter that drives recycling (ADR 000012 / §6.6). Generic over the
+/// `FilterRuntime::Instance` type so the pool is testable against a fake instance.
+struct PooledInstance<I> {
+    instance: I,
     served: u64,
 }
 
@@ -1442,14 +1529,14 @@ struct PooledInstance {
 /// checked-out + being-built), bounding lazy fill to the pool `cap`. The circuit breaker is
 /// **pool-wide**: a deterministically-trapping filter trips the whole pool once, not each
 /// instance independently.
-struct PoolInner {
-    idle: Vec<PooledInstance>,
+struct PoolInner<I> {
+    idle: Vec<PooledInstance<I>>,
     live: usize,
     consecutive_traps: u32,
     cooldown_until_ms: u64,
 }
 
-impl PoolInner {
+impl<I> PoolInner<I> {
     /// Clear the breaker after a successful call (a healthy request resets the trap streak).
     fn clear_breaker(&mut self) {
         self.consecutive_traps = 0;
@@ -1461,22 +1548,22 @@ impl PoolInner {
 /// single-instance-behind-one-`Mutex` placeholder (concurrency=1). Checkout reuses an idle
 /// instance, lazily builds one while under `cap`, or waits up to `checkout_timeout` then fails
 /// closed; `available` is signalled whenever an instance is returned or a slot is freed.
-struct TrustedPool {
-    inner: Mutex<PoolInner>,
+struct TrustedPool<I> {
+    inner: Mutex<PoolInner<I>>,
     available: Condvar,
     cap: usize,
     checkout_timeout: Duration,
     max_requests_per_instance: u64,
 }
 
-impl TrustedPool {
+impl<I> TrustedPool<I> {
     /// Build a pool seeded with one eager, already-initialized instance (so a single-threaded
     /// caller reuses it and `init` stays once). `cap` is the caller's clamped pool size.
     fn new(
         cap: usize,
         checkout_timeout: Duration,
         max_requests_per_instance: u64,
-        first: Instance,
+        first: I,
     ) -> Self {
         Self {
             inner: Mutex::new(PoolInner {
@@ -1505,8 +1592,8 @@ impl TrustedPool {
 /// bounding re-init storms (review f000003 #5). The `Option` is the isolation discriminator —
 /// `None` means untrusted (fresh instance per request).
 pub struct LoadedFilter {
-    inner: LoadedInner,
-    trusted: Option<TrustedPool>,
+    inner: LoadedInner<WasmtimeRuntime>,
+    trusted: Option<TrustedPool<WasmtimeInstance>>,
 }
 
 impl LoadedFilter {
@@ -1520,7 +1607,7 @@ impl LoadedFilter {
     /// ADR 000005 mechanism 2). Detected from the component's exports at load, so it is sound
     /// (fail-closed): a filter cannot read the body without declaring it in the contract.
     pub fn reads_body(&self) -> bool {
-        self.inner.body_export.is_some()
+        self.inner.runtime.body_export.is_some()
     }
 
     /// Run the request-side hook under the request's trace context (`trace`, ADR 000009). The
@@ -1555,32 +1642,11 @@ impl LoadedFilter {
         &self,
         req: &HttpRequest,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
-        match &self.trusted {
-            // trusted: check an instance out of the pool (reuse / lazily build / fail closed).
-            Some(pool) => self.inner.run_pooled(pool, |inst| {
-                self.inner
-                    .drive(inst.filter.call_on_request(&mut inst.store, req))
-            }),
-            // untrusted: fresh instance + init every request (the isolation trade).
-            None => {
-                let mut inst = self
-                    .inner
-                    .instantiate_initialized()
-                    .map_err(RunError::Instantiate)?;
-                inst.store
-                    .set_epoch_deadline(self.inner.request_deadline_ms);
-                match self
-                    .inner
-                    .drive(inst.filter.call_on_request(&mut inst.store, req))
-                {
-                    Ok(decision) => {
-                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                        Ok((decision, logs))
-                    }
-                    Err(e) => Err(RunError::from_call(e)),
-                }
-            }
-        }
+        self.inner.run_hook(self.trusted.as_ref(), |inst| {
+            self.inner
+                .runtime
+                .drive(inst.filter.call_on_request(&mut inst.store, req))
+        })
     }
 
     /// Run the request-side BODY hook (buffer-then-decide, ADR 000025). The host hands the filter
@@ -1618,29 +1684,12 @@ impl LoadedFilter {
         // Header-only filter: no `on-request-body` export, so the body never enters guest memory.
         // The fast path already skips buffering (`reads_body()` is false); this is the defensive
         // floor — pass the body through unchanged without instantiating anything.
-        let Some(idx) = self.inner.body_export.as_ref() else {
+        let Some(idx) = self.inner.runtime.body_export.as_ref() else {
             return Ok((RequestBodyDecision::Continue(body.to_vec()), Vec::new()));
         };
-        match &self.trusted {
-            Some(pool) => self
-                .inner
-                .run_pooled(pool, |inst| self.inner.call_body_hook(inst, idx, body)),
-            None => {
-                let mut inst = self
-                    .inner
-                    .instantiate_initialized()
-                    .map_err(RunError::Instantiate)?;
-                inst.store
-                    .set_epoch_deadline(self.inner.request_deadline_ms);
-                match self.inner.call_body_hook(&mut inst, idx, body) {
-                    Ok(decision) => {
-                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                        Ok((decision, logs))
-                    }
-                    Err(e) => Err(RunError::from_call(e)),
-                }
-            }
-        }
+        self.inner.run_hook(self.trusted.as_ref(), |inst| {
+            self.inner.runtime.call_body_hook(inst, idx, body)
+        })
     }
 
     /// Build and emit the span for one filter execution (ADR 000009). The filter's host-log
@@ -1701,30 +1750,206 @@ impl LoadedFilter {
         &self,
         resp: &HttpResponse,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
-        match &self.trusted {
-            Some(pool) => self.inner.run_pooled(pool, |inst| {
-                self.inner
-                    .drive(inst.filter.call_on_response(&mut inst.store, resp))
-            }),
-            None => {
-                let mut inst = self
-                    .inner
-                    .instantiate_initialized()
-                    .map_err(RunError::Instantiate)?;
-                inst.store
-                    .set_epoch_deadline(self.inner.request_deadline_ms);
-                match self
-                    .inner
-                    .drive(inst.filter.call_on_response(&mut inst.store, resp))
-                {
-                    Ok(decision) => {
-                        let logs = std::mem::take(&mut inst.store.data_mut().logs);
-                        Ok((decision, logs))
-                    }
-                    Err(e) => Err(RunError::from_call(e)),
-                }
+        self.inner.run_hook(self.trusted.as_ref(), |inst| {
+            self.inner
+                .runtime
+                .drive(inst.filter.call_on_response(&mut inst.store, resp))
+        })
+    }
+}
+
+/// Unit tests for the pool / lifecycle-dispatch DECISION logic in `LoadedInner`/`TrustedPool`
+/// against a `FakeRuntime` — no wasmtime engine, component, or Store involved at all. Exercises
+/// checkout/recycle/circuit-breaker/lifecycle semantics that `tests/pool.rs`'s real-component
+/// tests also cover, but with precise, deterministic control over instantiation counts and
+/// failures that a real wasm component cannot give.
+#[cfg(test)]
+mod pool_tests {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct FakeInstance {
+        id: u64,
+    }
+
+    /// A `FilterRuntime` with no wasmtime engine at all: `instantiate_initialized` just hands out
+    /// an incrementing id, so tests can assert exactly how many times an instance was (re)built.
+    struct FakeRuntime {
+        next_id: AtomicU64,
+        instantiate_calls: AtomicUsize,
+    }
+
+    impl FakeRuntime {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(0),
+                instantiate_calls: AtomicUsize::new(0),
             }
         }
+
+        fn instantiate_calls(&self) -> usize {
+            self.instantiate_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FilterRuntime for FakeRuntime {
+        type Instance = FakeInstance;
+
+        fn instantiate_initialized(&self) -> Result<FakeInstance> {
+            self.instantiate_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FakeInstance {
+                id: self.next_id.fetch_add(1, Ordering::SeqCst),
+            })
+        }
+
+        fn begin_request(&self, _instance: &mut FakeInstance) {}
+        fn set_request_deadline(&self, _instance: &mut FakeInstance) {}
+        fn take_logs(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
+            Vec::new()
+        }
+    }
+
+    fn fake_inner(runtime: FakeRuntime) -> LoadedInner<FakeRuntime> {
+        LoadedInner {
+            runtime,
+            filter_id: "test".to_string(),
+            sink: Arc::new(NoopSink),
+            isolation: Isolation::Trusted,
+        }
+    }
+
+    #[test]
+    fn trusted_pool_lazily_fills_and_reuses_idle_instance() {
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(2, Duration::from_millis(50), 1000, first);
+        let inner = fake_inner(runtime);
+
+        let a = inner
+            .run_hook(Some(&pool), |inst: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+            .unwrap();
+        let b = inner
+            .run_hook(Some(&pool), |inst: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+            .unwrap();
+
+        assert_eq!(
+            a.0, b.0,
+            "a single-threaded caller reuses the same instance"
+        );
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            1,
+            "only the eager initial build — no rebuild needed to reuse an idle instance"
+        );
+    }
+
+    #[test]
+    fn trusted_pool_checkout_waits_then_fails_closed_when_saturated() {
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(1, Duration::from_millis(20), 1000, first);
+        let inner = fake_inner(runtime);
+
+        let _held = inner.checkout(&pool).expect("first checkout succeeds");
+        let failed_closed = matches!(inner.checkout(&pool), Err(RunError::Unavailable));
+
+        assert!(
+            failed_closed,
+            "a saturated pool should time out and fail closed"
+        );
+    }
+
+    #[test]
+    fn trusted_pool_recycles_after_max_requests_per_instance() {
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(4, Duration::from_millis(50), 2, first);
+        let inner = fake_inner(runtime);
+
+        for _ in 0..2 {
+            inner
+                .run_hook(Some(&pool), |inst: &mut FakeInstance| {
+                    Ok::<_, wasmtime::Error>(inst.id)
+                })
+                .unwrap();
+        }
+        // the 2nd call above hit max_requests_per_instance and recycled the instance, so this
+        // 3rd call must rebuild — one more instantiate than the initial eager build.
+        inner
+            .run_hook(Some(&pool), |inst: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+            .unwrap();
+
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            2,
+            "instance recycles (rebuilds) after serving max_requests_per_instance"
+        );
+    }
+
+    #[test]
+    fn trusted_pool_opens_circuit_breaker_after_consecutive_traps_and_cools_down_then_self_heals() {
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(4, Duration::from_millis(50), 1000, first);
+        let inner = fake_inner(runtime);
+
+        for _ in 0..TRUSTED_TRAP_BREAKER_THRESHOLD {
+            let result = inner.run_hook(Some(&pool), |_inst: &mut FakeInstance| {
+                wasmtime::Result::<()>::Err(wasmtime::Error::msg("simulated trap"))
+            });
+            assert!(
+                matches!(result, Err(RunError::Trap(_))),
+                "expected a Trap before the breaker opens, got {result:?}"
+            );
+        }
+
+        // breaker open: `call` must not even be invoked while the cooldown is in effect.
+        let result = inner.run_hook(
+            Some(&pool),
+            |_inst: &mut FakeInstance| -> wasmtime::Result<()> {
+                panic!("must not be called while the circuit breaker is open")
+            },
+        );
+        assert!(
+            matches!(result, Err(RunError::Unavailable)),
+            "the pool-wide breaker should be open"
+        );
+
+        std::thread::sleep(Duration::from_millis(TRUSTED_TRAP_COOLDOWN_MS + 20));
+        let result = inner.run_hook(Some(&pool), |inst: &mut FakeInstance| {
+            Ok::<_, wasmtime::Error>(inst.id)
+        });
+        assert!(
+            result.is_ok(),
+            "the pool should self-heal (rebuild) once the cooldown elapses, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn untrusted_lifecycle_instantiates_fresh_every_call() {
+        let runtime = FakeRuntime::new();
+        let inner = fake_inner(runtime);
+
+        for _ in 0..3 {
+            inner
+                .run_hook(None, |inst: &mut FakeInstance| {
+                    Ok::<_, wasmtime::Error>(inst.id)
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            3,
+            "the untrusted lifecycle instantiates fresh + re-inits on every single call"
+        );
     }
 }
 

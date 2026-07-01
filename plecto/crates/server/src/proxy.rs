@@ -19,7 +19,7 @@ use crate::body::{
     INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body, empty_req, req_full,
 };
 use crate::headers::{copy_headers_preserving, headers_to_vec, set_forwarded, to_http_request};
-use crate::respond::{http_response, stream_response, synth, synth_retry_after};
+use crate::respond::{fault, http_response, stream_response, synth, synth_retry_after};
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
 
 /// A retryable upstream failure (ADR 000023). A timeout may already have been acted on by the
@@ -168,7 +168,7 @@ async fn proxy_core_inner(
         None => {
             return Ok(synth(
                 StatusCode::BAD_REQUEST,
-                "bad-path",
+                &fault::BAD_PATH,
                 b"bad request path",
             ));
         }
@@ -198,7 +198,7 @@ async fn proxy_core_inner(
     // Match against the full request — host, path, method, headers, query (ADR 000034); the most
     // specific route wins. `http_req` carries the forwarded-header-corrected inbound request.
     let Some(route) = snapshot.find_route(&http_req) else {
-        return Ok(synth(StatusCode::NOT_FOUND, "no-route", b"no route"));
+        return Ok(synth(StatusCode::NOT_FOUND, &fault::NO_ROUTE, b"no route"));
     };
     let idx = route.index;
 
@@ -212,7 +212,7 @@ async fn proxy_core_inner(
         state.metrics.inc_rate_limited();
         return Ok(synth_retry_after(
             StatusCode::TOO_MANY_REQUESTS,
-            "rate-limited",
+            &fault::RATE_LIMITED,
             b"rate limit exceeded",
             retry_after_ms.div_ceil(1000),
         ));
@@ -237,7 +237,7 @@ async fn proxy_core_inner(
     let Some(group) = route.pick_upstream() else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no-healthy-upstream",
+            &fault::NO_HEALTHY_UPSTREAM,
             b"no healthy upstream",
         ));
     };
@@ -294,14 +294,14 @@ async fn proxy_core_inner(
             Ok(None) => {
                 return Ok(synth(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "body-too-large",
+                    &fault::BODY_TOO_LARGE,
                     b"request body too large",
                 ));
             }
             Err(_) => {
                 return Ok(synth(
                     StatusCode::REQUEST_TIMEOUT,
-                    "body-timeout",
+                    &fault::BODY_TIMEOUT,
                     b"request body read timeout",
                 ));
             }
@@ -326,7 +326,7 @@ async fn proxy_core_inner(
             state.metrics.inc_circuit_open();
             return Ok(synth(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "circuit-open",
+                &fault::CIRCUIT_OPEN,
                 b"upstream overloaded",
             ));
         }
@@ -339,7 +339,7 @@ async fn proxy_core_inner(
     let Some(mut pick) = group.pick(hash_key) else {
         return Ok(synth(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no-healthy-upstream",
+            &fault::NO_HEALTHY_UPSTREAM,
             b"no healthy upstream",
         ));
     };
@@ -355,7 +355,7 @@ async fn proxy_core_inner(
                 if now >= deadline {
                     return Ok(synth(
                         StatusCode::GATEWAY_TIMEOUT,
-                        "request-timeout",
+                        &fault::REQUEST_TIMEOUT,
                         b"request timeout",
                     ));
                 }
@@ -443,7 +443,7 @@ async fn proxy_core_inner(
                 {
                     return Ok(synth(
                         StatusCode::GATEWAY_TIMEOUT,
-                        "request-timeout",
+                        &fault::REQUEST_TIMEOUT,
                         b"request timeout",
                     ));
                 }
@@ -463,7 +463,7 @@ async fn proxy_core_inner(
                 }
                 return Ok(synth(
                     StatusCode::GATEWAY_TIMEOUT,
-                    "upstream-timeout",
+                    &fault::UPSTREAM_TIMEOUT,
                     b"upstream timeout",
                 ));
             }

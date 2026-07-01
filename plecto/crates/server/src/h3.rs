@@ -19,7 +19,7 @@ use hyper::{Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
 
 use crate::proxy::proxy_core;
-use crate::respond::synth;
+use crate::respond::{fault, synth};
 use crate::{BoxError, MAX_CONCURRENT_STREAMS, ServerState};
 
 /// Build the QUIC `Endpoint` for HTTP/3 from control's QUIC TLS config, bound on the same port
@@ -115,7 +115,7 @@ async fn handle_h3_request(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "h3 fast-path error");
-            synth(StatusCode::BAD_GATEWAY, "upstream", b"upstream error")
+            synth(StatusCode::BAD_GATEWAY, &fault::UPSTREAM, b"upstream error")
         }
     };
 

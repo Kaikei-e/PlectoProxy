@@ -21,6 +21,19 @@
 //! streams straight back — filters see response headers / status only (they may synthesise a
 //! short-circuit body of their own).
 
+// Hot-path discipline (bp-rust): no unwrap/expect/panic/indexing on the data plane. Exempted
+// under `cfg(test)` — this crate's own `#[cfg(test)] mod` blocks legitimately use them;
+// `tests/*.rs` integration tests are separate crates and are never subject to this attribute.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 mod access_log;
 mod admin;
 mod body;

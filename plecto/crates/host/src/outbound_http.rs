@@ -151,9 +151,9 @@ impl PlectoHttpHooks {
             let _permit = permit; // held for the whole call, bounding concurrency
             let outcome = timeout(total, async move {
                 let addrs = resolver.resolve(&host, port).await.map_err(|_| dns_err())?;
-                if addrs.is_empty() {
+                let Some(&first_addr) = addrs.first() else {
                     return Err(dns_err());
-                }
+                };
                 // Verify EVERY resolved address; a legitimate endpoint resolves only to allowed
                 // space. A mix (e.g. a rebinding A-record set) is rejected wholesale.
                 for addr in &addrs {
@@ -162,7 +162,7 @@ impl PlectoHttpHooks {
                     }
                 }
                 connect_and_send(
-                    addrs[0],
+                    first_addr,
                     &host,
                     use_tls,
                     connect_timeout,
@@ -337,8 +337,9 @@ fn client_config() -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let cfg = Arc::new(cfg);
-    let _ = CFG.set(cfg);
-    Ok(CFG.get().expect("just set").clone())
+    // Build-then-store-then-fetch in one step: no separate "set, then unwrap the get" — a losing
+    // racer's freshly-built `cfg` is simply discarded in favour of whichever thread's `set` won.
+    Ok(CFG.get_or_init(|| cfg).clone())
 }
 
 /// DNS resolver seam: the system resolver in production; a static map in tests so the

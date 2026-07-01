@@ -3,12 +3,36 @@
 //! status / header can never panic the data plane.
 
 use hyper::body::Incoming;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Response, StatusCode};
 use plecto_control::{Header, HttpResponse};
 
 use crate::ResponseBody;
 use crate::body::{full, stream};
 use crate::headers::{copy_headers, copy_headers_preserving};
+
+const X_PLECTO_FAULT: HeaderName = HeaderName::from_static("x-plecto-fault");
+const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
+
+/// Static `x-plecto-fault` marker values for [`synth`] / [`synth_retry_after`]. `static` (not a
+/// bare literal) so every call site passes an already compile-time-validated `&'static
+/// HeaderValue` — `synth` itself then has no fallible header-build step left (bp-rust: no
+/// hot-path `.expect()`).
+pub(crate) mod fault {
+    use hyper::header::HeaderValue;
+
+    pub(crate) static BAD_PATH: HeaderValue = HeaderValue::from_static("bad-path");
+    pub(crate) static NO_ROUTE: HeaderValue = HeaderValue::from_static("no-route");
+    pub(crate) static RATE_LIMITED: HeaderValue = HeaderValue::from_static("rate-limited");
+    pub(crate) static NO_HEALTHY_UPSTREAM: HeaderValue =
+        HeaderValue::from_static("no-healthy-upstream");
+    pub(crate) static BODY_TOO_LARGE: HeaderValue = HeaderValue::from_static("body-too-large");
+    pub(crate) static BODY_TIMEOUT: HeaderValue = HeaderValue::from_static("body-timeout");
+    pub(crate) static CIRCUIT_OPEN: HeaderValue = HeaderValue::from_static("circuit-open");
+    pub(crate) static REQUEST_TIMEOUT: HeaderValue = HeaderValue::from_static("request-timeout");
+    pub(crate) static UPSTREAM_TIMEOUT: HeaderValue = HeaderValue::from_static("upstream-timeout");
+    pub(crate) static UPSTREAM: HeaderValue = HeaderValue::from_static("upstream");
+}
 
 /// A synthesised response (short-circuit / fail-closed) → a hyper `Response` with a buffered body.
 pub(crate) fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
@@ -39,33 +63,34 @@ pub(crate) fn stream_response(
 }
 
 /// A small fail-closed response with an `x-plecto-fault` marker (404 no-route, 502 upstream).
+/// Infallible by construction: builds the `Response` directly (never via the fallible
+/// `Response::builder()...body()` path) and only ever inserts a compile-time-checked `fault`.
 pub(crate) fn synth(
     status: StatusCode,
-    fault: &str,
+    fault: &'static HeaderValue,
     body: &'static [u8],
 ) -> Response<ResponseBody> {
-    Response::builder()
-        .status(status)
-        .header("x-plecto-fault", fault)
-        .body(full(body.to_vec()))
-        .expect("static synth response is always valid")
+    let mut resp = Response::new(full(body.to_vec()));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(X_PLECTO_FAULT, fault.clone());
+    resp
 }
 
 /// Like [`synth`] but also carries a `Retry-After` (seconds) hint — for the native rate-limit 429
-/// (ADR 000033), where the limiter knows when a token next frees up. The value is a decimal integer,
-/// always a valid header value, so the builder still cannot fail.
+/// (ADR 000033), where the limiter knows when a token next frees up. `retry_after_secs` is the one
+/// genuinely computed value here; a decimal-integer string is always a valid `HeaderValue`, but the
+/// fallback keeps this function infallible even if that were ever not the case.
 pub(crate) fn synth_retry_after(
     status: StatusCode,
-    fault: &str,
+    fault: &'static HeaderValue,
     body: &'static [u8],
     retry_after_secs: u64,
 ) -> Response<ResponseBody> {
-    Response::builder()
-        .status(status)
-        .header("x-plecto-fault", fault)
-        .header("retry-after", retry_after_secs.to_string())
-        .body(full(body.to_vec()))
-        .expect("static synth response is always valid")
+    let mut resp = synth(status, fault, body);
+    let retry_after = HeaderValue::from_str(&retry_after_secs.to_string())
+        .unwrap_or_else(|_| HeaderValue::from_static("0"));
+    resp.headers_mut().insert(RETRY_AFTER, retry_after);
+    resp
 }
 
 #[cfg(test)]

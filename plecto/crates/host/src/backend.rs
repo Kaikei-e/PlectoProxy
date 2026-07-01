@@ -119,6 +119,7 @@ pub fn apply_bucket(
 }
 
 /// Decode a stored counter (tolerant of short/empty values: missing == 0).
+#[allow(clippy::indexing_slicing)] // n = bytes.len().min(8), so buf[..n]/bytes[..n] are always in-bounds
 fn decode_i64(bytes: &[u8]) -> i64 {
     let mut buf = [0u8; 8];
     let n = bytes.len().min(8);
@@ -127,6 +128,7 @@ fn decode_i64(bytes: &[u8]) -> i64 {
 }
 
 /// Decode bucket state `(tokens, last_refill_ms)` from 16 LE bytes (None if malformed).
+#[allow(clippy::indexing_slicing)] // length is checked (== 16) three lines above
 fn decode_bucket(bytes: &[u8]) -> Option<(u64, u64)> {
     if bytes.len() != 16 {
         return None;

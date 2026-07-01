@@ -21,6 +21,19 @@
 //! stays **deny-by-default**: it lends ONLY the plecto host-API (log / clock / kv /
 //! counter / ratelimit). No WASI, network, filesystem, or sockets (ADR 000006).
 
+// Hot-path discipline (bp-rust): no unwrap/expect/panic/indexing on the data plane. Exempted
+// under `cfg(test)` — this crate's own `#[cfg(test)] mod tests` blocks legitimately use them;
+// `tests/*.rs` integration tests are separate crates and are never subject to this attribute.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 mod backend;
 mod observe;
 // Experimental streaming body filter (direction_0003 gates 1+2), OFF by default. A descendant of the
@@ -1723,6 +1736,7 @@ impl LoadedFilter {
 /// need it `pub`, but it is not part of the supported surface.
 #[doc(hidden)]
 #[cfg(feature = "test-support")]
+#[allow(clippy::expect_used)] // dev/test-only fixture loader (test-support feature); not data-plane code
 pub mod test_support {
     use super::TrustPolicy;
     use anyhow::{Result, anyhow};

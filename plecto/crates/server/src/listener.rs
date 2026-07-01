@@ -24,7 +24,7 @@ use crate::h3::{build_h3_endpoint, serve_h3};
 use crate::health::serve_health_checks;
 use crate::metrics::ServerMetrics;
 use crate::proxy::proxy_core;
-use crate::respond::synth;
+use crate::respond::{fault, synth};
 use crate::{
     MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, ResponseBody, ServerState, admin, upstream_connector,
 };
@@ -188,7 +188,7 @@ async fn handle(
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(error = %e, "fast-path error");
-                synth(StatusCode::BAD_GATEWAY, "upstream", b"upstream error")
+                synth(StatusCode::BAD_GATEWAY, &fault::UPSTREAM, b"upstream error")
             }
         };
     // Advertise HTTP/3 on TCP responses (ADR 000016); h3 responses are not tagged (already h3).

@@ -1714,6 +1714,13 @@ pub mod test_support {
         std::fs::read(env!("FILTER_APIKEY_COMPONENT")).expect("read filter-apikey component")
     }
 
+    /// The compiled `filter-quickstart` component bytes — the minimal starter filter (stamps one
+    /// response header) behind the `quickstart` example, built by this crate's `build.rs`.
+    pub fn filter_quickstart_component() -> Vec<u8> {
+        std::fs::read(env!("FILTER_QUICKSTART_COMPONENT"))
+            .expect("read filter-quickstart component")
+    }
+
     /// The compiled `filter-noop` component bytes — the "pure WASM no-op" rung of the benchmark
     /// cost ladder (no host-API calls), built by this crate's `build.rs`.
     pub fn filter_noop_component() -> Vec<u8> {

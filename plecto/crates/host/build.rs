@@ -14,10 +14,12 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let crates = manifest.parent().unwrap(); // plecto/crates
     let plecto = crates.parent().unwrap(); // plecto
+    let repo_root = plecto.parent().unwrap(); // repo root (holds bench/)
     let wit = plecto.join("wit"); // plecto/wit
     // The example filter guests live OUTSIDE the workspace, under examples/filters/ (each its own
-    // workspace), built here for wasm32 and componentized.
+    // workspace), built here for wasm32 and componentized. Benchmark-only guests live under bench/.
     let filters = plecto.join("examples").join("filters");
+    let bench_filters = repo_root.join("bench").join("filters");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
@@ -39,10 +41,19 @@ fn main() {
         "filter_apikey",
         "FILTER_APIKEY_COMPONENT",
     );
-    // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API calls).
+    // filter-quickstart is the minimal starter filter behind the `quickstart` example.
     build_component(
         &cargo,
-        &filters.join("filter-noop"),
+        &filters.join("filter-quickstart"),
+        &out_dir,
+        "filter_quickstart",
+        "FILTER_QUICKSTART_COMPONENT",
+    );
+    // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API calls).
+    // It is benchmark-only, so it lives under bench/filters/, not examples/.
+    build_component(
+        &cargo,
+        &bench_filters.join("filter-noop"),
         &out_dir,
         "filter_noop",
         "FILTER_NOOP_COMPONENT",

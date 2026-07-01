@@ -1,0 +1,17 @@
+# filter-quickstart — the simplest useful `plecto:filter`, for the 5-minute starter demo
+# (examples/quickstart). Built for wasm32-unknown-unknown and componentized by crates/host/build.rs
+# (ADR 000010), like filter-hello / filter-apikey. Declares its own [workspace] so the native
+# plecto/ workspace never absorbs it into a host-target build.
+[package]
+name = "filter-quickstart"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[workspace]

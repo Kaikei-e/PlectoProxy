@@ -240,9 +240,9 @@ cargo run -p plecto-server --example <name>   # Ctrl-C で停止
 | `tls-http` | 同一ポートで TLS 終端＋HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）、`Alt-Svc` による h3 広告。 |
 | `hot-reload` | manifest を編集して `kill -HUP <pid>`、無停止で設定をアトミックに差し替え（壊れた編集は fail-closed）。 |
 
-まず読むなら `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
+初めてなら [`examples/README.md`](examples/README.md) から —— 5 分の `quickstart` から上記のリアルなユースケースまでの学習パス。あるいはまず `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
 
-`examples/` にはデモではない micro-benchmark が 2 つ（`wasm-bench` と `edge-bench`）あり、[performance](performance/README.md) の数値を生む。
+ベンチマーク・ハーネス（`wasm-bench` / `edge-bench`）はデモではなく [`bench/harnesses/`](bench/) 配下にあり、[performance](performance/README.md) の数値を生む。
 
 ## ロードマップ
 

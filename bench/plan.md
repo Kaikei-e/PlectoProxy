@@ -52,7 +52,7 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
 | `ratelimit` | host token-bucket（ADR 000026）: overhead / enforcement / per-key fairness | k6 | `ratelimit_{overhead,enforce,fairness}.csv` | 許可 rps が refill rate に収束・hot key が light key を starve しない |
 | `body` | request-body hook（ADR 000025）の buffer-then-decide コスト + payload sweep | k6 | `body.csv` | hook の payload 比例コスト・streaming passthrough との対比 |
 
-> `ratelimit` と `body` は `examples/edge-bench`（`filter-hello` ベース）で駆動。bucket spec は manifest
+> `ratelimit` と `body` は `bench/harnesses/edge-bench`（`filter-hello` ベース）で駆動。bucket spec は manifest
 > （`RL_CAPACITY` / `RL_REFILL_TOKENS` / `RL_REFILL_INTERVAL_MS`）で host 設定（ADR 000026）。enforcement/
 > fairness は tight bucket、overhead は never-deny bucket を流す。
 

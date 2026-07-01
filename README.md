@@ -243,9 +243,9 @@ cargo run -p plecto-server --example <name>   # Ctrl-C to stop
 | `tls-http` | TLS termination with HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC) on one port, plus `Alt-Svc` h3 advertisement. |
 | `hot-reload` | Edit the manifest, `kill -HUP <pid>`, and watch the config swap atomically with zero downtime (a broken edit is fail-closed). |
 
-Read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
+New here? Start with [`examples/README.md`](examples/README.md) — a guided path from a 5-minute `quickstart` up through the real use cases above. Or read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
 
-Two more examples under `examples/` are micro-benchmarks rather than demos — `wasm-bench` and `edge-bench` — and produce the numbers in [performance](performance/README.md).
+The benchmark harnesses (`wasm-bench`, `edge-bench`) are not demos — they live under [`bench/harnesses/`](bench/) and produce the numbers in [performance](performance/README.md).
 
 ## Roadmap
 

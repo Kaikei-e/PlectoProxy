@@ -24,6 +24,11 @@ path = "src/main.rs"
 # Runnable, use-case-focused demos live at the workspace-level `examples/` dir (a sibling of
 # `crates/`), each its own `examples/<name>/main.rs`, but built as examples of this package so they
 # can use plecto-server + its dev-dependencies. Run with `cargo run -p plecto-server --example <name>`.
+# See examples/README.md for the guided path (start with `quickstart`).
+[[example]]
+name = "quickstart"
+path = "../../examples/quickstart/main.rs"
+
 [[example]]
 name = "load-balancing"
 path = "../../examples/load-balancing/main.rs"
@@ -44,7 +49,8 @@ path = "../../examples/wasm-auth/main.rs"
 # Benchmark harness: baseline vs pooled vs on-demand filter on one backend (see performance/).
 [[example]]
 name = "wasm-bench"
-path = "../../examples/wasm-bench/main.rs"
+# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md).
+path = "../../../bench/harnesses/wasm-bench/main.rs"
 
 [[example]]
 name = "hot-reload"
@@ -53,7 +59,8 @@ path = "../../examples/hot-reload/main.rs"
 # Benchmark harness: host rate-limit (ADR 000026) + request-body hook (ADR 000025) on one filter.
 [[example]]
 name = "edge-bench"
-path = "../../examples/edge-bench/main.rs"
+# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md).
+path = "../../../bench/harnesses/edge-bench/main.rs"
 
 [dependencies]
 plecto-control = { path = "../control" }

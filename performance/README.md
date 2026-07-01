@@ -255,7 +255,7 @@ load-bearing; this is the plaintext analogue of the TLS handshake-per-request ro
 
 Plecto runs each request's *decision* — auth, rewriting, rate limiting, policy — as a sandboxed
 **WebAssembly Component Model filter**, not native proxy code. This measures what that costs,
-changing only **how the decision runs**. The bundled `examples/wasm-bench` serves a **ladder** of
+changing only **how the decision runs**. The bundled `bench/harnesses/wasm-bench` serves a **ladder** of
 routes — all forwarding to the **same** backend — so each adjacent delta isolates one cost (the full
 table is in [the cost ladder](#the-wasm-cost-ladder--isolating-each-cost) below): a native `/baseline`,
 a pure no-op WASM filter pooled vs fresh (`/noop-pooled`, `/noop-fresh`), and the real `filter-apikey`
@@ -348,7 +348,7 @@ Plecto's rate limiter is a **host-native token bucket** (ADR 000026): the bucket
 (`capacity` / `refill_tokens` / `refill_interval_ms`) is configured **in the operator's manifest**,
 not by the filter — an untrusted filter passes only `(key, cost)` and so cannot widen its own limit.
 The refill + counting stay host-side (the WASM boundary is not crossed on the hot path); the filter
-only decides *whether* to consult the limiter and *on what key*. Driven through `examples/edge-bench`
+only decides *whether* to consult the limiter and *on what key*. Driven through `bench/harnesses/edge-bench`
 (`filter-hello`, pooled); a `429` carries `retry-after-ms`.
 
 ### Overhead — the cost of consulting the bucket
@@ -430,7 +430,7 @@ zero-copy bypass for header-only filters is a follow-up — v1 buffers whenever 
 
 ## Footprint
 
-Idle resident set and the marginal cost of an open connection (`examples/wasm-bench`):
+Idle resident set and the marginal cost of an open connection (`bench/harnesses/wasm-bench`):
 
 | Metric | Value |
 | --- | --- |

@@ -52,8 +52,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:
           toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
-          # wasm32-unknown-unknown: plecto-host's build.rs builds the header-only guest fixtures the
-          # WASM micro-bench loads (filter-hello / filter-noop).
+          # wasm32-unknown-unknown: plecto-host's build.rs builds the header-only guest fixture the
+          # WASM micro-bench loads (filter-hello).
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:

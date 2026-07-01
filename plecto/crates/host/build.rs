@@ -39,6 +39,14 @@ fn main() {
         "filter_apikey",
         "FILTER_APIKEY_COMPONENT",
     );
+    // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API calls).
+    build_component(
+        &cargo,
+        &filters.join("filter-noop"),
+        &out_dir,
+        "filter_noop",
+        "FILTER_NOOP_COMPONENT",
+    );
 
     // Experimental streaming body filter (feature `streaming-body`, OFF by default): build the
     // filter-streaming guest for wasm32-wasip2, which emits a Component directly (no wit-component

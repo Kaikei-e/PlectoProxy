@@ -1714,6 +1714,12 @@ pub mod test_support {
         std::fs::read(env!("FILTER_APIKEY_COMPONENT")).expect("read filter-apikey component")
     }
 
+    /// The compiled `filter-noop` component bytes — the "pure WASM no-op" rung of the benchmark
+    /// cost ladder (no host-API calls), built by this crate's `build.rs`.
+    pub fn filter_noop_component() -> Vec<u8> {
+        std::fs::read(env!("FILTER_NOOP_COMPONENT")).expect("read filter-noop component")
+    }
+
     /// The compiled `filter-extauthz` component bytes — the outbound-HTTP example (an ext_authz-style
     /// gate), built by this crate's `build.rs` when the `outbound-http` feature is on (ADR 000036).
     #[cfg(feature = "outbound-http")]

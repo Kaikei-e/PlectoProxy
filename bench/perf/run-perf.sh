@@ -151,18 +151,22 @@ phase_ejection(){
 
 # ---------------------------------------------------------------- Phase 3 WASM
 phase_wasm(){
-  log "Phase 3.1 — WASM overhead (oha 50c, 0 ms backend) -> wasm_overhead.csv"
+  log "Phase 3.1 — WASM cost ladder (oha 50c, 0 ms backend) -> wasm_overhead.csv"
   launch wasm-bench "$WASM_ADDR" "http://$WASM_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
   local tmp; tmp="$(mktemp -d)"
-  for r in baseline trusted ondemand; do
-    local hdr=(); [[ "$r" != baseline ]] && hdr=(-H "x-api-key: alice-secret")
+  # The isolated cost ladder over one backend; adjacent deltas isolate one cost each:
+  #   baseline(native) -> noop-pooled(dispatch+acquire) -> noop-fresh(instantiation) ->
+  #   trusted(a real filter's work) -> ondemand(that filter fresh-per-request).
+  local ladder=(baseline noop-pooled noop-fresh trusted ondemand)
+  for r in "${ladder[@]}"; do
+    local hdr=(); [[ "$r" == trusted || "$r" == ondemand ]] && hdr=(-H "x-api-key: alice-secret")
     gen "$OHA" -z 60s -c 50 --no-tui --output-format json "${hdr[@]}" \
       "http://$WASM_ADDR/$r/x" > "$tmp/$r.json" 2>/dev/null
     echo "  /$r -> $(oha_row "$tmp/$r.json")"
   done
   stop_proxy
   { echo "route,rps,p50,p90,p95,p99"
-    for r in baseline trusted ondemand; do
+    for r in "${ladder[@]}"; do
       read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/$r.json")"
       echo "$r,$rps,$p50,$p90,$p95,$p99"
     done; } > "$DATA/wasm_overhead.csv"
@@ -336,12 +340,48 @@ phase_churn(){
   cat "$DATA/churn.csv"
 }
 
+# ---------------------------------------------------------------- Phase 4b HTTP/3 functional check
+phase_h3(){
+  # HTTP/3 is a first-class server feature (tls-http serves it over QUIC). A rigorous, CO-safe H3
+  # LOAD benchmark needs an H3-capable open-loop generator (e.g. Nighthawk); oha and k6 lack native
+  # H3, so we VERIFY H3 works end-to-end here and defer the load numbers (see performance/README.md).
+  log "Phase 4b — HTTP/3 functional check (curl --http3-only over QUIC) -> h3.txt"
+  curl --version 2>/dev/null | grep -qi HTTP3 || { echo "curl lacks HTTP/3; skipping" | tee "$DATA/h3.txt"; return 0; }
+  launch tls-http "$TLS_ADDR" "" || return 1
+  for _ in $(seq 40); do curl -fsS -k "https://$TLS_ADDR/api/hello" >/dev/null 2>&1 && break; sleep 0.25; done
+  local out
+  out=$(curl -k -s -o /dev/null -w 'status=%{http_code} http_version=%{http_version}' --http3-only "https://$TLS_ADDR/api/hello" 2>/dev/null)
+  stop_proxy
+  echo "curl --http3-only /api/hello -> $out" | tee "$DATA/h3.txt"
+}
+
+# ---------------------------------------------------------------- Phase 9 weighted request mix
+phase_mix(){
+  log "Phase 9 — weighted request mix (k6 open-loop, 80/15/5 read/write/large across routes) -> mix.csv"
+  launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" RESP_BYTES=1024 || return 1
+  local tmp; tmp="$(mktemp -d)"
+  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e RATE="${MIX_RATE:-20000}" -e DUR=60s -e OUT="$tmp/mix.json" \
+    "$BENCH/k6/weighted-mix.js" 2>&1 | tail -2
+  stop_proxy
+  python3 -c '
+import json,csv,sys
+d=json.load(open(sys.argv[1]))
+with open(sys.argv[2],"w",newline="") as o:
+    w=csv.writer(o); w.writerow(["class","p50","p99","p99_9"])
+    w.writerow(["read",round(d["read_p50"],3),round(d["read_p99"],3),round(d["read_p99_9"],3)])
+    w.writerow(["write",round(d["write_p50"],3),round(d["write_p99"],3),""])
+    w.writerow(["large",round(d["large_p50"],3),round(d["large_p99"],3),""])
+print("wrote mix.csv (offered %.0f rps, dropped %d)"%(d["offered_rps"],d["dropped"]))
+' "$tmp/mix.json" "$DATA/mix.csv"
+  cat "$DATA/mix.csv"
+}
+
 case "${1:-all}" in
   sweep) phase_sweep;; openloop) phase_openloop;; rr) phase_rr;; ejection) phase_ejection;;
-  wasm) phase_wasm;; tls) phase_tls;; footprint) phase_footprint;;
-  ratelimit) phase_ratelimit;; body) phase_body;; churn) phase_churn;;
-  all) phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_wasm; phase_tls; \
-       phase_ratelimit; phase_body; phase_churn; phase_footprint;;
+  wasm) phase_wasm;; tls) phase_tls;; h3) phase_h3;; footprint) phase_footprint;;
+  ratelimit) phase_ratelimit;; body) phase_body;; churn) phase_churn;; mix) phase_mix;;
+  all) phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_wasm; phase_tls; phase_h3; \
+       phase_ratelimit; phase_body; phase_churn; phase_mix; phase_footprint;;
   *) echo "unknown phase: $1"; exit 2;;
 esac
 log "done: $1"

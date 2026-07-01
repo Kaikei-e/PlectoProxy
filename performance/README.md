@@ -57,15 +57,15 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 **WASM extension plane** (the cost of running a decision as a sandboxed component; oha / k6):
 
-- A **pooled** filter (init-once, instances reused) adds **~1.9 µs of CPU per request** on the hot
-  path and **+0.14 ms p99** versus a no-filter native baseline (~21 % of throughput at this run's
-  ~145k req/s). The **µs/req is the portable figure**; the percentage shrinks as the rest of the
-  request gets heavier.
-- The **same** filter run **fresh-per-request** falls to ~9.1k req/s vs ~114k pooled — a **~12×
-  difference**, the cost of re-paying `init` on every request.
+- A **cost ladder** isolates each cost by adjacent delta. The **irreducible dispatch floor** — a pure
+  no-op WASM filter, pooled — is **≈ 1.2 µs/req (−15 % throughput)** over the native baseline; a **real
+  filter's own work** (`filter-apikey`: header + host-KV + counter) adds only **another −5 %**; and
+  running that filter **fresh-per-request** instead of pooled costs **~15×** throughput — the price of
+  re-paying `init` every request, and the value of pooling. The **µs/req is the portable figure**.
+- These macro deltas **reconcile with the criterion [micro-benchmarks](#0-micro-benchmarks-in-process-criterion)**
+  (pooled call ~2.4 µs, fresh ~30 µs) — the two layers agree.
 - A rejected request (**HTTP 401 short-circuit**) is decided in **~0.3 ms and never reaches the
-  backend** — bad traffic is shed **~60× faster** than good traffic is forwarded through a 15 ms
-  backend.
+  backend** — bad traffic is shed **~60× faster** than good traffic is forwarded through a 15 ms backend.
 
 **Host-enforced rate limiting** (token bucket, spec host-configured in the manifest; k6):
 
@@ -101,6 +101,38 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 - **No comparative claims.** Mature proxies are referenced only for shared methodology, never ranking.
 - Charts rendered with matplotlib → WebP; an optional InfluxDB + Grafana stack (`INFLUX=1`) provides
   live dashboards during k6 runs (its images are a one-time setup pull; the load stays on loopback).
+
+---
+
+# 0. Micro-benchmarks (in-process, criterion)
+
+A deterministic, network-free layer (`cargo bench`, criterion) that isolates the **per-function** cost
+of the hot path with low noise — complementary to the end-to-end macro scenarios below, and the basis
+for the CI regression gate (`--save-baseline` / `--baseline`). Micro-cost × calls-per-request should
+roughly explain the macro deltas, and it does (the WASM ladder is the worked example).
+
+**Fast path** (`crates/control/benches/fastpath.rs`):
+
+| bench | cost | note |
+| --- | --- | --- |
+| LB pick — round-robin | 6.7 → 10 ns (3 → 32 instances) | ~O(1) |
+| LB pick — P2C weighted-least-request | ~7 → 10 ns | |
+| LB pick — weighted Maglev | 13.6 → 17.3 ns | + one table lookup |
+| route match (`find_route`) | 48 ns → 878 ns (1 → 64 routes) | scans by specificity |
+| ingress path normalization | ~110–140 ns | ADR 000027 |
+
+All three LB algorithms are covered here; the macro suite only load-tests round-robin.
+
+**Extension plane** (`crates/host/benches/wasm.rs`):
+
+| bench | cost | isolates |
+| --- | --- | --- |
+| `on_request` — pooled instance | ~2.4 µs/req | dispatch + call (init amortized) |
+| `on_request` — fresh instance / request | ~30 µs/req | + per-request instantiation (the pool's value) |
+| cold `load` (verify + instantiate + init) | ~10 ms | cosign signature + SBOM verification dominates |
+
+The ~12× pooled→fresh gap here is the same one the [macro ladder](#the-wasm-cost-ladder--isolating-each-cost)
+shows end-to-end — the two layers agree, so a divergence between them is a real bug.
 
 ---
 
@@ -223,40 +255,52 @@ load-bearing; this is the plaintext analogue of the TLS handshake-per-request ro
 
 Plecto runs each request's *decision* — auth, rewriting, rate limiting, policy — as a sandboxed
 **WebAssembly Component Model filter**, not native proxy code. This measures what that costs,
-changing only **how the decision runs**. The bundled `examples/wasm-bench` serves three routes
-that forward to the **same** backend:
-
-| Route | Decision path |
-| --- | --- |
-| `/baseline/*` | no filter — native fast path only |
-| `/trusted/*` | signed `filter-apikey` component, **pooled** (init-once, instances reused) |
-| `/ondemand/*` | the **same** component, **fresh instance per request** |
+changing only **how the decision runs**. The bundled `examples/wasm-bench` serves a **ladder** of
+routes — all forwarding to the **same** backend — so each adjacent delta isolates one cost (the full
+table is in [the cost ladder](#the-wasm-cost-ladder--isolating-each-cost) below): a native `/baseline`,
+a pure no-op WASM filter pooled vs fresh (`/noop-pooled`, `/noop-fresh`), and the real `filter-apikey`
+pooled vs fresh (`/trusted`, `/ondemand`).
 
 `filter-apikey` is a real `plecto:filter` component: it reads `x-api-key`, stamps
 `x-authenticated-user` on a valid key and forwards, or returns a typed `short-circuit` **401** on a
 missing/invalid key. It is cosign-signed and loaded through the production verify-then-load path
-(fail-closed).
+(fail-closed). `filter-noop` returns `continue` with **no host-API calls** — it exists only to expose
+the irreducible dispatch floor.
 
-## Overhead & the value of pooling
+## The WASM cost ladder — isolating each cost
 
 ![Throughput by decision path](img/wasm_throughput.webp)
 ![Per-request latency by decision path](img/wasm_latency.webp)
 
 > W1 — fixed 50 connections, 0 ms backend, valid key (oha). Isolates filter cost from upstream time.
 
-| Route | req/s | p50 | p95 | p99 | CPU/req |
-| --- | --- | --- | --- | --- | --- |
-| baseline (no filter) | 145,400 | 0.33 ms | 0.49 ms | 0.66 ms | 6.88 µs |
-| pooled WASM filter | 114,486 | 0.42 ms | 0.63 ms | 0.80 ms | 8.74 µs |
-| on-demand WASM filter | 9,124 | 4.21 ms | 14.80 ms | 21.75 ms | ~110 µs |
+Five routes forward to the **same** backend, so each **adjacent delta isolates exactly one cost**. A
+pure **no-op** WASM filter (no host-API calls) is the key addition — it separates "the WASM tax" from
+"a real filter's work", which older reports conflated.
 
-The **pooled** filter — Plecto's default for trusted components — adds **~1.9 µs of CPU per
-request** (6.88 → 8.74 µs/req) and **+0.14 ms p99** over the native baseline. At this run's ~145k
-req/s that is **~21 % of throughput**; at a heavier per-request cost it is a far smaller fraction.
-**The µs/req is the invariant to track for regressions, not the percentage.** The *same* filter run
-**on-demand** (fresh, re-initialised every request) collapses to ~9.1k req/s — **~12× less
-throughput** — because it re-pays `init` (~100 µs) on every request. That gap *is* the value of
-pooling.
+| Route | Decision path | req/s | p50 | p99 |
+| --- | --- | --- | --- | --- |
+| `/baseline` | native fast path (no filter) | 141,755 | 0.33 ms | 0.72 ms |
+| `/noop-pooled` | a **pure no-op** WASM filter, pooled | 120,696 | 0.40 ms | 0.78 ms |
+| `/noop-fresh` | the same no-op, **fresh instance / request** | 7,953 | 4.31 ms | 24.8 ms |
+| `/trusted` | the real `filter-apikey`, pooled | 114,846 | 0.42 ms | 0.79 ms |
+| `/ondemand` | `filter-apikey`, fresh instance / request | 8,401 | 4.50 ms | 23.0 ms |
+
+- **baseline → noop-pooled** = the **irreducible extension-plane dispatch cost** (chain dispatch +
+  instance acquisition + one empty host↔guest crossing), with *no* filter work: **−15 % throughput,
+  ≈ 1.2 µs/req**. Every WASM filter pays this floor.
+- **noop-pooled → noop-fresh** = the **per-request instantiation cost**, now cleanly isolated from any
+  host work: throughput collapses **~15×** (121k → 8k). This is what pooling buys.
+- **noop-pooled → trusted** = a **real filter's own work** on top of the no-op (header parse +
+  host-KV lookup + counter): only **−5 %**. The apikey filter is cheap; the dispatch floor dominates it.
+- **noop-fresh ≈ ondemand** confirms instantiation dominates the fresh path — the filter's per-request
+  work is noise next to re-paying `init` (~30 µs) every request.
+
+**The µs/req deltas are the invariants to track for regressions, not the percentages** (which shrink as
+the rest of the request gets heavier). These macro deltas **reconcile with the in-process
+[micro-benchmarks](#0-micro-benchmarks-in-process-criterion)**: criterion clocks the pooled per-request
+call at ~2.4 µs and the fresh (instantiate + init + call) at ~30 µs — the same ~12–15× gap the ladder
+shows end-to-end.
 
 ## Short-circuit: rejecting bad traffic at the edge
 
@@ -373,6 +417,40 @@ Idle resident set and the marginal cost of an open connection (`examples/wasm-be
 
 ---
 
+# 3. Realistic & protocol coverage
+
+## Weighted request mix
+
+> M1 — open-loop ~20k req/s, a weighted blend across routes on one gateway (k6). More representative
+> than a single hot endpoint: read-heavy with occasional writes and rare large payloads.
+
+| Class (share) | route | p50 | p99 | p99.9 |
+| --- | --- | --- | --- | --- |
+| read 80 % | GET `/baseline` (1 KB) | 0.20 ms | 12.5 ms | 27.6 ms |
+| write 15 % | POST `/body` (1 KB) | 0.29 ms | 13.6 ms | — |
+| large 5 % | POST `/body` (100 KB) | 0.96 ms | 17.6 ms | — |
+
+Steady-state p50s stay sub-millisecond, but the **tail (p99 12–18 ms) is elevated by the 5 % of 100 KB
+bodies** creating head-of-line pressure at 20k offered (1,544 dropped iterations) — exactly the
+realistic-mix behaviour a single-endpoint test hides. This exercises the router's match cost and the
+no-filter + body-hook paths together, under one arrival stream.
+
+## HTTP/3
+
+The fast path terminates **HTTP/3 over QUIC** (ADR 000016; `tls-http` serves h1/h2/h3 on one port). A
+functional check confirms it end-to-end:
+
+```
+curl --http3-only https://…/api/hello  ->  status=200 http_version=3
+```
+
+A **rigorous, coordinated-omission-safe H3 *load* benchmark is deferred**: the load generators here
+(oha, k6) have no native HTTP/3, and a correct H3 tail needs an H3-capable open-loop generator such as
+**Nighthawk**. Rather than publish process-spawn-bound `curl`-loop numbers, the H3 load figure is
+honestly left absent until that tooling is in place — the server support is verified, not the throughput.
+
+---
+
 ## Methodology — why the numbers look the way they do
 
 - **Open- vs closed-loop matters.** A closed-loop generator throttles itself whenever the server
@@ -391,6 +469,20 @@ Idle resident set and the marginal cost of an open connection (`examples/wasm-be
 - **Benchmarks find bugs.** The body scenario surfaced a delayed-ACK stall from Nagle on the upstream
   sockets (no `TCP_NODELAY`); disabling Nagle there — standard for L7 proxies — removed a ~40 ms p99
   cliff on streamed bodies. Disclosing *how* a number was produced is the point.
+- **Two layers that must agree.** In-process criterion micro-benchmarks isolate per-function cost
+  deterministically; the open-loop macro scenarios measure it end-to-end. Micro-cost × calls-per-request
+  should explain the macro delta — the WASM ladder is the worked example — so a divergence between the
+  layers is a bug in one of them, not noise.
+- **Tooling by job.** criterion for the deterministic in-process layer and the CI gate; k6
+  `constant-arrival-rate` (open-loop) for the macro tails; oha for single-route capacity ceilings.
+  Neither oha nor k6 has native HTTP/3, so H3 *load* is deferred to an H3-capable generator (Nighthawk)
+  rather than faked (see [HTTP/3](#http3)).
+- **CI regression gate (opt-in).** Per-PR runs only the light criterion micro-benchmarks
+  (`cargo bench -- --baseline main`, seconds); the heavy k6/oha macro suite runs on manual dispatch /
+  nightly. Hosted-runner numbers are treated as *relative* (regression direction), never absolute — CI
+  VMs are noisy neighbours. Running the project's own benchmarks in GitHub Actions is squarely within
+  GitHub's Acceptable Use ("testing … the software project associated with the repository"); keeping
+  heavy load off per-PR respects the "no disproportionate burden" clause.
 - **Prior art.** Disclosing open- vs closed-loop and corrected latency is standard in tools such as
   `wrk2` and k6. This report follows that spirit using only its own measurements.
 
@@ -405,8 +497,12 @@ cargo build --release -p plecto-server \
 
 # One phase, or `all`. Pins the proxy to a core set and generators to a disjoint set; writes
 # performance/data/*.csv. Phases:
-#   sweep openloop rr ejection wasm tls ratelimit body churn footprint all
+#   sweep openloop rr ejection wasm tls h3 ratelimit body churn mix footprint all
 bash bench/perf/run-perf.sh all
+
+# In-process micro-benchmarks (deterministic; the CI regression gate). Save a baseline, then compare:
+cargo bench -p plecto-control -p plecto-host -- --save-baseline main   # on the base branch
+cargo bench -p plecto-control -p plecto-host -- --baseline main        # on a change, to read the deltas
 
 # Optional live dashboard (images are a one-time setup pull; the load stays on loopback):
 INFLUX=1 bash bench/perf/run-perf.sh all     # http://localhost:3000/d/plecto-lb-k6
@@ -440,6 +536,8 @@ the local heavy-load harness are git-untracked working data, like `bench/`. The 
 - Gil Tene, *coordinated omission* — summarized in ScyllaDB's [On Coordinated Omission](https://www.scylladb.com/2021/04/22/on-coordinated-omission/).
 - [k6 executors](https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/) — closed-loop (`constant-vus`) vs open-loop (`constant-arrival-rate`) models.
 - [oha](https://github.com/hatoo/oha) — the single-connection-pool HTTP load generator used for the overhead, TLS and churn runs.
+- [criterion.rs](https://bheisler.github.io/criterion.rs/book/) — the in-process micro-benchmark harness (LB pick, route match, WASM per-request cost) and its baseline-comparison regression gate.
+- [Nighthawk](https://github.com/envoyproxy/nighthawk) — Envoy's open-loop, HTTP/1–2–3 load generator; the tool an HTTP/3 *load* benchmark would use (deferred here).
 - [wrk2](https://github.com/giltene/wrk2) — constant throughput with corrected latency recording.
 - [Wasmtime](https://docs.wasmtime.dev/) — the pooling allocator and epoch interruption behind pooled vs on-demand filter instances.
 - [WebAssembly Component Model](https://component-model.bytecodealliance.org/) — the `plecto:filter` contract is a Component Model world.

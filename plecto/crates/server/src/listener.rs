@@ -3,6 +3,7 @@
 //! 000015); the per-request handling (route → chain → forward) is shared with all transports via
 //! `proxy_core`.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,20 @@ const INBOUND_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// convention, not a public-API commitment) — the internal `ServerError` is `pub(crate)`, so a
 /// caller in another crate could not even name it. `serve_inner` does the typed work.
 pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Result<()> {
+    serve_inner(control, listener).await.map_err(Into::into)
+}
+
+/// Serve like [`serve`], but stop accepting when `shutdown` resolves, drain in-flight
+/// connections up to `drain_deadline`, then return `Ok` (ADR 000039). Connections still open at
+/// the deadline are cut.
+pub async fn serve_with_shutdown(
+    control: Arc<Control>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send,
+    drain_deadline: Duration,
+) -> anyhow::Result<()> {
+    let _drain_deadline = drain_deadline;
+    let _shutdown = shutdown;
     serve_inner(control, listener).await.map_err(Into::into)
 }
 

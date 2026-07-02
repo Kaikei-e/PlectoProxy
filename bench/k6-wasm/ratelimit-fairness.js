@@ -17,7 +17,9 @@ const hot429 = new Counter("hot_429");
 const lightOk = new Counter("light_ok");
 const light429 = new Counter("light_429");
 
+// No warmup exclusion, deliberately (see ratelimit-enforce.js): the hot key's initial burst is signal.
 export const options = {
+  discardResponseBodies: true,
   scenarios: {
     hot: {
       executor: "constant-arrival-rate",

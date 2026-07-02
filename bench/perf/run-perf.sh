@@ -5,6 +5,11 @@
 # tuning is applied (governor/turbo left as-is), so absolute throughput is bounded by this host and
 # the generator; read ratios, shapes and time-constants as the signal.
 #
+# Every measured window excludes a short warm-up: the k6 scenarios and plecto-loadgen burn it
+# in-script (send, don't record), oha runs get a discarded 5 s pre-run (warm_oha). Fixed-rate tail
+# measurements use oha's --latency-correction (coordinated-omission-safe); ceiling runs report
+# throughput, and their latencies are read as queueing-at-saturation, not service latency.
+#
 #   bash bench/perf/run-perf.sh <phase>    phase ∈ sweep openloop rr ejection wasm tls footprint all
 #
 # Default ports avoid colliding with other local services (override with *_ADDR env).
@@ -89,6 +94,10 @@ launch(){
 # oha JSON (latency in seconds) -> "rps p50 p90 p95 p99 p99_9" in ms
 oha_row(){ python3 "$HERE/oha_parse.py" "$1"; }
 
+# 5 s discarded warm-up before a measured oha run (same flags + URL): the k6 scenarios exclude
+# their warm-up in-script, oha can't, so the cold-start seconds are burned here instead.
+warm_oha(){ gen "$OHA" -z 5s --no-tui "$@" >/dev/null 2>&1; }
+
 # ---------------------------------------------------------------- Phase 2.1 sweep
 phase_sweep(){
   log "Phase 2.1 — closed-loop sweep (k6 constant-vus) -> sweep.csv"
@@ -169,10 +178,31 @@ phase_wasm(){
   local ladder=(baseline noop-pooled noop-fresh trusted ondemand)
   for r in "${ladder[@]}"; do
     local hdr=(); [[ "$r" == trusted || "$r" == ondemand ]] && hdr=(-H "x-api-key: alice-secret")
+    warm_oha -c 50 "${hdr[@]}" "http://$WASM_ADDR/$r/x"
     gen "$OHA" -z 60s -c 50 --no-tui --output-format json "${hdr[@]}" \
       "http://$WASM_ADDR/$r/x" > "$tmp/$r.json" 2>/dev/null
     echo "  /$r -> $(oha_row "$tmp/$r.json")"
   done
+
+  # Phase 3.2 — the ceiling runs above saturate the proxy, so their tails are queueing at max load
+  # (not meaningful latency). Re-run each rung at ONE fixed below-knee rate — 60% of the SLOWEST
+  # rung's ceiling, so every rung sees identical offered load — with oha's --latency-correction
+  # (coordinated-omission-safe). These tails are the honest per-rung latency comparison.
+  local floor qlat
+  floor="$(python3 -c '
+import json,sys
+print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[1:])))
+' "$tmp/baseline.json" "$tmp/noop-pooled.json" "$tmp/noop-fresh.json" "$tmp/trusted.json" "$tmp/ondemand.json")"
+  qlat="${WASM_QLAT:-$(( floor * 60 / 100 ))}"
+  log "Phase 3.2 — cost-ladder tails at fixed ${qlat} rps (oha -q --latency-correction) -> wasm_overhead_tail.csv"
+  { echo "route,rate,rps,p50,p90,p95,p99"
+    for r in "${ladder[@]}"; do
+      local hdr=(); [[ "$r" == trusted || "$r" == ondemand ]] && hdr=(-H "x-api-key: alice-secret")
+      gen "$OHA" -z 30s -c 50 -q "$qlat" --latency-correction --no-tui --output-format json "${hdr[@]}" \
+        "http://$WASM_ADDR/$r/x" > "$tmp/tail_$r.json" 2>/dev/null
+      read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/tail_$r.json")"
+      echo "$r,$qlat,$rps,$p50,$p90,$p95,$p99"
+    done; } > "$DATA/wasm_overhead_tail.csv"
   stop_proxy
   { echo "route,rps,p50,p90,p95,p99"
     for r in "${ladder[@]}"; do
@@ -180,6 +210,8 @@ phase_wasm(){
       echo "$r,$rps,$p50,$p90,$p95,$p99"
     done; } > "$DATA/wasm_overhead.csv"
   cat "$DATA/wasm_overhead.csv"
+  echo "--- tails at ${qlat} rps ---"
+  cat "$DATA/wasm_overhead_tail.csv"
 
   log "Phase 3.3 — short-circuit mixed (k6 2000 rps, 15 ms backend, 90/10) -> wasm_mixed.csv"
   launch wasm-bench "$WASM_ADDR" "http://$WASM_ADDR/baseline/x" BACKEND_LATENCY_MS=15 || return 1
@@ -204,6 +236,7 @@ phase_tls(){
   local tmp; tmp="$(mktemp -d)"
   # plain h1 baseline: the wasm-bench /baseline route (single backend, no filter, plaintext h1).
   launch wasm-bench "$WASM_ADDR" "http://$WASM_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
+  warm_oha -c 50 "http://$WASM_ADDR/baseline/x"
   gen "$OHA" -z 30s -c 50 --no-tui --output-format json "http://$WASM_ADDR/baseline/x" > "$tmp/plain.json" 2>/dev/null
   echo "  plain (h1)        -> $(oha_row "$tmp/plain.json")"
   stop_proxy
@@ -211,10 +244,13 @@ phase_tls(){
   launch tls-http "$TLS_ADDR" "" || return 1
   # health over https (self-signed): tolerant probe before measuring.
   for _ in $(seq 40); do gen "$OHA" -n 1 --insecure --no-tui "https://$TLS_ADDR/api/hello" >/dev/null 2>&1 && break; sleep 0.25; done
+  warm_oha -c 50 --insecure "https://$TLS_ADDR/api/hello"
   gen "$OHA" -z 30s -c 50 --no-tui --insecure --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h1_ka.json" 2>/dev/null
   echo "  tls h1 keepalive  -> $(oha_row "$tmp/tls_h1_ka.json")"
+  warm_oha -c 50 --insecure --disable-keepalive "https://$TLS_ADDR/api/hello"
   gen "$OHA" -z 30s -c 50 --no-tui --insecure --disable-keepalive --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h1_hs.json" 2>/dev/null
   echo "  tls h1 handshake  -> $(oha_row "$tmp/tls_h1_hs.json")"
+  warm_oha -c 50 --insecure --http2 "https://$TLS_ADDR/api/hello"
   gen "$OHA" -z 30s -c 50 --no-tui --insecure --http2 --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h2.json" 2>/dev/null
   echo "  tls (h2)          -> $(oha_row "$tmp/tls_h2.json")"
   stop_proxy
@@ -347,8 +383,14 @@ phase_churn(){
   log "Phase 8 — connection churn: keep-alive vs cold-connection (plain h1) -> churn.csv"
   launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" || return 1
   local tmp; tmp="$(mktemp -d)"
+  warm_oha -c 50 "http://$EDGE_ADDR/baseline/x"
   gen "$OHA" -z 30s -c 50 --no-tui --output-format json "http://$EDGE_ADDR/baseline/x" > "$tmp/ka.json" 2>/dev/null
   echo "  keep-alive        -> $(oha_row "$tmp/ka.json")"
+  # Cold-connection churn leaves the client side with one TIME_WAIT socket per request; 30 s at
+  # tens of k rps can brush the ephemeral-port range (net.ipv4.ip_local_port_range). Failures from
+  # port exhaustion would show as errors here, not latency — check the error count if cold rps
+  # collapses versus keep-alive by more than the handshake cost.
+  warm_oha -c 50 --disable-keepalive "http://$EDGE_ADDR/baseline/x"
   gen "$OHA" -z 30s -c 50 --no-tui --disable-keepalive --output-format json "http://$EDGE_ADDR/baseline/x" > "$tmp/cold.json" 2>/dev/null
   echo "  cold (TCP/req)    -> $(oha_row "$tmp/cold.json")"
   stop_proxy
@@ -376,22 +418,30 @@ phase_h3(){
 
 # ---------------------------------------------------------------- Phase 9 weighted request mix
 phase_mix(){
-  log "Phase 9 — weighted request mix (k6 open-loop, 80/15/5 read/write/large across routes) -> mix.csv"
+  log "Phase 9 — weighted request mix (60/25/10/5 read/auth/write/large) + paired same-rate read-only baseline -> mix.csv"
   launch edge-bench "$EDGE_ADDR" "http://$EDGE_ADDR/baseline/x" RESP_BYTES=1024 || return 1
   local tmp; tmp="$(mktemp -d)"
-  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e RATE="${MIX_RATE:-20000}" -e DUR=60s -e OUT="$tmp/mix.json" \
-    "$BENCH/k6/weighted-mix.js" 2>&1 | tail -2
+  # read-only first (the control), then the mix, both at the SAME arrival rate against the same
+  # proxy: the per-class deltas are attributable to the traffic blend, not the offered load.
+  for prof in read-only mix; do
+    gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$EDGE_ADDR" -e RATE="${MIX_RATE:-20000}" \
+      -e DUR=60s -e PROFILE="$prof" -e OUT="$tmp/mix_$prof.json" \
+      "$BENCH/k6/weighted-mix.js" 2>&1 | tail -2
+  done
   stop_proxy
   python3 -c '
 import json,csv,sys
-d=json.load(open(sys.argv[1]))
-with open(sys.argv[2],"w",newline="") as o:
-    w=csv.writer(o); w.writerow(["class","p50","p99","p99_9"])
-    w.writerow(["read",round(d["read_p50"],3),round(d["read_p99"],3),round(d["read_p99_9"],3)])
-    w.writerow(["write",round(d["write_p50"],3),round(d["write_p99"],3),""])
-    w.writerow(["large",round(d["large_p50"],3),round(d["large_p99"],3),""])
-print("wrote mix.csv (offered %.0f rps, dropped %d)"%(d["offered_rps"],d["dropped"]))
-' "$tmp/mix.json" "$DATA/mix.csv"
+with open(sys.argv[3],"w",newline="") as o:
+    w=csv.writer(o); w.writerow(["profile","class","p50","p99","p99_9"])
+    for f in (sys.argv[1],sys.argv[2]):
+        d=json.load(open(f)); p=d["profile"]
+        w.writerow([p,"read",round(d["read_p50"],3),round(d["read_p99"],3),round(d["read_p99_9"],3)])
+        if p=="mix":
+            w.writerow([p,"auth",round(d["auth_p50"],3),round(d["auth_p99"],3),""])
+            w.writerow([p,"write",round(d["write_p50"],3),round(d["write_p99"],3),""])
+            w.writerow([p,"large",round(d["large_p50"],3),round(d["large_p99"],3),""])
+        print("%s: offered %.0f rps, dropped %d, 429s %d"%(p,d["offered_rps"],d["dropped"],d.get("limited",0)))
+' "$tmp/mix_read-only.json" "$tmp/mix_mix.json" "$DATA/mix.csv"
   cat "$DATA/mix.csv"
 }
 

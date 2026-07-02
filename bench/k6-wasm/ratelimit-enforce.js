@@ -18,7 +18,10 @@ const limited = new Counter("limited");
 const latAccept = new Trend("lat_accept", true);
 const latLimit = new Trend("lat_limit", true);
 
+// NO warmup exclusion here, deliberately: the initial burst (~capacity tokens draining) IS part of
+// the measured signal — excluding the first seconds would hide the very convergence being proven.
 export const options = {
+  discardResponseBodies: true,
   summaryTrendStats: ["avg", "med", "p(95)", "p(99)", "max"],
   scenarios: {
     enforce: {

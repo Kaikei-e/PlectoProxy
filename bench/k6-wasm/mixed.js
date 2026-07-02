@@ -2,12 +2,15 @@
 // ~90% valid / ~10% invalid-or-missing key mix (expired tokens, scanners, misconfigured clients).
 // Accepted requests reach the (latency-injected) backend; rejected ones are short-circuited 401 at
 // the edge and never touch it — so we track the two paths' latencies separately.
+// The first WARMUP_S seconds send load unrecorded; DUR is the measured window.
 import http from "k6/http";
-import { Trend, Counter } from "k6/metrics";
+import exec from "k6/execution";
+import { Counter, Trend } from "k6/metrics";
 
 const BASE = __ENV.BASE || "http://localhost:8085";
 const RATE = Number(__ENV.RATE || 2000);
-const DUR = __ENV.DUR || "40s";
+const DUR_S = parseInt(__ENV.DUR || "40", 10);
+const WARMUP_S = Number(__ENV.WARMUP_S || 5);
 const OUT = __ENV.OUT || "mixed.json";
 const VALID = ["alice-secret", "bob-secret"];
 
@@ -17,11 +20,12 @@ const accepted = new Counter("accepted");
 const rejected = new Counter("rejected");
 
 export const options = {
+  discardResponseBodies: true,
   summaryTrendStats: ["avg", "min", "med", "p(90)", "p(95)", "p(99)", "max"],
   scenarios: {
     mix: {
       executor: "constant-arrival-rate",
-      rate: RATE, timeUnit: "1s", duration: DUR,
+      rate: RATE, timeUnit: "1s", duration: `${WARMUP_S + DUR_S}s`,
       preAllocatedVUs: 300, maxVUs: 3000,
     },
   },
@@ -36,6 +40,7 @@ export default function () {
     headers = { "x-api-key": VALID[roll % VALID.length] };
   }
   const res = http.get(`${BASE}/trusted/orders/42`, { headers });
+  if (Date.now() - exec.scenario.startTime < WARMUP_S * 1000) return;
   if (res.status === 200) { latAccept.add(res.timings.duration); accepted.add(1); }
   else { latReject.add(res.timings.duration); rejected.add(1); }
 }
@@ -43,10 +48,12 @@ export default function () {
 export function handleSummary(data) {
   const a = data.metrics.lat_accept ? data.metrics.lat_accept.values : {};
   const rj = data.metrics.lat_reject ? data.metrics.lat_reject.values : {};
+  const acc = data.metrics.accepted ? data.metrics.accepted.values.count : 0;
+  const rej = data.metrics.rejected ? data.metrics.rejected.values.count : 0;
   const out = {
-    offered_rps: data.metrics.http_reqs.values.rate,
-    accepted: data.metrics.accepted ? data.metrics.accepted.values.count : 0,
-    rejected: data.metrics.rejected ? data.metrics.rejected.values.count : 0,
+    offered_rps: (acc + rej) / DUR_S,
+    accepted: acc,
+    rejected: rej,
     accept_p50: a.med || 0, accept_p95: a["p(95)"] || 0, accept_p99: a["p(99)"] || 0,
     reject_p50: rj.med || 0, reject_p95: rj["p(95)"] || 0, reject_p99: rj["p(99)"] || 0,
   };

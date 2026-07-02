@@ -35,8 +35,20 @@ pub(crate) async fn proxy_core(
     parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
+    /// Decrements the in-flight gauge on drop: hyper drops this future when the client
+    /// connection dies mid-request (h2 RST_STREAM, disconnect), so a plain post-`.await`
+    /// decrement would leak and the gauge would drift upward monotonically. The RED tally
+    /// (`record_request`) is deliberately still skipped on cancellation — no response was sent.
+    struct InFlight<'a>(&'a crate::metrics::ServerMetrics);
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.dec_in_flight();
+        }
+    }
+
     let start = Instant::now();
     state.metrics.inc_in_flight();
+    let in_flight = InFlight(&state.metrics);
 
     // Capture the access-log fields BEFORE the core consumes `parts`, and only when logging is on —
     // a disabled access log allocates nothing on the hot path.
@@ -62,7 +74,7 @@ pub(crate) async fn proxy_core(
 
     let result = proxy_core_inner(state.clone(), scheme, peer, parts, body).await;
 
-    state.metrics.dec_in_flight();
+    drop(in_flight);
     let status = match &result {
         Ok(resp) => resp.status().as_u16(),
         // an inner error is mapped to 502 by the caller (`dispatch::handle`), so record it as such.

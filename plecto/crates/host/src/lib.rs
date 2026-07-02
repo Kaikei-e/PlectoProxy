@@ -1392,6 +1392,28 @@ struct LoadedInner<R: FilterRuntime> {
     isolation: Isolation,
 }
 
+/// Releases a reserved/held `live` pool slot on unwind. Armed while a checked-out instance (or a
+/// reserved build slot) is outside the pool's bookkeeping; the normal return paths disarm it and
+/// do their own accounting. Without this, a panic inside a guest call (a host-function bug, a
+/// wasmtime-internal panic) would drop the instance without decrementing `live` or waking a
+/// waiter — repeated panics would permanently shrink the pool's effective capacity.
+struct LiveSlotGuard<'a, I> {
+    pool: &'a TrustedPool<I>,
+    armed: bool,
+}
+
+impl<I> Drop for LiveSlotGuard<'_, I> {
+    fn drop(&mut self) {
+        if self.armed {
+            {
+                let mut g = self.pool.inner.lock();
+                g.live = g.live.saturating_sub(1);
+            }
+            self.pool.available.notify_one();
+        }
+    }
+}
+
 impl<R: FilterRuntime> LoadedInner<R> {
     /// Check out a trusted instance from the pool (ADR 000012): reuse an idle one, lazily build
     /// a fresh one while under `cap`, or — when every instance is checked out — wait up to the
@@ -1433,23 +1455,21 @@ impl<R: FilterRuntime> LoadedInner<R> {
             };
             match step {
                 Step::Use(p) => return Ok(p),
-                Step::Build => match self.runtime.instantiate_initialized() {
-                    Ok(instance) => {
-                        return Ok(PooledInstance {
-                            instance,
-                            served: 0,
-                        });
-                    }
-                    Err(e) => {
-                        // roll back the reserved slot and wake a waiter that may now build.
-                        {
-                            let mut g = pool.inner.lock();
-                            g.live = g.live.saturating_sub(1);
+                Step::Build => {
+                    // The guard rolls back the reserved slot (and wakes a waiter that may now
+                    // build) on error OR unwind; success disarms it — the caller now owns the slot.
+                    let mut guard = LiveSlotGuard { pool, armed: true };
+                    match self.runtime.instantiate_initialized() {
+                        Ok(instance) => {
+                            guard.armed = false;
+                            return Ok(PooledInstance {
+                                instance,
+                                served: 0,
+                            });
                         }
-                        pool.available.notify_one();
-                        return Err(RunError::Instantiate(e));
+                        Err(e) => return Err(RunError::Instantiate(e)),
                     }
-                },
+                }
                 Step::Retry => continue,
             }
         }
@@ -1489,6 +1509,10 @@ impl<R: FilterRuntime> LoadedInner<R> {
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
     ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
         let mut pooled = self.checkout(pool)?;
+        // Armed across the guest call: a panic unwinding out of `call` must still release the
+        // `live` slot and wake a waiter. Both normal arms below disarm and do their own
+        // bookkeeping (return-to-idle / recycle / discard).
+        let mut slot = LiveSlotGuard { pool, armed: true };
 
         self.runtime.begin_request(&mut pooled.instance);
         self.runtime.set_request_deadline(&mut pooled.instance);
@@ -1497,6 +1521,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
         match result {
             Ok(value) => {
                 let logs = self.runtime.take_logs(&mut pooled.instance);
+                slot.armed = false;
                 pooled.served = pooled.served.saturating_add(1);
                 if pooled.served >= pool.max_requests_per_instance {
                     // Recycle: drop the Store (returning the slot + freeing memory) BEFORE the
@@ -1518,6 +1543,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 // Trap → this instance's linear memory is undefined → discard it (release the
                 // slot first), then bump the pool-wide breaker; past the threshold open a short
                 // cooldown so a deterministically-trapping filter fails closed cheaply.
+                slot.armed = false;
                 drop(pooled);
                 let mut g = pool.inner.lock();
                 g.live = g.live.saturating_sub(1);

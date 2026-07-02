@@ -36,6 +36,14 @@ fn registry(n: usize, algo: &str, hash: &str) -> UpstreamRegistry {
     let manifest = Manifest::from_toml(&toml).expect("parse upstream manifest");
     let reg = UpstreamRegistry::new();
     reg.reconcile(&manifest.upstreams).expect("reconcile pool");
+    // Instances start pessimistic (unhealthy until probed); promote them so the bench measures a
+    // real pick over the eligible set, not the eligible==0 fail-fast path.
+    for group in reg.groups() {
+        for inst in &group.instances {
+            inst.record_probe_success();
+            inst.record_probe_success();
+        }
+    }
     reg
 }
 

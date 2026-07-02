@@ -6,17 +6,29 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
-use hyper::body::{Body, Frame};
+use hyper::body::{Body, Frame, SizeHint};
 
 use crate::BoxError;
 
 pub(super) struct H3ReqBody {
     recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+    /// Bytes left per the request's declared `content-length`, or `None` when it sent none.
+    /// Feeds `size_hint` so the transport-independent bodyless check (`exact() == Some(0)`,
+    /// which gates upstream retry and the body-buffer path) works for h3 like it does for
+    /// hyper's TCP `Incoming` — the trait's default hint is `(0, None)`, which reads as
+    /// "maybe a body" and silently disabled retry for every h3 request.
+    remaining: Option<u64>,
 }
 
 impl H3ReqBody {
-    pub(super) fn new(recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>) -> Self {
-        Self { recv }
+    pub(super) fn new(
+        recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+        content_length: Option<u64>,
+    ) -> Self {
+        Self {
+            recv,
+            remaining: content_length,
+        }
     }
 }
 
@@ -32,11 +44,21 @@ impl Body for H3ReqBody {
         match this.recv.poll_recv_data(cx) {
             Poll::Ready(Ok(Some(mut buf))) => {
                 let bytes = buf.copy_to_bytes(buf.remaining());
+                if let Some(remaining) = &mut this.remaining {
+                    *remaining = remaining.saturating_sub(bytes.len() as u64);
+                }
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
             Poll::Ready(Ok(None)) => Poll::Ready(None),
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Box::new(e)))),
             Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self.remaining {
+            Some(n) => SizeHint::with_exact(n),
+            None => SizeHint::default(),
         }
     }
 }

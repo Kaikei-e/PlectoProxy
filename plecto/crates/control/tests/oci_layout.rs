@@ -157,6 +157,101 @@ filters = ["fh"]
 }
 
 #[test]
+fn from_manifest_wires_redb_state_and_persists_across_restart() {
+    // ADR 000041: [state] backend = "redb" reaches the production path. A drained rate-limit
+    // bucket must survive a process restart (the fail-closed direction) — under the old
+    // memory-fixed wiring it would silently start full again.
+    let dir = tempdir().unwrap();
+    let (signer, artifact) = signed_artifact();
+    let digest = write_layout(&dir.path().join("fh"), &artifact).unwrap();
+    std::fs::write(dir.path().join("cosign.pub"), signer.public_key_pem()).unwrap();
+
+    let toml = format!(
+        r#"
+[state]
+backend = "redb"
+path = "plecto.redb"
+
+[trust]
+keys = ["cosign.pub"]
+
+[[filter]]
+id = "fh"
+source = "fh"
+digest = "{digest}"
+isolation = "untrusted"
+ratelimit = {{ capacity = 2, refill_tokens = 0, refill_interval_ms = 0 }}
+
+[chain]
+filters = ["fh"]
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+
+    let rl = [("x-plecto-ratelimit", "tenant-a")];
+    {
+        let control = Control::from_manifest(&manifest, dir.path()).unwrap();
+        // Drain the one-shot bucket (capacity 2, no refill).
+        assert!(matches!(
+            control.on_request(req(&rl)),
+            ChainOutcome::Forward(_)
+        ));
+        assert!(matches!(
+            control.on_request(req(&rl)),
+            ChainOutcome::Forward(_)
+        ));
+        assert!(
+            matches!(control.on_request(req(&rl)), ChainOutcome::Respond(r) if r.status == 429),
+            "the bucket is drained before the restart"
+        );
+    } // drop = the process restart (also releases the redb file lock)
+
+    let control = Control::from_manifest(&manifest, dir.path()).unwrap();
+    assert!(
+        matches!(control.on_request(req(&rl)), ChainOutcome::Respond(r) if r.status == 429),
+        "a drained bucket stays drained across a restart (redb persisted it)"
+    );
+}
+
+#[test]
+fn from_manifest_rejects_invalid_state_config() {
+    // A half-set [state] must fail the build, never silently run on memory (fail-closed).
+    let dir = tempdir().unwrap();
+
+    let no_path = Manifest::from_toml("[state]\nbackend = \"redb\"\n").unwrap();
+    match Control::from_manifest(&no_path, dir.path()) {
+        Ok(_) => panic!("redb without a path must be rejected"),
+        Err(e) => assert!(matches!(e, ControlError::InvalidStateConfig(_)), "got {e}"),
+    }
+
+    let stray_path = Manifest::from_toml("[state]\npath = \"s.redb\"\n").unwrap();
+    match Control::from_manifest(&stray_path, dir.path()) {
+        Ok(_) => panic!("a path without backend = \"redb\" must be rejected"),
+        Err(e) => assert!(matches!(e, ControlError::InvalidStateConfig(_)), "got {e}"),
+    }
+}
+
+#[test]
+fn from_manifest_rejects_redb_state_missing_parent_dir() {
+    // The redb path's parent must already exist: a typo'd path errors instead of silently
+    // growing a new tree (directory preparation is the operator's responsibility, ADR 000041).
+    let dir = tempdir().unwrap();
+    let manifest =
+        Manifest::from_toml("[state]\nbackend = \"redb\"\npath = \"missing/state.redb\"\n")
+            .unwrap();
+    match Control::from_manifest(&manifest, dir.path()) {
+        Ok(_) => panic!("a missing parent directory must be rejected"),
+        Err(e) => {
+            assert!(matches!(e, ControlError::StateBackendInit(_)), "got {e}");
+            assert!(
+                e.to_string().contains("parent"),
+                "the error names the missing parent: {e}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oci_layout_with_unreadable_index_is_fail_closed() {
     // A corrupted / incomplete OCI layout (here: a garbage index.json — the layout's entry point)
     // must fail closed at resolve. Digest pinning and per-blob integrity are already covered; this

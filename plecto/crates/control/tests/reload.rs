@@ -200,6 +200,36 @@ filters = ["fh"]
 }
 
 #[test]
+fn reload_rejecting_a_state_change_is_fail_closed() {
+    // ADR 000041: like [trust], the [state] backend is fixed at construction — the Host and
+    // its KvBackend live for the process. An edit must be rejected fail-closed (no false
+    // "Reloaded" while state silently stays on the old backend); restart to apply.
+    let dir = tempdir().unwrap();
+    let manifest_path = dir.path().join("plecto.toml");
+    let (host, store, digest) = setup();
+
+    write_manifest(&manifest_path, &digest, &["fh"]);
+    let control = Control::load_at(host, &manifest_path, Box::new(store)).unwrap();
+
+    // Operator switches the state backend to redb and fires a reload.
+    let v2 = format!(
+        "[state]\nbackend = \"redb\"\npath = \"state.redb\"\n{}",
+        manifest_toml(&digest, &["fh"])
+    );
+    std::fs::write(&manifest_path, v2).unwrap();
+    match control.reload_from_disk() {
+        Err(ControlError::StateChangeRequiresRestart) => {}
+        other => panic!("a [state] edit must be rejected fail-closed, got {other:?}"),
+    }
+
+    // The running set is untouched — the rejected reload left config A live (still blocks).
+    assert!(
+        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        "the live set is unchanged after a rejected state-change reload"
+    );
+}
+
+#[test]
 fn snapshot_pins_config_across_a_reload() {
     // f000004 #2: a request transaction takes one snapshot and runs both halves against it, so
     // a concurrent reload cannot desync the request/response sides. The snapshot keeps config A

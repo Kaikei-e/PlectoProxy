@@ -1280,6 +1280,104 @@ typo_field = true
         );
     }
 
+    // ----- ADR 000041: [state] — host state backend selection -----
+
+    #[test]
+    fn state_defaults_memory_and_parses_redb() {
+        // Absent [state] → memory, no path (zero-config startup keeps working).
+        let bare = Manifest::from_toml("").unwrap();
+        assert_eq!(bare.state.backend, StateBackendKind::Memory);
+        assert_eq!(bare.state.path, None);
+
+        // Explicit redb reads the knobs.
+        let m = Manifest::from_toml(
+            r#"
+[state]
+backend = "redb"
+path = "state/plecto.redb"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.state.backend, StateBackendKind::Redb);
+        assert_eq!(m.state.path.as_deref(), Some("state/plecto.redb"));
+
+        // deny_unknown_fields holds inside the section.
+        assert!(
+            Manifest::from_toml("[state]\nbackedn = \"redb\"\n").is_err(),
+            "a typo inside [state] is rejected"
+        );
+    }
+
+    #[test]
+    fn state_rides_the_content_hash_and_the_default_is_canonical() {
+        // An explicit default ([state] backend = "memory") and an absent section are the same
+        // config → same hash (determinism invariant, like an explicit isolation = "untrusted").
+        let absent = Manifest::from_toml("").unwrap();
+        let explicit = Manifest::from_toml("[state]\nbackend = \"memory\"\n").unwrap();
+        assert_eq!(
+            absent.content_hash().unwrap(),
+            explicit.content_hash().unwrap(),
+            "an explicit default [state] must not change the content hash"
+        );
+
+        // Choosing redb is a real config change → the hash flips. (Like [trust], the reload
+        // path rejects the change before hashing; the hash still reflects config identity.)
+        let redb =
+            Manifest::from_toml("[state]\nbackend = \"redb\"\npath = \"s.redb\"\n").unwrap();
+        assert_ne!(
+            absent.content_hash().unwrap(),
+            redb.content_hash().unwrap(),
+            "a state-backend change must flip the content hash"
+        );
+    }
+
+    #[test]
+    fn invalid_state_config_is_rejected() {
+        // redb without a path (nowhere to persist) and memory with one (the operator likely
+        // meant redb) are both fail-closed at build — a half-set [state] must never silently
+        // run on memory.
+        assert!(
+            State {
+                backend: StateBackendKind::Redb,
+                path: Some("s.redb".into()),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            State::default().validate().is_ok(),
+            "absent [state] is valid (memory)"
+        );
+
+        assert!(
+            State {
+                backend: StateBackendKind::Redb,
+                path: None,
+            }
+            .validate()
+            .is_err(),
+            "redb without a path is rejected"
+        );
+        assert!(
+            State {
+                backend: StateBackendKind::Redb,
+                path: Some("  ".into()),
+            }
+            .validate()
+            .is_err(),
+            "redb with a blank path is rejected"
+        );
+        assert!(
+            State {
+                backend: StateBackendKind::Memory,
+                path: Some("s.redb".into()),
+            }
+            .validate()
+            .is_err(),
+            "memory with a path is rejected (the operator likely meant redb)"
+        );
+    }
+
     // ----- ADR 000035: lb_algorithm, per-instance weight, maglev hash config -----
 
     fn upstream_toml(body: &str) -> Result<Manifest, ControlError> {

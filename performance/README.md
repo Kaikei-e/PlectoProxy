@@ -640,8 +640,9 @@ python3 performance/plot.py     # reads performance/data/*.csv -> performance/im
 ```
 
 (`matplotlib` brings `numpy` + `Pillow`; Pillow supplies the WebP encoder. The benchmark *method* —
-the runbook, scenarios, the Rust loadgen, plotting — is tracked, as are the curated CSVs and charts
-under `performance/`; raw run artifacts under `bench/` stay untracked. See `bench/plan.md`.)
+the runbook, scenarios, the Rust loadgen, plotting — is tracked, as are the rendered charts and this
+report; the measured CSVs are regenerable working data and stay untracked, like `bench/`'s raw run
+artifacts. See `bench/plan.md`.)
 
 ## Non-goals
 

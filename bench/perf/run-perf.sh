@@ -35,6 +35,15 @@ EDGE_ADDR="${EDGE_ADDR:-127.0.0.1:28086}"
 log(){ printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 gen(){ taskset -c "$GEN_CPUS" "$@"; }   # run a generator on the generator core set
 
+# plecto-loadgen (bench/loadgen): the Rust rr / ejection generators. Built lazily on first use
+# (a warm rebuild is a no-op); replaced the Python drivers, whose GIL-bound workers melted before
+# the proxy did.
+LOADGEN="$BENCH/loadgen/target/release/plecto-loadgen"
+loadgen(){
+  cargo build --release --quiet --manifest-path "$BENCH/loadgen/Cargo.toml" || return 1
+  gen "$LOADGEN" "$@"
+}
+
 # Optional live dashboard (opt-in): INFLUX=1 brings up the local InfluxDB+Grafana stack
 # (bench/docker-compose.yml) and streams every k6 phase to it, so a run is watchable in real time at
 # http://localhost:3000. Pulling the two images is a one-time SETUP fetch; the load itself stays
@@ -129,7 +138,7 @@ phase_openloop(){
 phase_rr(){
   log "Phase 2.3 — round-robin distribution -> rr.csv"
   launch load-balancing "$LB_ADDR" "http://$LB_ADDR/" || return 1
-  gen python3 "$HERE/rr_count.py" --target "http://$LB_ADDR/" --total 120000 --workers 48 --out "$DATA/rr.csv"
+  loadgen rr --target "http://$LB_ADDR/" --total 120000 --workers 48 --out "$DATA/rr.csv"
   stop_proxy
   cat "$DATA/rr.csv"
 }
@@ -141,7 +150,7 @@ phase_ejection(){
   local be; be=($(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$BLOG" | head -3))
   [[ "${#be[@]}" -eq 3 ]] || { echo "expected 3 backends, got ${be[*]:-none}"; stop_proxy; return 1; }
   echo "  backends: a=${be[0]} b=${be[1]} c=${be[2]}"
-  gen python3 "$HERE/ejection_driver.py" --target "http://$LB_ADDR/" --rate 4000 --duration 75 --workers 64 \
+  loadgen ejection --target "http://$LB_ADDR/" --rate 4000 --duration 75 --warmup 5 --workers 64 \
     --toggle "a=${be[0]}/toggle" "b=${be[1]}/toggle" "c=${be[2]}/toggle" \
     --out "$DATA/ejection_timeline.csv" --events-out "$DATA/ejection_events.csv"
   stop_proxy
@@ -226,15 +235,7 @@ phase_footprint(){
   local idle; idle="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"  # kB
   echo "idle VmRSS: ${idle} kB" | tee "$DATA/footprint.txt"
   # hold K steady keep-alive connections and re-read RSS
-  local wh="${WASM_ADDR%:*}" wp="${WASM_ADDR##*:}"
-  gen python3 -c '
-import http.client,sys,time
-host,port,K=sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
-conns=[]
-for _ in range(K):
-    c=http.client.HTTPConnection(host,port); c.request("GET","/baseline/x"); c.getresponse().read(); conns.append(c)
-time.sleep(6)
-' "$wh" "$wp" 1000 &
+  loadgen hold --target "http://$WASM_ADDR/baseline/x" --conns 1000 --seconds 6 &
   HOLD=$!
   sleep 3
   local busy; busy="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"

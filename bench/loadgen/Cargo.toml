@@ -1,0 +1,23 @@
+# plecto-loadgen — the Rust load generators behind run-perf.sh's rr / ejection phases.
+# A standalone workspace (like examples/filters and bench/filters): bench tooling never joins the
+# plecto/ product workspace, so `cargo test --all` there never builds it. It replaced the earlier
+# Python drivers, whose GIL-bound workers melted before the proxy did and polluted the timeline
+# with generator queueing.
+[workspace]
+
+[package]
+name = "plecto-loadgen"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+hyper = { version = "1", features = ["http1", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[profile.release]
+lto = true

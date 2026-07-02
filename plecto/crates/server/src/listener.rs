@@ -14,7 +14,7 @@ use std::time::Duration;
 use hyper::header::HeaderValue;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use plecto_control::Control;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -96,7 +96,14 @@ async fn serve_inner(
     let state = Arc::new(ServerState {
         control,
         client: HyperUpstreamClient::new(
-            Client::builder(TokioExecutor::new()).build(upstream_connector()),
+            // The pool needs a timer for idle expiry to be actively enforced (without one,
+            // `pool_idle_timeout` degrades to a lazy checkout-time check), and the default
+            // max-idle-per-host is unbounded — cap what a burst can strand.
+            Client::builder(TokioExecutor::new())
+                .pool_timer(TokioTimer::new())
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(32)
+                .build(upstream_connector()),
         ),
         alt_svc,
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -170,6 +177,9 @@ async fn serve_inner(
                 }
             },
         };
+        // Disable Nagle downstream, symmetric with `upstream_connector`: a streamed response
+        // relayed to the client in several writes must not stall on the peer's delayed-ACK timer.
+        let _ = stream.set_nodelay(true);
         let state = state.clone();
         // The TLS config is read PER accept (ADR 000014): a reload's new certs apply to new
         // connections, while in-flight ones keep the cert they negotiated with. `None` → plain.

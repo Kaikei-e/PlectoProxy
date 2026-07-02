@@ -310,6 +310,14 @@ pub(crate) fn build_filter_span(
 /// network export lands.
 pub trait TelemetrySink: Send + Sync {
     fn export(&self, span: &FilterSpan);
+
+    /// Whether this sink consumes spans at all. When `false`, the host skips span construction
+    /// entirely on the per-request path — `build_filter_span` allocates (name, attributes, one
+    /// event per host-log line), which would otherwise be paid per hook call just to be dropped
+    /// by `export`. Defaults to `true`; only a sink that discards everything should override.
+    fn enabled(&self) -> bool {
+        true
+    }
 }
 
 /// The default: observability off, zero cost.
@@ -318,6 +326,10 @@ pub struct NoopSink;
 
 impl TelemetrySink for NoopSink {
     fn export(&self, _span: &FilterSpan) {}
+
+    fn enabled(&self) -> bool {
+        false
+    }
 }
 
 /// A reference / test sink that retains every span in memory.

@@ -1687,6 +1687,9 @@ impl LoadedFilter {
         req: &HttpRequest,
         trace: &RequestTrace,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
+        if !self.inner.sink.enabled() {
+            return self.run_on_request(req);
+        }
         let start = SystemTime::now();
         let elapsed = Instant::now();
         let result = self.run_on_request(req);
@@ -1725,6 +1728,9 @@ impl LoadedFilter {
         body: &[u8],
         trace: &RequestTrace,
     ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
+        if !self.inner.sink.enabled() {
+            return self.run_on_request_body(body);
+        }
         let start = SystemTime::now();
         let elapsed = Instant::now();
         let result = self.run_on_request_body(body);
@@ -1795,6 +1801,9 @@ impl LoadedFilter {
         resp: &HttpResponse,
         trace: &RequestTrace,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
+        if !self.inner.sink.enabled() {
+            return self.run_on_response(resp);
+        }
         let start = SystemTime::now();
         let elapsed = Instant::now();
         let result = self.run_on_response(resp);

@@ -65,7 +65,8 @@ pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability,
-    OutlierDetection, RateLimitKeyKind, Route, RouteRateLimit, TlsCert, Trust, Upstream,
+    OutlierDetection, RateLimitKeyKind, Route, RouteRateLimit, State, StateBackendKind, TlsCert,
+    Trust, Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
@@ -134,6 +135,10 @@ pub struct Control {
     /// would change it is rejected (`TrustChangeRequiresRestart`) rather than silently dropped
     /// (f000004 #1): trust roots are fixed for the life of the `Host` / epoch ticker.
     trust: Trust,
+    /// The `[state]` section the `Host`'s `KvBackend` was built from (ADR 000041), captured at
+    /// construction. Same contract as `trust`: the backend lives for the life of the `Host`,
+    /// so a reload that would change it is rejected (`StateChangeRequiresRestart`).
+    state: manifest::State,
     /// Base directory the manifest's relative paths (filter `source`, TLS `cert_path`/`key_path`)
     /// resolve against (ADR 000014). Captured at construction so a reload re-reads certs from the
     /// same root. `"."` for the in-memory `load` core (tests use absolute cert paths).
@@ -169,6 +174,7 @@ impl Control {
             upstreams,
             manifest_path: None,
             trust: manifest.trust.clone(),
+            state: manifest.state.clone(),
             base_dir: base_dir.to_path_buf(),
             filter_metrics,
             observability: manifest.observability.clone(),
@@ -202,6 +208,7 @@ impl Control {
             upstreams,
             manifest_path: None,
             trust: manifest.trust.clone(),
+            state: manifest.state.clone(),
             base_dir: base_dir.to_path_buf(),
             // The caller supplied the `Host`, so its sink is the caller's (or `NoopSink`); this
             // testable core keeps its own empty tally rather than reaching into that host.
@@ -230,6 +237,7 @@ impl Control {
             upstreams,
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
+            state: manifest.state.clone(),
             base_dir: base_dir.to_path_buf(),
             filter_metrics,
             observability: manifest.observability.clone(),
@@ -262,6 +270,7 @@ impl Control {
             upstreams,
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
+            state: manifest.state.clone(),
             base_dir,
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
@@ -290,8 +299,9 @@ type BuiltHost = (
     Option<Arc<plecto_host::otlp::OtlpBuffer>>,
 );
 
-/// Construct the `Host` (trust roots from the manifest's PEMs, ADR 000006) and the offline OCI
-/// artifact store, both rooted at `base_dir`. Shared by `from_manifest` and `from_manifest_path`.
+/// Construct the `Host` (trust roots from the manifest's PEMs, ADR 000006; state backend from
+/// `[state]`, ADR 000041) and the offline OCI artifact store, both rooted at `base_dir`.
+/// Shared by `from_manifest` and `from_manifest_path`.
 fn build_host_and_store(manifest: &Manifest, base_dir: &Path) -> Result<BuiltHost, ControlError> {
     let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
     for key_path in &manifest.trust.keys {
@@ -299,18 +309,46 @@ fn build_host_and_store(manifest: &Manifest, base_dir: &Path) -> Result<BuiltHos
     }
     let trust =
         TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
+    let kv = build_state_backend(&manifest.state, base_dir)?;
     // Wire the host-aggregated filter metrics (ADR 000009): a `MetricsSink` tallies every filter
     // execution. Set BEFORE filters load (the sink is cloned into each at `load`), and retained on
     // `Control` so the fast path's admin endpoint can snapshot it. The default was `NoopSink`
     // (observability off) — this is the wiring that makes the M5 span/metrics stage observable.
     let filter_metrics = Arc::new(MetricsSink::new());
-    let host = Host::new(trust)
+    let host = Host::with_backend(trust, kv)
         .map_err(|e| ControlError::HostInit(e.to_string()))?
         .with_telemetry_sink(filter_metrics.clone());
     // OTLP export (ADR 000040): the span buffer fans in beside the metrics tally.
     let (host, otlp) = add_otlp_buffer(host, manifest);
     let store = oci::OciLayoutStore::new(base_dir);
     Ok((host, store, filter_metrics, otlp))
+}
+
+/// Build the `KvBackend` the manifest's `[state]` selects (ADR 000041): the one store the
+/// `host-kv` / `host-counter` / `host-ratelimit` capabilities share. `memory` keeps today's
+/// process-lifetime behaviour; `redb` opens (or creates) the database at the manifest-relative
+/// `path`. The parent directory must already exist — a typo'd path errors here instead of
+/// silently growing a new tree (directory preparation is the operator's responsibility).
+fn build_state_backend(
+    state: &manifest::State,
+    base_dir: &Path,
+) -> Result<Arc<dyn plecto_host::KvBackend>, ControlError> {
+    state.validate()?;
+    match state.backend {
+        StateBackendKind::Memory => Ok(Arc::new(plecto_host::MemoryBackend::default())),
+        StateBackendKind::Redb => {
+            let path = base_dir.join(state.path.as_deref().unwrap_or_default());
+            if !path.parent().is_some_and(Path::is_dir) {
+                return Err(ControlError::StateBackendInit(format!(
+                    "parent directory of {} does not exist",
+                    path.display()
+                )));
+            }
+            let backend = plecto_host::RedbBackend::open(&path)
+                .map_err(|e| ControlError::StateBackendInit(e.to_string()))?;
+            Ok(Arc::new(backend))
+        }
+    }
 }
 
 /// When `[observability] otlp_endpoint` is set, fan the OTLP span buffer (ADR 000040) in beside

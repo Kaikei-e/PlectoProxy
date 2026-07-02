@@ -28,6 +28,27 @@ pub enum ControlError {
     #[error("manifest [trust] changed; trust roots are fixed at construction — restart to apply")]
     TrustChangeRequiresRestart,
 
+    /// A reload's manifest changed the `[state]` section. The state backend is fixed at
+    /// construction like the trust roots (ADR 000041): the `Host` holds one `KvBackend` for
+    /// its life, so a backend/path edit cannot take effect on a reload. Rejecting it
+    /// fail-closed keeps an operator from believing a durability change took effect when it
+    /// did not — change the backend by restarting with the new manifest.
+    #[error(
+        "manifest [state] changed; the state backend is fixed at construction — restart to apply"
+    )]
+    StateChangeRequiresRestart,
+
+    /// The `[state]` section is inconsistent (ADR 000041): `redb` without a `path`, or a
+    /// `path` under `memory`. Rejected fail-closed so a half-edited section never silently
+    /// runs on memory while the operator believes state is durable.
+    #[error("invalid [state] config: {0}")]
+    InvalidStateConfig(String),
+
+    /// The configured state backend could not be constructed (ADR 000041): the redb file's
+    /// parent directory is missing, or redb failed to open/create the database.
+    #[error("state backend init failed: {0}")]
+    StateBackendInit(String),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 

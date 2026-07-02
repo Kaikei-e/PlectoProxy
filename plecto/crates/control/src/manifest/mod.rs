@@ -31,6 +31,10 @@ use crate::error::ControlError;
 pub struct Manifest {
     #[serde(default)]
     pub trust: Trust,
+    /// `[state]`: the host state backend (ADR 000041). Rides the content hash like `[trust]`,
+    /// and like `[trust]` it is fixed at construction — a reload rejects a change.
+    #[serde(default)]
+    pub state: State,
     /// `[[filter]]` entries.
     #[serde(default, rename = "filter")]
     pub filters: Vec<FilterEntry>,
@@ -533,6 +537,32 @@ pub enum RateLimitKeyKind {
     Route,
     /// A per-client-IP bucket (peer address, v4 /32 + v6 /64), bounded to a fixed-size table.
     ClientIp,
+}
+
+/// The host state backend (`[state]`, ADR 000041): the single knob choosing where the three
+/// state capabilities (`host-kv` / `host-counter` / `host-ratelimit`) keep their bytes.
+/// `memory` (the default) keeps zero-config startup — state dies with the process; `redb`
+/// makes it durable at `path`, so counters and rate-limit windows survive a restart
+/// (fail-closed direction, ADR 000004). One backend serves all three capabilities; fixed at
+/// construction like `[trust]` (`PartialEq` backs the reload rejection — restart to apply).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    #[serde(default)]
+    pub backend: StateBackendKind,
+    /// Manifest-relative path of the redb database file. Required iff `backend = "redb"`;
+    /// the parent directory must already exist (operator responsibility).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Manifest spelling of the state backend (ADR 000041). Defaults to `memory`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StateBackendKind {
+    #[default]
+    Memory,
+    Redb,
 }
 
 /// Trust roots: paths (manifest-relative) to trusted signer public keys, PEM (ADR 000006).
@@ -1322,8 +1352,7 @@ path = "state/plecto.redb"
 
         // Choosing redb is a real config change → the hash flips. (Like [trust], the reload
         // path rejects the change before hashing; the hash still reflects config identity.)
-        let redb =
-            Manifest::from_toml("[state]\nbackend = \"redb\"\npath = \"s.redb\"\n").unwrap();
+        let redb = Manifest::from_toml("[state]\nbackend = \"redb\"\npath = \"s.redb\"\n").unwrap();
         assert_ne!(
             absent.content_hash().unwrap(),
             redb.content_hash().unwrap(),

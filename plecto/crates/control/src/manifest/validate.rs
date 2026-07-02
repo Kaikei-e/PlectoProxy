@@ -4,9 +4,30 @@
 
 use super::{
     FilterEntry, HashKeyKind, LbAlgorithm, MAX_HASH_TABLE_SIZE, MAX_INSTANCE_WEIGHT,
-    OutboundConfig, Upstream,
+    OutboundConfig, State, StateBackendKind, Upstream,
 };
 use crate::error::ControlError;
+
+impl State {
+    /// Validate the `[state]` section (ADR 000041) fail-closed at build, before the backend is
+    /// constructed. A half-set section must never silently run on memory: `redb` needs a path
+    /// (nowhere to persist otherwise), and a path under `memory` means the operator likely
+    /// intended `redb` — running memory anyway would look durable while losing every restart.
+    pub(crate) fn validate(&self) -> Result<(), ControlError> {
+        let path = self.path.as_deref().map(str::trim).unwrap_or("");
+        match self.backend {
+            StateBackendKind::Redb if path.is_empty() => Err(ControlError::InvalidStateConfig(
+                "backend = \"redb\" requires a non-empty `path`".to_string(),
+            )),
+            StateBackendKind::Memory if self.path.is_some() => {
+                Err(ControlError::InvalidStateConfig(
+                    "`path` is only valid with backend = \"redb\"".to_string(),
+                ))
+            }
+            StateBackendKind::Redb | StateBackendKind::Memory => Ok(()),
+        }
+    }
+}
 
 impl Upstream {
     /// Validate this upstream's load-balancing config (ADR 000035) fail-closed at build, before the

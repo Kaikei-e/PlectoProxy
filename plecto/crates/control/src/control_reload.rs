@@ -18,6 +18,7 @@ impl Control {
     pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
         let _gate = self.reload_gate.lock();
         self.ensure_trust_unchanged(manifest)?;
+        self.ensure_state_unchanged(manifest)?;
         let active = build_active(
             &self.host,
             manifest,
@@ -40,6 +41,17 @@ impl Control {
         Ok(())
     }
 
+    /// Reject a reload whose manifest changes the `[state]` section (ADR 000041). The state
+    /// backend is fixed for the life of the `Host` — same contract, same reasoning as
+    /// `ensure_trust_unchanged`: a silently-dropped backend/path edit would read as a
+    /// successful durability change that never happened.
+    pub(crate) fn ensure_state_unchanged(&self, manifest: &Manifest) -> Result<(), ControlError> {
+        if manifest.state != self.state {
+            return Err(ControlError::StateChangeRequiresRestart);
+        }
+        Ok(())
+    }
+
     /// Re-read the on-disk manifest and reload if its `config version` changed. The trigger
     /// (SIGHUP, `serve_reloads`) is content-free, so this is where the new config is actually
     /// read. Idempotent: an unchanged manifest (same semantic `content_hash`) is a no-op —
@@ -55,9 +67,11 @@ impl Control {
             .as_ref()
             .ok_or(ControlError::NoManifestPath)?;
         let manifest = read_manifest(path)?;
-        // A [trust] change is rejected before anything else: it must never be reported as a
-        // successful reload (f000004 #1), even though it would flip the content hash below.
+        // A [trust] or [state] change is rejected before anything else: it must never be
+        // reported as a successful reload (f000004 #1 / ADR 000041), even though it would flip
+        // the content hash below.
         self.ensure_trust_unchanged(&manifest)?;
+        self.ensure_state_unchanged(&manifest)?;
         let new_hash = manifest.content_hash()?;
         // Cheap idempotency gate: skip the rebuild + drain entirely when the config version
         // is unchanged (a comment-only edit, or a spurious trigger).

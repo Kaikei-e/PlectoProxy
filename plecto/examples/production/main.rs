@@ -78,6 +78,11 @@ async fn main() -> anyhow::Result<()> {
     let i2 = spawn_instance("api-2").await?;
     let i3 = spawn_instance("api-3").await?;
 
+    // The [state] redb file's parent must exist before the binary starts (ADR 000041: directory
+    // preparation is the operator's responsibility — a typo'd path errors instead of growing a
+    // new tree). This dir is that ops step.
+    std::fs::create_dir_all(deploy.join("state"))?;
+
     let manifest_path = deploy.join("manifest.toml");
     std::fs::write(&manifest_path, manifest_toml(&digest, i1, i2, i3))?;
 
@@ -139,6 +144,11 @@ fn manifest_toml(digest: &str, i1: SocketAddr, i2: SocketAddr, i3: SocketAddr) -
 
 [trust]
 keys = ["trust.pem"]              # the roots allowed to sign filters (verify-then-load)
+
+[state]
+backend = "redb"                  # durable host state (ADR 000041): filter KV, counters and
+path = "state/plecto.redb"        # rate-limit windows survive restarts. Fixed at construction —
+                                  # changing it needs a restart, not a reload. Default: "memory".
 
 [[filter]]
 id = "apikey"

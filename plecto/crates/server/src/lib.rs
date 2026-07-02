@@ -45,6 +45,7 @@ mod headers;
 mod health;
 mod listener;
 mod metrics;
+mod otlp;
 mod proxy;
 mod respond;
 mod retry;
@@ -144,6 +145,10 @@ pub(crate) struct ServerState {
     /// request and served on the admin endpoint. Always recorded (cheap atomics); whether anyone
     /// can scrape them is gated by `[observability] admin_addr`.
     metrics: Arc<ServerMetrics>,
+    /// The OTLP span buffer (ADR 000040), present iff `[observability] otlp_endpoint` is set:
+    /// `proxy_core` pushes one SERVER request span per sampled transaction; the export pump
+    /// (spawned by the listener) drains it.
+    otlp: Option<Arc<plecto_control::otlp::OtlpBuffer>>,
 }
 
 /// An upstream HTTP connector with `TCP_NODELAY` set. A proxy must disable Nagle on its upstream

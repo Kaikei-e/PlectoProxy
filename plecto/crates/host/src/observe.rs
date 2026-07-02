@@ -57,9 +57,17 @@ fn next_span_id() -> SpanId {
 /// The host-owned trace context for one request transaction. Created by the chain driver (the
 /// [`ConfigSnapshot`](crate) / fast-path server), it parents every filter span so the whole
 /// chain — request side and response side — shares one trace. Cheap to copy.
+///
+/// `request_span_id` is ALWAYS locally minted — it names the request (SERVER) span Plecto itself
+/// owns. An inbound `traceparent`'s span id is kept separately as `parent_span_id` (the remote
+/// parent), never reused as our own: emitting a span under an id another process minted would
+/// collide with that process's exporter (ADR 000040). This is the standard proxy shape — the
+/// upstream and every filter span nest under Plecto's request span.
 #[derive(Debug, Clone, Copy)]
 pub struct RequestTrace {
     trace_id: TraceId,
+    /// The inbound (remote) span this transaction continues under, `None` for a local root.
+    parent_span_id: Option<SpanId>,
     request_span_id: SpanId,
     flags: TraceFlags,
 }
@@ -69,14 +77,16 @@ impl RequestTrace {
     pub fn root() -> Self {
         Self {
             trace_id: next_trace_id(),
+            parent_span_id: None,
             request_span_id: next_span_id(),
             flags: TraceFlags::SAMPLED,
         }
     }
 
     /// Continue an inbound trace from a W3C `traceparent` (`00-{trace}-{span}-{flags}`). The
-    /// inbound span becomes this request's parent. Returns `None` on any malformed field
-    /// (fail-soft: a bad header just starts no continuation, never a panic on untrusted input).
+    /// inbound span becomes this request's REMOTE PARENT; the request span id itself is minted
+    /// locally. Returns `None` on any malformed field (fail-soft: a bad header just starts no
+    /// continuation, never a panic on untrusted input).
     pub fn from_traceparent(traceparent: &str) -> Option<Self> {
         let mut parts = traceparent.split('-');
         let (version, trace, span, flags) =
@@ -87,19 +97,21 @@ impl RequestTrace {
         let tb: [u8; 16] = hex::decode(trace).ok()?.try_into().ok()?;
         let sb: [u8; 8] = hex::decode(span).ok()?.try_into().ok()?;
         let trace_id = TraceId::from_bytes(tb);
-        let request_span_id = SpanId::from_bytes(sb);
-        if trace_id == TraceId::INVALID || request_span_id == SpanId::INVALID {
+        let inbound_span_id = SpanId::from_bytes(sb);
+        if trace_id == TraceId::INVALID || inbound_span_id == SpanId::INVALID {
             return None;
         }
         let flag_byte = u8::from_str_radix(flags, 16).ok()?;
         Some(Self {
             trace_id,
-            request_span_id,
+            parent_span_id: Some(inbound_span_id),
+            request_span_id: next_span_id(),
             flags: TraceFlags::new(flag_byte),
         })
     }
 
-    /// Format as a W3C `traceparent` for downstream propagation.
+    /// Format as a W3C `traceparent` for downstream propagation. Carries the (locally-minted)
+    /// request span id, so the upstream's spans nest under Plecto's request span.
     pub fn to_traceparent(&self) -> String {
         format!(
             "00-{}-{}-{:02x}",
@@ -116,6 +128,11 @@ impl RequestTrace {
     /// The request (root) span id — the parent of every filter span in this transaction.
     pub fn request_span_id(&self) -> SpanId {
         self.request_span_id
+    }
+
+    /// The inbound (remote) span this transaction continues under, or `None` for a local root.
+    pub fn parent_span_id(&self) -> Option<SpanId> {
+        self.parent_span_id
     }
 
     pub fn is_sampled(&self) -> bool {
@@ -217,6 +234,9 @@ pub struct FilterSpan {
     pub attributes: Vec<KeyValue>,
     /// The filter's host-log lines, as span events (this is where dropped logs now land).
     pub events: Vec<Event>,
+    /// The transaction's W3C sampled flag. An exporting sink (OTLP, ADR 000040) skips unsampled
+    /// spans; the in-process tally sinks count them all (metrics are not sampled).
+    pub sampled: bool,
 }
 
 impl FilterSpan {
@@ -301,6 +321,7 @@ pub(crate) fn build_filter_span(
             KeyValue::new("plecto.hook", hook.as_str()),
         ],
         events,
+        sampled: trace.is_sampled(),
     }
 }
 
@@ -458,10 +479,37 @@ mod tests {
     }
 
     #[test]
-    fn traceparent_round_trips() {
+    fn traceparent_continuation_keeps_trace_and_flags_but_mints_a_local_span_id() {
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let t = RequestTrace::from_traceparent(tp).expect("valid traceparent parses");
-        assert_eq!(t.to_traceparent(), tp, "round-trips losslessly");
+        assert!(t.is_sampled());
+        let inbound = SpanId::from_bytes([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
+        assert_eq!(
+            t.parent_span_id(),
+            Some(inbound),
+            "the inbound span is kept as the REMOTE PARENT"
+        );
+        assert_ne!(
+            t.request_span_id(),
+            inbound,
+            "the request span id is minted locally, never the caller's (ADR 000040)"
+        );
+        let out = t.to_traceparent();
+        assert!(
+            out.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-") && out.ends_with("-01"),
+            "trace id + flags are preserved downstream, span id is Plecto's own: {out}"
+        );
+        assert_eq!(
+            out.split('-').nth(2),
+            Some(hex::encode(t.request_span_id().to_bytes()).as_str()),
+            "the propagated span id is the request span's"
+        );
+    }
+
+    #[test]
+    fn root_trace_has_no_remote_parent() {
+        let t = RequestTrace::root();
+        assert_eq!(t.parent_span_id(), None);
         assert!(t.is_sampled());
     }
 

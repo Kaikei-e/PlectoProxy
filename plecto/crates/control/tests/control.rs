@@ -316,6 +316,63 @@ fn request_and_response_spans_share_one_trace_via_snapshot() {
 }
 
 #[test]
+fn otlp_endpoint_wires_the_span_buffer_beside_the_callers_sink() {
+    // ADR 000040: `[observability] otlp_endpoint` fans the OTLP span buffer in ALONGSIDE the
+    // caller's sink — export never replaces the existing observability, and both see the same
+    // filter spans.
+    let sink = Arc::new(InMemorySink::new());
+    let (signer, artifact) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("fh", artifact);
+    let host = Host::new(signer.trust_policy().unwrap())
+        .unwrap()
+        .with_telemetry_sink(sink.clone());
+    let toml = format!(
+        r#"
+[observability]
+otlp_endpoint = "http://127.0.0.1:4318"
+
+[[filter]]
+id = "fh"
+source = "fh"
+digest = "{digest}"
+isolation = "untrusted"
+
+[chain]
+filters = ["fh"]
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+
+    assert_eq!(control.otlp_endpoint(), Some("http://127.0.0.1:4318"));
+    let buffer = control
+        .otlp_buffer()
+        .expect("the buffer exists iff the endpoint is set");
+
+    let snap = control.snapshot();
+    let _ = snap.on_request(req(&[]));
+
+    assert_eq!(sink.len(), 1, "the caller's sink still sees the span");
+    let exported = buffer.drain(16);
+    assert_eq!(exported.len(), 1, "the buffer received the same span");
+    assert_eq!(exported[0].name, "fh");
+    assert!(exported[0].sampled);
+}
+
+#[test]
+fn without_otlp_endpoint_there_is_no_buffer() {
+    let (signer, artifact) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("fh", artifact);
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let manifest = Manifest::from_toml(&manifest_toml(&digest, &["fh"])).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+    assert_eq!(control.otlp_endpoint(), None);
+    assert!(control.otlp_buffer().is_none());
+}
+
+#[test]
 fn duplicate_filter_id_is_rejected() {
     // f000004 #6 / the host flagged filter-id uniqueness as the caller's job — control is that
     // caller. Two `[[filter]]` sharing an id is a config error, caught before a half-built set

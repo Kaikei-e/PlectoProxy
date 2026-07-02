@@ -6,10 +6,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use hyper::body::Body;
 use hyper::{Response, StatusCode};
+use plecto_control::otlp::SpanRecord;
 use plecto_control::{
     ChainOutcome, HashInput, HashKeySource, HttpResponse, RateLimitDecision, RequestBodyOutcome,
     RequestTrace,
@@ -74,7 +75,30 @@ pub(crate) async fn proxy_core(
             path: parts.uri.path().to_string(),
         });
 
-    let result = proxy_core_inner(state.clone(), scheme, peer, parts, body).await;
+    // Continue an inbound distributed trace (ADR 000009): if the caller sent a W3C `traceparent`,
+    // parse it and pin the transaction to it so Plecto's spans JOIN the caller's trace — the
+    // inbound span becomes the REMOTE PARENT of a locally-minted request span (ADR 000040).
+    // Fail-soft: a missing / malformed header falls back to a new root, never a panic on
+    // untrusted input (review f000005 P1#2; `from_traceparent` is the fail-soft parser).
+    let trace = parts
+        .headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(RequestTrace::from_traceparent)
+        .unwrap_or_else(RequestTrace::root);
+
+    // Request-span fields for OTLP export (ADR 000040), captured BEFORE the core consumes
+    // `parts` and only when a configured exporter will actually see them — like the access log,
+    // a disabled (or unsampled) transaction allocates nothing on the hot path.
+    let otlp_request = state.otlp.as_ref().filter(|_| trace.is_sampled()).map(|_| {
+        (
+            parts.method.as_str().to_string(),
+            parts.uri.path().to_string(),
+            SystemTime::now(),
+        )
+    });
+
+    let result = proxy_core_inner(state.clone(), scheme, peer, trace, parts, body).await;
 
     drop(in_flight);
     let status = match &result {
@@ -87,6 +111,14 @@ pub(crate) async fn proxy_core(
     if let Some(access) = access {
         access_log::record(scheme, peer, &access, status, elapsed);
     }
+    // One SERVER span per sampled transaction (ADR 000040): the root the filter spans (and the
+    // upstream's own trace, via the propagated traceparent) nest under. Push is a bounded-queue
+    // append — a slow collector can never back-pressure this path.
+    if let (Some(buffer), Some((method, path, started))) = (state.otlp.as_ref(), otlp_request) {
+        buffer.push(SpanRecord::request_span(
+            &trace, &method, &path, scheme, status, started, elapsed,
+        ));
+    }
     result
 }
 
@@ -97,6 +129,7 @@ async fn proxy_core_inner(
     state: Arc<ServerState>,
     scheme: &'static str,
     peer: SocketAddr,
+    trace: RequestTrace,
     parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
@@ -126,20 +159,9 @@ async fn proxy_core_inner(
     // filter sees a value it can trust; the corrected headers then forward to the upstream.
     set_forwarded(&mut http_req.headers, peer.ip(), scheme);
 
-    // Continue an inbound distributed trace (ADR 000009): if the caller sent a W3C `traceparent`,
-    // parse it and pin the transaction to it so Plecto's filter spans JOIN the caller's trace
-    // (and the traceparent forwarded upstream keeps the same trace-id) instead of starting a fresh
-    // root. Fail-soft — a missing / malformed header falls back to a new root, never a panic on
-    // untrusted input (review f000005 P1#2; `from_traceparent` is the fail-soft parser).
-    let trace = parts
-        .headers
-        .get("traceparent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(RequestTrace::from_traceparent)
-        .unwrap_or_else(RequestTrace::root);
-
     // One snapshot pins config + trace for the whole transaction (a concurrent reload cannot
-    // desync the request and response halves); cloning it is a cheap Arc + trace-id clone.
+    // desync the request and response halves); cloning it is a cheap Arc + trace-id clone. The
+    // trace itself was resolved by `proxy_core`, which also emits the request span (ADR 000040).
     let snapshot = state.control.snapshot_with_trace(trace);
     // Match against the full request — host, path, method, headers, query (ADR 000034); the most
     // specific route wins. `http_req` carries the forwarded-header-corrected inbound request.

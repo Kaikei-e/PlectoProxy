@@ -36,6 +36,7 @@
 
 mod backend;
 mod observe;
+pub mod otlp;
 // Experimental streaming body filter (direction_0003 gates 1+2), OFF by default. A descendant of the
 // crate root, so it reuses the private `EpochTicker` metering; the shipped path is untouched.
 #[cfg(feature = "streaming-body")]
@@ -1092,6 +1093,15 @@ impl Host {
     /// The sink is cloned into each filter at `load`, so set it before loading.
     pub fn with_telemetry_sink(mut self, sink: Arc<dyn TelemetrySink>) -> Self {
         self.sink = sink;
+        self
+    }
+
+    /// Add `sink` ALONGSIDE the current one (fan-out) instead of replacing it — the composition
+    /// hook for wiring the OTLP export buffer (ADR 000040) next to whatever sink the caller
+    /// already set. Same load-time rule as [`with_telemetry_sink`](Self::with_telemetry_sink):
+    /// compose before loading filters.
+    pub fn with_added_telemetry_sink(mut self, sink: Arc<dyn TelemetrySink>) -> Self {
+        self.sink = Arc::new(observe::FanOutSink::new(vec![self.sink, sink]));
         self
     }
 

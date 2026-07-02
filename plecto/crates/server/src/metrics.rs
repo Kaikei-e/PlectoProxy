@@ -120,9 +120,11 @@ impl ServerMetrics {
     }
 
     /// Render the Prometheus text exposition format: the native RED metrics plus the host-aggregated
-    /// filter-execution metrics (ADR 000009). Built by `format!` + `join` (no `write!` Result to
-    /// swallow); a cold path, so the allocation is immaterial.
-    pub(crate) fn render(&self, filter: &MetricsSnapshot) -> String {
+    /// filter-execution metrics (ADR 000009), plus — when export is configured — the OTLP queue
+    /// telemetry (ADR 000040: `otlp` is the buffer's point-in-time (dropped, queued) pair). Built by
+    /// `format!` + `join` (no `write!` Result to swallow); a cold path, so the allocation is
+    /// immaterial.
+    pub(crate) fn render(&self, filter: &MetricsSnapshot, otlp: Option<(u64, usize)>) -> String {
         const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
         let mut out: Vec<String> = Vec::new();
 
@@ -237,6 +239,22 @@ impl ServerMetrics {
             filter.total_duration.as_secs_f64()
         ));
 
+        // --- OTLP export queue (ADR 000040), only when an exporter is configured ---
+        if let Some((dropped, queued)) = otlp {
+            out.push(
+                "# HELP plecto_otlp_dropped_spans_total Spans lost to a full queue or failed exports."
+                    .to_string(),
+            );
+            out.push("# TYPE plecto_otlp_dropped_spans_total counter".to_string());
+            out.push(format!("plecto_otlp_dropped_spans_total {dropped}"));
+
+            out.push(
+                "# HELP plecto_otlp_queue_spans Spans currently queued for export.".to_string(),
+            );
+            out.push("# TYPE plecto_otlp_queue_spans gauge".to_string());
+            out.push(format!("plecto_otlp_queue_spans {queued}"));
+        }
+
         let mut text = out.join("\n");
         text.push('\n');
         text
@@ -264,7 +282,7 @@ mod tests {
         m.record_request(404, Duration::from_millis(1));
         m.record_request(503, Duration::from_millis(50));
 
-        let text = m.render(&snap(0, 0, 0));
+        let text = m.render(&snap(0, 0, 0), None);
         assert!(text.contains("plecto_requests_total{status_class=\"2xx\"} 2"));
         assert!(text.contains("plecto_requests_total{status_class=\"4xx\"} 1"));
         assert!(text.contains("plecto_requests_total{status_class=\"5xx\"} 1"));
@@ -282,7 +300,7 @@ mod tests {
         }
         // all five clamp into 1xx or 5xx — the point is simply that none panicked.
         assert!(
-            m.render(&snap(0, 0, 0))
+            m.render(&snap(0, 0, 0), None)
                 .contains("plecto_request_duration_seconds_count 5")
         );
     }
@@ -293,7 +311,7 @@ mod tests {
         for ms in [2u64, 8, 30, 300] {
             m.record_request(200, Duration::from_millis(ms));
         }
-        let text = m.render(&snap(0, 0, 0));
+        let text = m.render(&snap(0, 0, 0), None);
         let counts: Vec<u64> = text
             .lines()
             .filter(|l| l.starts_with("plecto_request_duration_seconds_bucket"))
@@ -318,7 +336,7 @@ mod tests {
         m.inc_in_flight();
         m.dec_in_flight();
         assert!(
-            m.render(&snap(0, 0, 0))
+            m.render(&snap(0, 0, 0), None)
                 .contains("plecto_requests_in_flight 1")
         );
     }
@@ -326,9 +344,22 @@ mod tests {
     #[test]
     fn folds_in_host_filter_metrics() {
         let m = ServerMetrics::new();
-        let text = m.render(&snap(5, 2, 1));
+        let text = m.render(&snap(5, 2, 1), None);
         assert!(text.contains("plecto_filter_executions_total 5"));
         assert!(text.contains("plecto_filter_errors_total 2"));
         assert!(text.contains("plecto_filter_short_circuits_total 1"));
+    }
+
+    #[test]
+    fn otlp_queue_telemetry_renders_only_when_export_is_configured() {
+        let m = ServerMetrics::new();
+        let off = m.render(&snap(0, 0, 0), None);
+        assert!(
+            !off.contains("plecto_otlp_"),
+            "no OTLP lines without an exporter"
+        );
+        let on = m.render(&snap(0, 0, 0), Some((7, 3)));
+        assert!(on.contains("plecto_otlp_dropped_spans_total 7"));
+        assert!(on.contains("plecto_otlp_queue_spans 3"));
     }
 }

@@ -73,6 +73,12 @@ pub struct Observability {
     /// rendered as JSON by the binary's subscriber). `false` by default.
     #[serde(default)]
     pub access_log: bool,
+    /// OTLP/HTTP collector base URL (e.g. `http://localhost:4318`) — the exporter appends
+    /// `/v1/traces`, mirroring `OTEL_EXPORTER_OTLP_ENDPOINT` semantics (ADR 000040). `None` = no
+    /// trace export (the default). Captured at construction, like `admin_addr`: changing it
+    /// requires a restart, not a reload.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
 }
 
 /// One TLS server certificate (ADR 000014). The fast path terminates TLS with rustls and selects
@@ -679,17 +685,20 @@ mod tests {
 
     #[test]
     fn observability_defaults_off_and_parses_when_present() {
-        // Absent `[observability]` → admin endpoint off, access log off (operational simplicity).
+        // Absent `[observability]` → admin endpoint off, access log off, no OTLP export
+        // (operational simplicity).
         let bare = Manifest::from_toml("").unwrap();
         assert_eq!(bare.observability.admin_addr, None);
         assert!(!bare.observability.access_log);
+        assert_eq!(bare.observability.otlp_endpoint, None);
 
-        // Present → both knobs are read.
+        // Present → the knobs are read.
         let m = Manifest::from_toml(
             r#"
 [observability]
 admin_addr = "127.0.0.1:9090"
 access_log = true
+otlp_endpoint = "http://localhost:4318"
 "#,
         )
         .unwrap();
@@ -698,6 +707,10 @@ access_log = true
             Some("127.0.0.1:9090")
         );
         assert!(m.observability.access_log);
+        assert_eq!(
+            m.observability.otlp_endpoint.as_deref(),
+            Some("http://localhost:4318")
+        );
     }
 
     #[test]
@@ -711,6 +724,7 @@ access_log = true
 [observability]
 admin_addr = "127.0.0.1:9090"
 access_log = true
+otlp_endpoint = "http://localhost:4318"
 "#,
         )
         .unwrap();

@@ -63,7 +63,10 @@ async fn admin_handle(
         "/metrics" => (
             StatusCode::OK,
             "text/plain; version=0.0.4; charset=utf-8",
-            state.metrics.render(&state.control.filter_metrics()),
+            state.metrics.render(
+                &state.control.filter_metrics(),
+                state.otlp.as_ref().map(|b| (b.dropped_spans(), b.len())),
+            ),
         ),
         "/healthz" => (
             StatusCode::OK,

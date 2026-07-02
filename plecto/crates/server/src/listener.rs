@@ -93,6 +93,13 @@ async fn serve_inner(
         HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", tcp_addr.port())).ok()
     });
 
+    // OTLP export wiring (ADR 000040): grab the buffer + endpoint before `control` moves into
+    // the state; the pump task itself is spawned below, once the drain channel exists.
+    let otlp_export = control
+        .otlp_endpoint()
+        .map(str::to_string)
+        .zip(control.otlp_buffer());
+
     let state = Arc::new(ServerState {
         control,
         client: HyperUpstreamClient::new(
@@ -109,6 +116,7 @@ async fn serve_inner(
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
         metrics: Arc::new(ServerMetrics::new()),
+        otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
     });
 
     // The drain flag (ADR 000039): flipped to `true` exactly once, at shutdown. Every connection
@@ -134,6 +142,16 @@ async fn serve_inner(
     // flips its healthy/unhealthy state, so the round-robin in `proxy_core` only ever picks live
     // instances. Spawned like the reload loop — the server owns the task, Control owns the state.
     tokio::spawn(serve_health_checks(state.control.clone()));
+
+    // OTLP export pump (ADR 000040): drains the span buffer to the collector. The handle is kept
+    // (unlike the fire-and-forget tasks above) so shutdown can await its final flush.
+    let otlp_pump = otlp_export.map(|(endpoint, buffer)| {
+        tokio::spawn(crate::otlp::serve_otlp_export(
+            buffer,
+            endpoint,
+            drain_rx.clone(),
+        ))
+    });
 
     if let Some(cfg) = quic_cfg {
         match build_h3_endpoint(cfg, tcp_addr) {
@@ -224,6 +242,16 @@ async fn serve_inner(
             "graceful shutdown: drain deadline expired; cutting remaining connections"
         );
         conns.abort_all();
+    }
+    // Flush the OTLP queue before returning (the spec's Shutdown-includes-ForceFlush): the pump
+    // saw the same drain flip and is flushing under its own deadline; give it that long plus a
+    // beat, then move on — telemetry never holds the process open indefinitely.
+    if let Some(pump) = otlp_pump {
+        let _ = tokio::time::timeout(
+            crate::otlp::SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(1),
+            pump,
+        )
+        .await;
     }
     Ok(())
 }

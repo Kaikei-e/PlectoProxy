@@ -87,6 +87,9 @@ pub use plecto_host::{
     FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse, InMemorySink, MetricsSink,
     MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
 };
+// The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the
+// hand-written wire encoding through the control plane, without depending on `plecto-host`.
+pub use plecto_host::otlp;
 
 /// The atomically-swappable active configuration: the loaded filters, the chain order, and
 /// the `content_hash` of the manifest that produced them. Held behind an `ArcSwap`; never
@@ -141,6 +144,11 @@ pub struct Control {
     /// Operational observability config (`[observability]`, ADR 000009), captured at construction:
     /// the admin endpoint bind address and the access-log toggle. Not part of the config version.
     observability: Observability,
+    /// The OTLP span buffer (ADR 000040), present iff `[observability] otlp_endpoint` is set:
+    /// fanned in beside the sinks above at `Host` construction, drained by the fast path's
+    /// export pump. Like the admin listener, it binds once at startup — a reload swaps only the
+    /// filter set, so the buffer (and the endpoint) live for the process.
+    otlp: Option<Arc<plecto_host::otlp::OtlpBuffer>>,
 }
 
 impl Control {
@@ -150,7 +158,7 @@ impl Control {
     /// path in the manifest (`trust.keys`, each filter `source`) is resolved relative to
     /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
     pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
-        let (host, store, filter_metrics) = build_host_and_store(manifest, base_dir)?;
+        let (host, store, filter_metrics, otlp) = build_host_and_store(manifest, base_dir)?;
         let upstreams = Arc::new(UpstreamRegistry::new());
         let active = build_active(&host, manifest, &store, base_dir, &upstreams)?;
         Ok(Self {
@@ -164,6 +172,7 @@ impl Control {
             base_dir: base_dir.to_path_buf(),
             filter_metrics,
             observability: manifest.observability.clone(),
+            otlp,
         })
     }
 
@@ -181,6 +190,9 @@ impl Control {
         // Tests that exercise `[[tls]]` use absolute cert paths, so this base does not bite them.
         let base_dir = Path::new(".");
         let upstreams = Arc::new(UpstreamRegistry::new());
+        // OTLP export (ADR 000040): fan the span buffer in BESIDE the caller's sink (never
+        // replacing it), before `build_active` loads filters (the sink is cloned into each).
+        let (host, otlp) = add_otlp_buffer(host, manifest);
         let active = build_active(&host, manifest, store.as_ref(), base_dir, &upstreams)?;
         Ok(Self {
             host,
@@ -195,6 +207,7 @@ impl Control {
             // testable core keeps its own empty tally rather than reaching into that host.
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
+            otlp,
         })
     }
 
@@ -206,7 +219,7 @@ impl Control {
     pub fn from_manifest_path(manifest_path: &Path) -> Result<Self, ControlError> {
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
-        let (host, store, filter_metrics) = build_host_and_store(&manifest, base_dir)?;
+        let (host, store, filter_metrics, otlp) = build_host_and_store(&manifest, base_dir)?;
         let upstreams = Arc::new(UpstreamRegistry::new());
         let active = build_active(&host, &manifest, &store, base_dir, &upstreams)?;
         Ok(Self {
@@ -220,6 +233,7 @@ impl Control {
             base_dir: base_dir.to_path_buf(),
             filter_metrics,
             observability: manifest.observability.clone(),
+            otlp,
         })
     }
 
@@ -238,6 +252,7 @@ impl Control {
             .to_path_buf();
         let manifest = read_manifest(manifest_path)?;
         let upstreams = Arc::new(UpstreamRegistry::new());
+        let (host, otlp) = add_otlp_buffer(host, &manifest);
         let active = build_active(&host, &manifest, store.as_ref(), &base_dir, &upstreams)?;
         Ok(Self {
             host,
@@ -250,6 +265,7 @@ impl Control {
             base_dir,
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
+            otlp,
         })
     }
 
@@ -265,12 +281,18 @@ fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
     Manifest::from_toml(&toml)
 }
 
+/// What `build_host_and_store` assembles for the manifest-driven constructors: the `Host` (sinks
+/// wired), the offline OCI store, and the observability handles `Control` retains.
+type BuiltHost = (
+    Host,
+    oci::OciLayoutStore,
+    Arc<MetricsSink>,
+    Option<Arc<plecto_host::otlp::OtlpBuffer>>,
+);
+
 /// Construct the `Host` (trust roots from the manifest's PEMs, ADR 000006) and the offline OCI
 /// artifact store, both rooted at `base_dir`. Shared by `from_manifest` and `from_manifest_path`.
-fn build_host_and_store(
-    manifest: &Manifest,
-    base_dir: &Path,
-) -> Result<(Host, oci::OciLayoutStore, Arc<MetricsSink>), ControlError> {
+fn build_host_and_store(manifest: &Manifest, base_dir: &Path) -> Result<BuiltHost, ControlError> {
     let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
     for key_path in &manifest.trust.keys {
         pems.push(std::fs::read(base_dir.join(key_path))?);
@@ -285,8 +307,23 @@ fn build_host_and_store(
     let host = Host::new(trust)
         .map_err(|e| ControlError::HostInit(e.to_string()))?
         .with_telemetry_sink(filter_metrics.clone());
+    // OTLP export (ADR 000040): the span buffer fans in beside the metrics tally.
+    let (host, otlp) = add_otlp_buffer(host, manifest);
     let store = oci::OciLayoutStore::new(base_dir);
-    Ok((host, store, filter_metrics))
+    Ok((host, store, filter_metrics, otlp))
+}
+
+/// When `[observability] otlp_endpoint` is set, fan the OTLP span buffer (ADR 000040) in beside
+/// the host's current sink. Must run before filters load (the sink is cloned into each).
+fn add_otlp_buffer(
+    host: Host,
+    manifest: &Manifest,
+) -> (Host, Option<Arc<plecto_host::otlp::OtlpBuffer>>) {
+    if manifest.observability.otlp_endpoint.is_none() {
+        return (host, None);
+    }
+    let buffer = Arc::new(plecto_host::otlp::OtlpBuffer::default());
+    (host.with_added_telemetry_sink(buffer.clone()), Some(buffer))
 }
 
 /// Resolve + verify + load every manifest filter into a fresh `ActiveConfig`. Pure w.r.t. the

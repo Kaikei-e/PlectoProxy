@@ -118,6 +118,11 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # dhat: host-heap profiler for the `mem-probe` example (feature `dhat-heap`). Dev-only, so it is
 # never linked into a production build of the lib.
 dhat = "0.3"
+# OTLP decode ORACLE for the hand-written exporter (ADR 000040): the official generated proto
+# types verify the encoder's bytes in round-trip tests. `gen-tonic-messages` pulls prost only —
+# no tonic/gRPC stack. Dev-only, never linked into a production build.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "0.14"
 
 [[bench]]
 name = "wasm"

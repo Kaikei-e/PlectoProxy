@@ -220,7 +220,7 @@ The suite proves the slice end-to-end: a request flows through the host into a r
 
 ### Run the demos
 
-Six self-contained, use-case-focused demos live under `examples/<name>/`, forming a learning path from a 5-minute `quickstart` up to the real things a gateway does ([`examples/README.md`](plecto/examples/README.md) is the map). Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup.
+Nine self-contained, use-case-focused demos live under `examples/<name>/`, forming a learning path from a 5-minute `quickstart` up to the real things a gateway does ([`examples/README.md`](plecto/examples/README.md) is the map; each demo directory has its own README with the exact `curl`s and expected output). Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup.
 
 The quickest way to see one work end to end is the guided tour — it starts the demo, waits for it, runs the `curl` commands, visualizes the output, and cleans up:
 
@@ -243,6 +243,9 @@ cargo run -p plecto-server --example <name>   # Ctrl-C to stop
 | `filter-chain` | The filter chain over plain HTTP: continue / modify (header rewrite) / short-circuit 403 / host-native rate limit. |
 | `tls-http` | TLS termination with HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC) on one port, plus `Alt-Svc` h3 advertisement. |
 | `hot-reload` | Edit the manifest, `kill -HUP <pid>`, and watch the config swap atomically with zero downtime (a broken edit is fail-closed). |
+| `canary` | **A rollout you can operate** — a 90/10 weighted traffic split (deterministic apportionment), a header-match route that sends internal testers straight to v2, and a zero-downtime drain/promote via SIGHUP (ADR 000034). |
+| `resilience` | **The failure axes, visible from curl** — flip an instance's failure mode at runtime and watch: per-try timeout + retry to another instance, the overall deadline (504 `request-timeout`), the circuit breaker (503 `circuit-open`), and silent outlier ejection while clients keep seeing 200 (ADR 000023 / 000028 / 000031 / 000032). |
+| `production` | **The shape you operate** — the real `plecto` binary serving a deploy dir (`manifest.toml` + trust root + signed OCI layout, two terminals): signed WASM auth, a native rate-limit floor, `least_request` LB, and the `/metrics` admin endpoint (ADR 000009 / 000033 / 000035). |
 
 New here? Start with [`examples/README.md`](plecto/examples/README.md) — a guided path from a 5-minute `quickstart` up through the real use cases above. Or read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
 
@@ -280,7 +283,7 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │   │   └── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, LB, upstream (+ CONTEXT.md)
 │   └── examples/              # runnable demos + example filter guests — see examples/README.md (the DX map)
 │       ├── README.md          # the guided learning path (quickstart → real use cases)
-│       ├── <use-case>/        # six demos: cargo run -p plecto-server --example <name>
+│       ├── <use-case>/        # nine demos: cargo run -p plecto-server --example <name>
 │       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs)
 │           ├── filter-quickstart/ # minimal starter filter (stamps one response header)
 │           ├── filter-apikey/ # real-world example filter: API-key auth gate (WASM component)

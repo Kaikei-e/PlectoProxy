@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # try.sh — run a Plecto example and visualize its behaviour, end to end.
 #
-#   ./examples/try.sh <name>     name ∈ wasm-auth | load-balancing | filter-chain | tls-http | hot-reload
+#   ./examples/try.sh <name>     name ∈ wasm-auth | load-balancing | filter-chain | tls-http |
+#                                        hot-reload | canary | resilience | production
 #   ./examples/try.sh all        run every scenario in turn
 #
 # It starts the example in the background, waits until it's ready, drives the relevant curl
@@ -19,9 +20,10 @@ note() { printf '%s\n' "${D}# $*${X}"; }
 run()  { printf '%s\n' "${Y}\$ $*${X}"; eval "$@"; }
 bar()  { local n=$1 s=; while [ "$n" -gt 0 ]; do s="$s█"; n=$((n-1)); done; printf '%s' "$s"; }
 
-NAME=""; PID=""; LOG=""
+NAME=""; PID=""; LOG=""; BIN_PID=""
 cleanup() {
   [ -n "$PID" ] && kill "$PID" 2>/dev/null
+  [ -n "$BIN_PID" ] && kill "$BIN_PID" 2>/dev/null
   [ -n "$NAME" ] && pkill -f "examples/${NAME}$" 2>/dev/null
   [ -n "$LOG" ] && rm -f "$LOG"
 }
@@ -31,7 +33,9 @@ start() { # start example $1, stream its output to $LOG, set PID
   NAME="$1"; LOG="$(mktemp)"
   pkill -f "examples/${NAME}$" 2>/dev/null && sleep 0.3 # clear a stale instance from a prior run
   say "starting example: ${B}$NAME${X}${C} (compiling on first run, please wait…)"
-  ( cd "$WS" && CARGO_BUILD_JOBS=2 cargo run -q -p plecto-server --example "$NAME" ) >"$LOG" 2>&1 &
+  # build synchronously first, so a cold compile never eats into wait_ready's budget
+  ( cd "$WS" && CARGO_BUILD_JOBS=2 cargo build -q -p plecto-server --example "$NAME" )
+  ( cd "$WS" && cargo run -q -p plecto-server --example "$NAME" ) >"$LOG" 2>&1 &
   PID=$!
 }
 
@@ -150,6 +154,95 @@ scenario_hot_reload() {
   note "expected: 'upstream received: /api/hello'"
 }
 
+scenario_canary() {
+  start canary
+  wait_ready "http://localhost:8083/checkout" || return 1
+  banner
+  local pid manifest
+  pid="$(grep -oE 'pid      : [0-9]+' "$LOG" | grep -oE '[0-9]+' | head -1)"
+  manifest="$(grep -E 'manifest : ' "$LOG" | head -1 | sed 's/.*manifest : //')"
+  vtally() { # hit the proxy $1 times, show the per-version distribution as bars
+    local n="$1" v; declare -A c=();
+    for _ in $(seq "$n"); do
+      v="$(curl -s http://localhost:8083/checkout | grep -oE 'checkout v[12]' | awk '{print $2}')"
+      [ -n "$v" ] && c[$v]=$(( ${c[$v]:-0} + 1 ))
+    done
+    for k in v1 v2; do printf '  %s │ %s %s\n' "$k" "${G}$(bar "${c[$k]:-0}")${X}" "(${c[$k]:-0})"; done
+  }
+  say "the public 90/10 split: 20 requests land exactly 18/2 (deterministic apportionment)"
+  vtally 20
+  say "an internal tester forces the canary: the x-canary header-match route wins"
+  run "curl -s -H 'x-canary: always' http://localhost:8083/checkout"
+  run "curl -s -H 'x-canary: always' http://localhost:8083/checkout"
+  say "the rollout looks bad — drain the canary: weight 10 → 0, then SIGHUP (zero downtime)"
+  run "sed -i 's|weight = 10|weight = 0|' '$manifest'"
+  run "kill -HUP $pid"; sleep 0.8
+  say "public traffic is now 100% v1"
+  vtally 20
+  say "…but the tester route still reaches v2, so you can debug the bad canary safely"
+  run "curl -s -H 'x-canary: always' http://localhost:8083/checkout"
+}
+
+scenario_resilience() {
+  start resilience
+  wait_ready "http://localhost:8087/orders" || return 1
+  banner
+  local insts a
+  insts="$(grep -oE 'inst  : [abc] -> http://[0-9.]+:[0-9]+' "$LOG" | grep -oE '[0-9.]+:[0-9]+')"
+  a="$(echo "$insts" | head -1)"
+  say "baseline: round-robin over three healthy instances"
+  run "for i in \$(seq 6); do curl -s http://localhost:8087/orders; done"
+  say "retry rescues a slow instance: a → slow; per-try timeout (500ms) + re-send → still 200"
+  run "curl -s http://$a/mode/slow"
+  run "for i in 1 2 3; do curl -s -w '  (%{time_total}s)\n' -o /dev/stdout http://localhost:8087/orders; done"
+  say "ALL instances slow → retrying can't help; the overall deadline (800ms) fails closed 504"
+  for i in $insts; do curl -s "http://$i/mode/slow" >/dev/null; done
+  run "curl -s -i http://localhost:8087/orders | grep -E 'HTTP/|x-plecto-fault'"
+  say "circuit breaker (max 2 in-flight): 4 concurrent → 2 admitted, 2 shed 503 circuit-open instantly"
+  # subshell: `wait` must wait for the four curls only, not the example server job
+  run "( for i in 1 2 3 4; do curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' http://localhost:8087/orders & done; wait )"
+  say "outlier detection: reset, then a → 503. Clients keep seeing 200 (retried around) while a's streak builds"
+  for i in $insts; do curl -s "http://$i/mode/ok" >/dev/null; done
+  run "curl -s http://$a/mode/fail"
+  run "for i in \$(seq 9); do curl -s -o /dev/null -w '%{http_code} ' http://localhost:8087/orders; done; echo"
+  run "curl -s http://$a/stats"
+  say "after 3 consecutive 503s, a is ejected for 5s — its hit counter freezes (healthz never went red)"
+  run "for i in \$(seq 9); do curl -s -o /dev/null -w '%{http_code} ' http://localhost:8087/orders; done; echo"
+  run "curl -s http://$a/stats"
+  note "expected: the same count as before — no request touches the ejected instance"
+}
+
+scenario_production() {
+  start production
+  local manifest="$WS/target/production-demo/manifest.toml"
+  local i
+  printf '%s' "${D}# waiting for the deploy dir ${X}"
+  for i in $(seq 300); do
+    [ -f "$manifest" ] && grep -q 'STEP 3' "$LOG" 2>/dev/null && { printf '%s\n' "${D}ready${X}"; break; }
+    kill -0 "$PID" 2>/dev/null || { printf '\n%s\n' "${R}example exited early — log:${X}"; cat "$LOG"; return 1; }
+    sleep 0.2
+  done
+  banner
+  say "starting the REAL plecto binary on the deploy dir (this is what you'd supervise in prod)"
+  note "cargo run -q -p plecto-server -- target/production-demo/manifest.toml 127.0.0.1:8086"
+  ( cd "$WS" && CARGO_BUILD_JOBS=2 cargo build -q -p plecto-server --bin plecto )
+  ( cd "$WS" && cargo run -q -p plecto-server -- target/production-demo/manifest.toml 127.0.0.1:8086 ) >/dev/null 2>&1 &
+  BIN_PID=$!
+  wait_ready "http://127.0.0.1:8086/api/data" 401 || return 1
+  say "auth: no key → the signed WASM filter short-circuits 401; a valid key → 200"
+  run "curl -s -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8086/api/data"
+  run "for i in \$(seq 6); do curl -s -H 'x-api-key: alice-secret' http://127.0.0.1:8086/api/data; done"
+  say "the native rate-limit floor (5 rps, burst 10, per client IP): burst through it"
+  run "for i in \$(seq 14); do curl -s -o /dev/null -w '%{http_code} ' -H 'x-api-key: alice-secret' http://127.0.0.1:8086/api/data; done; echo"
+  note "the auth curls above already spent tokens — the floor runs before the chain, even on a 401"
+  say "the admin endpoint on its own port: RED metrics + readiness"
+  run "curl -s http://127.0.0.1:9099/metrics | grep -E '^plecto_' | head"
+  run "curl -s -o /dev/null -w 'readyz: HTTP %{http_code}\n' http://127.0.0.1:9099/readyz"
+  say "graceful shutdown: SIGTERM the binary — it stops accepting, drains, exits 0"
+  run "kill -TERM $BIN_PID"; sleep 1
+  BIN_PID=""
+}
+
 # ───────────────────────── dispatch ─────────────────────────
 
 one() {
@@ -159,10 +252,13 @@ one() {
     filter-chain)   scenario_filter_chain ;;
     tls-http)       scenario_tls_http ;;
     hot-reload)     scenario_hot_reload ;;
+    canary)         scenario_canary ;;
+    resilience)     scenario_resilience ;;
+    production)     scenario_production ;;
     *) echo "unknown example: $1"; usage; exit 1 ;;
   esac
   say "done — stopping $NAME"
-  cleanup; PID=""; NAME=""; LOG=""
+  cleanup; PID=""; NAME=""; LOG=""; BIN_PID=""
 }
 
 usage() {
@@ -173,12 +269,15 @@ ${B}Plecto demo runner${X}
   $0 filter-chain     continue / modify / short-circuit 403 / rate-limit
   $0 tls-http         TLS termination across HTTP/1.1, HTTP/2, HTTP/3 + Alt-Svc
   $0 hot-reload       edit manifest + SIGHUP → atomic zero-downtime swap (before/after)
+  $0 canary           90/10 weighted split + tester header route + zero-downtime drain
+  $0 resilience       retry / overall timeout 504 / circuit breaker 503 / outlier ejection
+  $0 production       the real plecto binary on a deploy dir: auth, rate floor, /metrics
   $0 all              run every scenario in turn
 EOF
 }
 
 case "${1:-}" in
   "" ) usage ;;
-  all) for s in wasm-auth load-balancing filter-chain tls-http hot-reload; do one "$s"; done ;;
+  all) for s in wasm-auth load-balancing filter-chain tls-http hot-reload canary resilience production; do one "$s"; done ;;
   *  ) one "$1" ;;
 esac

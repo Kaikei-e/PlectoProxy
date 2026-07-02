@@ -30,7 +30,8 @@ clippy:
 # fmt check + clippy
 lint: fmt-check clippy
 
-# run a guided demo end to end: wasm-auth | load-balancing | filter-chain | tls-http | hot-reload
+# run a guided demo end to end: wasm-auth | load-balancing | filter-chain | tls-http |
+# hot-reload | canary | resilience | production
 demo NAME:
     cd {{plecto}} && ./examples/try.sh {{NAME}}
 

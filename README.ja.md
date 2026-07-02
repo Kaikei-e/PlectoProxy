@@ -217,7 +217,7 @@ cargo test --all
 
 ### デモを動かす
 
-ユースケース別の自己完結デモが `examples/<name>/` に 6 つあり、5 分の `quickstart` から gateway が実際にやることまでの学習パスを成す（地図は [`examples/README.md`](plecto/examples/README.md)）。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。
+ユースケース別の自己完結デモが `examples/<name>/` に 9 つあり、5 分の `quickstart` から gateway が実際にやることまでの学習パスを成す（地図は [`examples/README.md`](plecto/examples/README.md)。各デモのディレクトリには `curl` と期待出力を明記した README がある）。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。
 
 手早く end-to-end で見るならガイド付きツアー —— デモを起動し、readiness を待ち、`curl` を流し、結果を可視化して、後片付けまで自動でやる:
 
@@ -240,6 +240,9 @@ cargo run -p plecto-server --example <name>   # Ctrl-C で停止
 | `filter-chain` | plain HTTP で filter chain: continue / modify（ヘッダ書換）/ short-circuit 403 / host-native rate limit。 |
 | `tls-http` | 同一ポートで TLS 終端＋HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）、`Alt-Svc` による h3 広告。 |
 | `hot-reload` | manifest を編集して `kill -HUP <pid>`、無停止で設定をアトミックに差し替え（壊れた編集は fail-closed）。 |
+| `canary` | **運用できるロールアウト** —— 90/10 の weighted traffic split（決定論的 apportionment）、社内テスターを v2 へ直行させる header-match route、SIGHUP による無停止の drain / promote（ADR 000034）。 |
+| `resilience` | **curl で見える故障の軸** —— instance の故障モードを実行中に切替: per-try timeout ＋別 instance への retry、overall deadline（504 `request-timeout`）、circuit breaker（503 `circuit-open`）、そしてクライアントが 200 を見続ける裏での outlier ejection（ADR 000023 / 000028 / 000031 / 000032）。 |
+| `production` | **運用の形そのもの** —— 実 `plecto` バイナリが deploy dir（`manifest.toml`＋trust root＋署名済み OCI layout、ターミナル 2 枚）を serve: 署名済み WASM 認証、native rate-limit floor、`least_request` LB、`/metrics` admin endpoint（ADR 000009 / 000033 / 000035）。 |
 
 初めてなら [`examples/README.md`](plecto/examples/README.md) から —— 5 分の `quickstart` から上記のリアルなユースケースまでの学習パス。あるいはまず `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
 
@@ -277,7 +280,7 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │   │   └── server/            # fast path: HTTP/1.1·2（hyper）+ HTTP/3（quinn）, routing, LB, upstream（+ CONTEXT.md）
 │   └── examples/              # 動かせるデモ + 例フィルタ guest — 地図は examples/README.md（DX 入口）
 │       ├── README.md          # 学習パス（quickstart → リアルなユースケース）
-│       ├── <use-case>/        # デモ 6 種: cargo run -p plecto-server --example <name>
+│       ├── <use-case>/        # デモ 9 種: cargo run -p plecto-server --example <name>
 │       └── filters/           # 例 plecto:filter guest（独立 workspace・build.rs が component 化）
 │           ├── filter-quickstart/ # 最簡スターター（応答に 1 ヘッダ付与）
 │           ├── filter-apikey/ # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）

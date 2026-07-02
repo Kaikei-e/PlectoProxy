@@ -12,9 +12,14 @@ Run any of them with:
 cargo run -p plecto-server --example <name>
 ```
 
+Each example directory has its own README with the exact `curl`s and their expected
+output; `./examples/try.sh <name>` (or `just demo <name>`) runs the whole scenario for you.
+
 ## Learning path
 
-Start at the top and work down — each step adds one concept.
+Start at the top and work down — each step adds one concept. 1–3 are the **extension
+plane** (what a WASM filter is), 4–8 are the **native fast path** (what the gateway does
+around it), 9 puts it all in one real deployment.
 
 | # | Example | What you learn |
 |---|---------|----------------|
@@ -24,6 +29,9 @@ Start at the top and work down — each step adds one concept.
 | 4 | **`load-balancing`** | The native fast path: one upstream over three instances, round-robin + active health checks, and **fail-closed** ejection/recovery (a total outage → 503, no client errors). |
 | 5 | **`tls-http`** | TLS termination (rustls): HTTP/1.1, HTTP/2 (ALPN), and **HTTP/3 over QUIC** on one port, with `/api/*` routing. |
 | 6 | **`hot-reload`** | Zero-downtime config swap: edit the manifest, `kill -HUP`, and watch it take effect atomically — a broken edit stays fail-closed (the proxy never drops). |
+| 7 | **`canary`** | A rollout you can operate: a 90/10 weighted split, a header-match route for internal testers, and a zero-downtime drain/promote via SIGHUP (ADR 000034). |
+| 8 | **`resilience`** | The failure axes, each visible from curl: per-try timeout + retry to another instance, the overall deadline (504), the circuit breaker (503 `circuit-open`), and silent outlier ejection (ADR 000023/000028/000031/000032). |
+| 9 | **`production`** | The shape you operate: the **real `plecto` binary** serving a deploy dir (manifest + trust root + signed OCI layout), with `least_request` LB, a native rate-limit floor, and the `/metrics` admin endpoint (two terminals). |
 
 **Advanced (feature-gated).** The outbound **ext_authz** capability (ADR 000036, `--features
 outbound-http`) and the **streaming body** filter (`--features streaming-body`) are exercised today by

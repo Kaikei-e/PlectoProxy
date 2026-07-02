@@ -60,6 +60,22 @@ path = "../../../bench/harnesses/wasm-bench/main.rs"
 name = "hot-reload"
 path = "../../examples/hot-reload/main.rs"
 
+# Native fast-path showcases (ADR 000034 / 000023 / 000028 / 000032): canary traffic split and
+# the resilience axes (retry, timeouts, circuit breaker, outlier detection).
+[[example]]
+name = "canary"
+path = "../../examples/canary/main.rs"
+
+[[example]]
+name = "resilience"
+path = "../../examples/resilience/main.rs"
+
+# The production-shaped walkthrough: prepares a signed deploy dir, then the REAL `plecto` binary
+# serves it from a manifest.toml (second terminal), with the admin endpoint scrapeable.
+[[example]]
+name = "production"
+path = "../../examples/production/main.rs"
+
 # Benchmark harness: host rate-limit (ADR 000026) + request-body hook (ADR 000025) on one filter.
 [[example]]
 name = "edge-bench"

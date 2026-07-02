@@ -16,6 +16,7 @@ impl Control {
     /// filter fails to resolve / verify / load, the swap does **not** happen and the current
     /// set stays live — reload is all-or-nothing. The trust policy is fixed at construction.
     pub fn reload(&self, manifest: &Manifest) -> Result<(), ControlError> {
+        let _gate = self.reload_gate.lock();
         self.ensure_trust_unchanged(manifest)?;
         let active = build_active(
             &self.host,
@@ -48,6 +49,7 @@ impl Control {
     /// Errors with `NoManifestPath` if this plane was not built from an on-disk manifest
     /// (`load` / `from_manifest`); use `from_manifest_path` / `load_at` for a reloadable plane.
     pub fn reload_from_disk(&self) -> Result<ReloadOutcome, ControlError> {
+        let _gate = self.reload_gate.lock();
         let path = self
             .manifest_path
             .as_ref()

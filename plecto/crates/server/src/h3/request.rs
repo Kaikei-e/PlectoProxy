@@ -25,7 +25,15 @@ pub(super) async fn handle_h3_request(
     let (req, stream) = resolver.resolve_request().await.map_err(http3_err)?;
     let (mut send, recv) = stream.split();
     let (parts, ()) = req.into_parts();
-    let body = H3ReqBody::new(recv).boxed();
+    // The declared content-length drives the body's size hint: `content-length: 0` makes the
+    // bodyless check (and thus upstream retry) work for h3 exactly like TCP. A request with no
+    // content-length keeps the default hint — it may stream a body, so it stays non-retryable.
+    let content_length = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let body = H3ReqBody::new(recv, content_length).boxed();
 
     let resp = match proxy_core(state, "https", peer, parts, body).await {
         Ok(r) => r,

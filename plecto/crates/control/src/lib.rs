@@ -116,6 +116,11 @@ pub struct Control {
     host: Host,
     store: Box<dyn ArtifactStore>,
     active: ArcSwap<ActiveConfig>,
+    /// Serializes reloads: `build_active` reconciles the shared `upstreams` registry in place and
+    /// then stores `active`, so two interleaved reloads could leave routes holding groups the
+    /// registry no longer probes (permanently pessimistic → 503). The shipped SIGHUP loop is
+    /// single-threaded; this guard closes the hole for any other embedder of the public API.
+    reload_gate: parking_lot::Mutex<()>,
     /// The upstream instances + their health state (ADR 000017). Lives OUTSIDE `active` so a
     /// reload's `build_active` reconciles it in place — health state survives the swap. The
     /// fast-path server reads it both via routing (`RouteInfo.upstream`, resolved at build time)
@@ -152,6 +157,7 @@ impl Control {
             host,
             store: Box::new(store),
             active: ArcSwap::from_pointee(active),
+            reload_gate: parking_lot::Mutex::new(()),
             upstreams,
             manifest_path: None,
             trust: manifest.trust.clone(),
@@ -180,6 +186,7 @@ impl Control {
             host,
             store,
             active: ArcSwap::from_pointee(active),
+            reload_gate: parking_lot::Mutex::new(()),
             upstreams,
             manifest_path: None,
             trust: manifest.trust.clone(),
@@ -206,6 +213,7 @@ impl Control {
             host,
             store: Box::new(store),
             active: ArcSwap::from_pointee(active),
+            reload_gate: parking_lot::Mutex::new(()),
             upstreams,
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),
@@ -235,6 +243,7 @@ impl Control {
             host,
             store,
             active: ArcSwap::from_pointee(active),
+            reload_gate: parking_lot::Mutex::new(()),
             upstreams,
             manifest_path: Some(manifest_path.to_path_buf()),
             trust: manifest.trust.clone(),

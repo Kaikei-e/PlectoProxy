@@ -21,7 +21,9 @@ use crate::body::{
 use crate::error::ServerError;
 use crate::forward::{ForwardOutcome, ForwardRequest, forward_with_retry};
 use crate::headers::{headers_to_vec, set_forwarded, to_http_request};
-use crate::respond::{fault, http_response, stream_response, synth, synth_retry_after};
+use crate::respond::{
+    fault, http_response, stream_response, stream_response_direct, synth, synth_retry_after,
+};
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
 
 /// The transport-agnostic transaction core (Stage A observability wrapper, ADR 000009). Every
@@ -35,8 +37,20 @@ pub(crate) async fn proxy_core(
     parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
+    /// Decrements the in-flight gauge on drop: hyper drops this future when the client
+    /// connection dies mid-request (h2 RST_STREAM, disconnect), so a plain post-`.await`
+    /// decrement would leak and the gauge would drift upward monotonically. The RED tally
+    /// (`record_request`) is deliberately still skipped on cancellation — no response was sent.
+    struct InFlight<'a>(&'a crate::metrics::ServerMetrics);
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.dec_in_flight();
+        }
+    }
+
     let start = Instant::now();
     state.metrics.inc_in_flight();
+    let in_flight = InFlight(&state.metrics);
 
     // Capture the access-log fields BEFORE the core consumes `parts`, and only when logging is on —
     // a disabled access log allocates nothing on the hot path.
@@ -62,7 +76,7 @@ pub(crate) async fn proxy_core(
 
     let result = proxy_core_inner(state.clone(), scheme, peer, parts, body).await;
 
-    state.metrics.dec_in_flight();
+    drop(in_flight);
     let status = match &result {
         Ok(resp) => resp.status().as_u16(),
         // an inner error is mapped to 502 by the caller (`dispatch::handle`), so record it as such.
@@ -94,7 +108,9 @@ async fn proxy_core_inner(
     // (possibly laxer, unfiltered) route we selected — closing the per-route-filter bypass. An
     // ambiguous (encoded-separator) or root-escaping path is rejected fail-closed.
     match plecto_control::normalize_path(&http_req.path) {
-        Some(path) => http_req.path = path,
+        // Borrowed = already normalized (the common case); only a rewritten path is stored back.
+        Some(std::borrow::Cow::Owned(path)) => http_req.path = path,
+        Some(std::borrow::Cow::Borrowed(_)) => {}
         None => {
             return Ok(synth(
                 StatusCode::BAD_REQUEST,
@@ -148,15 +164,17 @@ async fn proxy_core_inner(
         ));
     }
 
-    // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store) ---
-    let snap_req = snapshot.clone();
-    let forward = match tokio::task::spawn_blocking(move || {
-        snap_req.dispatch_request(idx, http_req)
-    })
-    .await?
-    {
-        ChainOutcome::Respond(resp) => return Ok(http_response(resp)),
-        ChainOutcome::Forward(req) => req,
+    // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
+    // A route with no filters skips the hop entirely — an empty chain is the identity, and the
+    // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax. ---
+    let forward = if route.has_filters {
+        let snap_req = snapshot.clone();
+        match tokio::task::spawn_blocking(move || snap_req.dispatch_request(idx, http_req)).await? {
+            ChainOutcome::Respond(resp) => return Ok(http_response(resp)),
+            ChainOutcome::Forward(req) => req,
+        }
+    } else {
+        http_req
     };
 
     // Weighted traffic split (ADR 000034): pick which backend upstream group to forward to, in the
@@ -314,6 +332,15 @@ async fn proxy_core_inner(
 
     // --- response side: the route's chain in reverse (status / headers only) ---
     let (uparts, ubody) = upstream_resp.into_parts();
+    if !route.has_filters {
+        // No chain to run: skip the blocking-pool hop and the contract projection; the hop-by-hop
+        // strip still applies, directly on the original header bytes.
+        return Ok(stream_response_direct(
+            uparts.status,
+            &uparts.headers,
+            ubody,
+        ));
+    }
     let http_resp = HttpResponse {
         status: uparts.status.as_u16(),
         headers: headers_to_vec(&uparts.headers),

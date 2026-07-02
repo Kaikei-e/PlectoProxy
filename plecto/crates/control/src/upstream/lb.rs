@@ -223,7 +223,13 @@ impl UpstreamGroup {
                 seen += 1;
             }
         }
-        let (x, y) = (cand_lo?, cand_hi?);
+        // Restore draw order so a load tie keeps the FIRST sampled instance (uniform over the
+        // eligible set) — keeping min(a, b) would bias ties toward low ordinals and starve the last.
+        let (x, y) = if a <= b {
+            (cand_lo?, cand_hi?)
+        } else {
+            (cand_hi?, cand_lo?)
+        };
         let chosen = if lower_load(x, y) { x } else { y };
         Some(self.metered_pick(chosen.clone()))
     }
@@ -537,6 +543,31 @@ mod tests {
             0,
             "active-request counts released when the Picks drop"
         );
+    }
+
+    #[test]
+    fn least_request_tie_break_covers_every_instance() {
+        // All instances idle → every P2C comparison is a load tie. The tie-break must keep the
+        // first *sampled* instance (uniform over the eligible set), not min(a, b): that bias
+        // would starve the last ordinal entirely (min of two distinct indices is never n-1).
+        let g = lb_group(
+            bare(&["a:1", "b:2", "c:3", "d:4"]),
+            LbAlgorithm::LeastRequest,
+            None,
+        );
+        let mut hits = [0u32; 4];
+        for _ in 0..4000 {
+            let p = g.pick(None).unwrap(); // dropped per iteration, so loads stay tied at zero
+            let idx = g
+                .instances
+                .iter()
+                .position(|i| Arc::ptr_eq(i, p.instance()))
+                .unwrap();
+            hits[idx] += 1;
+        }
+        for (i, &h) in hits.iter().enumerate() {
+            assert!(h > 500, "instance {i} starved under idle ties: {hits:?}");
+        }
     }
 
     #[test]

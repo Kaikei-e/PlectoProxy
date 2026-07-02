@@ -5,6 +5,7 @@
 //! dispatch, not the match). Matching is allocation-free: the compiled dimensions are pre-normalised
 //! at build, and per request we only scan and compare borrowed slices.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -166,8 +167,9 @@ impl RouteInfo {
 
     /// Apply this route's host-native prefix strip to the path the fast-path server forwards to
     /// the upstream. The chain already ran against the original path; this only affects what the
-    /// upstream sees. No rule (or a non-matching path) leaves the path unchanged.
-    pub fn rewrite_path(&self, path: &str) -> String {
+    /// upstream sees. No rule (or a non-matching path) leaves the path unchanged — borrowed, so
+    /// the common no-strip case allocates nothing.
+    pub fn rewrite_path<'a>(&self, path: &'a str) -> Cow<'a, str> {
         rewrite_path(path, self.strip_prefix.as_deref())
     }
 
@@ -183,9 +185,11 @@ impl RouteInfo {
     }
 }
 
-/// Normalise an authority for host matching: drop any `:port`, lower-case. (`example.COM:8443`
-/// → `example.com`.) IPv6 literals in brackets keep their colons inside `[...]`.
-fn normalize_host(authority: &str) -> String {
+/// Normalise an authority for host matching: drop any `:port` and a trailing dot, borrowed — no
+/// allocation on the request path. (`example.COM:8443` → `example.COM`; case is handled at the
+/// comparison via `eq_ignore_ascii_case` against the pre-lowered route host.) IPv6 literals in
+/// brackets keep their colons inside `[...]`.
+fn normalize_host(authority: &str) -> &str {
     let host = if let Some(rest) = authority.strip_prefix('[') {
         // `[::1]:8080` → `[::1]`
         match rest.split_once(']') {
@@ -195,13 +199,12 @@ fn normalize_host(authority: &str) -> String {
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
-    let lowered = host.to_ascii_lowercase();
     // Absolute-form hosts carry a trailing dot (`example.com.`); strip a single one so they match
     // the canonical `example.com` route and cannot silently slip to a wildcard route (/
     // CWE-644). IPv6 literals (`[...]`) never end in a dot, so this only affects DNS names.
-    match lowered.strip_suffix('.') {
-        Some(stripped) if !lowered.starts_with('[') => stripped.to_string(),
-        _ => lowered,
+    match host.strip_suffix('.') {
+        Some(stripped) if !host.starts_with('[') => stripped,
+        _ => host,
     }
 }
 
@@ -216,7 +219,9 @@ fn normalize_host(authority: &str) -> String {
 /// Policy: reject control bytes, backslash, and percent-encoded separators/dots (`%2e`/`%2f`/`%5c`,
 /// ambiguous between front-end and back-end), then lexically remove `.`/`..` segments; a `..` that
 /// escapes the root is rejected. The query string (after `?`) is preserved verbatim.
-pub fn normalize_path(target: &str) -> Option<String> {
+/// A path with no `.`/`..` segments — the overwhelming majority — is returned borrowed
+/// (`Cow::Borrowed`), so the per-request common case allocates nothing.
+pub fn normalize_path(target: &str) -> Option<Cow<'_, str>> {
     let (raw, query) = match target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (target, None),
@@ -224,7 +229,7 @@ pub fn normalize_path(target: &str) -> Option<String> {
     // A non-origin target (asterisk-form, or no leading `/`) cannot fall under a `/`-prefixed
     // route, so it needs no traversal handling — pass it through unchanged.
     if !raw.starts_with('/') {
-        return Some(target.to_string());
+        return Some(Cow::Borrowed(target));
     }
     // Reject control bytes / backslash and percent-encoded separators or dots: an origin that
     // decodes `%2f`/`%2e`/`%5c` would re-derive a path different from the one we route on and
@@ -234,6 +239,11 @@ pub fn normalize_path(target: &str) -> Option<String> {
     }
     if contains_encoded_separator(raw) {
         return None;
+    }
+    // No `.`/`..` segment → the lexical resolution below is the identity (split + join over `/`
+    // reproduces the input byte-for-byte, empty segments included), so return the input borrowed.
+    if !raw.split('/').any(|seg| seg == "." || seg == "..") {
+        return Some(Cow::Borrowed(target));
     }
     // Lexically resolve `.` / `..` over `/`-separated segments. `out` always holds the leading ""
     // (root); a `..` that would pop past it escapes the root and is rejected (fail-closed).
@@ -258,7 +268,7 @@ pub fn normalize_path(target: &str) -> Option<String> {
         norm.push('?');
         norm.push_str(q);
     }
-    Some(norm)
+    Some(Cow::Owned(norm))
 }
 
 /// Does the path contain a percent-encoded separator or dot (`%2e`/`%2f`/`%5c`, any hex case)?
@@ -275,12 +285,11 @@ fn contains_encoded_separator(path: &str) -> bool {
 }
 
 /// Does `path` fall under `prefix` on a `/` boundary? `/api` matches `/api` and `/api/x` but not
-/// `/apix`; `/` matches everything. A `?query` / `#fragment` acts as a boundary too, so a bare
-/// prefix with a query (`/search?q=x` under `/search`) still matches (review f000005 P1#1) — the
-/// inbound `path` carries the query (`path_and_query`), but the MATCH decision is over the path
-/// only. Rewriting (`rewrite_path`) keeps the query; this is purely the selection predicate.
+/// `/apix`; `/` matches everything. `path` is the BARE path — `select` strips the `?query` /
+/// `#fragment` once per request (not once per route), so a bare prefix with a query
+/// (`/search?q=x` under `/search`) still matches (review f000005 P1#1). Rewriting
+/// (`rewrite_path`) keeps the query; this is purely the selection predicate.
 fn path_under_prefix(prefix: &str, path: &str) -> bool {
-    let path = path.split(['?', '#']).next().unwrap_or(path);
     if !path.starts_with(prefix) {
         return false;
     }
@@ -303,7 +312,7 @@ fn route_matches(
     query: &str,
 ) -> bool {
     if let Some(h) = &r.host
-        && h != host
+        && !h.eq_ignore_ascii_case(host)
     {
         return false;
     }
@@ -355,10 +364,12 @@ fn query_param_matches(query: &str, name: &str, value: &str) -> bool {
 pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts<'_>) -> Option<usize> {
     let host = normalize_host(req.authority);
     let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    // Strip the query/fragment once here; `path_under_prefix` then compares bare paths per route.
+    let path = req.path.split(['?', '#']).next().unwrap_or(req.path);
     routes
         .iter()
         .enumerate()
-        .filter(|(_, r)| route_matches(r, &host, req.path, req.method, req.headers, query))
+        .filter(|(_, r)| route_matches(r, host, path, req.method, req.headers, query))
         // Specificity key, most-significant first. `max_by_key` keeps the LAST max on ties, so the
         // final `usize::MAX - i` (earliest index largest) makes the earliest manifest route win.
         .max_by_key(|(i, r)| {
@@ -376,20 +387,21 @@ pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts<'_>) -> Option
 
 /// Apply a route's host-native prefix strip to the forwarded path (the chain already saw the
 /// original). Leaves the path unchanged if it does not start with `strip`; always keeps a
-/// leading `/`. `/api` stripped from `/api/users` → `/users`; from `/api` → `/`.
-pub(crate) fn rewrite_path(path: &str, strip: Option<&str>) -> String {
+/// leading `/`. `/api` stripped from `/api/users` → `/users`; from `/api` → `/`. The unchanged
+/// and clean-strip cases are borrowed — no allocation on the request path.
+pub(crate) fn rewrite_path<'a>(path: &'a str, strip: Option<&str>) -> Cow<'a, str> {
     let Some(strip) = strip else {
-        return path.to_string();
+        return Cow::Borrowed(path);
     };
     let Some(rest) = path.strip_prefix(strip) else {
-        return path.to_string();
+        return Cow::Borrowed(path);
     };
     if rest.is_empty() {
-        "/".to_string()
+        Cow::Borrowed("/")
     } else if rest.starts_with('/') {
-        rest.to_string()
+        Cow::Borrowed(rest)
     } else {
-        format!("/{rest}")
+        Cow::Owned(format!("/{rest}"))
     }
 }
 
@@ -782,11 +794,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_host_drops_port_and_lowercases() {
+    fn normalize_host_drops_port_and_preserves_case() {
         // Host matching is case-insensitive and port-insensitive (CWE-644: the routing decision
-        // must not be steered by case tricks or a `:port` suffix a client appended).
-        assert_eq!(normalize_host("EXAMPLE.com:8443"), "example.com");
-        assert_eq!(normalize_host("Example.Com"), "example.com");
+        // must not be steered by case tricks or a `:port` suffix a client appended). Case is left
+        // as-is here — the comparison in `route_matches` is `eq_ignore_ascii_case`, so the request
+        // path stays allocation-free.
+        assert_eq!(normalize_host("EXAMPLE.com:8443"), "EXAMPLE.com");
+        assert_eq!(normalize_host("Example.Com"), "Example.Com");
         assert_eq!(normalize_host("host:80"), "host");
     }
 
@@ -795,7 +809,7 @@ mod tests {
         // IPv6 literals keep the colons inside `[...]`; only a trailing `:port` is dropped.
         assert_eq!(normalize_host("[::1]:8080"), "[::1]");
         assert_eq!(normalize_host("[::1]"), "[::1]");
-        assert_eq!(normalize_host("[2001:DB8::1]:443"), "[2001:db8::1]");
+        assert_eq!(normalize_host("[2001:DB8::1]:443"), "[2001:DB8::1]");
     }
 
     #[test]
@@ -824,7 +838,7 @@ mod tests {
         // / CWE-644: an absolute-form host (`example.com.`) must canonicalise to
         // `example.com` so it matches the host-constrained route instead of slipping to a wildcard.
         assert_eq!(normalize_host("example.com."), "example.com");
-        assert_eq!(normalize_host("EXAMPLE.COM.:8443"), "example.com");
+        assert_eq!(normalize_host("EXAMPLE.COM.:8443"), "EXAMPLE.COM");
         assert_eq!(normalize_host("example.com"), "example.com");
         // an IPv6 literal is unaffected (never ends in a dot).
         assert_eq!(normalize_host("[::1]"), "[::1]");

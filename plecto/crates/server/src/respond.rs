@@ -8,7 +8,7 @@ use plecto_control::{Header, HttpResponse};
 
 use crate::ResponseBody;
 use crate::body::full;
-use crate::headers::{copy_headers, copy_headers_preserving};
+use crate::headers::{copy_headers, copy_headers_direct, copy_headers_preserving};
 
 const X_PLECTO_FAULT: HeaderName = HeaderName::from_static("x-plecto-fault");
 const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
@@ -58,6 +58,21 @@ pub(crate) fn stream_response(
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     copy_headers_preserving(builder.headers_mut(), headers, original);
+    builder
+        .body(body)
+        .unwrap_or_else(|_| Response::new(full(b"response build error".to_vec())))
+}
+
+/// Stream an upstream response through untouched — the filterless fast path. No contract
+/// projection: the status and header bytes forward verbatim, with only the hop-by-hop /
+/// `Connection`-named strip applied (`copy_headers_direct`).
+pub(crate) fn stream_response_direct(
+    status: StatusCode,
+    headers: &hyper::HeaderMap,
+    body: ResponseBody,
+) -> Response<ResponseBody> {
+    let mut builder = Response::builder().status(status);
+    copy_headers_direct(builder.headers_mut(), headers);
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(full(b"response build error".to_vec())))

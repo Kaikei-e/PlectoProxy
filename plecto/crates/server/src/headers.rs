@@ -152,7 +152,9 @@ pub(crate) fn headers_to_vec(map: &hyper::HeaderMap) -> Vec<Header> {
     let named = connection_named(map);
     map.iter()
         .filter(|(name, _)| {
-            !is_hop_by_hop(name.as_str()) && !named.contains(&name.as_str().to_ascii_lowercase())
+            // `HeaderName::as_str()` is already lowercase (the `http` crate normalizes on parse),
+            // and `named` holds lowered tokens — compare directly, no per-header allocation.
+            !is_hop_by_hop(name.as_str()) && (named.is_empty() || !named.contains(name.as_str()))
         })
         .map(|(name, value)| Header {
             name: name.as_str().to_string(),
@@ -222,6 +224,21 @@ pub(crate) fn copy_headers_preserving(
                 }
             }
         }
+    }
+}
+
+/// Copy a hyper `HeaderMap` into another directly — the filterless fast path. Drops the static
+/// hop-by-hop set AND any header dynamically named by `Connection` (RFC 9110 §7.6.1), exactly like
+/// `headers_to_vec` + `copy_headers_preserving` compose, but without the contract projection: the
+/// original bytes forward verbatim (`HeaderName`/`HeaderValue` clones are refcounted, no copy).
+pub(crate) fn copy_headers_direct(dst: Option<&mut hyper::HeaderMap>, src: &hyper::HeaderMap) {
+    let Some(dst) = dst else { return };
+    let named = connection_named(src);
+    for (name, value) in src {
+        if is_hop_by_hop(name.as_str()) || (!named.is_empty() && named.contains(name.as_str())) {
+            continue;
+        }
+        dst.append(name.clone(), value.clone());
     }
 }
 

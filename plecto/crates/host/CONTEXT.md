@@ -111,15 +111,21 @@ _Avoid_: IP allowlist（allowlist はホスト名側の別段）
 _Avoid_: trace（trace は span の集合で別粒度）, log line（点ではなく実行の span）
 
 **Request span / Trace context**:
-1 リクエスト transaction の親 span と、それを束ねる trace 文脈（trace-id + 親 span-id）。host が管理し、各 filter span の
-親になる。フィルタは自分の trace 文脈を持たず、host が境界を跨いで伝播する（W3C `traceparent` で in/out）。`ConfigSnapshot`
-が保持し、request 半と response 半で同一。
+1 リクエスト transaction の親 span（SERVER kind、fast path が起こす）と、それを束ねる trace 文脈。span id は**常にローカル
+採番**で、inbound `traceparent` の span は remote parent として別保持する（他プロセス所有の id で span を発行しない）。
+各 filter span と upstream のトレースはこの request span の下にネストする。フィルタは自分の trace 文脈を持たず、host が
+境界を跨いで伝播する（W3C `traceparent` で in/out）。`ConfigSnapshot` が保持し、request 半と response 半で同一。
 _Avoid_: session（別概念）, correlation id（trace context はより構造的）
 
 **Telemetry sink**:
-host が filter span を出す先（sync・deny-by-default で既定は no-op）。OTLP/SDK へのネットワーク export はこの継ぎ目越しの
-named-deferred。`NoopSink` / `InMemorySink` / `MetricsSink` / `FanOutSink`。
+host が filter span を出す先（sync・deny-by-default で既定は no-op）。`NoopSink` / `InMemorySink` / `MetricsSink` /
+`FanOutSink` / `OtlpBuffer`（OTLP export の受け口）。
 _Avoid_: exporter（OTel SDK の async `SpanExporter` を指す。Plecto の sink は sync の別物）, collector（外部の集約先）
+
+**OTLP buffer / Export pump**:
+OTLP export の二つ組。buffer は sync データプレーン側の有界 span キュー（sink の一実装、溢れは drop + 計数）、pump は
+fast path 側の非同期送出タスク（batch を OTLP/HTTP で collector へ POST）。データプレーンは pump を待たない（pull-based）。
+_Avoid_: batch processor（OTel SDK の同名コンポーネントと混同する）, queue（一般語すぎる）
 
 **Host-aggregated metrics**:
 span ストリームから host が in-process 集約する RED 系メトリクス（実行数・エラー・short-circuit・レイテンシ）。フィルタ向け

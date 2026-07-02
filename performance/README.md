@@ -119,13 +119,16 @@ roughly explain the macro deltas, and it does (the WASM ladder is the worked exa
 
 | bench | cost | note |
 | --- | --- | --- |
-| LB pick — round-robin | 6.7 → 10 ns (3 → 32 instances) | ~O(1) |
-| LB pick — P2C weighted-least-request | ~7 → 10 ns | |
-| LB pick — weighted Maglev | 13.6 → 17.3 ns | + one table lookup |
-| route match (`find_route`) | 48 ns → 878 ns (1 → 64 routes) | scans by specificity |
-| ingress path normalization | ~110–140 ns | ADR 000027 |
+| LB pick — round-robin | 22 → 28 ns (3 → 32 instances) | ~O(1) over the eligible set |
+| LB pick — P2C weighted-least-request | 32 → 55 ns | two eligibility passes + the sampled compare |
+| LB pick — weighted Maglev | ~16–19 ns | + one table lookup |
+| route match (`find_route`) | 36 ns → 230 ns (1 → 64 routes) | scans by specificity, allocation-free |
+| ingress path normalization | ~50–70 ns clean / ~160 ns dot-segments | ADR 000027; a clean path is borrowed, no allocation |
 
 All three LB algorithms are covered here; the macro suite only load-tests round-robin.
+(An earlier revision under-reported the LB picks at ~7–17 ns: the bench never promoted its
+instances to healthy, so it was timing the eligible==0 fail-fast path, not a real pick — the
+kind of methodological bug this report exists to disclose.)
 
 **Extension plane** (`crates/host/benches/wasm.rs`):
 

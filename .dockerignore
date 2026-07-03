@@ -1,0 +1,6 @@
+# Keep the build context to the Rust workspace: everything else (docs, benches, target trees)
+# only slows the daemon upload and busts layer caches.
+*
+!plecto/
+plecto/target/
+plecto/examples/filters/*/target/

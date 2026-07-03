@@ -161,6 +161,15 @@ pub struct Upstream {
     pub hash: Option<HashConfig>,
     /// Active-health-check policy for this upstream's instances (ADR 000017).
     pub health: HealthConfig,
+    /// How often (ms) hostname addresses are re-resolved and the endpoint set refreshed — the
+    /// standard periodic-DNS endpoint-discovery technique (the shape of nginx `resolve` / Envoy
+    /// STRICT_DNS): each A/AAAA record becomes a load-balancing endpoint with its own health;
+    /// a vanished record is dropped, a new one starts pessimistic (ADR 000017); a failed
+    /// resolution keeps the last-known-good set. Interval-based (getaddrinfo carries no TTL) —
+    /// pick a value at or below your DNS TTL. `0` disables (the default): hostnames still
+    /// resolve per connect, but the endpoint set stays as declared.
+    #[serde(default)]
+    pub resolve_interval_ms: u64,
     /// End-to-end timeout (ms) for forwarding a request to this upstream (ADR 000019 / review
     /// f000005 P2#4). Bounds time-to-response-headers; once headers arrive the body streams without
     /// a deadline, so streaming responses are unaffected. Exceeding it fails closed with **504**.

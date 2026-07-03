@@ -113,6 +113,33 @@ path_prefix = "/api"
     .expect("traffic never flowed through the resolving upstream");
     assert_eq!(status, StatusCode::OK);
 
+    // The STRICT_DNS-style swap is observable on the group: within a few refresh intervals the
+    // configured hostname endpoint is REPLACED by resolved IP-literal endpoints (one per A/AAAA
+    // record), which is what makes each record a real LB endpoint with its own health.
+    let swapped = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let groups = control.upstream_groups();
+            let endpoints = groups
+                .iter()
+                .find(|g| g.name == "app")
+                .expect("the app group exists")
+                .endpoints();
+            let all_ip_literals = !endpoints.instances.is_empty()
+                && endpoints
+                    .instances
+                    .iter()
+                    .all(|i| i.address().parse::<SocketAddr>().is_ok());
+            if all_ip_literals {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        swapped.is_ok(),
+        "the hostname endpoint must be swapped for resolved IP-literal endpoints"
+    );
 }
 
 #[tokio::test]
@@ -134,7 +161,22 @@ upstream = "app"
 path_prefix = "/api"
 "#
     );
-    // RED phase: the field must parse; endpoint-identity assertions land with the API.
-    let _control = Arc::new(loaded_control(&toml).unwrap());
-    let _ = upstream;
+    let control = Arc::new(loaded_control(&toml).unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    {
+        let control = control.clone();
+        tokio::spawn(async move {
+            let _ = serve(control, listener).await;
+        });
+    }
+
+    // Give the refresher a few cycles, then confirm the endpoint identity is stable (an IP
+    // literal never round-trips through DNS, so its health state is never reset by a refresh).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let groups = control.upstream_groups();
+    let group = groups.iter().find(|g| g.name == "app").unwrap();
+    let endpoints = group.endpoints();
+    assert_eq!(endpoints.instances.len(), 1);
+    assert_eq!(endpoints.instances[0].address(), upstream.to_string());
 }

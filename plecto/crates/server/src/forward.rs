@@ -242,7 +242,7 @@ mod tests {
             .reconcile(&manifest.upstreams, std::path::Path::new("."))
             .unwrap();
         let group = registry.group("test").unwrap();
-        for inst in &group.instances {
+        for inst in &group.endpoints().instances {
             inst.record_probe_success();
         }
         group

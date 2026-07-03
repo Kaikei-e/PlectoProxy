@@ -125,10 +125,13 @@ impl UpstreamGroup {
         exclude: Option<&Arc<UpstreamInstance>>,
         key: Option<HashInput<'_>>,
     ) -> Option<Pick> {
-        match &self.lb {
-            LbState::RoundRobin => self.round_robin_pick(exclude),
-            LbState::LeastRequest => self.least_request_pick(exclude),
-            LbState::Maglev(table) => self.maglev_pick(table, exclude, key),
+        // One endpoint-set snapshot per pick: a concurrent DNS re-resolution swap (ADR 000017 /
+        // periodic-DNS discovery) never desyncs the instance list from the Maglev table.
+        let ep = self.endpoints.load();
+        match &ep.lb {
+            LbState::RoundRobin => self.round_robin_pick(&ep.instances, exclude),
+            LbState::LeastRequest => self.least_request_pick(&ep.instances, exclude),
+            LbState::Maglev(table) => self.maglev_pick(table, &ep.instances, exclude, key),
         }
     }
 
@@ -159,10 +162,13 @@ impl UpstreamGroup {
     /// neighbour (degraded distribution stays even instead of skewing ~1:2). Two allocation-free
     /// passes; if an instance flips between them we return the last eligible seen rather than a
     /// spurious `None`. No per-instance load is metered — round-robin is the zero-overhead default.
-    pub(super) fn round_robin_pick(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Pick> {
+    pub(super) fn round_robin_pick(
+        &self,
+        instances: &[Arc<UpstreamInstance>],
+        exclude: Option<&Arc<UpstreamInstance>>,
+    ) -> Option<Pick> {
         let ctx = self.eligibility_ctx();
-        let eligible = self
-            .instances
+        let eligible = instances
             .iter()
             .filter(|i| self.is_eligible(i, exclude, ctx))
             .count();
@@ -172,7 +178,7 @@ impl UpstreamGroup {
         let target = self.rr.fetch_add(1, Ordering::Relaxed) % eligible;
         let mut seen = 0;
         let mut last = None;
-        for inst in &self.instances {
+        for inst in instances {
             if self.is_eligible(inst, exclude, ctx) {
                 last = Some(inst);
                 if seen == target {
@@ -189,10 +195,13 @@ impl UpstreamGroup {
     /// integer cross-product, no float; `+1` lets weight bias even idle instances). Two passes over
     /// the small instance list. The selected instance's load is metered (incremented now, decremented
     /// when the returned `Pick` drops — across the retry hand-off too).
-    fn least_request_pick(&self, exclude: Option<&Arc<UpstreamInstance>>) -> Option<Pick> {
+    fn least_request_pick(
+        &self,
+        instances: &[Arc<UpstreamInstance>],
+        exclude: Option<&Arc<UpstreamInstance>>,
+    ) -> Option<Pick> {
         let ctx = self.eligibility_ctx();
-        let n = self
-            .instances
+        let n = instances
             .iter()
             .filter(|i| self.is_eligible(i, exclude, ctx))
             .count();
@@ -200,8 +209,7 @@ impl UpstreamGroup {
             return None;
         }
         if n == 1 {
-            let only = self
-                .instances
+            let only = instances
                 .iter()
                 .find(|i| self.is_eligible(i, exclude, ctx))?;
             return Some(self.metered_pick(only.clone()));
@@ -212,7 +220,7 @@ impl UpstreamGroup {
         let mut cand_lo = None;
         let mut cand_hi = None;
         let mut seen = 0u32;
-        for inst in &self.instances {
+        for inst in instances {
             if self.is_eligible(inst, exclude, ctx) {
                 if seen == lo {
                     cand_lo = Some(inst);
@@ -241,20 +249,21 @@ impl UpstreamGroup {
     fn maglev_pick(
         &self,
         table: &MaglevTable,
+        instances: &[Arc<UpstreamInstance>],
         exclude: Option<&Arc<UpstreamInstance>>,
         key: Option<HashInput<'_>>,
     ) -> Option<Pick> {
         if let Some(k) = key {
             let ctx = self.eligibility_ctx();
             if let Some(idx) = table.lookup(k.hash())
-                && let Some(inst) = self.instances.get(idx)
+                && let Some(inst) = instances.get(idx)
                 && self.is_eligible(inst, exclude, ctx)
             {
                 return Some(self.unmetered_pick(inst.clone()));
             }
         }
         // No key, or the affinity target can't serve → fall back to round-robin over the eligible set.
-        self.round_robin_pick(exclude)
+        self.round_robin_pick(instances, exclude)
     }
 
     /// Wrap an instance in a `Pick` with NO load metering (round-robin / maglev).
@@ -283,7 +292,9 @@ impl UpstreamGroup {
     /// pick path minus the retry `exclude`; a `false` here means a `pick` would return `None`.
     pub fn has_eligible(&self) -> bool {
         let (check_outlier, now_ms) = self.eligibility_ctx();
-        self.instances
+        self.endpoints
+            .load()
+            .instances
             .iter()
             .any(|inst| inst.is_healthy() && (!check_outlier || !inst.is_outlier_ejected(now_ms)))
     }
@@ -321,6 +332,7 @@ mod tests {
             lb_algorithm: LbAlgorithm::RoundRobin,
             hash: None,
             tls: None,
+            resolve_interval_ms: 0,
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
@@ -351,23 +363,26 @@ mod tests {
         .unwrap();
         let group = reg.group("pool").unwrap();
         // promote both (cold-start: one success each).
-        group.instances[0].record_probe_success();
-        group.instances[1].record_probe_success();
+        group.endpoints().instances[0].record_probe_success();
+        group.endpoints().instances[1].record_probe_success();
 
-        let a = group.instances[0].clone();
+        let a = group.endpoints().instances[0].clone();
         let other = group
             .pick_excluding(&a, None)
             .expect("a different healthy instance exists");
         assert!(
-            Arc::ptr_eq(other.instance(), &group.instances[1]),
+            Arc::ptr_eq(other.instance(), &group.endpoints().instances[1]),
             "pick_excluding skips the excluded instance"
         );
 
         // eject instance[1] (unhealthy_threshold = 3) → `a` is the only healthy one left.
         for _ in 0..3 {
-            group.instances[1].record_probe_failure();
+            group.endpoints().instances[1].record_probe_failure();
         }
-        assert!(!group.instances[1].is_healthy(), "instance[1] is ejected");
+        assert!(
+            !group.endpoints().instances[1].is_healthy(),
+            "instance[1] is ejected"
+        );
         assert!(
             group.pick_excluding(&a, None).is_none(),
             "the only healthy instance can't be retried around"
@@ -390,8 +405,8 @@ mod tests {
         );
 
         // make a and c healthy, leave b unhealthy
-        g.instances[0].record_probe_success();
-        g.instances[2].record_probe_success();
+        g.endpoints().instances[0].record_probe_success();
+        g.endpoints().instances[2].record_probe_success();
 
         let mut seen = HashSet::new();
         for _ in 0..6 {
@@ -416,8 +431,8 @@ mod tests {
         )
         .unwrap();
         let g = reg.group("u").unwrap();
-        g.instances[0].record_probe_success(); // a:1 healthy
-        g.instances[2].record_probe_success(); // c:3 healthy, b:2 stays ejected
+        g.endpoints().instances[0].record_probe_success(); // a:1 healthy
+        g.endpoints().instances[2].record_probe_success(); // c:3 healthy, b:2 stays ejected
 
         let mut a = 0u32;
         let mut c = 0u32;
@@ -446,7 +461,7 @@ mod tests {
         .unwrap();
         let g0 = reg.group("u").unwrap();
         for i in 0..3 {
-            g0.instances[i].record_probe_success(); // all three healthy
+            g0.endpoints().instances[i].record_probe_success(); // all three healthy
         }
         // advance the cursor two steps: a:1, b:2 (cursor now at 2)
         assert_eq!(g0.pick(None).unwrap().address(), "a:1");
@@ -460,7 +475,7 @@ mod tests {
         .unwrap();
         let g1 = reg.group("u").unwrap();
         assert!(
-            g1.instances.iter().all(|i| i.is_healthy()),
+            g1.endpoints().instances.iter().all(|i| i.is_healthy()),
             "health survives an unchanged-policy reload (ADR 000017)"
         );
         assert_eq!(
@@ -484,6 +499,7 @@ mod tests {
                 lb_algorithm: algo,
                 hash,
                 tls: None,
+                resolve_interval_ms: 0,
                 health: health(1, 1),
                 request_timeout_ms: 30_000,
                 max_retries: 0,
@@ -495,7 +511,7 @@ mod tests {
         )
         .unwrap();
         let g = reg.group("u").unwrap();
-        for inst in &g.instances {
+        for inst in &g.endpoints().instances {
             inst.record_probe_success(); // cold-start: all healthy
         }
         g
@@ -549,8 +565,9 @@ mod tests {
     #[test]
     fn least_request_meters_in_flight_and_releases_on_drop() {
         let g = lb_group(bare(&["a:1", "b:2"]), LbAlgorithm::LeastRequest, None);
-        let total =
-            |g: &UpstreamGroup| -> usize { g.instances.iter().map(|i| i.in_flight()).sum() };
+        let total = |g: &UpstreamGroup| -> usize {
+            g.endpoints().instances.iter().map(|i| i.in_flight()).sum()
+        };
         assert_eq!(total(&g), 0);
         {
             let _p = g.pick(None).unwrap();
@@ -579,6 +596,7 @@ mod tests {
         for _ in 0..4000 {
             let p = g.pick(None).unwrap(); // dropped per iteration, so loads stay tied at zero
             let idx = g
+                .endpoints()
                 .instances
                 .iter()
                 .position(|i| Arc::ptr_eq(i, p.instance()))
@@ -593,7 +611,7 @@ mod tests {
     #[test]
     fn least_request_fails_closed_when_all_unhealthy() {
         let g = lb_group(bare(&["a:1", "b:2"]), LbAlgorithm::LeastRequest, None);
-        for inst in &g.instances {
+        for inst in &g.endpoints().instances {
             inst.record_probe_failure(); // unhealthy_threshold = 1 → ejected
         }
         assert!(g.pick(None).is_none(), "no eligible instance → None → 503");
@@ -668,7 +686,8 @@ mod tests {
         let key = HashInput::Bytes(b"sticky-key");
         let primary = addr_of(&g.pick(Some(key)).unwrap());
         // eject the affinity target (unhealthy_threshold = 1).
-        g.instances
+        g.endpoints()
+            .instances
             .iter()
             .find(|i| i.address() == primary)
             .unwrap()

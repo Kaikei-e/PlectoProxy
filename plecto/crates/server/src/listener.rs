@@ -136,6 +136,11 @@ async fn serve_inner(
     // instances. Spawned like the reload loop — the server owns the task, Control owns the state.
     tokio::spawn(serve_health_checks(state.control.clone()));
 
+    // Periodic DNS re-resolution of hostname upstreams (`resolve_interval_ms`): a second
+    // supervisor beside the health checks, swapping each resolving group's endpoint set in place
+    // (nginx `resolve` / Envoy STRICT_DNS shape). Idles cheaply when no upstream opts in.
+    tokio::spawn(crate::dns::serve_dns_refresh(state.control.clone()));
+
     // OTLP export pump (ADR 000040): drains the span buffer to the collector. The handle is kept
     // (unlike the fire-and-forget tasks above) so shutdown can await its final flush.
     let otlp_pump = otlp_export.map(|(endpoint, buffer)| {

@@ -205,6 +205,7 @@ mod tests {
                 lb_algorithm: LbAlgorithm::RoundRobin,
                 hash: None,
                 tls: None,
+                resolve_interval_ms: 0,
                 health: HealthConfig {
                     path: "/healthz".to_string(),
                     interval_ms: 1000,
@@ -224,7 +225,7 @@ mod tests {
         .unwrap();
         let g = reg.group(name).unwrap();
         if healthy {
-            g.instances[0].record_probe_success();
+            g.endpoints().instances[0].record_probe_success();
         }
         g
     }

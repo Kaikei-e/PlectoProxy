@@ -81,7 +81,7 @@ pub use rustls::ClientConfig as TlsClientConfig;
 pub use rustls::ServerConfig as TlsServerConfig;
 pub use snapshot::ConfigSnapshot;
 pub use upstream::{
-    HashInput, HashKeySource, Pick, UpstreamGroup, UpstreamInstance, UpstreamRegistry,
+    Endpoints, HashInput, HashKeySource, Pick, UpstreamGroup, UpstreamInstance, UpstreamRegistry,
 };
 
 // Re-export the host surface a caller drives the control plane with, so they need not depend

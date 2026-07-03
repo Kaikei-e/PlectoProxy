@@ -8,12 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::ControlError;
-use crate::manifest::{HashKeyKind, LbAlgorithm, Upstream};
+use crate::manifest::{HashKeyKind, Upstream};
 
 use super::UpstreamGroup;
 use super::instance::UpstreamInstance;
-use super::lb::{HashKeySource, LbState};
-use crate::maglev::MaglevTable;
+use super::lb::HashKeySource;
 
 /// The live set of upstreams, keyed by name. Owned by `Control`, OUTSIDE the swapped
 /// `ActiveConfig`, so health state survives a reload (ADR 000017). The `Mutex` is contended only by
@@ -91,44 +90,67 @@ impl UpstreamRegistry {
             // identical; a change re-probes the upstream from pessimistic (new thresholds apply /
             // old probe results were for a different security context).
             let prev = prev_any.filter(|g| g.health == up.health && g.tls_manifest == up.tls);
-            let instances: Vec<Arc<UpstreamInstance>> = up
+            let configured: Vec<(String, u32)> = up
                 .addresses
                 .iter()
-                .map(|spec| {
-                    let addr = spec.address();
-                    let weight = spec.weight();
-                    // reuse only when address AND weight are unchanged; a weight edit (LB capacity)
-                    // builds a fresh instance, like a health-policy change.
-                    prev.and_then(|g| {
-                        g.instances
-                            .iter()
-                            .find(|i| i.address() == addr && i.weight() == weight)
-                            .cloned()
-                    })
-                    .unwrap_or_else(|| {
-                        Arc::new(UpstreamInstance::new(addr.to_string(), weight, &up.health))
-                    })
-                })
+                .map(|spec| (spec.address().to_string(), spec.weight()))
                 .collect();
+            let resolve_interval = Duration::from_millis(up.resolve_interval_ms);
+            let maglev_table_size =
+                up.hash.as_ref().map(|h| h.table_size).unwrap_or(65537) as usize;
+            let prev_endpoints = prev.map(|g| g.endpoints.load_full());
+            // A resolving group whose declared addresses / LB config are unchanged carries its
+            // CURRENT endpoint set (the resolved IPs + their health) across the reload wholesale —
+            // otherwise every reload would discard the resolved set and re-enter the pessimistic
+            // window until the next refresh + probe pass.
+            let carry_resolved = prev
+                .filter(|g| {
+                    !resolve_interval.is_zero()
+                        && !g.resolve_interval.is_zero()
+                        && g.configured == configured
+                        && g.lb_algorithm == up.lb_algorithm
+                        && g.maglev_table_size == maglev_table_size
+                })
+                .and_then(|_| prev_endpoints.clone());
+            let endpoints = match carry_resolved {
+                Some(current) => current,
+                None => {
+                    let instances: Vec<Arc<UpstreamInstance>> = configured
+                        .iter()
+                        .map(|(addr, weight)| {
+                            // reuse only when address AND weight are unchanged; a weight edit (LB
+                            // capacity) builds a fresh instance, like a health-policy change.
+                            prev_endpoints
+                                .as_ref()
+                                .and_then(|ep| {
+                                    ep.instances
+                                        .iter()
+                                        .find(|i| i.address() == addr && i.weight() == *weight)
+                                        .cloned()
+                                })
+                                .unwrap_or_else(|| {
+                                    Arc::new(UpstreamInstance::new(
+                                        addr.clone(),
+                                        *weight,
+                                        &up.health,
+                                    ))
+                                })
+                        })
+                        .collect();
+                    // Build the LB state from the manifest (ADR 000035). Maglev recomputes its
+                    // lookup table from the instance set + weights; validation above guaranteed a
+                    // hash block and a valid (prime, in-range) table size.
+                    Arc::new(super::Endpoints::build(
+                        instances,
+                        up.lb_algorithm,
+                        maglev_table_size,
+                    ))
+                }
+            };
             // carry the round-robin cursor across the reload (independent of which instances or the
             // health policy changed — it is only a rotation counter) so the first post-reload pick
             // continues the rotation instead of restarting at the eligible set's head (ADR 000024).
             let rr = prev_any.map(|g| g.rr.load(Ordering::Relaxed)).unwrap_or(0);
-            // Build the LB state from the manifest (ADR 000035). Maglev recomputes its lookup table
-            // from the instance set + weights; validation above guaranteed a hash block and a valid
-            // (prime, in-range) table size.
-            let lb = match up.lb_algorithm {
-                LbAlgorithm::RoundRobin => LbState::RoundRobin,
-                LbAlgorithm::LeastRequest => LbState::LeastRequest,
-                LbAlgorithm::Maglev => {
-                    let entries: Vec<(&str, u32)> = instances
-                        .iter()
-                        .map(|i| (i.address(), i.weight()))
-                        .collect();
-                    let m = up.hash.as_ref().map(|h| h.table_size).unwrap_or(65537) as usize;
-                    LbState::Maglev(MaglevTable::build(&entries, m))
-                }
-            };
             let hash_key = up.hash.as_ref().map(|h| match h.key {
                 HashKeyKind::Header => {
                     HashKeySource::Header(h.header.clone().unwrap_or_default().to_ascii_lowercase())
@@ -140,7 +162,11 @@ impl UpstreamRegistry {
                 Arc::new(UpstreamGroup {
                     name: up.name.clone(),
                     health: up.health.clone(),
-                    instances,
+                    endpoints: arc_swap::ArcSwap::new(endpoints),
+                    configured,
+                    resolve_interval,
+                    lb_algorithm: up.lb_algorithm,
+                    maglev_table_size,
                     request_timeout: Duration::from_millis(up.request_timeout_ms),
                     overall_timeout: Duration::from_millis(up.overall_timeout_ms),
                     max_retries: up.max_retries,
@@ -152,7 +178,6 @@ impl UpstreamRegistry {
                         up.outlier_detection.base_ejection_time_ms,
                     ),
                     outlier_max_ejection_percent: up.outlier_detection.max_ejection_percent,
-                    lb,
                     hash_key,
                     tls_manifest: up.tls.clone(),
                     tls_client,
@@ -180,7 +205,9 @@ impl UpstreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{AddressSpec, CircuitBreaker, HealthConfig, OutlierDetection};
+    use crate::manifest::{
+        AddressSpec, CircuitBreaker, HealthConfig, LbAlgorithm, OutlierDetection,
+    };
 
     fn health(healthy_threshold: u32, unhealthy_threshold: u32) -> HealthConfig {
         HealthConfig {
@@ -203,6 +230,7 @@ mod tests {
             lb_algorithm: LbAlgorithm::RoundRobin,
             hash: None,
             tls: None,
+            resolve_interval_ms: 0,
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
@@ -221,8 +249,8 @@ mod tests {
         )
         .unwrap();
         let g0 = reg.group("u").unwrap();
-        g0.instances[0].record_probe_success(); // a:1 becomes healthy
-        assert!(g0.instances[0].is_healthy());
+        g0.endpoints().instances[0].record_probe_success(); // a:1 becomes healthy
+        assert!(g0.endpoints().instances[0].is_healthy());
 
         // reload: drop b:2, keep a:1, add c:3 — same health policy
         reg.reconcile(
@@ -231,14 +259,14 @@ mod tests {
         )
         .unwrap();
         let g1 = reg.group("u").unwrap();
-        assert_eq!(g1.instances.len(), 2);
+        assert_eq!(g1.endpoints().instances.len(), 2);
         assert!(
-            g1.instances[0].is_healthy(),
+            g1.endpoints().instances[0].is_healthy(),
             "the unchanged a:1 keeps its health across reload"
         );
-        assert_eq!(g1.instances[1].address(), "c:3");
+        assert_eq!(g1.endpoints().instances[1].address(), "c:3");
         assert!(
-            !g1.instances[1].is_healthy(),
+            !g1.endpoints().instances[1].is_healthy(),
             "the new c:3 starts pessimistic"
         );
     }
@@ -251,8 +279,8 @@ mod tests {
             std::path::Path::new("."),
         )
         .unwrap();
-        reg.group("u").unwrap().instances[0].record_probe_success();
-        assert!(reg.group("u").unwrap().instances[0].is_healthy());
+        reg.group("u").unwrap().endpoints().instances[0].record_probe_success();
+        assert!(reg.group("u").unwrap().endpoints().instances[0].is_healthy());
 
         // same address, different health policy → fresh pessimistic instance, new thresholds apply
         reg.reconcile(
@@ -261,7 +289,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !reg.group("u").unwrap().instances[0].is_healthy(),
+            !reg.group("u").unwrap().endpoints().instances[0].is_healthy(),
             "a health-policy change re-probes the instance from pessimistic"
         );
     }
@@ -322,8 +350,8 @@ mod tests {
         let reg = UpstreamRegistry::new();
         reg.reconcile(&[upstream("u", &["a:1"], health(1, 3))], dir.path())
             .unwrap();
-        reg.group("u").unwrap().instances[0].record_probe_success();
-        assert!(reg.group("u").unwrap().instances[0].is_healthy());
+        reg.group("u").unwrap().endpoints().instances[0].record_probe_success();
+        assert!(reg.group("u").unwrap().endpoints().instances[0].is_healthy());
 
         let mut up = upstream("u", &["a:1"], health(1, 3));
         up.tls = Some(crate::manifest::UpstreamTls {
@@ -331,7 +359,7 @@ mod tests {
         });
         reg.reconcile(&[up], dir.path()).unwrap();
         assert!(
-            !reg.group("u").unwrap().instances[0].is_healthy(),
+            !reg.group("u").unwrap().endpoints().instances[0].is_healthy(),
             "enabling [upstream.tls] must re-probe the instance from pessimistic"
         );
     }
@@ -344,7 +372,7 @@ mod tests {
         let reg = UpstreamRegistry::new();
         reg.reconcile(&[upstream("u", &["a:1"], health(1, 3))], dir.path())
             .unwrap();
-        reg.group("u").unwrap().instances[0].record_probe_success();
+        reg.group("u").unwrap().endpoints().instances[0].record_probe_success();
 
         let mut up = upstream("u", &["a:1"], health(1, 3));
         up.tls = Some(crate::manifest::UpstreamTls {
@@ -358,7 +386,7 @@ mod tests {
         let g = reg.group("u").unwrap();
         assert_eq!(g.scheme(), "http", "the running group is untouched");
         assert!(
-            g.instances[0].is_healthy(),
+            g.endpoints().instances[0].is_healthy(),
             "the running instance keeps its health after the rejected reconcile"
         );
     }

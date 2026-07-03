@@ -33,7 +33,8 @@ pub use instance::UpstreamInstance;
 pub use lb::{HashInput, HashKeySource, Pick};
 pub use registry::UpstreamRegistry;
 
-use crate::manifest::HealthConfig;
+use crate::maglev::MaglevTable;
+use crate::manifest::{HealthConfig, LbAlgorithm};
 use lb::LbState;
 
 /// Wall-clock milliseconds since the epoch, for outlier-ejection windows (ADR 000032) and as the
@@ -46,16 +47,62 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// A named upstream: its instances, the round-robin cursor, and the health policy (ADR 000017).
+/// The swappable endpoint set of a group: the instances plus the LB state compiled from them
+/// (a Maglev table indexes into `instances`, so the two must swap together). Behind an `ArcSwap`
+/// on the group so periodic DNS re-resolution (the standard periodic-DNS endpoint-discovery
+/// technique — the shape of nginx `resolve` / Envoy STRICT_DNS) can replace the set in place
+/// while routes keep holding their `Arc<UpstreamGroup>`.
+#[derive(Debug)]
+pub struct Endpoints {
+    /// The instances, in configured (or resolved) address order.
+    pub instances: Vec<Arc<UpstreamInstance>>,
+    pub(in crate::upstream) lb: LbState,
+}
+
+impl Endpoints {
+    /// Compile the LB state for `instances` (ADR 000035) and wrap the pair. A Maglev upstream
+    /// recomputes its lookup table from the (possibly re-resolved) instance set.
+    pub(super) fn build(
+        instances: Vec<Arc<UpstreamInstance>>,
+        algorithm: LbAlgorithm,
+        maglev_table_size: usize,
+    ) -> Self {
+        let lb = match algorithm {
+            LbAlgorithm::RoundRobin => LbState::RoundRobin,
+            LbAlgorithm::LeastRequest => LbState::LeastRequest,
+            LbAlgorithm::Maglev => {
+                let entries: Vec<(&str, u32)> = instances
+                    .iter()
+                    .map(|i| (i.address(), i.weight()))
+                    .collect();
+                LbState::Maglev(MaglevTable::build(&entries, maglev_table_size))
+            }
+        };
+        Self { instances, lb }
+    }
+}
+
+/// A named upstream: its endpoint set, the round-robin cursor, and the health policy (ADR 000017).
 #[derive(Debug)]
 pub struct UpstreamGroup {
     /// The upstream `name` routes refer to.
     pub name: String,
     /// The active-health-check policy (the prober reads `path` / `interval_ms` / `timeout_ms`).
     pub health: HealthConfig,
-    /// The instances, in manifest address order. Fixed for the life of this group value; a reload
-    /// builds a NEW group, reusing unchanged instances' `Arc`s to preserve their health.
-    pub instances: Vec<Arc<UpstreamInstance>>,
+    /// The current endpoint set + its compiled LB state. Swapped atomically by DNS re-resolution
+    /// (`update_endpoints`); otherwise fixed for the life of this group value — a reload builds a
+    /// NEW group, reusing unchanged instances' `Arc`s to preserve their health.
+    endpoints: arc_swap::ArcSwap<Endpoints>,
+    /// The manifest-declared `(address, weight)` list — the re-resolution input (each hostname is
+    /// re-expanded to its current A/AAAA records; an IP literal passes through unchanged).
+    configured: Vec<(String, u32)>,
+    /// How often hostname addresses are re-resolved (`resolve_interval_ms`); `ZERO` = never (the
+    /// default — hostnames still resolve per connect, but the endpoint set stays as configured).
+    resolve_interval: Duration,
+    /// The LB algorithm + Maglev table size, retained so `update_endpoints` can recompile the LB
+    /// state for a re-resolved instance set.
+    lb_algorithm: LbAlgorithm,
+    maglev_table_size: usize,
     /// Per-try timeout for ONE forward attempt to this upstream (ADR 000019, reframed as the per-try
     /// bound by ADR 000031); `Duration::ZERO` disables it. Bounds one attempt's time-to-response-
     /// headers, failing closed 504 on overrun. Not part of `health`, so a timeout-only change
@@ -87,11 +134,6 @@ pub struct UpstreamGroup {
     outlier_consecutive: u32,
     outlier_base_ejection: Duration,
     outlier_max_ejection_percent: u32,
-    /// The per-instance load-balancing algorithm (ADR 000035): `RoundRobin` (the default, uses `rr`),
-    /// `LeastRequest` (power-of-two-choices over `in_flight`/`weight`), or `Maglev` (consistent
-    /// hashing via the precomputed table). Rebuilt from the manifest on reconcile, so an
-    /// algorithm/weight change rebuilds the table but is not part of `health`.
-    lb: LbState,
     /// The request attribute a `Maglev` upstream hashes for affinity (ADR 000035); `None` for the
     /// other algorithms. The fast path reads this to project the hash key from a request.
     hash_key: Option<HashKeySource>,
@@ -147,6 +189,62 @@ impl UpstreamGroup {
     /// the fast path can key its per-config connection pool on the `Arc`'s identity.
     pub fn tls_client_config(&self) -> Option<&Arc<rustls::ClientConfig>> {
         self.tls_client.as_ref()
+    }
+
+    /// A snapshot of the current endpoint set (instances + LB state). One atomic load; the
+    /// returned `Arc` stays valid across a concurrent re-resolution swap.
+    pub fn endpoints(&self) -> Arc<Endpoints> {
+        self.endpoints.load_full()
+    }
+
+    /// How often the fast path should re-resolve this group's hostname addresses, or `None` when
+    /// re-resolution is off (the default).
+    pub fn resolve_interval(&self) -> Option<Duration> {
+        (!self.resolve_interval.is_zero()).then_some(self.resolve_interval)
+    }
+
+    /// The manifest-declared `(address, weight)` list — the re-resolution input.
+    pub fn configured_addresses(&self) -> &[(String, u32)] {
+        &self.configured
+    }
+
+    /// Replace the endpoint set with `resolved` `(address, weight)` pairs — the periodic-DNS
+    /// endpoint-discovery swap. An unchanged pair keeps its instance `Arc` (health and in-flight
+    /// state survive, exactly like a reload's reconcile); a new pair starts pessimistic (ADR
+    /// 000017 — a fresh address must prove itself before entering rotation); a vanished pair is
+    /// dropped (in-flight requests finish on their cloned `Arc`). The LB state is recompiled (a
+    /// Maglev table indexes the new set). Returns `false` (and swaps nothing) when the set is
+    /// unchanged, so an idle refresh tick costs one atomic load and a compare.
+    pub fn update_endpoints(&self, resolved: &[(String, u32)]) -> bool {
+        let current = self.endpoints.load();
+        let unchanged = current.instances.len() == resolved.len()
+            && current
+                .instances
+                .iter()
+                .zip(resolved)
+                .all(|(inst, (addr, weight))| inst.address() == addr && inst.weight() == *weight);
+        if unchanged {
+            return false;
+        }
+        let instances: Vec<Arc<UpstreamInstance>> = resolved
+            .iter()
+            .map(|(addr, weight)| {
+                current
+                    .instances
+                    .iter()
+                    .find(|i| i.address() == addr && i.weight() == *weight)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(UpstreamInstance::new(addr.clone(), *weight, &self.health))
+                    })
+            })
+            .collect();
+        self.endpoints.store(Arc::new(Endpoints::build(
+            instances,
+            self.lb_algorithm,
+            self.maglev_table_size,
+        )));
+        true
     }
 }
 

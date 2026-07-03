@@ -39,7 +39,9 @@ pub(crate) async fn serve_health_checks(control: Arc<Control>) {
         for g in &groups {
             let interval = Duration::from_millis(g.health.interval_ms.max(1));
             period = period.min(interval);
-            for inst in &g.instances {
+            // one endpoint-set snapshot per group per tick: a concurrent DNS re-resolution swap
+            // is picked up on the next loop, exactly like a reload's reconcile.
+            for inst in &g.endpoints().instances {
                 let key = (g.name.clone(), inst.address().to_string());
                 let due = last
                     .get(&key)

@@ -424,6 +424,7 @@ mod tests {
                 lb_algorithm: LbAlgorithm::RoundRobin,
                 hash: None,
                 tls: None,
+                resolve_interval_ms: 0,
                 health: HealthConfig {
                     path: "/healthz".to_string(),
                     interval_ms: 1000,

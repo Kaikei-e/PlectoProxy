@@ -47,13 +47,14 @@ impl UpstreamGroup {
         // Threshold reached. Honour the ejection cap: never eject so many that the pool drops below
         // its working minimum (`100 - max_ejection_percent`). Integer math, no float.
         let now_ms = now_millis();
-        let already_ejected = self
+        let endpoints = self.endpoints();
+        let already_ejected = endpoints
             .instances
             .iter()
             .filter(|i| i.is_outlier_ejected(now_ms))
             .count();
         if (already_ejected + 1) * 100
-            > self.outlier_max_ejection_percent as usize * self.instances.len()
+            > self.outlier_max_ejection_percent as usize * endpoints.instances.len()
         {
             // Cap reached — keep this instance in rotation, but reset its streak so it gets a fresh
             // threshold's worth of chances rather than re-tripping on the very next failure.
@@ -111,6 +112,7 @@ mod tests {
                 lb_algorithm: LbAlgorithm::RoundRobin,
                 hash: None,
                 tls: None,
+                resolve_interval_ms: 0,
                 health: health(1, 1),
                 request_timeout_ms: 30_000,
                 max_retries: 0,
@@ -126,7 +128,7 @@ mod tests {
         )
         .unwrap();
         let g = reg.group("u").unwrap();
-        for inst in &g.instances {
+        for inst in &g.endpoints().instances {
             inst.record_probe_success(); // cold-start: all healthy
         }
         g
@@ -135,7 +137,7 @@ mod tests {
     #[test]
     fn outlier_ejects_after_consecutive_gateway_failures_and_success_resets() {
         let g = outlier_group(&["a:1", "b:2"], 2, 60_000, 100);
-        let a = g.instances[0].clone();
+        let a = g.endpoints().instances[0].clone();
         assert!(
             !g.record_outcome(&a, true),
             "1st failure is below the threshold"
@@ -160,7 +162,7 @@ mod tests {
     #[test]
     fn outlier_ejection_window_expires() {
         let g = outlier_group(&["a:1", "b:2"], 1, 1000, 100);
-        let a = g.instances[0].clone();
+        let a = g.endpoints().instances[0].clone();
         assert!(
             g.record_outcome(&a, true),
             "threshold 1 → one failure ejects"
@@ -178,8 +180,8 @@ mod tests {
         // 3 instances, 50% cap → at most 1 may be ejected; the rest stay in rotation even while
         // failing, so fail-closed never becomes a self-inflicted total outage.
         let g = outlier_group(&["a:1", "b:2", "c:3"], 1, 60_000, 50);
-        let a = g.instances[0].clone();
-        let b = g.instances[1].clone();
+        let a = g.endpoints().instances[0].clone();
+        let b = g.endpoints().instances[1].clone();
         assert!(g.record_outcome(&a, true), "a ejects (1/3 within 50%)");
         assert!(
             !g.record_outcome(&b, true),
@@ -191,7 +193,7 @@ mod tests {
     #[test]
     fn outlier_disabled_never_ejects() {
         let g = outlier_group(&["a:1"], 0, 60_000, 100); // consecutive 0 = disabled
-        let a = g.instances[0].clone();
+        let a = g.endpoints().instances[0].clone();
         for _ in 0..100 {
             assert!(
                 !g.record_outcome(&a, true),
@@ -204,7 +206,7 @@ mod tests {
     #[test]
     fn outlier_ejected_instance_is_skipped_by_pick() {
         let g = outlier_group(&["a:1", "b:2"], 1, 60_000, 100);
-        let a = g.instances[0].clone();
+        let a = g.endpoints().instances[0].clone();
         assert!(g.record_outcome(&a, true), "eject a");
         for _ in 0..6 {
             assert_eq!(

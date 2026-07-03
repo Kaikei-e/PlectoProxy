@@ -38,6 +38,7 @@ mod access_log;
 mod admin;
 mod body;
 mod dispatch;
+mod dns;
 mod error;
 mod forward;
 mod h3;

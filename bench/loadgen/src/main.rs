@@ -6,13 +6,23 @@
 //!   plecto-loadgen rr --target http://127.0.0.1:28080/ --total 120000 --workers 48 --out rr.csv
 //!   plecto-loadgen ejection --target http://127.0.0.1:28080/ --rate 4000 --duration 75 \
 //!       --workers 64 --toggle a=URL b=URL c=URL --out timeline.csv --events-out events.csv
+//!   plecto-loadgen swap --target http://127.0.0.1:28080/ --rate 4000 --duration 60 \
+//!       --exec-at 15='cp swapped.toml plecto.toml && kill -HUP 12345' --out swap.csv
+//!   plecto-loadgen ws --mode echo --target ws://127.0.0.1:28085/ws --conns 50 --size 1024 \
+//!       --duration 30 --out ws_echo.csv
 //!
 //! `rr` fires N keep-alive GETs and tallies the `X-Instance` header (round-robin split to
 //! single-request precision). `ejection` holds a fixed open-loop arrival rate while a controller
 //! drives the fault timeline (15 s eject b / 30 rejoin b / 45 eject all / 60 restore all / 75 end)
 //! and buckets per-second per-instance served counts plus the 503/error rate; `--warmup` seconds
 //! of unrecorded load precede t=0 so the timeline starts at steady state. `hold` opens N idle
-//! keep-alive connections for the footprint phase's RSS read.
+//! keep-alive connections for the footprint phase's RSS read. `swap` is `ejection`'s open-loop
+//! timeline generalized: instead of HTTP-hitting `/toggle` endpoints, it runs arbitrary shell
+//! commands at scheduled offsets (a manifest rewrite + `kill -HUP`, for ADR 000044's endpoint-swap
+//! scenario) and buckets served counts by whatever `X-Instance` labels appear — the label set
+//! itself is allowed to change mid-run. `ws` drives Plecto's Upgrade-tunneled `/ws` route (ADR
+//! 000048): `handshake` paces open-loop connection attempts, `hold` opens N idle tunnels for an
+//! RSS read, `echo` sustains a per-connection request/response loop measuring throughput + latency.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -28,19 +38,24 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+mod ws;
+
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone)]
-struct Target {
-    addr: String,
-    authority: String,
-    path: String,
+pub(crate) struct Target {
+    pub(crate) addr: String,
+    pub(crate) authority: String,
+    pub(crate) path: String,
 }
 
+/// Accepts both `http://` (the HTTP generators) and `ws://` (the `ws` subcommand) — the handshake
+/// itself is a plain HTTP/1.1 request either way, so only the scheme label differs.
 fn parse_target(url: &str) -> Result<Target, BoxError> {
     let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| format!("target must be an http:// URL: {url}"))?;
+        .or_else(|| url.strip_prefix("ws://"))
+        .ok_or_else(|| format!("target must be an http:// or ws:// URL: {url}"))?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -342,6 +357,142 @@ async fn run_ejection(a: EjectionArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------- swap
+
+struct SwapArgs {
+    target: String,
+    rate: u64,
+    duration: u64,
+    warmup: u64,
+    workers: u64,
+    exec_at: Vec<(u64, String)>,
+    out: String,
+    events_out: String,
+}
+
+/// Run `cmd` (via `sh -c`) at `warmup + delay` seconds after `start`, for each `(delay, cmd)` in
+/// `exec_at` — the ADR 000044 analogue of `ejection`'s HTTP `/toggle` controller, except the
+/// action is an operator-side one (a manifest rewrite + `kill -HUP`) rather than a request.
+async fn exec_controller(
+    mut exec_at: Vec<(u64, String)>,
+    start: Instant,
+    warmup: u64,
+) -> Vec<(u64, String)> {
+    exec_at.sort_by_key(|(sec, _)| *sec);
+    let mut events = Vec::new();
+    for (delay, cmd) in exec_at {
+        tokio::time::sleep_until(start + Duration::from_secs(warmup + delay)).await;
+        let label = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .status()
+            .await
+        {
+            Ok(s) if s.success() => format!("exec: {cmd}"),
+            Ok(s) => format!("exec (exit {:?}): {cmd}", s.code()),
+            Err(e) => format!("exec failed ({e}): {cmd}"),
+        };
+        events.push((delay, label.replace(',', ";")));
+    }
+    events
+}
+
+/// `ejection`'s open-loop timeline generalized: the same fixed-rate arrival pacing and
+/// per-second/per-`X-Instance`-label bucketing (`ejection_worker` is reused verbatim — it has no
+/// ejection-specific logic, only the controller differs), but the label SET is not assumed to be
+/// `{a,b,c}` — a swap can retire one label and introduce another mid-run, so the CSV's columns are
+/// derived from whatever labels actually appear.
+async fn run_swap(a: SwapArgs) -> Result<(), BoxError> {
+    let t = parse_target(&a.target)?;
+    let tokens = Arc::new(AtomicI64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..a.workers)
+        .map(|_| {
+            tokio::spawn(ejection_worker(
+                t.clone(),
+                tokens.clone(),
+                done.clone(),
+                start,
+                a.warmup,
+            ))
+        })
+        .collect();
+    let ctl = tokio::spawn(exec_controller(a.exec_at.clone(), start, a.warmup));
+
+    // Pace arrivals open-loop, identical to `ejection` (see its comment for the rationale).
+    let slot = Duration::from_millis(10);
+    let per_slot = ((a.rate as f64 / 100.0).round() as i64).max(1);
+    let cap = (a.rate as i64) * 3;
+    for i in 0..(a.warmup + a.duration) * 100 {
+        let cur = tokens.load(Ordering::Relaxed);
+        if cur < cap {
+            tokens.fetch_add(per_slot.min(cap - cur), Ordering::Relaxed);
+        }
+        tokio::time::sleep_until(start + slot * (i as u32 + 1)).await;
+    }
+    let grace = Instant::now() + Duration::from_secs(5);
+    while tokens.load(Ordering::Relaxed) > 0 && Instant::now() < grace {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    done.store(true, Ordering::Relaxed);
+
+    let mut timeline: HashMap<u64, HashMap<String, u64>> = HashMap::new();
+    for h in handles {
+        for (sec, insts) in h.await? {
+            let bucket = timeline.entry(sec).or_default();
+            for (k, v) in insts {
+                *bucket.entry(k).or_insert(0) += v;
+            }
+        }
+    }
+    let events = ctl.await?;
+
+    let mut labels: Vec<String> = timeline
+        .values()
+        .flat_map(|m| m.keys().cloned())
+        .filter(|k| k != "failed")
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    labels.sort();
+    labels.push("failed".to_string());
+
+    let mut secs: Vec<u64> = timeline
+        .keys()
+        .copied()
+        .filter(|s| *s < a.duration)
+        .collect();
+    secs.sort_unstable();
+    let mut csv = format!("t,{}\n", labels.join(","));
+    for s in &secs {
+        let row = &timeline[s];
+        let vals: Vec<String> = labels
+            .iter()
+            .map(|l| row.get(l).copied().unwrap_or(0).to_string())
+            .collect();
+        let _ = writeln!(csv, "{s},{}", vals.join(","));
+    }
+    std::fs::write(&a.out, csv)?;
+
+    let mut ev = String::from("t,label\n");
+    for (tm, label) in &events {
+        let _ = writeln!(ev, "{tm},{label}");
+    }
+    std::fs::write(&a.events_out, ev)?;
+
+    let total: u64 = timeline.values().flat_map(HashMap::values).sum();
+    let failed: u64 = timeline.values().filter_map(|m| m.get("failed")).sum();
+    println!(
+        "swap: {total} responses over {} s, {failed} failed ({:.2}%); events={:?}",
+        secs.len(),
+        100.0 * failed as f64 / total.max(1) as f64,
+        events.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------- hold
 
 struct HoldArgs {
@@ -372,6 +523,227 @@ async fn run_hold(a: HoldArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------- ws
+
+struct WsArgs {
+    mode: String,
+    target: String,
+    rate: u64,
+    duration: u64,
+    warmup: u64,
+    workers: u64,
+    conns: u64,
+    seconds: u64,
+    size: u64,
+    out: String,
+}
+
+/// One open-loop handshake attempt per available token: connect + complete the RFC 6455 upgrade,
+/// then close cleanly. Buckets successes/failures per second (after `warmup`), the same steady-
+/// state convention as `ejection_worker`.
+async fn ws_handshake_worker(
+    t: Target,
+    tokens: Arc<AtomicI64>,
+    done: Arc<AtomicBool>,
+    start: Instant,
+    warmup: u64,
+) -> HashMap<u64, (u64, u64)> {
+    let mut local: HashMap<u64, (u64, u64)> = HashMap::new();
+    while !done.load(Ordering::Relaxed) {
+        if tokens.fetch_sub(1, Ordering::Relaxed) <= 0 {
+            tokens.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_micros(500)).await;
+            continue;
+        }
+        let res = tokio::time::timeout(Duration::from_secs(5), ws::connect(&t)).await;
+        let Some(sec) = start.elapsed().as_secs().checked_sub(warmup) else {
+            continue;
+        };
+        let entry = local.entry(sec).or_insert((0, 0));
+        match res {
+            Ok(Ok(mut stream)) => {
+                entry.0 += 1;
+                let _ = ws::write_frame(&mut stream, 0x8, &[]).await; // close cleanly
+            }
+            _ => entry.1 += 1,
+        }
+    }
+    local
+}
+
+async fn run_ws_handshake(a: &WsArgs) -> Result<(), BoxError> {
+    let t = parse_target(&a.target)?;
+    let tokens = Arc::new(AtomicI64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..a.workers)
+        .map(|_| {
+            tokio::spawn(ws_handshake_worker(
+                t.clone(),
+                tokens.clone(),
+                done.clone(),
+                start,
+                a.warmup,
+            ))
+        })
+        .collect();
+
+    let slot = Duration::from_millis(10);
+    let per_slot = ((a.rate as f64 / 100.0).round() as i64).max(1);
+    let cap = (a.rate as i64) * 3;
+    for i in 0..(a.warmup + a.duration) * 100 {
+        let cur = tokens.load(Ordering::Relaxed);
+        if cur < cap {
+            tokens.fetch_add(per_slot.min(cap - cur), Ordering::Relaxed);
+        }
+        tokio::time::sleep_until(start + slot * (i as u32 + 1)).await;
+    }
+    let grace = Instant::now() + Duration::from_secs(5);
+    while tokens.load(Ordering::Relaxed) > 0 && Instant::now() < grace {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    done.store(true, Ordering::Relaxed);
+
+    let mut timeline: HashMap<u64, (u64, u64)> = HashMap::new();
+    for h in handles {
+        for (sec, (ok, fail)) in h.await? {
+            let entry = timeline.entry(sec).or_insert((0, 0));
+            entry.0 += ok;
+            entry.1 += fail;
+        }
+    }
+    let mut secs: Vec<u64> = timeline
+        .keys()
+        .copied()
+        .filter(|s| *s < a.duration)
+        .collect();
+    secs.sort_unstable();
+    let mut csv = String::from("t,success,failed\n");
+    for s in &secs {
+        let (ok, fail) = timeline[s];
+        let _ = writeln!(csv, "{s},{ok},{fail}");
+    }
+    std::fs::write(&a.out, csv)?;
+
+    let total_ok: u64 = timeline.values().map(|(ok, _)| ok).sum();
+    let total_fail: u64 = timeline.values().map(|(_, fail)| fail).sum();
+    println!(
+        "ws handshake: {total_ok} ok, {total_fail} failed over {} s ({:.1}/s achieved)",
+        secs.len(),
+        total_ok as f64 / secs.len().max(1) as f64
+    );
+    Ok(())
+}
+
+/// Open N established WS tunnels (post-101), hold them idle for `seconds`, exit — the `hold`
+/// subcommand's shape, but through the Upgrade handshake, for a tunnel-footprint RSS read.
+async fn run_ws_hold(a: &WsArgs) -> Result<(), BoxError> {
+    let t = parse_target(&a.target)?;
+    let mut streams = Vec::with_capacity(a.conns as usize);
+    for _ in 0..a.conns {
+        if let Ok(stream) = ws::connect(&t).await {
+            streams.push(stream);
+        }
+    }
+    println!(
+        "ws hold: {} tunnels open for {} s",
+        streams.len(),
+        a.seconds
+    );
+    tokio::time::sleep(Duration::from_secs(a.seconds)).await;
+    drop(streams);
+    Ok(())
+}
+
+/// One connection's sustained request/response loop: send a `size`-byte binary frame, wait for
+/// the echo, repeat back-to-back (closed-loop per connection — the same concurrency model oha's
+/// `-c N` uses) until `warmup + duration` has elapsed since the shared `start`. Round-trip
+/// latencies are recorded only once warmup has passed.
+async fn ws_echo_worker(
+    t: Target,
+    size: usize,
+    start: Instant,
+    warmup: u64,
+    duration: u64,
+) -> Vec<f64> {
+    let mut latencies = Vec::new();
+    let Ok(mut stream) = ws::connect(&t).await else {
+        return latencies;
+    };
+    let payload = vec![b'x'; size];
+    let end = start + Duration::from_secs(warmup + duration);
+    let warm_until = start + Duration::from_secs(warmup);
+    while Instant::now() < end {
+        let t0 = Instant::now();
+        if ws::write_frame(&mut stream, 0x2, &payload).await.is_err() {
+            break;
+        }
+        match ws::read_frame(&mut stream).await {
+            Ok(Some(_)) => {
+                if t0 >= warm_until {
+                    latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            _ => break,
+        }
+    }
+    latencies
+}
+
+async fn run_ws_echo(a: &WsArgs) -> Result<(), BoxError> {
+    let t = parse_target(&a.target)?;
+    let start = Instant::now();
+    let handles: Vec<_> = (0..a.conns)
+        .map(|_| {
+            tokio::spawn(ws_echo_worker(
+                t.clone(),
+                a.size as usize,
+                start,
+                a.warmup,
+                a.duration,
+            ))
+        })
+        .collect();
+    let mut all: Vec<f64> = Vec::new();
+    for h in handles {
+        all.extend(h.await?);
+    }
+    all.sort_by(f64::total_cmp);
+    let n = all.len();
+    let pct = |p: f64| -> f64 {
+        if n == 0 {
+            return 0.0;
+        }
+        let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
+        all[idx.min(n - 1)]
+    };
+    let dur = a.duration.max(1) as f64;
+    let msgs_per_sec = n as f64 / dur;
+    let mb_per_sec = (n as f64 * a.size as f64) / dur / 1_000_000.0;
+    let (p50, p90, p99) = (pct(50.0), pct(90.0), pct(99.0));
+    let csv = format!(
+        "conns,size_bytes,duration_s,messages,messages_per_sec,mb_per_sec,p50_ms,p90_ms,p99_ms\n\
+         {},{},{},{n},{msgs_per_sec:.1},{mb_per_sec:.2},{p50:.3},{p90:.3},{p99:.3}\n",
+        a.conns, a.size, a.duration
+    );
+    std::fs::write(&a.out, csv)?;
+    println!(
+        "ws echo: {n} messages over {} s ({} conns, {}B) -> {msgs_per_sec:.0} msg/s, p50={p50:.3}ms p99={p99:.3}ms",
+        a.duration, a.conns, a.size
+    );
+    Ok(())
+}
+
+async fn run_ws(a: WsArgs) -> Result<(), BoxError> {
+    match a.mode.as_str() {
+        "handshake" => run_ws_handshake(&a).await,
+        "hold" => run_ws_hold(&a).await,
+        "echo" => run_ws_echo(&a).await,
+        other => Err(format!("unknown ws --mode: {other} (want handshake|hold|echo)").into()),
+    }
+}
+
 // ---------------------------------------------------------------------------- CLI
 
 fn usage() -> ! {
@@ -379,7 +751,12 @@ fn usage() -> ! {
         "usage:\n  plecto-loadgen rr --target URL [--total N] [--workers W] [--out FILE]\n  \
          plecto-loadgen ejection --target URL --toggle a=URL b=URL c=URL \
          [--rate R] [--duration S] [--warmup S] [--workers W] [--out FILE] [--events-out FILE]\n  \
-         plecto-loadgen hold --target URL [--conns N] [--seconds S]"
+         plecto-loadgen swap --target URL --exec-at SEC=CMD [--exec-at SEC=CMD ...] \
+         [--rate R] [--duration S] [--warmup S] [--workers W] [--out FILE] [--events-out FILE]\n  \
+         plecto-loadgen hold --target URL [--conns N] [--seconds S]\n  \
+         plecto-loadgen ws --mode handshake|hold|echo --target ws://HOST:PORT/PATH \
+         [--rate R] [--duration S] [--warmup S] [--workers W] [--conns N] [--seconds S] \
+         [--size BYTES] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -461,6 +838,81 @@ fn parse_ejection(rest: &[String]) -> EjectionArgs {
     a
 }
 
+fn parse_swap(rest: &[String]) -> SwapArgs {
+    let mut a = SwapArgs {
+        target: "http://127.0.0.1:8080/".to_string(),
+        rate: 4000,
+        duration: 60,
+        warmup: 5,
+        workers: 64,
+        exec_at: Vec::new(),
+        out: "swap.csv".to_string(),
+        events_out: "swap_events.csv".to_string(),
+    };
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--target" => a.target = take(&mut it, flag),
+            "--rate" => a.rate = take_num(&mut it, flag).max(1),
+            "--duration" => a.duration = take_num(&mut it, flag).max(1),
+            "--warmup" => a.warmup = take_num(&mut it, flag),
+            "--workers" => a.workers = take_num(&mut it, flag).max(1),
+            "--out" => a.out = take(&mut it, flag),
+            "--events-out" => a.events_out = take(&mut it, flag),
+            "--exec-at" => {
+                let kv = take(&mut it, flag);
+                let Some((sec, cmd)) = kv.split_once('=') else {
+                    usage()
+                };
+                let Ok(sec) = sec.parse::<u64>() else { usage() };
+                a.exec_at.push((sec, cmd.to_string()));
+            }
+            _ => usage(),
+        }
+    }
+    if a.exec_at.is_empty() {
+        eprintln!("--exec-at SEC=CMD is required (at least one)");
+        std::process::exit(2)
+    }
+    a
+}
+
+fn parse_ws(rest: &[String]) -> WsArgs {
+    let mut a = WsArgs {
+        mode: String::new(),
+        target: "ws://127.0.0.1:8080/ws".to_string(),
+        rate: 500,
+        duration: 30,
+        warmup: 5,
+        workers: 32,
+        conns: 50,
+        seconds: 6,
+        size: 1024,
+        out: "ws.csv".to_string(),
+    };
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--mode" => a.mode = take(&mut it, flag),
+            "--target" => a.target = take(&mut it, flag),
+            "--rate" => a.rate = take_num(&mut it, flag).max(1),
+            "--duration" => a.duration = take_num(&mut it, flag).max(1),
+            "--warmup" => a.warmup = take_num(&mut it, flag),
+            "--workers" => a.workers = take_num(&mut it, flag).max(1),
+            "--conns" => a.conns = take_num(&mut it, flag).max(1),
+            "--seconds" => a.seconds = take_num(&mut it, flag),
+            "--size" => a.size = take_num(&mut it, flag).max(1),
+            "--out" => a.out = take(&mut it, flag),
+            _ => usage(),
+        }
+    }
+    if !["handshake", "hold", "echo"].contains(&a.mode.as_str()) {
+        eprintln!("--mode is required: handshake|hold|echo");
+        std::process::exit(2)
+    }
+    a
+}
+
 fn parse_hold(rest: &[String]) -> HoldArgs {
     let mut a = HoldArgs {
         target: "http://127.0.0.1:8080/".to_string(),
@@ -488,7 +940,9 @@ async fn main() {
     let result = match cmd.as_str() {
         "rr" => run_rr(parse_rr(rest)).await,
         "ejection" => run_ejection(parse_ejection(rest)).await,
+        "swap" => run_swap(parse_swap(rest)).await,
         "hold" => run_hold(parse_hold(rest)).await,
+        "ws" => run_ws(parse_ws(rest)).await,
         _ => usage(),
     };
     if let Err(e) = result {

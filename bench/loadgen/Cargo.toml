@@ -13,11 +13,17 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "process", "io-util"] }
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# sha1 + base64: the RFC 6455 handshake (Sec-WebSocket-Key / -Accept) for the `ws` subcommand.
+sha1 = "0.10"
+base64 = "0.22"
+# rand: per-frame WS masking keys + the handshake nonce (RFC 6455 doesn't need cryptographic
+# strength here — just non-degenerate variation across frames/connections).
+rand = "0.8"
 
 [profile.release]
 lto = true

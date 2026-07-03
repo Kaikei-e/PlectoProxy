@@ -29,12 +29,46 @@ permissions:
   contents: write # create the draft release + upload assets
   packages: write # push the GHCR image
   id-token: write # cosign keyless signing (Fulcio OIDC)
+  actions: read # the gate job reads the tagged commit's CI run
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # No artifact leaves this workflow before the tagged commit's CI is green. The container
+  # image in particular is pushed live to GHCR (not draft-gated), so tagging in the same
+  # breath as the push must not race CI: wait for the commit's CI run to conclude, fail
+  # closed on anything but success (including a commit CI never ran on).
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Require a green CI run for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "gating release artifacts on CI for ${GITHUB_SHA}"
+          while true; do
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=1")
+            status=$(jq -r '.workflow_runs[0].status // "absent"' <<<"${runs}")
+            conclusion=$(jq -r '.workflow_runs[0].conclusion // "pending"' <<<"${runs}")
+            if [ "${status}" = "completed" ]; then
+              if [ "${conclusion}" = "success" ]; then
+                echo "CI is green for this commit"
+                exit 0
+              fi
+              echo "CI concluded '${conclusion}' for this commit — refusing to release" >&2
+              exit 1
+            fi
+            # "absent" = CI has not started (or the tag points at a commit CI never covers);
+            # keep waiting — the job's timeout-minutes fails this closed rather than shipping.
+            echo "CI run status: ${status} — waiting 20s"
+            sleep 20
+          done
+
   binaries:
+    needs: gate
     strategy:
       matrix:
         include:
@@ -93,6 +127,7 @@ jobs:
             "${NAME}.spdx.json" --clobber
 
   container:
+    needs: gate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

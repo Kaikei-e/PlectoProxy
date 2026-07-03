@@ -41,7 +41,10 @@ RUN cargo build --manifest-path plecto/Cargo.toml --release --locked -p plecto-s
     && cp plecto/target/release/plecto /plecto
 
 FROM scratch AS build-prebuilt
-COPY --from=prebuilt plecto /plecto
+# --chmod=755: actions/upload-artifact's zip transport does not reliably preserve the executable
+# bit (confirmed 2026-07-04 — the release workflow's uploaded binary came back non-executable),
+# so force it explicitly rather than trusting whatever mode the artifact round-trip hands back.
+COPY --chmod=755 --from=prebuilt plecto /plecto
 
 FROM build-${SOURCE} AS build
 
@@ -49,7 +52,7 @@ FROM build-${SOURCE} AS build
 # a dynamically-linked glibc binary. (A static musl build would allow distroless/static, but
 # aws-lc-sys makes musl cross-builds toolchain-heavy; revisit if/when that dependency drops out.)
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=build /plecto /usr/local/bin/plecto
+COPY --chmod=755 --from=build /plecto /usr/local/bin/plecto
 ENTRYPOINT ["/usr/local/bin/plecto"]
 # The manifest is the single static source of config (`[listen]` included). Mount the deploy
 # directory — not the single file — so SIGHUP reload survives editor inode swaps (field report §3.5).

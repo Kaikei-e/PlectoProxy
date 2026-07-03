@@ -52,6 +52,47 @@ pub(crate) struct CompiledRoute {
     /// (`Arc`) so every request on the route consults the same token buckets within a config
     /// generation; a reload builds a fresh limiter (the node-local buckets reset).
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
+    /// This route's Upgrade opt-in (ADR 000048), or `None` for deny-by-default (strip as today).
+    pub(crate) upgrade: Option<Arc<UpgradeConfig>>,
+}
+
+/// A route's compiled `[route.upgrade]` (ADR 000048): the lower-cased token allowlist and the
+/// tunnel idle timeout. Pre-normalised at build so the per-request check is a scan over a
+/// (typically one-element) list.
+#[derive(Debug)]
+pub struct UpgradeConfig {
+    protocols: Vec<String>,
+    idle_timeout: Option<std::time::Duration>,
+}
+
+impl UpgradeConfig {
+    pub(crate) fn new(protocols: &[String], idle_timeout_ms: u64) -> Self {
+        Self {
+            protocols: protocols
+                .iter()
+                .map(|p| p.trim().to_ascii_lowercase())
+                .collect(),
+            idle_timeout: (idle_timeout_ms > 0)
+                .then(|| std::time::Duration::from_millis(idle_timeout_ms)),
+        }
+    }
+
+    /// The first token of the client's `Upgrade` header value this route allows (lower-cased
+    /// canonical form), or `None` — the request then stays plain HTTP (the header is stripped).
+    /// RFC 9110 §7.8: token comparison is case-insensitive; the header may list alternatives.
+    pub fn allowed_token(&self, upgrade_header: &str) -> Option<&str> {
+        upgrade_header.split(',').map(str::trim).find_map(|tok| {
+            self.protocols
+                .iter()
+                .find(|p| p.eq_ignore_ascii_case(tok))
+                .map(String::as_str)
+        })
+    }
+
+    /// The established tunnel's idle timeout; `None` = the operator disabled it (`0`).
+    pub fn idle_timeout(&self) -> Option<std::time::Duration> {
+        self.idle_timeout
+    }
 }
 
 /// A manifest route validated against the (already-loaded) filter set and upstream names, carrying
@@ -122,6 +163,33 @@ pub(crate) fn validate_routes<'a>(
                 });
             }
         }
+        // Validate the Upgrade opt-in (ADR 000048): an empty allowlist is a config typo, and
+        // `h2c` is rejected outright — Plecto has no h2c on either side (ADR 000015), and
+        // forwarding `Upgrade: h2c` is the classic smuggling vector the allowlist exists to block.
+        if let Some(up) = &r.upgrade {
+            if up.protocols.is_empty() {
+                return Err(ControlError::InvalidRoute {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    reason: "upgrade.protocols must be non-empty".to_string(),
+                });
+            }
+            for p in &up.protocols {
+                if p.trim().is_empty() {
+                    return Err(ControlError::InvalidRoute {
+                        path_prefix: r.matcher.path_prefix.clone(),
+                        reason: "upgrade.protocols contains an empty token".to_string(),
+                    });
+                }
+                if p.trim().eq_ignore_ascii_case("h2c") {
+                    return Err(ControlError::InvalidRoute {
+                        path_prefix: r.matcher.path_prefix.clone(),
+                        reason: "h2c upgrade is not supported (h2 is TLS+ALPN only; \
+                                 forwarding h2c enables request smuggling)"
+                            .to_string(),
+                    });
+                }
+            }
+        }
         validated.push(ValidatedRoute { route: r, targets });
     }
     Ok(validated)
@@ -154,6 +222,9 @@ pub struct RouteInfo {
     /// This route's native rate limiter (ADR 000033), or `None` for unlimited. `Arc`-shared with the
     /// live config so the per-request `RouteInfo` consults the route's persistent buckets.
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
+    /// This route's Upgrade opt-in (ADR 000048), or `None` for deny-by-default. The fast path
+    /// tunnels only when the client's token is allowlisted here.
+    pub upgrade: Option<Arc<UpgradeConfig>>,
 }
 
 impl RouteInfo {
@@ -462,6 +533,7 @@ mod tests {
             backends: backends(upstream),
             strip_prefix: None,
             rate_limit: None,
+            upgrade: None,
         }
     }
 
@@ -503,6 +575,7 @@ mod tests {
             backends,
             strip_prefix: None,
             rate_limit,
+            upgrade: None,
         }
     }
 
@@ -583,6 +656,56 @@ mod tests {
             validate_routes(&zero_burst, &filters, &upstream_names),
             Err(ControlError::InvalidRouteRateLimit { .. })
         ));
+    }
+
+    #[test]
+    fn validate_routes_rejects_h2c_and_empty_upgrade_tokens() {
+        // ADR 000048: `h2c` must never be tunnelable (h2 is TLS+ALPN only, ADR 000015; a
+        // forwarded `Upgrade: h2c` is the classic smuggling vector), and an empty allowlist or
+        // token is a config typo — both fail closed at build.
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let with_upgrade = |protocols: Vec<&str>| {
+            let mut r = manifest_route(Some("real"), vec![], vec![], None);
+            r.upgrade = Some(crate::manifest::RouteUpgrade {
+                protocols: protocols.into_iter().map(str::to_string).collect(),
+                idle_timeout_ms: 300_000,
+            });
+            vec![r]
+        };
+
+        for bad in [vec![], vec!["H2C"], vec!["websocket", "h2c"], vec!["  "]] {
+            assert!(
+                matches!(
+                    validate_routes(&with_upgrade(bad.clone()), &filters, &upstream_names),
+                    Err(ControlError::InvalidRoute { .. })
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(
+            validate_routes(&with_upgrade(vec!["websocket"]), &filters, &upstream_names).is_ok()
+        );
+    }
+
+    #[test]
+    fn upgrade_config_matches_tokens_case_insensitively_and_ignores_unlisted() {
+        let cfg = UpgradeConfig::new(&["WebSocket".to_string()], 300_000);
+        assert_eq!(cfg.allowed_token("websocket"), Some("websocket"));
+        assert_eq!(cfg.allowed_token("WEBSOCKET"), Some("websocket"));
+        assert_eq!(
+            cfg.allowed_token("h2c, websocket"),
+            Some("websocket"),
+            "the first ALLOWLISTED token wins; unlisted ones are skipped, never forwarded"
+        );
+        assert_eq!(cfg.allowed_token("h2c"), None);
+        assert_eq!(cfg.allowed_token(""), None);
+
+        assert_eq!(
+            UpgradeConfig::new(&["websocket".to_string()], 0).idle_timeout(),
+            None,
+            "0 disables the idle timer"
+        );
     }
 
     #[test]

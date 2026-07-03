@@ -72,7 +72,7 @@ pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
-pub use route::{RouteInfo, normalize_path};
+pub use route::{RouteInfo, UpgradeConfig, normalize_path};
 /// The rustls TLS client config the fast path re-encrypts upstream forward legs with
 /// (ADR 000042), re-exported for the same reason as [`TlsServerConfig`].
 pub use rustls::ClientConfig as TlsClientConfig;
@@ -546,6 +546,11 @@ fn build_active(
             rate_limit: r
                 .rate_limit
                 .map(|rl| Arc::new(ratelimit::NativeRateLimit::new(rl))),
+            // Compile the Upgrade opt-in (ADR 000048) — tokens were validated non-empty/non-h2c.
+            upgrade: r
+                .upgrade
+                .as_ref()
+                .map(|u| Arc::new(route::UpgradeConfig::new(&u.protocols, u.idle_timeout_ms))),
         });
     }
 

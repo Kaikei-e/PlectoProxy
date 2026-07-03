@@ -50,6 +50,17 @@ fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
     named
 }
 
+/// The client's `Upgrade` header value when the request genuinely asks for a protocol switch:
+/// RFC 9110 §7.8 requires an `upgrade` option in `Connection` alongside the `Upgrade` header,
+/// so both must be present — an `Upgrade` header without the `Connection` option is not an
+/// upgrade request and stays subject to the plain hop-by-hop strip.
+pub(crate) fn upgrade_request_header(map: &hyper::HeaderMap) -> Option<&str> {
+    if !connection_named(map).contains("upgrade") {
+        return None;
+    }
+    map.get(hyper::header::UPGRADE)?.to_str().ok()
+}
+
 /// Did the client's `TE` header ask for trailers (RFC 9110 §10.1.4)? Tokens may carry parameters
 /// or weights (`trailers`, `gzip;q=0.5`), so each comma-separated token is compared by its bare
 /// name. Used by the forward path (ADR 000042) to re-issue exactly `te: trailers` on an

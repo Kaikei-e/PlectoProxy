@@ -21,7 +21,9 @@ use crate::body::{
 };
 use crate::error::ServerError;
 use crate::forward::{ForwardOutcome, ForwardRequest, forward_with_retry};
-use crate::headers::{headers_to_vec, set_forwarded, to_http_request};
+use crate::headers::{
+    copy_headers, copy_headers_direct, headers_to_vec, set_forwarded, to_http_request,
+};
 use crate::respond::{
     fault, http_response, stream_response, stream_response_direct, synth, synth_retry_after,
 };
@@ -130,10 +132,14 @@ async fn proxy_core_inner(
     scheme: &'static str,
     peer: SocketAddr,
     trace: RequestTrace,
-    parts: hyper::http::request::Parts,
+    mut parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let mut http_req = to_http_request(&parts, scheme);
+    // Only a bodyless request can be retried without buffering — and only a bodyless request can
+    // be an Upgrade handshake (ADR 000048). `exact() == Some(0)` is hyper's framing-accurate
+    // "no body"; computed up front, before the body moves.
+    let bodyless = body.size_hint().exact() == Some(0);
 
     // Normalize the request path once at ingress (CWE-22 Path Traversal / CWE-436
     // Interpretation Conflict): route selection, the filter chain, and the forwarded path then all
@@ -186,6 +192,22 @@ async fn proxy_core_inner(
         ));
     }
 
+    // HTTP/1.1 Upgrade opt-in (ADR 000048): tunnel only when the route declares the token, the
+    // client genuinely asked (`Connection: upgrade` + an allowlisted `Upgrade`), the transport
+    // can hand its connection over (h1 — hyper left an OnUpgrade on the request; h2/h3 never
+    // do), and the handshake is bodyless. Anything else stays a plain HTTP request with the
+    // Upgrade/Connection pair stripped as hop-by-hop, exactly as before.
+    let upgrade = if bodyless {
+        route.upgrade.as_ref().and_then(|cfg| {
+            let header = crate::headers::upgrade_request_header(&parts.headers)?;
+            let token = cfg.allowed_token(header)?.to_string();
+            let on_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>()?;
+            Some((token, on_upgrade, cfg.idle_timeout()))
+        })
+    } else {
+        None
+    };
+
     // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
     // A route with no filters skips the hop entirely — an empty chain is the identity, and the
     // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax. ---
@@ -234,8 +256,7 @@ async fn proxy_core_inner(
     let overall = group.overall_timeout();
     let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
     // Only a bodyless request can be retried without buffering: the opaque streamed body
-    // (ADR 000013) can't be replayed. `exact() == Some(0)` is hyper's framing-accurate "no body".
-    let bodyless = body.size_hint().exact() == Some(0);
+    // (ADR 000013) can't be replayed (`bodyless` was computed up front).
     let mut real_body = Some(body);
 
     // --- request-side body hook (ADR 000025): buffer the body (bounded) ONLY when a filter on the
@@ -287,7 +308,7 @@ async fn proxy_core_inner(
     // saturated backend. One slot per request, held across the retry loop and released by RAII on
     // every return path; an unlimited breaker (the default) is a zero-cost no-op permit. The breaker
     // is overload protection, NOT a health signal — a shed request never demotes an instance.
-    let _permit = match group.try_acquire() {
+    let permit = match group.try_acquire() {
         Some(permit) => permit,
         None => {
             state.metrics.inc_circuit_open();
@@ -317,11 +338,12 @@ async fn proxy_core_inner(
         original_headers: &parts.headers,
         upstream_path: &upstream_path,
         traceparent: &snapshot.traceparent(),
+        upgrade_token: upgrade.as_ref().map(|(t, _, _)| t.as_str()),
     };
     // The client for this group's security context (ADR 000042): the shared plain client, or the
     // pooled TLS client for its `[upstream.tls]` config. A cheap clone (shared pool inside).
     let client = state.clients.for_group(&group);
-    let upstream_resp = match forward_with_retry(
+    let (mut upstream_resp, upstream_pick) = match forward_with_retry(
         &client,
         &state.metrics,
         &group,
@@ -336,7 +358,7 @@ async fn proxy_core_inner(
     )
     .await
     {
-        ForwardOutcome::Response(resp) => resp,
+        ForwardOutcome::Response(resp, pick) => (resp, pick),
         ForwardOutcome::OverallTimeout => {
             return Ok(synth(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -354,6 +376,82 @@ async fn proxy_core_inner(
         ForwardOutcome::SendFailed(e) => return Err(e.into()),
         ForwardOutcome::BuildFailed(e) => return Err(e.into()),
     };
+
+    // --- upgrade switch (ADR 000048): a verified 101 splices the two connections into an opaque
+    // tunnel; any other status falls through to the normal response path (the handshake was
+    // simply refused — the upstream's answer is a legitimate response). ---
+    if upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let Some((token, downstream_on, idle)) = upgrade else {
+            // A 101 the client never solicited (or an unlisted token): relaying it would hand
+            // the upstream a raw byte stream the client cannot parse as HTTP — response
+            // smuggling. Fail closed (RFC 9110 §7.8: no unrequested switch).
+            return Ok(synth(
+                StatusCode::BAD_GATEWAY,
+                &fault::BAD_UPGRADE,
+                b"unsolicited upgrade",
+            ));
+        };
+        // The upstream must switch to the token we offered (case-insensitive, RFC 9110 §7.8).
+        let token_ok = upstream_resp
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(&token)));
+        if !token_ok {
+            return Ok(synth(
+                StatusCode::BAD_GATEWAY,
+                &fault::BAD_UPGRADE,
+                b"upgrade token mismatch",
+            ));
+        }
+        let upstream_on = hyper::upgrade::on(&mut upstream_resp);
+        // The 101 back to the client: the response-side chain still sees the handshake headers
+        // (status/headers only), end-to-end headers (e.g. Sec-WebSocket-Accept) pass the
+        // hop-by-hop strip, then the switch signal itself is re-issued deliberately.
+        let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        if route.has_filters {
+            let http_resp = HttpResponse {
+                status: StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+                headers: headers_to_vec(upstream_resp.headers()),
+                body: Vec::new(),
+            };
+            let snap_resp = snapshot.clone();
+            let edited =
+                tokio::task::spawn_blocking(move || snap_resp.dispatch_response(idx, http_resp))
+                    .await?;
+            if edited.status != StatusCode::SWITCHING_PROTOCOLS.as_u16() || !edited.body.is_empty()
+            {
+                // A response filter vetoed the switch (or trapped fail-closed): honour its
+                // response and never splice — the upstream connection drops with `upstream_on`.
+                return Ok(http_response(edited));
+            }
+            copy_headers(builder.headers_mut(), &edited.headers);
+        } else {
+            copy_headers_direct(builder.headers_mut(), upstream_resp.headers());
+        }
+        if let Some(h) = builder.headers_mut() {
+            if let Ok(v) = hyper::header::HeaderValue::from_str(&token) {
+                h.insert(hyper::header::UPGRADE, v);
+            }
+            h.insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("upgrade"),
+            );
+        }
+        let resp101 = builder
+            .body(crate::body::full(Vec::new()))
+            .map_err(ServerError::from)?;
+        let drain = state.drain.clone();
+        tokio::spawn(async move {
+            // Long-lived tunnels stay inside the existing resource accounting (ADR 000048): the
+            // breaker permit (ADR 000028) and the LB pick guard (least-request in-flight) live
+            // exactly as long as the tunnel, and the drain flag closes it at shutdown.
+            let _permit = permit;
+            let _pick = upstream_pick;
+            crate::tunnel::run(downstream_on, upstream_on, idle, drain).await;
+        });
+        return Ok(resp101);
+    }
 
     // --- response side: the route's chain in reverse (status / headers only) ---
     let (uparts, ubody) = upstream_resp.into_parts();

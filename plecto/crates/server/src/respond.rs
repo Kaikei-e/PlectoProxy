@@ -31,6 +31,7 @@ pub(crate) mod fault {
     pub(crate) static REQUEST_TIMEOUT: HeaderValue = HeaderValue::from_static("request-timeout");
     pub(crate) static UPSTREAM_TIMEOUT: HeaderValue = HeaderValue::from_static("upstream-timeout");
     pub(crate) static UPSTREAM: HeaderValue = HeaderValue::from_static("upstream");
+    pub(crate) static BAD_UPGRADE: HeaderValue = HeaderValue::from_static("bad-upgrade");
 }
 
 /// A synthesised response (short-circuit / fail-closed) → a hyper `Response` with a buffered body.

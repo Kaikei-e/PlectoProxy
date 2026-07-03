@@ -493,6 +493,31 @@ pub struct Route {
     /// (or per client-IP), needs no WASM filter, and never crosses the WASM boundary.
     #[serde(default)]
     pub rate_limit: Option<RouteRateLimit>,
+    /// HTTP/1.1 Upgrade opt-in (ADR 000048): the Upgrade tokens this route tunnels. Absent =
+    /// deny-by-default (the Upgrade/Connection pair keeps being stripped as hop-by-hop).
+    #[serde(default)]
+    pub upgrade: Option<RouteUpgrade>,
+}
+
+/// A route's Upgrade declaration (`[route.upgrade]`, ADR 000048). The allowlist shape is the
+/// h2c-smuggling mitigation (only listed tokens are ever re-issued upstream); `h2c` itself is
+/// rejected at validation (ADR 000015 — Plecto has no h2c on either side).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteUpgrade {
+    /// Upgrade tokens to tunnel, matched case-insensitively against the client's `Upgrade`
+    /// header (e.g. `["websocket"]`). Must be non-empty; `h2c` is rejected.
+    pub protocols: Vec<String>,
+    /// Idle timeout for an established tunnel, in ms — a byte in EITHER direction resets it
+    /// (the activity-based form nginx/Envoy/HAProxy all share). `0` disables the timer.
+    #[serde(default = "default_upgrade_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+}
+
+/// 5 minutes — Envoy's stream-idle default; long enough for ping/pong-quiet apps, short enough
+/// that an abandoned tunnel cannot hold a connection permit for hours.
+fn default_upgrade_idle_timeout_ms() -> u64 {
+    300_000
 }
 
 /// The match dimensions of a route (`[route.match]`, ADR 000034), modelled on Gateway-API v1.5.0

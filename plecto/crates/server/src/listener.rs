@@ -102,6 +102,11 @@ async fn serve_inner(
         .map(str::to_string)
         .zip(control.otlp_buffer());
 
+    // The drain flag (ADR 000039): flipped to `true` exactly once, at shutdown. Every connection
+    // task holds a receiver and gracefully closes its connection when it flips; the h3 loops stop
+    // accepting; spawned upgrade tunnels (ADR 000048) close. `false` for the serving lifetime.
+    let (drain_tx, drain_rx) = watch::channel(false);
+
     let state = Arc::new(ServerState {
         control,
         clients: UpstreamClients::new(),
@@ -110,12 +115,8 @@ async fn serve_inner(
         body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
         metrics: Arc::new(ServerMetrics::new()),
         otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
+        drain: drain_rx.clone(),
     });
-
-    // The drain flag (ADR 000039): flipped to `true` exactly once, at shutdown. Every connection
-    // task holds a receiver and gracefully closes its connection when it flips; the h3 loops stop
-    // accepting. `false` for the entire serving lifetime.
-    let (drain_tx, drain_rx) = watch::channel(false);
 
     // Admin endpoint (Stage A observability, ADR 000009): a SEPARATE listener for `/metrics` +
     // liveness/readiness, bound only when `[observability] admin_addr` is set. A bad address disables
@@ -301,7 +302,10 @@ async fn serve_conn<I>(
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(INBOUND_HEADER_READ_TIMEOUT)
             .max_headers(MAX_HEADERS)
-            .serve_connection(io, service);
+            .serve_connection(io, service)
+            // Upgrade support (ADR 000048): without this, the OnUpgrade a 101 fulfils would
+            // error and no tunnel could ever splice. h1 only — h2/h3 use (extended) CONNECT.
+            .with_upgrades();
         tokio::pin!(conn);
         tokio::select! {
             res = conn.as_mut() => res,

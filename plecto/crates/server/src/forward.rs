@@ -19,7 +19,10 @@ use crate::{ReqBody, ResponseBody};
 /// already knows how to turn each of these into the right response / propagated error — this enum
 /// only reports WHICH of those cases happened, not how to render it.
 pub(crate) enum ForwardOutcome {
-    Response(hyper::Response<ResponseBody>),
+    /// The upstream answered. Carries the winning attempt's `Pick` so an upgrade tunnel
+    /// (ADR 000048) can keep the least-request in-flight guard alive for the tunnel's lifetime;
+    /// every other caller just drops it with the outcome.
+    Response(hyper::Response<ResponseBody>, plecto_control::Pick),
     /// The overall request deadline (ADR 000031) elapsed, either before an attempt or while
     /// waiting on one.
     OverallTimeout,
@@ -41,6 +44,9 @@ pub(crate) struct ForwardRequest<'a> {
     pub(crate) original_headers: &'a HeaderMap,
     pub(crate) upstream_path: &'a str,
     pub(crate) traceparent: &'a str,
+    /// `Some(token)` when this is an allowlisted Upgrade handshake (ADR 000048): the exact
+    /// (lower-cased) token to re-issue toward the upstream. `None` for every plain request.
+    pub(crate) upgrade_token: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -105,6 +111,20 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
         {
             h.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
         }
+        // Upgrade controlled re-issue (ADR 000048), the TE-shaped pattern above: the general
+        // hop-by-hop strip removed the inbound Upgrade/Connection pair; on an upgrade-declared
+        // route re-issue exactly the ONE allowlisted token — never a forward of arbitrary
+        // Upgrade values (the h2c-smuggling guard lives in the allowlist, not here).
+        if let Some(token) = forward.upgrade_token
+            && let Some(h) = builder.headers_mut()
+            && let Ok(v) = HeaderValue::from_str(token)
+        {
+            h.insert(hyper::header::UPGRADE, v);
+            h.insert(
+                hyper::header::CONNECTION,
+                HeaderValue::from_static("upgrade"),
+            );
+        }
         let upstream_req = match builder.body(attempt_body) {
             Ok(req) => req,
             Err(e) => return ForwardOutcome::BuildFailed(e),
@@ -149,7 +169,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
                     pick = next_pick;
                     continue;
                 }
-                return ForwardOutcome::Response(resp);
+                return ForwardOutcome::Response(resp, pick);
             }
             None => {
                 if overall_elapsed {
@@ -255,6 +275,7 @@ mod tests {
             original_headers: headers,
             upstream_path: "/",
             traceparent: "test-trace",
+            upgrade_token: None,
         }
     }
 
@@ -286,7 +307,7 @@ mod tests {
         .await;
 
         match outcome {
-            ForwardOutcome::Response(resp) => assert_eq!(resp.status(), 200),
+            ForwardOutcome::Response(resp, _) => assert_eq!(resp.status(), 200),
             _ => panic!("expected the retry sequence to end in a 200 response"),
         }
         assert_eq!(
@@ -389,7 +410,7 @@ mod tests {
         .await;
 
         match outcome {
-            ForwardOutcome::Response(resp) => assert_eq!(resp.status(), 200),
+            ForwardOutcome::Response(resp, _) => assert_eq!(resp.status(), 200),
             _ => panic!("expected success after retrying the connect failure"),
         }
         assert_eq!(

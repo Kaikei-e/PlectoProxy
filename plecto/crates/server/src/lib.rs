@@ -50,6 +50,7 @@ mod otlp;
 mod proxy;
 mod respond;
 mod retry;
+mod tunnel;
 mod upstream_client;
 
 use std::sync::Arc;
@@ -152,6 +153,9 @@ pub(crate) struct ServerState {
     /// `proxy_core` pushes one SERVER request span per sampled transaction; the export pump
     /// (spawned by the listener) drains it.
     otlp: Option<Arc<plecto_control::otlp::OtlpBuffer>>,
+    /// The graceful-shutdown drain flag (ADR 000039), cloned into every spawned upgrade tunnel
+    /// (ADR 000048) so an indefinite tunnel closes at drain instead of outliving the server.
+    drain: tokio::sync::watch::Receiver<bool>,
 }
 
 /// An upstream TCP connector with `TCP_NODELAY` set. A proxy must disable Nagle on its upstream

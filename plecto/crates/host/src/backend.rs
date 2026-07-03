@@ -14,6 +14,7 @@
 //! the namespace.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -201,6 +202,13 @@ impl KvBackend for MemoryBackend {
 
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("plecto_state");
 
+/// Every `DURABLE_FLUSH_EVERY`th hot-path commit is upgraded from `Durability::None` to
+/// `Immediate`. redb frees pages only at a durable commit, so an unbounded None-only run
+/// (a counter/ratelimit-heavy workload with no kv writes) would grow the file without bound.
+/// 1024 amortises the fsync to noise on the hot path while bounding both the file growth
+/// between durable commits and the window of updates a crash can lose.
+const DURABLE_FLUSH_EVERY: u64 = 1024;
+
 /// redb-backed durable state. Atomicity comes from redb's single-writer write
 /// transaction: each `increment` / `try_acquire` does its read-modify-write inside one
 /// transaction (ADR 000004). redb is fully synchronous; ADR 000011's async-aware seam
@@ -208,14 +216,55 @@ const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("plecto_
 /// pool here without touching callers.
 pub struct RedbBackend {
     db: Database,
+    /// Hot-path (non-durable) commits since the last durable one. Only touched while
+    /// holding redb's single-writer transaction, so relaxed atomics suffice.
+    non_durable_run: AtomicU64,
+    flush_every: u64,
+    /// Durable commits forced by the cadence (observability for the flush tests).
+    forced_flushes: AtomicU64,
 }
 
 impl RedbBackend {
     /// Open (or create) the redb database at `path`.
     pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        Self::open_inner(path, DURABLE_FLUSH_EVERY)
+    }
+
+    #[cfg(test)]
+    fn open_with_flush_every(
+        path: impl AsRef<std::path::Path>,
+        flush_every: u64,
+    ) -> anyhow::Result<Self> {
+        Self::open_inner(path, flush_every)
+    }
+
+    fn open_inner(path: impl AsRef<std::path::Path>, flush_every: u64) -> anyhow::Result<Self> {
         Ok(Self {
             db: Database::create(path)?,
+            non_durable_run: AtomicU64::new(0),
+            flush_every,
+            forced_flushes: AtomicU64::new(0),
         })
+    }
+
+    #[cfg(test)]
+    fn forced_flushes(&self) -> u64 {
+        self.forced_flushes.load(Ordering::Relaxed)
+    }
+
+    /// The durability of the next hot-path commit: `None` (skip the per-commit fsync) until
+    /// the run reaches `flush_every`, then one `Immediate` commit — which also makes every
+    /// earlier commit in the run durable and lets redb free their copied-on-write pages.
+    /// Called while holding the single-writer write transaction, so the run is exact.
+    fn hot_path_durability(&self) -> redb::Durability {
+        let run = self.non_durable_run.fetch_add(1, Ordering::Relaxed) + 1;
+        if run >= self.flush_every {
+            self.non_durable_run.store(0, Ordering::Relaxed);
+            self.forced_flushes.fetch_add(1, Ordering::Relaxed);
+            redb::Durability::Immediate
+        } else {
+            redb::Durability::None
+        }
     }
 
     fn get_inner(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
@@ -236,6 +285,9 @@ impl RedbBackend {
             table.insert(key, value)?;
         }
         wtxn.commit()?;
+        // This commit was durable (the `Immediate` default), so every earlier hot-path commit
+        // is durable too — the flush cadence restarts.
+        self.non_durable_run.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -246,6 +298,8 @@ impl RedbBackend {
             table.remove(key)?;
         }
         wtxn.commit()?;
+        // Durable commit (see `set_inner`): the flush cadence restarts.
+        self.non_durable_run.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -253,10 +307,12 @@ impl RedbBackend {
         let mut wtxn = self.db.begin_write()?;
         // Counters are ephemeral hot-path state (ADR 000005): a crash losing the last few
         // increments is harmless, so skip the per-commit fsync of the default
-        // `Durability::Immediate`. Atomicity is unaffected — the read-modify-write is still one
-        // write txn. Durable KV (`set` / `delete`) keeps `Immediate`. set_durability only errors
-        // if a persistent savepoint changed in this txn; we never use savepoints.
-        wtxn.set_durability(redb::Durability::None)?;
+        // `Durability::Immediate` — except every `flush_every`th commit, which stays durable
+        // so redb can free the run's pages (`hot_path_durability`). Atomicity is unaffected —
+        // the read-modify-write is still one write txn. Durable KV (`set` / `delete`) keeps
+        // `Immediate`. set_durability only errors if a persistent savepoint changed in this
+        // txn; we never use savepoints.
+        wtxn.set_durability(self.hot_path_durability())?;
         let next = {
             let mut table = wtxn.open_table(STATE_TABLE)?;
             let cur = table.get(key)?.map(|g| decode_i64(g.value())).unwrap_or(0);
@@ -277,8 +333,9 @@ impl RedbBackend {
     ) -> anyhow::Result<Acquire> {
         let mut wtxn = self.db.begin_write()?;
         // Rate-limit buckets are ephemeral hot-path state (ADR 000005): same reasoning as
-        // counters — skip the per-commit fsync; atomicity stays (one write txn).
-        wtxn.set_durability(redb::Durability::None)?;
+        // counters — skip the per-commit fsync, durable every `flush_every`th commit;
+        // atomicity stays (one write txn).
+        wtxn.set_durability(self.hot_path_durability())?;
         let result = {
             let mut table = wtxn.open_table(STATE_TABLE)?;
             let prev = {

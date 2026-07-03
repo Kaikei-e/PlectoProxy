@@ -348,6 +348,18 @@ pub fn validate_manifest_path(path: &Path) -> Result<String, ControlError> {
     validate_manifest(&manifest, base_dir)
 }
 
+/// The manifest's JSON Schema (ADR 000049), derived from the very serde model `from_toml` parses
+/// with — the schema cannot drift from the structs, and `deny_unknown_fields` surfaces as
+/// `additionalProperties: false`, so editor validation rejects exactly what `validate` rejects.
+/// draft-07 output: the level taplo / Even Better TOML consume (schemars' 2020-12 default is
+/// outside taplo's documented support). Serialising a just-generated schema cannot fail; the
+/// fallback keeps this total rather than panicking in a CLI path.
+pub fn manifest_json_schema() -> String {
+    let generator = schemars::generate::SchemaSettings::draft07().into_generator();
+    let schema = generator.into_root_schema_for::<Manifest>();
+    serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// What `build_host_and_store` assembles for the manifest-driven constructors: the `Host` (sinks
 /// wired), the offline OCI store, and the observability handles `Control` retains.
 type BuiltHost = (

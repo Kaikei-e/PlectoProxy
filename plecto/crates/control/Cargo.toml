@@ -36,6 +36,8 @@ ipnet = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# the manifest JSON Schema derive (ADR 000049): schema output that cannot drift from the structs.
+schemars = { workspace = true }
 toml = { workspace = true }
 arc-swap = { workspace = true }
 # parking_lot: non-poisoning locks for the native rate limiter's bucket cells (ADR 000033). A

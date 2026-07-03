@@ -9,6 +9,7 @@
 //! - `plecto validate <manifest.toml>` — statically validate a manifest and exit (the `nginx -t`
 //!   shape: strict parse + every fail-closed startup check that needs no artifact; for CI and
 //!   pre-SIGHUP checks)
+//! - `plecto schema` — print the manifest's JSON Schema (draft-07) for editor completion / CI
 //! - `plecto --version` — print the version and exit
 
 use std::path::Path;
@@ -39,11 +40,17 @@ async fn run() -> anyhow::Result<()> {
         .with_target(true)
         .try_init();
 
-    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate <manifest.toml> | plecto --version";
+    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate <manifest.toml> | plecto schema | plecto --version";
     let mut args = std::env::args().skip(1);
     let manifest = match args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.as_str() {
         "--version" | "-V" => {
             println!("plecto {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // The manifest's JSON Schema (ADR 000049), derived from the same serde model `validate`
+        // parses with — pipe to a file and point taplo / Even Better TOML at it (`#:schema`).
+        "schema" => {
+            println!("{}", plecto_control::manifest_json_schema());
             return Ok(());
         }
         // Static manifest validation (the `nginx -t` shape): strict parse + every fail-closed

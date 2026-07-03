@@ -63,6 +63,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # serde_json: serialize the OCI image-manifest blob to bytes we digest + write (ADR 000007).
 serde_json = "1"
+# schemars: derive the manifest JSON Schema from the same serde model (ADR 000049) —
+# draft-07 output for taplo/Even Better TOML. Default features only (no chrono/url pulled).
+schemars = "1"
 # arc-swap: lock-free atomic swap of the active filter set on reload (ADR 000007).
 arc-swap = "1"
 # sha2 + hex: OCI content-digest pinning (sha256 over blob bytes), pure-Rust / offline.

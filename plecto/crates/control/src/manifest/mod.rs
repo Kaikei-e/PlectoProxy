@@ -26,7 +26,7 @@ use crate::error::ControlError;
 /// `serde_json` emitting fields and `Vec` elements in a fixed order; a `HashMap` would
 /// serialise in nondeterministic order and silently break reload idempotency. If a manifest
 /// ever needs a map, use `BTreeMap` (ordered) and keep this invariant.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(default)]
@@ -71,7 +71,7 @@ pub struct Manifest {
 /// config, so the bind address lives here rather than only in a positional CLI arg (containers
 /// need `0.0.0.0` binds without entrypoint gymnastics); an explicit CLI `listen_addr` still wins
 /// as the operator's override.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
     /// `host:port` the data plane binds (e.g. `0.0.0.0:8443`). `None` = the binary's default
@@ -89,7 +89,7 @@ pub struct Listen {
 /// listener exposing Prometheus metrics + liveness/readiness, and an opt-in structured access log.
 /// Off by default — Plecto stays quiet and exposes nothing extra unless asked (operational
 /// simplicity). Captured at construction; a reload does not re-bind the admin listener.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observability {
     /// `host:port` the admin endpoint binds (e.g. `127.0.0.1:9090`). `None` = no admin listener
@@ -114,7 +114,7 @@ pub struct Observability {
 /// cert presented when no SNI matches. `cert_path` / `key_path` are manifest-relative PEM files
 /// (a cert chain and its private key). Only the **paths** ride the manifest content hash, so a
 /// path change reloads but an in-place file edit does not (ADR 000014).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsCert {
     /// SNI host this cert serves (case-insensitive). `None` = the default cert.
@@ -133,7 +133,7 @@ pub struct TlsCert {
 /// http/1.1 (ADR 000042). Every upstream carries an active-health-check policy (`health`) —
 /// required, because instances start pessimistic (unhealthy) and only a passing probe puts one
 /// into rotation (ADR 000017).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
@@ -208,7 +208,7 @@ pub struct Upstream {
 /// Upstream TLS re-encryption config (`[upstream.tls]`, ADR 000042). Presence of the section
 /// enables TLS to every instance of the upstream; server certificate verification is ALWAYS on
 /// (no insecure option — custom CA covers the self-signed / internal-CA case, fail-closed).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
     /// Manifest-relative path to a PEM bundle of CA certificates that REPLACES the webpki
@@ -222,7 +222,9 @@ pub struct UpstreamTls {
 /// Per-upstream load-balancing algorithm (ADR 000035). `round_robin` is the default and keeps the
 /// pre-000035 healthy-set rotation (ADR 000024); the others are opt-in. This selects an INSTANCE
 /// within a chosen upstream group — a layer below the route→group weighted split (ADR 000034).
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LbAlgorithm {
     /// Healthy-set round-robin (ADR 000017 / 000024) — the default.
@@ -242,7 +244,7 @@ pub enum LbAlgorithm {
 /// table back to the bare string, so an explicitly-written default weight does not change the
 /// content hash (the manifest determinism invariant — same spirit as an explicit `isolation =
 /// "untrusted"`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AddressSpec {
     /// A bare `host:port` — weight 1.
@@ -255,7 +257,7 @@ pub enum AddressSpec {
 /// (ADR 000035). Weight biases both the least-request comparison and the Maglev table share toward
 /// higher-capacity instances; `1` is the default, `0` is rejected at build (drain an instance by
 /// removing its address, not by zeroing its weight).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WeightedAddress {
     pub address: String,
@@ -309,7 +311,7 @@ pub(crate) const MAX_INSTANCE_WEIGHT: u32 = 1000;
 /// The Maglev consistent-hashing config (ADR 000035), `[upstream.hash]`. Only valid when
 /// `lb_algorithm = "maglev"`. Names the request attribute hashed for affinity and the lookup-table
 /// size.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HashConfig {
     /// Which request attribute is the hash key.
@@ -326,7 +328,7 @@ pub struct HashConfig {
 }
 
 /// The request attribute a Maglev upstream hashes for affinity (ADR 000035).
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HashKeyKind {
     /// The value of a named request header (requires `header`).
@@ -349,7 +351,7 @@ pub(crate) const MAX_HASH_TABLE_SIZE: u32 = 5_000_011;
 /// saturated?", and this "is the instance misbehaving on live traffic?". An ejected instance leaves
 /// the rotation for a (backing-off) ejection window, independent of the health bit; a shed request
 /// (circuit breaker) never feeds it, only real upstream 5xx responses do.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutlierDetection {
     /// Consecutive gateway-class 5xx (502/503/504) from live forwards to eject an instance; `0` =
@@ -391,7 +393,7 @@ fn default_max_ejection_percent() -> u32 {
 /// SEPARATE from outlier detection / health (ADR 000017): health answers "is this instance up?",
 /// the breaker answers "is this upstream saturated?". A request rejected by the breaker is the
 /// upstream shedding load, not an instance failing — so it never demotes an instance.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CircuitBreaker {
     /// Max concurrent in-flight requests the fast path will forward to this upstream at once. At the
@@ -411,7 +413,7 @@ pub struct CircuitBreaker {
 /// never-yet-healthy instance (cold-start fast path), after which the full `healthy_threshold`
 /// governs re-entry. Only `path` is required; the rest default. `PartialEq` lets a reload detect a
 /// changed policy and re-probe the upstream's instances from scratch (ADR 000017 reconcile).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     /// The probe request path, e.g. `/healthz`.
@@ -464,7 +466,7 @@ fn default_unhealthy_threshold() -> u32 {
 /// prefix-strip, without a `plecto:filter` contract change. `filters` / `strip_prefix` / `rate_limit`
 /// are per-route: they apply identically across every backend (ADR 000034 keeps a backend a pure
 /// `{upstream, weight}` pair; a route needing different policy per target uses a separate route).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// The match dimensions (`[route.match]`): host / path_prefix / method / headers / query (ADR
@@ -502,7 +504,7 @@ pub struct Route {
 /// A route's Upgrade declaration (`[route.upgrade]`, ADR 000048). The allowlist shape is the
 /// h2c-smuggling mitigation (only listed tokens are ever re-issued upstream); `h2c` itself is
 /// rejected at validation (ADR 000015 — Plecto has no h2c on either side).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteUpgrade {
     /// Upgrade tokens to tunnel, matched case-insensitively against the client's `Upgrade`
@@ -525,7 +527,7 @@ fn default_upgrade_idle_timeout_ms() -> u64 {
 /// unspecified dimension is a wildcard. Among matching routes the most specific wins (see
 /// `route::select`): host-constrained > longest `path_prefix` > `method` present > more header
 /// matches > more query matches, with manifest order the final stable tie-break.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     /// Match only this authority (case-insensitive, port ignored). `None` matches any host.
@@ -551,7 +553,7 @@ pub struct RouteMatch {
 /// `[[upstream]]` `name` and its integer `weight`. The proportion a backend receives is
 /// `weight / Σweights` (Gateway-API semantics). `weight` defaults to 1, caps at 1_000_000 (Σ
 /// overflow guard), and `0` drains the backend (no traffic). Validated at build (ADR 000034 5b).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
     /// The `[[upstream]]` `name` this backend forwards to.
@@ -594,7 +596,7 @@ impl Route {
 /// otherwise lacks. `rate`/`burst` map onto the same token-bucket math as `host-ratelimit`
 /// (`capacity = burst`, refill `rate` tokens every second), but the surface is deliberately the
 /// friendlier two-knob (rate + burst) form, since this is a blunt floor, not a policy limiter.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRateLimit {
     /// Sustained requests per second (tokens added each second). Must be non-zero.
@@ -609,7 +611,9 @@ pub struct RouteRateLimit {
 }
 
 /// The dimension a native route rate limit counts against (ADR 000033).
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum RateLimitKeyKind {
     /// One shared bucket for the whole route — a total cap regardless of client.
@@ -625,7 +629,7 @@ pub enum RateLimitKeyKind {
 /// makes it durable at `path`, so counters and rate-limit windows survive a restart
 /// (fail-closed direction, ADR 000004). One backend serves all three capabilities; fixed at
 /// construction like `[trust]` (`PartialEq` backs the reload rejection — restart to apply).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct State {
     #[serde(default)]
@@ -637,7 +641,9 @@ pub struct State {
 }
 
 /// Manifest spelling of the state backend (ADR 000041). Defaults to `memory`.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum StateBackendKind {
     #[default]
@@ -648,7 +654,7 @@ pub enum StateBackendKind {
 /// Trust roots: paths (manifest-relative) to trusted signer public keys, PEM (ADR 000006).
 /// `PartialEq` lets `reload` detect a trust-section change (which it rejects — trust is fixed
 /// at construction, f000004 #1).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Trust {
     #[serde(default)]
@@ -659,7 +665,7 @@ pub struct Trust {
 /// as an inline table `ratelimit = { capacity = .., refill_tokens = .., refill_interval_ms = .. }`.
 /// The operator owns it, so an untrusted filter cannot supply or override its own limit (the WIT
 /// `try-acquire` carries only `key` + `cost`).
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Maximum tokens the bucket can hold.
@@ -671,7 +677,9 @@ pub struct RateLimitConfig {
 }
 
 /// A URL scheme an outbound allowlist entry may name (ADR 000036). Defaults to `https`.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SchemeKind {
     #[default]
@@ -691,7 +699,7 @@ impl SchemeKind {
 
 /// One allowed outbound destination — an exact `(scheme, host, port)` triple (ADR 000036). No
 /// wildcards: the target endpoints (JWKS / introspection / ext_authz) are fixed and known.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowDest {
     /// Exact host — a DNS name (matched case-insensitively) or an IP literal.
@@ -711,7 +719,7 @@ pub struct AllowDest {
 /// RFC1918 / ULA CIDRs past the SSRF guard's private-range block (for internal ext_authz); it never
 /// opens the always-blocked reserved floor (loopback / link-local / cloud-metadata). Timeouts and
 /// sizes are host-clamped.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OutboundConfig {
     /// The exact destinations this filter may call. Must be non-empty when the section is present.
@@ -731,7 +739,7 @@ pub struct OutboundConfig {
 }
 
 /// One filter to load, pinned by OCI digest.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterEntry {
     /// Host-assigned identity; namespaces the filter's KV (ADR 000011) and names it in chains.
@@ -763,7 +771,9 @@ pub struct FilterEntry {
 }
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationKind {
     #[default]
@@ -773,7 +783,7 @@ pub enum IsolationKind {
 
 /// The single ordered chain for v0.1 (named chains / route matching are deferred to the
 /// fast-path server).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chain {
     #[serde(default)]

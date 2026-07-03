@@ -143,6 +143,8 @@ h3-quinn = { workspace = true }
 # plain production build of plecto-server never needs wasm32-unknown-unknown).
 plecto-host = { path = "../host", features = ["test-support"] }
 tempfile = "3"
+# decode `plecto schema`'s stdout in the CLI E2E (ADR 000049). Dev-only.
+serde_json = { workspace = true }
 # OTLP decode ORACLE for the hand-written exporter's E2E (ADR 000040): the official generated
 # proto types, kept independent of the shipped encoder. `gen-tonic-messages` pulls prost only —
 # no tonic/gRPC stack. Dev-only, never linked into a production build.

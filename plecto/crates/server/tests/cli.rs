@@ -46,6 +46,48 @@ fn version_flag_prints_the_package_version_and_exits_zero() {
 }
 
 #[test]
+fn schema_emits_a_draft07_json_schema_describing_the_manifest() {
+    // `plecto schema` (ADR 000049): the manifest's JSON Schema on stdout, derived from the same
+    // serde model `from_toml` parses with. draft-07 is the level taplo / Even Better TOML
+    // consume; `deny_unknown_fields` must surface as `additionalProperties: false` so editor
+    // validation catches typos exactly like `validate` does.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["schema"], dir.path());
+    assert!(
+        out.status.success(),
+        "schema exits 0, stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let schema: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(
+        schema["$schema"], "http://json-schema.org/draft-07/schema#",
+        "draft-07 output (the taplo-compatible level)"
+    );
+    assert_eq!(
+        schema["additionalProperties"],
+        serde_json::Value::Bool(false),
+        "deny_unknown_fields → additionalProperties: false"
+    );
+    let props = schema["properties"]
+        .as_object()
+        .expect("root schema has properties");
+    for key in [
+        "trust",
+        "state",
+        "filter",
+        "chain",
+        "upstream",
+        "route",
+        "tls",
+        "observability",
+        "listen",
+    ] {
+        assert!(props.contains_key(key), "schema describes [{key}]");
+    }
+}
+
+#[test]
 fn validate_accepts_a_good_manifest_and_exits_without_serving() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("plecto.toml"), VALID_MANIFEST).unwrap();

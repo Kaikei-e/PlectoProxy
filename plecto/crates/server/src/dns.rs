@@ -19,36 +19,64 @@ use std::time::{Duration, Instant};
 
 use plecto_control::{Control, UpstreamGroup};
 
+/// One group's last successful expansion per hostname address — the last-known-good set a failed
+/// re-resolution falls back to. Behind a `tokio::sync::Mutex` so a group's refresh task owns it
+/// for the duration of the refresh (the lock IS the "one in-flight refresh per group" guard).
+type GroupCache = Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>;
+
+/// The supervisor's task-local bookkeeping, keyed by group name (like the health supervisor's
+/// probe clock): when each group last started a refresh, and its last-known-good cache.
+#[derive(Default)]
+struct RefreshState {
+    last_run: HashMap<String, Instant>,
+    last_good: HashMap<String, GroupCache>,
+}
+
 /// Run the DNS re-resolution supervisor until the server stops. No-ops (idles at a coarse tick)
 /// while no group sets `resolve_interval_ms`.
 pub(crate) async fn serve_dns_refresh(control: Arc<Control>) {
-    // per-(group, address) last successful expansion — the last-known-good set a failed
-    // re-resolution falls back to. Task-local, like the health supervisor's probe clock.
-    let mut last_good: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut last_run: HashMap<String, Instant> = HashMap::new();
+    let mut state = RefreshState::default();
     loop {
         let groups = control.upstream_groups();
-        let now = Instant::now();
-        let mut live: HashSet<String> = HashSet::new();
-        let mut period = Duration::from_secs(5);
-        for g in &groups {
-            let Some(interval) = g.resolve_interval() else {
-                continue;
-            };
-            period = period.min(interval);
-            live.insert(g.name.clone());
-            let due = last_run
-                .get(&g.name)
-                .is_none_or(|t| now.duration_since(*t) >= interval);
-            if due {
-                last_run.insert(g.name.clone(), now);
-                refresh_group(g, &mut last_good, lookup).await;
-            }
-        }
-        last_run.retain(|k, _| live.contains(k));
-        last_good.retain(|(g, _), _| live.contains(g));
+        let period = refresh_tick(&groups, &mut state, &lookup).await;
         tokio::time::sleep(period.max(Duration::from_millis(20))).await;
     }
+}
+
+/// One supervisor tick: refresh every due group and return how long to sleep until the next
+/// tick (the shortest configured interval, or a coarse idle period when no group resolves).
+async fn refresh_tick<F, Fut>(
+    groups: &[Arc<UpstreamGroup>],
+    state: &mut RefreshState,
+    resolver: &F,
+) -> Duration
+where
+    F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::io::Result<Vec<SocketAddr>>> + Send,
+{
+    let now = Instant::now();
+    let mut live: HashSet<String> = HashSet::new();
+    let mut period = Duration::from_secs(5);
+    for g in groups {
+        let Some(interval) = g.resolve_interval() else {
+            continue;
+        };
+        period = period.min(interval);
+        live.insert(g.name.clone());
+        let due = state
+            .last_run
+            .get(&g.name)
+            .is_none_or(|t| now.duration_since(*t) >= interval);
+        if due {
+            state.last_run.insert(g.name.clone(), now);
+            let cache = state.last_good.entry(g.name.clone()).or_default().clone();
+            let mut cache = cache.lock().await;
+            refresh_group(g, &mut cache, resolver.clone()).await;
+        }
+    }
+    state.last_run.retain(|k, _| live.contains(k));
+    state.last_good.retain(|k, _| live.contains(k));
+    period
 }
 
 /// The production resolver: getaddrinfo via tokio's blocking pool. `addr` is `host:port`, so the
@@ -63,7 +91,7 @@ async fn lookup(addr: String) -> std::io::Result<Vec<SocketAddr>> {
 /// nondeterminism never causes a spurious swap.
 async fn refresh_group<F, Fut>(
     group: &Arc<UpstreamGroup>,
-    last_good: &mut HashMap<(String, String), Vec<String>>,
+    last_good: &mut HashMap<String, Vec<String>>,
     resolver: F,
 ) -> bool
 where
@@ -76,7 +104,6 @@ where
             resolved.push((addr.clone(), *weight));
             continue;
         }
-        let key = (group.name.clone(), addr.clone());
         match resolver(addr.clone()).await {
             Ok(addrs) if !addrs.is_empty() => {
                 let mut expansion: Vec<String> =
@@ -84,9 +111,9 @@ where
                 expansion.sort();
                 expansion.dedup();
                 resolved.extend(expansion.iter().map(|a| (a.clone(), *weight)));
-                last_good.insert(key, expansion);
+                last_good.insert(addr.clone(), expansion);
             }
-            _ => match last_good.get(&key) {
+            _ => match last_good.get(addr) {
                 // failed (or empty) resolution: keep the last-known-good expansion rather than
                 // emptying the set — a flaky resolver must not take a serving upstream down.
                 Some(last) => resolved.extend(last.iter().map(|a| (a.clone(), *weight))),
@@ -104,11 +131,11 @@ mod tests {
     use super::*;
     use plecto_control::{Manifest, UpstreamRegistry};
 
-    fn resolving_group(addresses: &str) -> Arc<UpstreamGroup> {
+    fn resolving_group_named(name: &str, addresses: &str) -> Arc<UpstreamGroup> {
         let toml = format!(
             r#"
             [[upstream]]
-            name = "app"
+            name = "{name}"
             addresses = [{addresses}]
             resolve_interval_ms = 100
             [upstream.health]
@@ -121,11 +148,52 @@ mod tests {
         registry
             .reconcile(&manifest.upstreams, std::path::Path::new("."))
             .unwrap();
-        registry.group("app").unwrap()
+        registry.group(name).unwrap()
+    }
+
+    fn resolving_group(addresses: &str) -> Arc<UpstreamGroup> {
+        resolving_group_named("app", addresses)
     }
 
     fn addrs(list: &[&str]) -> std::io::Result<Vec<SocketAddr>> {
         Ok(list.iter().map(|a| a.parse().unwrap()).collect())
+    }
+
+    #[tokio::test]
+    async fn one_blocked_resolver_does_not_stall_another_groups_refresh() {
+        // ADR 000044: each due group refreshes on its own task, so one black-holed resolver
+        // (getaddrinfo hanging at resolv.conf timeout × attempts) must not serialize every other
+        // group's refresh behind it. The barrier only releases when BOTH groups' resolutions are
+        // in flight at once — a serial supervisor deadlocks here and trips the timeout.
+        let ga = resolving_group_named("a", "\"a.internal:80\"");
+        let gb = resolving_group_named("b", "\"b.internal:80\"");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let resolver = {
+            let barrier = barrier.clone();
+            move |_addr: String| {
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    addrs(&["10.0.0.9:80"])
+                }
+            }
+        };
+        let groups = vec![ga.clone(), gb.clone()];
+        let mut state = RefreshState::default();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            refresh_tick(&groups, &mut state, &resolver).await;
+            loop {
+                let done =
+                    |g: &Arc<UpstreamGroup>| g.endpoints().instances[0].address() == "10.0.0.9:80";
+                if done(&ga) && done(&gb) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both groups must refresh concurrently, not serially");
     }
 
     #[tokio::test]

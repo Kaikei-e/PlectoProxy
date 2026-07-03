@@ -40,4 +40,18 @@ impl Control {
     pub fn otlp_buffer(&self) -> Option<Arc<OtlpBuffer>> {
         self.otlp.clone()
     }
+
+    /// The manifest's data-plane bind address (`[listen] addr`), or `None` for the binary default.
+    /// Captured at construction, like `admin_addr` — a reload does not re-bind; the CLI's explicit
+    /// positional arg overrides it.
+    pub fn listen_addr(&self) -> Option<&str> {
+        self.listen.addr.as_deref()
+    }
+
+    /// The `Alt-Svc` h3 advertisement port override (`[listen] advertised_port`), or `None` to
+    /// advertise the bound port. For container port mappings where the published port differs
+    /// from the bound one (moka-1 field report §3.4).
+    pub fn advertised_port(&self) -> Option<u16> {
+        self.listen.advertised_port
+    }
 }

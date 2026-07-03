@@ -86,11 +86,14 @@ async fn serve_inner(
 
     // HTTP/3 (ADR 000016): when QUIC TLS is configured (i.e. there is `[[tls]]`), bind an
     // independent QUIC/UDP listener on the SAME port number as the TCP one and advertise it via
-    // `Alt-Svc` on TCP responses. No TLS → no h3 (QUIC requires TLS), and no `Alt-Svc`.
+    // `Alt-Svc` on TCP responses. No TLS → no h3 (QUIC requires TLS), and no `Alt-Svc`. The
+    // advertised port is `[listen] advertised_port` when set (container port mapping — the
+    // PUBLISHED port, field report §3.4), else the bound port.
     let quic_cfg = control.quic_tls_config();
-    let alt_svc = quic_cfg.as_ref().and_then(|_| {
-        HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", tcp_addr.port())).ok()
-    });
+    let advertised_port = control.advertised_port().unwrap_or_else(|| tcp_addr.port());
+    let alt_svc = quic_cfg
+        .as_ref()
+        .and_then(|_| HeaderValue::from_str(&format!("h3=\":{advertised_port}\"; ma=86400")).ok());
 
     // OTLP export wiring (ADR 000040): grab the buffer + endpoint before `control` moves into
     // the state; the pump task itself is spawned below, once the drain channel exists.

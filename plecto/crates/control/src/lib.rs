@@ -152,6 +152,9 @@ pub struct Control {
     /// Operational observability config (`[observability]`, ADR 000009), captured at construction:
     /// the admin endpoint bind address and the access-log toggle. Not part of the config version.
     observability: Observability,
+    /// The data-plane listener config (`[listen]`), captured at construction like
+    /// `observability`: the listener binds once at startup, so a reload does not re-bind.
+    listen: manifest::Listen,
     /// The OTLP span buffer (ADR 000040), present iff `[observability] otlp_endpoint` is set:
     /// fanned in beside the sinks above at `Host` construction, drained by the fast path's
     /// export pump. Like the admin listener, it binds once at startup — a reload swaps only the
@@ -181,6 +184,7 @@ impl Control {
             base_dir: base_dir.to_path_buf(),
             filter_metrics,
             observability: manifest.observability.clone(),
+            listen: manifest.listen.clone(),
             otlp,
         })
     }
@@ -217,6 +221,7 @@ impl Control {
             // testable core keeps its own empty tally rather than reaching into that host.
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
+            listen: manifest.listen.clone(),
             otlp,
         })
     }
@@ -244,6 +249,7 @@ impl Control {
             base_dir: base_dir.to_path_buf(),
             filter_metrics,
             observability: manifest.observability.clone(),
+            listen: manifest.listen.clone(),
             otlp,
         })
     }
@@ -277,6 +283,7 @@ impl Control {
             base_dir,
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
+            listen: manifest.listen.clone(),
             otlp,
         })
     }

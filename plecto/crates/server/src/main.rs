@@ -63,9 +63,15 @@ async fn run() -> anyhow::Result<()> {
         }
         manifest => manifest.to_string(),
     };
-    let listen = args.next().unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let listen_arg = args.next();
 
     let control = Arc::new(Control::from_manifest_path(Path::new(&manifest))?);
+
+    // Bind precedence: the explicit CLI arg (operator override) > the manifest's `[listen] addr`
+    // (the static single source, field report §3.2) > the loopback default.
+    let listen = listen_arg
+        .or_else(|| control.listen_addr().map(str::to_string))
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
     // The SIGHUP reload loop (ADR 000008 / 000039): `from_manifest_path` remembers the path, so
     // each SIGHUP re-reads the on-disk manifest and swaps it in atomically, fail-closed (a bad

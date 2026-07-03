@@ -184,7 +184,7 @@ def main():
         # ---- Full matrix (glibc default allocator) --------------------------------------------
         for route in ROUTES:
             for size in SIZES:
-                proxy = launch_proxy("edge-bench-glibc", {})
+                proxy = launch_proxy("bench-server-glibc", {})
                 try:
                     for vus in VUS:
                         tag = f"{route}_{size}_{vus}_glibc"
@@ -204,10 +204,10 @@ def main():
                     proxy.wait(timeout=5)
         # ---- Allocator sweep on the worst cell (body, 1 MB, 50 VUs) ----------------------------
         sweep = [
-            ("glibc", "edge-bench-glibc", {}),
-            ("arena4", "edge-bench-glibc", {"MALLOC_ARENA_MAX": "4"}),
-            ("arena1", "edge-bench-glibc", {"MALLOC_ARENA_MAX": "1"}),
-            ("jemalloc", "edge-bench-jemalloc", {}),
+            ("glibc", "bench-server-glibc", {}),
+            ("arena4", "bench-server-glibc", {"MALLOC_ARENA_MAX": "4"}),
+            ("arena1", "bench-server-glibc", {"MALLOC_ARENA_MAX": "1"}),
+            ("jemalloc", "bench-server-jemalloc", {}),
         ]
         for alloc, binary, env_extra in sweep:
             proxy = launch_proxy(binary, env_extra)

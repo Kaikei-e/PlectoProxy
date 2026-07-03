@@ -293,6 +293,54 @@ fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
     Manifest::from_toml(&toml)
 }
 
+/// Statically validate `manifest` — the `plecto validate` core (the `nginx -t` shape): every
+/// check the server would fail closed on at startup that needs no artifact and mutates nothing.
+/// Covers the strict parse (the caller already ran it), `[trust]` key files, `[state]` coherence,
+/// per-filter metering/rate-limit ranges, duplicate ids, chain and route references, the weighted
+/// split, `[[tls]]` cert/key loads, and `[[upstream]]` (LB config + `[upstream.tls]` CA loads).
+/// Returns the manifest's config version (semantic content hash, ADR 000008) on success.
+///
+/// Deliberately NOT covered, so a CI run needs only the manifest + its referenced config files:
+/// OCI artifact resolution and the signature/SBOM load gate (the deploy dir may not exist where
+/// validation runs — startup still enforces them, ADR 000006/000007), and the `[state]` backend
+/// open (validation must never create a redb file).
+pub fn validate_manifest(manifest: &Manifest, base_dir: &Path) -> Result<String, ControlError> {
+    let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
+    for key_path in &manifest.trust.keys {
+        pems.push(std::fs::read(base_dir.join(key_path))?);
+    }
+    TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
+    manifest.state.validate()?;
+    let mut filter_ids: HashSet<&str> = HashSet::with_capacity(manifest.filters.len());
+    for entry in &manifest.filters {
+        if !filter_ids.insert(entry.id.as_str()) {
+            return Err(ControlError::DuplicateFilterId(entry.id.clone()));
+        }
+        entry.validate()?;
+    }
+    for id in &manifest.chain.filters {
+        if !filter_ids.contains(id.as_str()) {
+            return Err(ControlError::UnknownChainFilter(id.clone()));
+        }
+    }
+    let upstream_names: HashSet<&str> =
+        manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
+    route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
+    tls::build_server_configs(&manifest.tls, base_dir)?;
+    // A throwaway registry runs the full upstream validation (names, LB, `[upstream.tls]` CA
+    // loads) without touching any live state.
+    UpstreamRegistry::new().reconcile(&manifest.upstreams, base_dir)?;
+    manifest.content_hash()
+}
+
+/// [`validate_manifest`] for an on-disk manifest: reads + strictly parses `path`, resolving
+/// relative paths against the manifest's own directory (the same rule the server applies).
+pub fn validate_manifest_path(path: &Path) -> Result<String, ControlError> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let manifest = read_manifest(path)?;
+    validate_manifest(&manifest, base_dir)
+}
+
 /// What `build_host_and_store` assembles for the manifest-driven constructors: the `Host` (sinks
 /// wired), the offline OCI store, and the observability handles `Control` retains.
 type BuiltHost = (
@@ -413,7 +461,8 @@ fn build_active(
     // below instead of calling `targets()` again.
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
-    let validated_routes = route::validate_routes(&manifest.routes, &filters, &upstream_names)?;
+    let filter_ids: HashSet<&str> = filters.keys().map(String::as_str).collect();
+    let validated_routes = route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
 
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
     // from `[[tls]]`, sharing one SNI cert resolver. A bad cert is fail-closed here, so a failed

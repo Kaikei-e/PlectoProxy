@@ -143,7 +143,10 @@ fn validate_rejects_a_bad_upstream_ca_path() {
 
     let out = run(&["validate", "plecto.toml"], dir.path());
 
-    assert!(!out.status.success(), "a missing CA file must fail validate");
+    assert!(
+        !out.status.success(),
+        "a missing CA file must fail validate"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("missing-ca.pem"),

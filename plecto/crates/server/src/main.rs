@@ -4,7 +4,12 @@
 //! manifest and swaps it in without downtime (ADR 000008 / 000039); SIGTERM / SIGINT stop
 //! accepting, drain in-flight connections, and exit cleanly (ADR 000039).
 //!
-//! Usage: `plecto <manifest.toml> [listen_addr]` (listen defaults to `127.0.0.1:8080`).
+//! Usage:
+//! - `plecto <manifest.toml> [listen_addr]` — serve (listen defaults to `127.0.0.1:8080`)
+//! - `plecto validate <manifest.toml>` — statically validate a manifest and exit (the `nginx -t`
+//!   shape: strict parse + every fail-closed startup check that needs no artifact; for CI and
+//!   pre-SIGHUP checks)
+//! - `plecto --version` — print the version and exit
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,10 +39,30 @@ async fn run() -> anyhow::Result<()> {
         .with_target(true)
         .try_init();
 
+    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate <manifest.toml> | plecto --version";
     let mut args = std::env::args().skip(1);
-    let manifest = args
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: plecto <manifest.toml> [listen_addr]"))?;
+    let manifest = match args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.as_str() {
+        "--version" | "-V" => {
+            println!("plecto {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Static manifest validation (the `nginx -t` shape): strict parse + every fail-closed
+        // startup check that needs no artifact and mutates nothing, then exit. Plain (non-JSON)
+        // output — this is an operator/CI command, not the serving process.
+        "validate" => {
+            let path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: plecto validate <manifest.toml>"))?;
+            match plecto_control::validate_manifest_path(Path::new(&path)) {
+                Ok(version) => {
+                    println!("manifest OK: {path} (config version {version})");
+                    return Ok(());
+                }
+                Err(e) => anyhow::bail!("manifest INVALID: {path}: {e}"),
+            }
+        }
+        manifest => manifest.to_string(),
+    };
     let listen = args.next().unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
     let control = Arc::new(Control::from_manifest_path(Path::new(&manifest))?);

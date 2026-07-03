@@ -6,11 +6,11 @@
 //! at build, and per request we only scan and compare borrowed slices.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use plecto_host::{Header, LoadedFilter};
+use plecto_host::Header;
 
 use crate::error::ControlError;
 use crate::manifest::Route;
@@ -64,14 +64,14 @@ pub(crate) struct ValidatedRoute<'a> {
 }
 
 /// Validate every route's forwarding target (`upstream`/`backends`), weighted split, filter
-/// references, and native rate-limit config — PURELY, against the already-loaded filter set and
+/// references, and native rate-limit config — PURELY, against the declared filter ids and
 /// upstream names, with no I/O and no registry mutation (ADR 000013 / 000017 / 000033 / 000034).
 /// Fails closed on the first invalid route, mirroring the checks `build_active` used to run
-/// inline. Directly unit-testable with hand-built `filters` / `upstream_names` — no `Host` or OCI
-/// artifact store needed.
+/// inline. Takes filter IDS (not loaded filters), so the static `validate_manifest` path shares
+/// it without loading any artifact. Directly unit-testable with hand-built sets.
 pub(crate) fn validate_routes<'a>(
     routes: &'a [Route],
-    filters: &HashMap<String, Arc<LoadedFilter>>,
+    filter_ids: &HashSet<&str>,
     upstream_names: &HashSet<&str>,
 ) -> Result<Vec<ValidatedRoute<'a>>, ControlError> {
     let mut validated = Vec::with_capacity(routes.len());
@@ -98,7 +98,7 @@ pub(crate) fn validate_routes<'a>(
             reason,
         })?;
         for f in &r.filters {
-            if !filters.contains_key(f) {
+            if !filter_ids.contains(f.as_str()) {
                 return Err(ControlError::UnknownRouteFilter {
                     path_prefix: r.matcher.path_prefix.clone(),
                     filter: f.clone(),
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn validate_routes_rejects_unknown_upstream() {
         let routes = vec![manifest_route(Some("ghost"), vec![], vec![], None)];
-        let filters = HashMap::new();
+        let filters = HashSet::new();
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
         let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
         assert!(matches!(
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn validate_routes_rejects_unknown_filter() {
         let routes = vec![manifest_route(Some("real"), vec![], vec!["missing"], None)];
-        let filters = HashMap::new();
+        let filters = HashSet::new();
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
         let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
         assert!(matches!(
@@ -540,7 +540,7 @@ mod tests {
             vec![],
             None,
         )];
-        let filters = HashMap::new();
+        let filters = HashSet::new();
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
         assert!(matches!(
             validate_routes(&routes, &filters, &upstream_names),
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn validate_routes_rejects_zero_rate_or_burst() {
-        let filters = HashMap::new();
+        let filters = HashSet::new();
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
 
         let zero_rate = vec![manifest_route(
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn validate_routes_accepts_a_valid_route_and_carries_its_resolved_targets() {
         let routes = vec![manifest_route(Some("real"), vec![], vec![], None)];
-        let filters = HashMap::new();
+        let filters = HashSet::new();
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
         let validated = validate_routes(&routes, &filters, &upstream_names).unwrap();
         assert_eq!(validated.len(), 1);

@@ -2295,6 +2295,7 @@ name = "plecto-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "h3",
  "h3-quinn",
@@ -2312,6 +2313,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",

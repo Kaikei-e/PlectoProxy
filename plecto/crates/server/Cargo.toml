@@ -46,15 +46,24 @@ path = "../../examples/filter-chain/main.rs"
 name = "wasm-auth"
 path = "../../examples/wasm-auth/main.rs"
 
-# Benchmark harness: baseline vs pooled vs on-demand filter on one backend (see performance/).
+# Benchmark harness: the canonical bench server — WASM cost ladder + host rate-limit + body hook +
+# WS upgrade tunnel, all on one process (see performance/README.md). Merges the former
+# `wasm-bench` / `edge-bench` harnesses so the plain-HTTP/1.1 ceiling is measured exactly once.
 [[example]]
-name = "wasm-bench"
+name = "bench-server"
 # A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md),
 # OUTSIDE this `plecto/` workspace directory. `required-features` keeps a plain `cargo build
 # --examples` / `--all-targets` (e.g. against a standalone `plecto/` checkout, where bench/ does
 # not exist) from needing that path — only an explicit `--features bench-harnesses` does.
 required-features = ["bench-harnesses"]
-path = "../../../bench/harnesses/wasm-bench/main.rs"
+path = "../../../bench/harnesses/bench-server/main.rs"
+
+# Benchmark harness: endpoint-set swap under load (ADR 000044) — a SIGHUP reload changes the
+# upstream's configured address set (the same shape a periodic-DNS re-resolution swap takes).
+[[example]]
+name = "swap-bench"
+required-features = ["bench-harnesses"]
+path = "../../../bench/harnesses/swap-bench/main.rs"
 
 [[example]]
 name = "hot-reload"
@@ -76,14 +85,6 @@ path = "../../examples/resilience/main.rs"
 name = "production"
 path = "../../examples/production/main.rs"
 
-# Benchmark harness: host rate-limit (ADR 000026) + request-body hook (ADR 000025) on one filter.
-[[example]]
-name = "edge-bench"
-# A benchmark harness, not a learning example — it lives under bench/ (see performance/README.md),
-# OUTSIDE this `plecto/` workspace directory (see the `wasm-bench` entry above for why this is gated).
-required-features = ["bench-harnesses"]
-path = "../../../bench/harnesses/edge-bench/main.rs"
-
 # Standalone upstream for the memory matrix (mem-matrix.sh): runs the backend in its own process so
 # the proxy's RSS is measured alone (not co-mingled with the in-process upstream's buffers).
 [[example]]
@@ -92,13 +93,13 @@ required-features = ["bench-harnesses"]
 path = "../../../bench/harnesses/upstream/main.rs"
 
 [features]
-# Gates the `wasm-bench` / `edge-bench` / `upstream` benchmark-harness examples (`required-features`
-# on each), whose `path` points outside this `plecto/` workspace directory into the repo-root-level
-# `bench/`. OFF by default, so `cargo build --examples` / `--all-targets` never needs that sibling
-# directory to exist — only an explicit `--features bench-harnesses` builds them (see
-# performance/README.md for the full reproduction command).
+# Gates the `bench-server` / `swap-bench` / `upstream` benchmark-harness examples
+# (`required-features` on each), whose `path` points outside this `plecto/` workspace directory
+# into the repo-root-level `bench/`. OFF by default, so `cargo build --examples` / `--all-targets`
+# never needs that sibling directory to exist — only an explicit `--features bench-harnesses`
+# builds them (see performance/README.md for the full reproduction command).
 bench-harnesses = []
-# Marker feature for the `edge-bench` harness: swaps in jemalloc's global allocator so the memory
+# Marker feature for the `bench-server` harness: swaps in jemalloc's global allocator so the memory
 # matrix can attribute hypothesis (C) — glibc arena retention — by comparing against the default
 # glibc build and `MALLOC_ARENA_MAX=1`. No effect on the lib or the default build; tikv-jemallocator
 # is a dev-dependency, never linked into a production build.
@@ -154,6 +155,11 @@ hex = { workspace = true }
 parking_lot = { workspace = true }
 # rcgen: generate a fresh self-signed cert for the TLS E2E (ring backend, no aws-lc-rs/cmake).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-# tikv-jemallocator: the jemalloc build variant of the edge-bench harness (feature `jemalloc`), for
-# the memory matrix's allocator sweep. Dev-only — never in a production build.
+# tikv-jemallocator: the jemalloc build variant of the bench-server harness (feature `jemalloc`),
+# for the memory matrix's allocator sweep. Dev-only — never in a production build.
 tikv-jemallocator = "0.6"
+# sha1 + base64: the RFC 6455 `Sec-WebSocket-Accept` handshake for bench-server's `/ws` mock
+# upstream (ADR 000048's WS benchmark). Both are already transitive dependencies of this workspace
+# (rustls / cosign stack) — no new supply-chain surface, just promoted to direct dev-deps.
+sha1 = "0.10"
+base64 = "0.22"

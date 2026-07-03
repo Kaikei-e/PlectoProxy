@@ -445,6 +445,67 @@ mod tests {
     }
 
     #[test]
+    fn redb_periodic_durable_flush_caps_a_non_durable_run() {
+        // Hot-path commits (increment / try_acquire) skip the per-commit fsync
+        // (Durability::None), but redb frees pages only at a durable commit — an unbounded
+        // None-only run (a counter/ratelimit-heavy workload with no kv writes) would grow the
+        // file without bound. Every `flush_every`th hot-path commit must be durable.
+        let dir = tempfile::tempdir().unwrap();
+        let b = RedbBackend::open_with_flush_every(dir.path().join("state.redb"), 4).unwrap();
+
+        let spec = Bucket {
+            capacity: 1000,
+            refill_tokens: 0,
+            refill_interval_ms: 0,
+        };
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.increment(b"c", 0); // a read (delta 0) commits nothing and must not advance the run
+        b.try_acquire(b"rl", 1, spec, 0);
+        assert_eq!(
+            b.forced_flushes(),
+            0,
+            "three hot-path commits stay non-durable"
+        );
+
+        b.try_acquire(b"rl", 1, spec, 0);
+        assert_eq!(
+            b.forced_flushes(),
+            1,
+            "the 4th commit in a run is upgraded to durable"
+        );
+
+        for _ in 0..4 {
+            b.increment(b"c", 1);
+        }
+        assert_eq!(b.forced_flushes(), 2, "the cadence repeats");
+    }
+
+    #[test]
+    fn redb_durable_kv_write_resets_the_flush_cadence() {
+        // set/delete commit with Durability::Immediate, which already makes every earlier
+        // non-durable commit durable (and frees its pages) — the flush cadence restarts
+        // instead of forcing a redundant flush shortly after.
+        let dir = tempfile::tempdir().unwrap();
+        let b = RedbBackend::open_with_flush_every(dir.path().join("state.redb"), 4).unwrap();
+
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.set(b"k", b"v".to_vec()); // durable; the run restarts
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        assert_eq!(
+            b.forced_flushes(),
+            0,
+            "a durable set resets the non-durable run"
+        );
+        b.increment(b"c", 1);
+        assert_eq!(b.forced_flushes(), 1);
+    }
+
+    #[test]
     fn redb_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");

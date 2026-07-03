@@ -202,6 +202,13 @@ impl KvBackend for MemoryBackend {
 
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("plecto_state");
 
+/// Cap on redb's lazily-filled page cache. The library default (1 GiB) is sized for a
+/// process that IS the database; embedded stores conventionally cap far lower (SQLite ~2 MiB,
+/// RocksDB 32 MiB, Kafka Streams 50 MiB per store). The cache only evicts at the cap, so a
+/// long-lived proxy would otherwise grow toward the full gigabyte; 64 MiB still dwarfs the
+/// working set of 8–16-byte counters and bucket states.
+const REDB_CACHE_BYTES: usize = 64 << 20;
+
 /// Every `DURABLE_FLUSH_EVERY`th hot-path commit is upgraded from `Durability::None` to
 /// `Immediate`. redb frees pages only at a durable commit, so an unbounded None-only run
 /// (a counter/ratelimit-heavy workload with no kv writes) would grow the file without bound.
@@ -239,8 +246,11 @@ impl RedbBackend {
     }
 
     fn open_inner(path: impl AsRef<std::path::Path>, flush_every: u64) -> anyhow::Result<Self> {
+        let db = redb::Builder::new()
+            .set_cache_size(REDB_CACHE_BYTES)
+            .create(path)?;
         Ok(Self {
-            db: Database::create(path)?,
+            db,
             non_durable_run: AtomicU64::new(0),
             flush_every,
             forced_flushes: AtomicU64::new(0),

@@ -11,6 +11,8 @@
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use plecto_control::{Control, HashInput, HttpRequest, Manifest, UpstreamRegistry};
@@ -80,6 +82,55 @@ fn bench_lb_pick(c: &mut Criterion) {
     g.finish();
 }
 
+/// The per-pick `ArcSwap<Endpoints>` load (ADR 000044) under CONTINUOUS concurrent swap churn — a
+/// background thread hammers `update_endpoints` with two address sets that share every instance
+/// but one, while the foreground times `pick`. The shared instances are pre-promoted to healthy so
+/// `pick` always has a real eligible set to choose from — the one rotating instance always starts
+/// pessimistic (there is no active prober here) and simply never joins rotation, avoiding the
+/// eligible==0 fail-fast trap the LB-pick bench's own history warns about (see its comment above).
+/// This isolates the swap's steady-state cost, not the common idle tick (which `update_endpoints`
+/// short-circuits to one atomic load + compare when nothing changed — not exercised here).
+fn bench_pick_under_swap_churn(c: &mut Criterion) {
+    let mut g = c.benchmark_group("pick_under_swap_churn");
+    for &n in &[3usize, 8, 32] {
+        let reg = registry(n, "round_robin", "");
+        let group = reg.group("pool").unwrap();
+        for inst in &group.endpoints().instances[..n - 1] {
+            inst.record_probe_success();
+            inst.record_probe_success();
+        }
+
+        let stable: Vec<(String, u32)> = (0..n - 1)
+            .map(|i| (format!("10.0.0.{}:8080", i + 1), 1))
+            .collect();
+        let mut set_a = stable.clone();
+        set_a.push(("10.0.9.1:8080".to_string(), 1));
+        let mut set_b = stable;
+        set_b.push(("10.0.9.2:8080".to_string(), 1));
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let churner = {
+            let group = group.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut toggle = false;
+                while !stop.load(Ordering::Relaxed) {
+                    group.update_endpoints(if toggle { &set_b } else { &set_a });
+                    toggle = !toggle;
+                }
+            })
+        };
+
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(group.pick(None)))
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        churner.join().expect("the churn thread must not panic");
+    }
+    g.finish();
+}
+
 fn bench_find_route(c: &mut Criterion) {
     let mut g = c.benchmark_group("find_route");
     for &n in &[1usize, 16, 64] {
@@ -129,6 +180,7 @@ fn bench_normalize_path(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_lb_pick,
+    bench_pick_under_swap_churn,
     bench_find_route,
     bench_normalize_path
 );

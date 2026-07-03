@@ -70,8 +70,18 @@ where
         if due {
             state.last_run.insert(g.name.clone(), now);
             let cache = state.last_good.entry(g.name.clone()).or_default().clone();
-            let mut cache = cache.lock().await;
-            refresh_group(g, &mut cache, resolver.clone()).await;
+            let group = g.clone();
+            let resolver = resolver.clone();
+            // Each due group refreshes on its own task (ADR 000044): one black-holed resolver
+            // must not serialize every other group's refresh behind its getaddrinfo timeouts.
+            // The cache mutex doubles as the one-in-flight-per-group guard — a refresh still
+            // running past the group's interval makes the next tick skip, never queue.
+            tokio::spawn(async move {
+                let Ok(mut cache) = cache.try_lock() else {
+                    return;
+                };
+                refresh_group(&group, &mut cache, resolver).await;
+            });
         }
     }
     state.last_run.retain(|k, _| live.contains(k));
@@ -98,6 +108,9 @@ where
     F: Fn(String) -> Fut,
     Fut: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
+    // Drop cache entries for addresses no longer declared: a reload that removed a hostname must
+    // not revive its stale expansion if the same name is re-added generations later.
+    last_good.retain(|addr, _| group.configured_addresses().iter().any(|(a, _)| a == addr));
     let mut resolved: Vec<(String, u32)> = Vec::new();
     for (addr, weight) in group.configured_addresses() {
         if addr.parse::<SocketAddr>().is_ok() {

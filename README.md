@@ -23,7 +23,7 @@ Plecto pairs **two complementary halves** through a typed [WIT](https://componen
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (37 ADRs, 35 accepted) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a native L7 **rate-limit** floor. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (49 ADRs, 48 accepted) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a native L7 **rate-limit** floor. Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `--version`); `v0.1.0` is tagged with a signed-artifact release pipeline (cosign + SBOM) of its own. The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto?
 
@@ -36,7 +36,7 @@ Every gateway eventually faces the same question: **where does custom logic go?*
 | Out-of-process (`ext_proc`, sidecar) | ❌ | ✅ | ✅ | ✅ |
 | **WASM filters — Plecto** | ✅ | ✅ | ✅ | ✅ |
 
-Running data-plane filters as WASM is an idea **Envoy and proxy-wasm pioneered and proved** over the better part of a decade — Plecto owes them the core insight. proxy-wasm targets the earlier WASM ABI (v0.2.1); since then the **Component Model and WIT** have matured into a typed, polyglot, composable foundation, and Plecto explores what a gateway looks like when it is built natively on them. High-performance Rust proxies such as **Cloudflare's Pingora** likewise show how fast a native data path can be. Plecto's particular focus is **pairing that native speed with a Component-Model extension plane** — for teams who want to self-host and keep their traffic and secrets on their own infrastructure, with **data sovereignty** as a first principle.
+WASM data-plane filters are an idea **Envoy and proxy-wasm pioneered** — proxy-wasm targets the earlier WASM ABI (v0.2.1); the **Component Model and WIT** have since matured into a typed, polyglot, composable foundation, and Plecto builds on them natively. High-performance Rust proxies like **Cloudflare's Pingora** show how fast a native data path can be; Plecto's focus is **pairing that speed with a Component-Model extension plane**, for teams who want to self-host and keep traffic and secrets on their own infrastructure — **data sovereignty** as a first principle.
 
 See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alternatives.
 
@@ -54,11 +54,10 @@ See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alterna
 
 ## Architecture
 
-Plecto is a fast **native highway** plus a **checkpoint where your own code runs**. The highway
-(native Rust) accepts connections, terminates TLS, speaks HTTP, routes and load-balances. The
-checkpoint is the **extension plane**: every request is handed to your *filter* — a small sandboxed
-WASM program — which **inspects it and returns one of three decisions**. That decision is where the
-policy lives.
+Plecto is a fast **native highway** plus a **checkpoint where your own code runs**: native Rust
+accepts connections, terminates TLS, speaks HTTP, routes, and load-balances; the **extension plane**
+hands each request to your *filter* — a small sandboxed WASM program — which inspects it and returns
+one of three decisions. That decision is where the policy lives.
 
 ```mermaid
 flowchart LR
@@ -89,14 +88,13 @@ flowchart LR
     decide <-->|"borrows only the capabilities it was lent"| state
 ```
 
-The three decisions are the whole mental model: **continue** (pass through), **modify** (rewrite a
-header/body, then pass), or **reject** (answer the client *now* — a `401/403/429` that **never
-reaches the upstream**, so bad traffic is shed at the edge). The filter is **stateless**: anything it
-needs to remember (a counter, a rate-limit bucket, a cached value) lives in the host, and it can call
-**only** the host services it was explicitly lent — nothing else (deny-by-default).
+**Continue** (pass through), **modify** (rewrite a header/body, then pass), or **reject** (answer the
+client *now* with `401/403/429` — the upstream is **never reached**) are the whole mental model. The
+filter is **stateless**: anything it needs to remember lives in the host, reached only through
+capabilities it was explicitly lent (deny-by-default).
 
-A filter is just a signed WASM component, and the **same** component can run two ways depending on
-how much you trust it — which is the single biggest performance lever:
+A filter is a signed WASM component, and the **same** component runs two ways depending on how much
+you trust it — the single biggest performance lever:
 
 ```mermaid
 flowchart TB
@@ -116,7 +114,7 @@ flowchart TB
     fresh --> guards
 ```
 
-**Rule of thumb:** user-specific logic / policy / WAF / auth / rewrite → a WASM filter; TLS / routing / LB / connection pools / global counters → native Rust. This split is the project's governing principle, fixed as a role-driven placement rule in [ADR 000029](docs/ADR/000029.md) — native grows only for cross-cutting data-plane concerns and global counters, never for per-request policy. The WASM "tax" (data copy + host-call overhead) is charged only to request-decision logic, never to the speed path — measured at **~2 µs/request** for a pooled filter ([performance](performance/README.md)).
+**Rule of thumb:** user-specific logic / policy / WAF / auth / rewrite → a WASM filter; TLS / routing / LB / connection pools / global counters → native Rust — a role-driven placement rule fixed in [ADR 000029](docs/ADR/000029.md): native grows only for cross-cutting concerns, never per-request policy. The WASM "tax" (data copy + host-call overhead) hits only request-decision logic, never the speed path — **~2 µs/request** for a pooled filter ([performance](performance/README.md)).
 
 ## What the gateway does today
 
@@ -124,14 +122,13 @@ The native fast path has matured well past "a proxy that works." A snapshot of w
 
 | Concern | Today |
 | --- | --- |
-| **Edge & HTTP** | HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC, Alt-Svc advertised); TLS termination with SNI cert selection (rustls, manifest-declared certs, fail-closed) — [13](docs/ADR/000013.md) · [14](docs/ADR/000014.md) · [15](docs/ADR/000015.md) · [16](docs/ADR/000016.md) |
-| **Routing** | match on host · path-prefix · method · header(exact) · query, resolved in **specificity order**; weighted **traffic split / canary**; host-native prefix strip; path normalized at ingress as a fail-closed auth boundary — [13](docs/ADR/000013.md) · [27](docs/ADR/000027.md) · [34](docs/ADR/000034.md) |
-| **Load balancing** | per-upstream **round-robin** (default), **weighted least-request** (power-of-two-choices), or **weighted Maglev** consistent hashing (header / source-IP affinity) — [17](docs/ADR/000017.md) · [24](docs/ADR/000024.md) · [35](docs/ADR/000035.md) |
-| **Resilience** | active **+** passive **health checks**; **outlier detection** (eject misbehaving instances); per-upstream **circuit breaker** (concurrency cap); **two-tier timeouts** (per-try + overall); **bounded retry** with jittered backoff + retry-on-5xx — [17](docs/ADR/000017.md) · [28](docs/ADR/000028.md) · [30](docs/ADR/000030.md) · [31](docs/ADR/000031.md) · [32](docs/ADR/000032.md) |
-| **Rate limiting** | native L7 token-bucket floor per **route** / per **client-IP**; plus the per-filter `host-ratelimit` capability lent to filters — [26](docs/ADR/000026.md) · [33](docs/ADR/000033.md) |
-| **Extension plane** | `plecto:filter` chain over headers **and** a request body; typed `decision`; trusted **pooled** / untrusted **fresh** instances; deny-by-default host-API (kv · counter · log · clock · rate-limit) with per-filter + host-wide quotas; **outbound HTTP** (ext_authz / JWKS / introspection) lent through the same gate with a per-filter allowlist + IP-pinned SSRF guard (feature-gated) — [1](docs/ADR/000001.md) · [12](docs/ADR/000012.md) · [25](docs/ADR/000025.md) · [27](docs/ADR/000027.md) · [36](docs/ADR/000036.md) |
-| **Client IP** | edge-model propagation — strip the inbound forwarding-header family, re-issue `X-Forwarded-For` / `X-Real-IP` from the real peer before the chain runs — [18](docs/ADR/000018.md) · [22](docs/ADR/000022.md) |
-| **Supply chain & ops** | OCI digest-pinned filters; cosign signature + SBOM↔component verification; zero-downtime SIGHUP reload (atomic `ArcSwap`, all-or-nothing); W3C trace propagation + host-aggregated RED metrics + opt-in access log — [6](docs/ADR/000006.md) · [7](docs/ADR/000007.md) · [8](docs/ADR/000008.md) · [9](docs/ADR/000009.md) |
+| **Edge & HTTP** | HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC, Alt-Svc advertised); TLS termination with SNI cert selection, manifest-declared, fail-closed — [ADR 13–16](docs/ADR/000013.md) |
+| **Routing & upgrades** | host / path-prefix / method / header / query matching in **specificity order**; weighted **traffic split / canary**; ingress path normalization as a fail-closed auth boundary; per-route **HTTP/1.1 `Upgrade`** tunnelling for WebSocket (`h2c` rejected) — [34](docs/ADR/000034.md) · [48](docs/ADR/000048.md) |
+| **Load balancing & upstreams** | **round-robin** (default), **weighted least-request** (P2C), or **weighted Maglev** per upstream; active + passive health checks, outlier detection, circuit breaker, two-tier timeouts, jittered retry; per-upstream **TLS+ALPN re-encryption** (gRPC-ready) and **periodic DNS re-resolution** — [17](docs/ADR/000017.md) · [35](docs/ADR/000035.md) · [42](docs/ADR/000042.md) · [44](docs/ADR/000044.md) |
+| **Rate limiting** | native L7 token-bucket floor per **route** / **client-IP**, plus a per-filter `host-ratelimit` capability — [33](docs/ADR/000033.md) |
+| **Extension plane** | `plecto:filter` chain over headers and, for opted-in filters, the body (header-only filters skip buffering — zero-copy); typed `decision`; trusted **pooled** / untrusted **fresh** instances; deny-by-default host-API with per-filter + host-wide quotas; feature-gated **outbound HTTP** behind an SSRF guard — [1](docs/ADR/000001.md) · [25](docs/ADR/000025.md) · [38](docs/ADR/000038.md) |
+| **Client IP** | edge-model propagation — re-issues `X-Forwarded-For` / `X-Real-IP` from the real peer before the chain runs — [18](docs/ADR/000018.md) |
+| **Supply chain & ops** | cosign + SBOM-verified filter loading; zero-downtime SIGHUP reload + graceful shutdown wired into the shipped binary; W3C trace propagation, RED metrics, OTLP export; `plecto validate` / `schema` / `--version`; Plecto's own binary and container image carry the same signed-artifact discipline — [6](docs/ADR/000006.md) · [39](docs/ADR/000039.md) · [46](docs/ADR/000046.md) · [47](docs/ADR/000047.md) |
 
 ## The filter contract
 
@@ -157,44 +154,63 @@ interface host-log     { log: func(level: level, message: string); }
 // the WASM boundary. The bucket spec (capacity/refill) is host-configured in the manifest; the
 // filter passes only (key, cost), so an untrusted filter cannot widen its own limit (ADR 000005 / 000026).
 
+// Base contract: header-only filters (auth, rate-limit, WAF, rewrite) target this world. The host
+// reads the ABSENCE of `on-request-body` as the signal to skip buffering the body entirely —
+// zero-copy passthrough for filters that never touch it (ADR 000038).
 world filter {
-  // granted capabilities only — log · clock · kv · counter · rate-limit
   import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
-  export init: func();                                        // heavy, once per instance
-  export on-request:      func(req: http-request)  -> request-decision;       // hot path (headers)
-  export on-request-body: func(body: list<u8>)     -> request-body-decision;  // body hook (ADR 000025)
-  export on-response:     func(resp: http-response) -> response-decision;     // hot path (headers)
+  export init: func();                                                // heavy, once per instance
+  export on-request:  func(req: http-request)  -> request-decision;   // hot path (headers)
+  export on-response: func(resp: http-response) -> response-decision; // hot path (headers)
+}
+
+// Body-reading contract: `filter` plus `on-request-body`. Its PRESENCE is what makes the host
+// buffer the request body and run this hook (buffer-then-decide, ADR 000025).
+world filter-body {
+  import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
+  export init: func();
+  export on-request:      func(req: http-request)  -> request-decision;
+  export on-request-body: func(body: list<u8>)     -> request-body-decision;  // buffered body hook
+  export on-response:     func(resp: http-response) -> response-decision;
 }
 ```
 
-> v0.1.0 started **sync + header-only**; the request-side **body hook** (`on-request-body`, a buffered `list<u8>` in v1, [ADR 000025](docs/ADR/000025.md)) now runs end-to-end, so a filter can transform or short-circuit on the body, not just headers — the [roadmap](#roadmap) covers how the fast path buffers it. An **experimental, feature-gated** `stream<u8>` body world ([ADR 000020](docs/ADR/000020.md)) and `wasi:http` type reuse come next, gated on the P3 guest toolchain.
+> v0.1.0 started **sync + header-only**; the request-side **body hook** (`on-request-body`, a buffered `list<u8>` in v1, [ADR 000025](docs/ADR/000025.md)) now runs end-to-end for filters targeting `filter-body`. An **experimental, feature-gated** `stream<u8>` body world ([ADR 000020](docs/ADR/000020.md)) and `wasi:http` type reuse are next, gated on the P3 guest toolchain.
 
 ## Writing a filter
 
-A filter is just a component that implements the world. Here is the included example (`examples/filters/filter-hello`), in Rust:
+A filter is just a component that implements the world. Here is the included example (`examples/filters/filter-quickstart`), in Rust:
 
 ```rust
 wit_bindgen::generate!({ path: "../../../wit", world: "filter" });
 
-struct FilterHello;
+struct FilterQuickstart;
 
-impl Guest for FilterHello {
+impl Guest for FilterQuickstart {
     fn init() {}
 
-    fn on_request(req: HttpRequest) -> RequestDecision {
-        host_log::log(host_log::Level::Info, "filter-hello: on-request");
-        if req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("x-plecto-block")) {
-            RequestDecision::ShortCircuit(HttpResponse { status: 403, /* … */ })
-        } else {
-            RequestDecision::Continue
-        }
+    fn on_request(_req: HttpRequest) -> RequestDecision {
+        RequestDecision::Continue
     }
 
-    fn on_response(_: HttpResponse) -> ResponseDecision { ResponseDecision::Continue }
+    fn on_response(_resp: HttpResponse) -> ResponseDecision {
+        // The one visible thing this filter does: stamp a header so `curl -i` shows a WASM filter
+        // touched the response.
+        ResponseDecision::Modified(ResponseEdit {
+            set_status: None,
+            set_headers: vec![Header { name: "x-plecto".into(), value: "hello-from-wasm".into() }],
+            remove_headers: vec![],
+        })
+    }
 }
 
-export!(FilterHello);
+export!(FilterQuickstart);
 ```
+
+This targets the header-only `filter` world, so the host streams the body straight through untouched.
+A filter that needs the body targets `filter-body` and adds one export — see
+[`filter-apikey`](plecto/examples/filters/filter-apikey) (header-only) or
+[`filter-hello`](plecto/examples/filters/filter-hello) (`filter-body`, the host's own conformance fixture).
 
 Because the contract is WIT, **any language that compiles to a WASM component can write a filter** — Rust, Go (TinyGo), JavaScript/TypeScript (`jco`), or Python (`componentize-py`). Polyglot filter SDKs are on the [roadmap](#roadmap).
 
@@ -203,72 +219,56 @@ A complete how-to — scaffold, build, the manifest field reference, signing, an
 ## Try it
 
 The repository pins its toolchain and WASM target in
-[`plecto/rust-toolchain.toml`](plecto/rust-toolchain.toml), so [`rustup`](https://rustup.rs/) sets
-up the right Rust (edition 2024) and the `wasm32-unknown-unknown` target on your first build — no
-manual `rustup target add` step.
+[`plecto/rust-toolchain.toml`](plecto/rust-toolchain.toml) — [`rustup`](https://rustup.rs/) sets it
+up automatically on your first build (outside that toolchain: `rustup target add wasm32-unknown-unknown`).
 
 ```bash
-# Build and test everything. The host build script compiles the example filter to a
-# WASM component and the tests load it into the wasmtime host and exercise the contract.
 cd plecto
-cargo test --all
+cargo test --all   # builds the example filter to a WASM component, loads it into the wasmtime host,
+                    # and exercises the contract end to end
 ```
 
-(Building outside that toolchain? Add the target once: `rustup target add wasm32-unknown-unknown`.)
-
-The suite proves the slice end-to-end: a request flows through the host into a real filter component, the typed `decision` round-trips, and the filter reaches **only** the capabilities it was lent (the example component imports `plecto:filter/*` and nothing else — zero WASI, network, or filesystem access).
+The example component imports only `plecto:filter/*` — zero WASI, network, or filesystem access — so
+the suite proves a filter reaches **only** the capabilities it was lent, with the typed `decision`
+round-tripping through a real component.
 
 ### Run the demos
 
-Nine self-contained, use-case-focused demos live under `examples/<name>/`, forming a learning path from a 5-minute `quickstart` up to the real things a gateway does ([`examples/README.md`](plecto/examples/README.md) is the map; each demo directory has its own README with the exact `curl`s and expected output). Each wires the **production load path** (sign + offline OCI layout + verify + load, all fail-closed), starts a tiny upstream, serves a real proxy, and prints copy-paste `curl` commands on startup.
-
-The quickest way to see one work end to end is the guided tour — it starts the demo, waits for it, runs the `curl` commands, visualizes the output, and cleans up:
+Nine self-contained demos live under `examples/<name>/`, each wiring the **production load path** (sign + offline OCI layout + verify + load, fail-closed) and printing copy-paste `curl` commands on startup. [`examples/README.md`](plecto/examples/README.md) is the guided learning path with the full write-up of each; here's the quick map:
 
 ```bash
 cd plecto
-./examples/try.sh <name>      # or `all`; or `just demo <name>` from the repo root
-```
-
-Prefer to drive it yourself? Run the server directly and use the `curl` recipes it prints on startup:
-
-```bash
-cargo run -p plecto-server --example <name>   # Ctrl-C to stop
+./examples/try.sh <name>                      # guided tour: runs it, curls it, cleans up (or `all`)
+cargo run -p plecto-server --example <name>   # or drive it yourself, Ctrl-C to stop
 ```
 
 | `<name>` | What it shows |
 | --- | --- |
-| `quickstart` | **The 5-minute hello** — a signed WASM filter stamps `x-plecto: hello-from-wasm` on the response, so one `curl -i` proves a sandboxed component touched your traffic. Start here. |
-| `wasm-auth` | **A real WASM filter doing real work** — a signed API-key auth component (`examples/filters/filter-apikey`) that 401s without a valid key, stamps the caller's identity, and counts per-user requests in host KV. The point of Plecto. |
-| `load-balancing` | One upstream over three instances: round-robin across the healthy set, active health probes, ejection when an instance goes unhealthy, and 503 when none are left (ADR 000017). Least-request (P2C) and Maglev consistent hashing, plus circuit breaking and outlier detection, are opt-in per-upstream knobs on the same upstream (ADR 000028 / 000032 / 000035). |
-| `filter-chain` | The filter chain over plain HTTP: continue / modify (header rewrite) / short-circuit 403 / host-native rate limit. |
-| `tls-http` | TLS termination with HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC) on one port, plus `Alt-Svc` h3 advertisement. |
-| `hot-reload` | Edit the manifest, `kill -HUP <pid>`, and watch the config swap atomically with zero downtime (a broken edit is fail-closed). |
-| `canary` | **A rollout you can operate** — a 90/10 weighted traffic split (deterministic apportionment), a header-match route that sends internal testers straight to v2, and a zero-downtime drain/promote via SIGHUP (ADR 000034). |
-| `resilience` | **The failure axes, visible from curl** — flip an instance's failure mode at runtime and watch: per-try timeout + retry to another instance, the overall deadline (504 `request-timeout`), the circuit breaker (503 `circuit-open`), and silent outlier ejection while clients keep seeing 200 (ADR 000023 / 000028 / 000031 / 000032). |
-| `production` | **The shape you operate** — the real `plecto` binary serving a deploy dir (`manifest.toml` + trust root + signed OCI layout, two terminals): signed WASM auth, a native rate-limit floor, `least_request` LB, and the `/metrics` admin endpoint (ADR 000009 / 000033 / 000035). |
-
-New here? Start with [`examples/README.md`](plecto/examples/README.md) — a guided path from a 5-minute `quickstart` up through the real use cases above. Or read `wasm-auth` first: it shows custom request logic running as a sandboxed component that can touch only the host-API it was lent — cosign-style signature + SBOM verification, the typed `decision`, and host-held state, end to end.
+| `quickstart` | 5-minute hello: a signed WASM filter stamps a response header. Start here. |
+| `wasm-auth` | A real filter doing real work — signed API-key auth, host KV, typed decisions. |
+| `load-balancing` | Round-robin over 3 instances, active health checks, fail-closed ejection. |
+| `filter-chain` | continue / modify / short-circuit / host-native rate limit, composed. |
+| `tls-http` | TLS termination across HTTP/1.1, HTTP/2 (ALPN), and HTTP/3 on one port. |
+| `hot-reload` | Zero-downtime config swap via SIGHUP; a broken edit stays fail-closed. |
+| `canary` | 90/10 weighted traffic split, header-match routing, SIGHUP drain/promote. |
+| `resilience` | Per-try timeout+retry, circuit breaker, outlier ejection — all visible from curl. |
+| `production` | The real `plecto` binary serving a full deploy dir, two terminals. |
 
 The benchmark harnesses (`wasm-bench`, `edge-bench`) are not demos — they live under [`bench/harnesses/`](bench/) and produce the numbers in [performance](performance/README.md).
 
 ## Roadmap
 
-Plecto is built ADR-first; each milestone realizes specific design decisions in `docs/ADR/`.
+Plecto is built ADR-first, milestone by milestone. The full detail — landed items, what's next, and the deciding ADR for each — lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); here's the snapshot:
 
-- **M0 — Foundation** ✅ *(done)*
-  The `plecto:filter@0.1.0` contract, a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
-- **M1 — Filter runtime hardening** ✅ *(landed)*
-  Trust-branched instances: trusted filters reuse a fixed-capacity, lazily-filled **pool** checked out per request (bounded-wait fail-closed, pool-wide circuit breaker, recycle-after-N); untrusted run **fresh-per-request** (linear memory fresh by construction). redb-backed host KV + atomic counters + **host-native token-bucket rate limiting** (bucket spec host-set in the manifest, keyed per request — an untrusted filter cannot widen its own limit, [ADR 26](docs/ADR/000026.md)), per-filter key namespacing, **per-filter + host-wide quotas** on that state (fail-closed over quota, untrusted `init` deadline tightened — [ADR 27](docs/ADR/000027.md)), and **epoch metering + memory/table limits**. The trusted/untrusted split is *forced* (not just perf) by the init/zeroization knot.
-- **M2 — The data path (fast path)** 🚧 *(matured by the role-driven model of [ADR 29](docs/ADR/000029.md))*
-  A tokio + hyper + quinn `plecto-server` that terminates **HTTP/1.1, HTTP/2 (ALPN) and HTTP/3 (QUIC)** and **TLS** (rustls, manifest-declared certs, fail-closed), **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split / canary** ([ADR 34](docs/ADR/000034.md)), runs the route's filter chain via a `spawn_blocking` bridge to the M1 pool, and **load-balances** across healthy upstream instances with a per-upstream choice of **round-robin**, **weighted least-request (P2C)**, or **weighted Maglev** consistent hashing ([ADR 35](docs/ADR/000035.md)). Resilience is layered on the same upstream: active/passive **health checks** (pessimistic start, fail-closed 503 when none healthy), **outlier detection** ([ADR 32](docs/ADR/000032.md)), a per-upstream **circuit breaker** ([ADR 28](docs/ADR/000028.md)), **two-tier timeouts** (per-try + overall, [ADR 31](docs/ADR/000031.md)), **bounded retry** with jittered backoff and retry-on-5xx ([ADR 30](docs/ADR/000030.md)), and a native L7 **rate-limit** floor per route / client-IP ([ADR 33](docs/ADR/000033.md)). Edge-model client-IP propagation re-issues `X-Forwarded-For` / `X-Real-IP` from the real peer ([ADR 18](docs/ADR/000018.md) / [22](docs/ADR/000022.md)). The data path is **security-hardened** ([ADR 27](docs/ADR/000027.md)): the request path is normalized once at ingress so a per-route filter is a reliable auth boundary (encoded separators / dot-escapes rejected fail-closed), inbound resource limits are enforced (connection cap, header-read timeout, body-read deadline, body-buffer budget), and filter-untouched header bytes pass through **byte-for-byte**. *Next:* upstream TLS, EWMA/latency-aware LB, ring-hash hashing, header-presence / regex match.
-- **M4 — Provenance & zero-downtime reload** ✅ *(landed)*
-  OCI-artifact filter distribution (offline image-layout, digest-pinned) + cosign signature verification + SBOM↔component binding, and content-hash-reconciled hot reload from a declarative manifest (atomic `ArcSwap`, all-or-nothing, SIGHUP-driven). What remains is a *remote* registry fetch path (the `wkg` boundary, out-of-band by design). — [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
-- **M5 — Observability & opt-in distribution** 🚧 *(span/metrics core landed; export deferred)*
-  **Landed:** host-propagated W3C trace context (inbound `traceparent` continued through the proxy), one span per filter execution over the OpenTelemetry data model, and a sync `TelemetrySink` (in-memory + host-aggregated RED metrics). **Deferred:** OTLP network export (`wasi-otel` / SDK exporter, named-deferred to stay no-tokio) and opt-in `foca`/`openraft` config consensus. — [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
-- **M3 — Async & bodies** 🚧 *(Stage 1 landed; Stage 2 in progress)*
-  The frontier, since M4/M5 are largely done. **Stage 1 (landed):** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0) (2026-06-22) made WASI 0.3 + Component Model async default-on; the host runs guest hooks via `call_async` on wasmtime fibers, bridged to its still-sync public API with `block_on`. **Stage 2 (in progress):** the request-side **body hook** is wired **end-to-end** — `on-request-body` (buffer-then-decide; body as a buffered `list<u8>` in v1) through the contract, the host, **and the fast path** (the proxy buffers a filtered route's body bounded — 16 MiB cap, fail-closed 413 — while bodyless requests and filter-less routes stay zero-copy), conformance- and E2E-green ([ADR 25](docs/ADR/000025.md)). An **experimental, feature-gated** `stream<u8>` increment has landed: behind the off-by-default `streaming-body` feature, a separate `plecto:filter-streaming` world drives an async `process-body(stream<u8>)` on the host (no whole-body buffer; server-side wiring is the next increment) over a minimal WASI slice, and stays out of the default build until `wasm32-wasip3` reaches Tier-2. Header **byte-equivalence** through the proxy (filter-untouched bytes preserved) landed alongside. [ADR 20](docs/ADR/000020.md) keeps the `wasi:http` convergence direction — deny-by-default independent of the type vocabulary.
-- **M6 — Polyglot SDKs & reference filters** 🚧 *(the outbound capability has landed feature-gated)*
-  Go / JS / Python filter templates and reference auth / rate-limit / WAF filters. The capability surface a filter can be lent is expanding deny-by-default: **outbound HTTP has landed behind the off-by-default `outbound-http` feature** ([ADR 36](docs/ADR/000036.md)) — a filter can make ext_authz / JWKS / token-introspection / OPA calls through `wasi:http/outgoing-handler`, gated by an operator per-filter allowlist and an **IP-pinned SSRF guard** (every resolved address classified, DNS-rebinding closed), fail-closed and resource-bounded; it stays out of the default build until the `wasi:http` convergence gate. WAF is deliberately placed in the extension plane rather than native ([ADR 37](docs/ADR/000037.md)).
+| Milestone | Status | Covers |
+| --- | --- | --- |
+| **M0** — Foundation | ✅ done | `plecto:filter@0.1.0` contract, wasmtime host, capability boundary, CI |
+| **M1** — Filter runtime hardening | ✅ landed | trusted pool / untrusted fresh-per-request, redb KV, host-native rate limiting, quotas |
+| **M2** — The data path (fast path) | 🚧 maturing | HTTP/1–3 + TLS, routing / LB / resilience, upstream TLS + periodic DNS re-resolve, WebSocket tunnelling |
+| **M3** — Async & bodies | 🚧 Stages 1–2 landed | wasmtime-46 async, header/body-world split, buffer-then-decide body hook; `stream<u8>` is experimental |
+| **M4** — Provenance & zero-downtime reload | ✅ landed | OCI + cosign + SBOM filter loading, SIGHUP reload + graceful shutdown, signed releases of Plecto itself |
+| **M5** — Observability & opt-in distribution | 🚧 mostly landed | W3C trace propagation, RED metrics, OTLP export landed; opt-in config consensus deferred |
+| **M6** — Polyglot SDKs & reference filters | 🚧 outbound landed | SSRF-guarded outbound HTTP (feature-gated); Go/JS/Python SDKs and reference filters pending |
 
 ## Project layout
 
@@ -285,22 +285,24 @@ Plecto is built ADR-first; each milestone realizes specific design decisions in 
 │       ├── README.md          # the guided learning path (quickstart → real use cases)
 │       ├── <use-case>/        # nine demos: cargo run -p plecto-server --example <name>
 │       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs)
-│           ├── filter-quickstart/ # minimal starter filter (stamps one response header)
-│           ├── filter-apikey/ # real-world example filter: API-key auth gate (WASM component)
-│           ├── filter-hello/  # conformance-fixture filter the host tests load (wasm32-unknown-unknown)
-│           ├── filter-template/ # copy-ready starting point for your own filter (vendored WIT)
-│           ├── filter-streaming/ # experimental stream<u8> body filter (feature-gated, wasm32-wasip2)
-│           └── filter-extauthz/ # ext_authz over the SSRF-guarded outbound capability (feature-gated)
+│           ├── filter-quickstart/ # minimal starter (stamps one header)
+│           ├── filter-apikey/ # API-key auth gate (real-world example)
+│           ├── filter-hello/  # the host's own conformance fixture
+│           ├── filter-template/ # copy-ready starter (vendored WIT)
+│           ├── filter-streaming/ # experimental stream<u8> filter (feature-gated)
+│           └── filter-extauthz/ # ext_authz over outbound HTTP (feature-gated)
 ├── bench/                     # benchmark harnesses + runbook (k6/oha; harnesses/, filters/, perf/)
 ├── performance/              # the benchmark write-up + results (see performance/README.md)
-├── docs/ADR/                  # Architecture Decision Records (000001–000037)
+├── docs/ADR/                  # Architecture Decision Records (000001–000049)
+├── CHANGELOG.md               # Keep a Changelog + pre-1.0 versioning policy
 ├── CLAUDE.md                  # project conventions & design summary
-└── CONTEXT-MAP.md             # domain glossary map (split per context)
+├── CONTEXT-MAP.md             # domain glossary map (split per context)
+└── Dockerfile                 # reference multi-stage build (distroless runtime)
 ```
 
 ## Design decisions
 
-Plecto records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 37 (35 accepted, 2 proposed) live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+Plecto records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 49 (48 accepted, 1 proposed) live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
 
 ## Contributing
 

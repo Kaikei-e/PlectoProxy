@@ -1,8 +1,9 @@
 //! A starter `plecto:filter`. Copy this crate, rename it, and put your policy in `on_request`.
 //!
-//! It implements the whole `filter` world: `init` plus the request / request-body / response
-//! hooks. The default behaviour passes everything through, except it short-circuits with `403`
-//! when a request carries an `x-block` header — replace that with your own decision.
+//! It implements the header-only `filter` world: `init` plus the request / response hooks (see
+//! `on_response` below for how to add the body hook and move to `filter-body`). The default
+//! behaviour passes everything through, except it short-circuits with `403` when a request
+//! carries an `x-block` header — replace that with your own decision.
 //!
 //! A filter is stateless: anything it must remember (a counter, a rate-limit bucket, a cached
 //! value) lives in host state, reached through the capabilities the host lent it (here, only

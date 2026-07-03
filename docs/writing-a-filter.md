@@ -10,15 +10,19 @@ the trusted/untrusted execution split. This guide is the practical how-to.
 
 ## 1. The contract in one minute
 
-A filter implements the `plecto:filter` world (see [`plecto/wit/world.wit`](../plecto/wit/world.wit)).
-It exports four functions:
+A filter implements one of two `plecto:filter` worlds (see
+[`plecto/wit/world.wit`](../plecto/wit/world.wit)): the header-only `filter` world, or `filter-body`
+if it also needs the request body. `filter-body` is `filter` plus one export — the **absence** of
+that export in the base world is itself the signal the host uses to skip buffering the body and
+stream it straight through, at no cost to a header-only filter (ADR 000038). Target `filter-body`
+only when your filter actually reads the body.
 
-| Export | When it runs | Returns |
-| --- | --- | --- |
-| `init` | once per instance (heavy setup) | — |
-| `on-request` | per request, on the headers | `continue` / `modified(edit)` / `short-circuit(response)` |
-| `on-request-body` | per request, on the buffered body | `continue(body)` / `short-circuit(response)` |
-| `on-response` | per response, on the headers | `continue` / `modified(edit)` |
+| Export | World | When it runs | Returns |
+| --- | --- | --- | --- |
+| `init` | both | once per instance (heavy setup) | — |
+| `on-request` | both | per request, on the headers | `continue` / `modified(edit)` / `short-circuit(response)` |
+| `on-request-body` | `filter-body` only | per request, on the buffered body | `continue(body)` / `short-circuit(response)` |
+| `on-response` | both | per response, on the headers | `continue` / `modified(edit)` |
 
 A filter is **stateless**. Anything it must remember lives in host state, reached only through the
 capabilities the host explicitly lends it — **deny-by-default**:
@@ -92,7 +96,7 @@ A correct filter imports only `plecto:filter/*` — no `wasi:*`, no network, no 
 The manifest is the static source of truth for which filters load, with which trust roots, in what
 order, and how requests route to upstreams (ADR 000007 / 000008). It is TOML. A ready-to-edit copy
 ships with the template ([`manifest.toml`](../plecto/examples/filters/filter-template/manifest.toml)).
-The authoritative schema is [`plecto/crates/control/src/manifest.rs`](../plecto/crates/control/src/manifest.rs);
+The authoritative schema is [`plecto/crates/control/src/manifest/mod.rs`](../plecto/crates/control/src/manifest/mod.rs);
 the field reference below mirrors it.
 
 ### `[trust]`
@@ -130,6 +134,8 @@ filter cannot widen its own limit.
 [[upstream]]
 name = "app"                          # required
 addresses = ["127.0.0.1:9000", "127.0.0.1:9001"]  # required: host:port instances, round-robined
+resolve_interval_ms = 0               # optional (default 0 = off): re-resolve hostname addresses
+                                       # on this interval, each A/AAAA record its own LB endpoint
 request_timeout_ms = 30000            # optional (default 30000; 0 disables — long-poll/streaming)
 max_retries = 1                       # optional (default 1; 0 disables retry onto another instance)
 [upstream.health]                     # required: instances start unhealthy, a probe admits them
@@ -139,10 +145,17 @@ timeout_ms = 1000                     # optional (default 1000)
 healthy_threshold = 2                 # optional (default 2)
 unhealthy_threshold = 3               # optional (default 3)
 port = 9100                           # optional (default: probe the instance's own traffic port)
+[upstream.tls]                        # optional (absent = plain HTTP/1.1 to every instance)
+ca_path = "certs/internal-ca.pem"     # optional: replaces the webpki roots (self-signed / internal CA)
 ```
 
 Every upstream **requires** a `[upstream.health]` block with at least `path`, because instances start
-pessimistic and only a passing probe puts one into rotation (ADR 000017).
+pessimistic and only a passing probe puts one into rotation (ADR 000017). `[upstream.tls]`
+re-encrypts the forward leg to every instance with ALPN-negotiated HTTP/2 (falling back to
+HTTP/1.1) — verification is always on, with no insecure escape hatch (ADR 000042); `TE: trailers`
+and response trailers pass through, so gRPC upstreams work end to end. `resolve_interval_ms`
+re-resolves a hostname address on an interval (Compose service names, k8s headless Services);
+`0` (the default) resolves once, the pre-000044 behaviour.
 
 ### `[[route]]`
 
@@ -153,7 +166,14 @@ upstream = "app"         # required: the [[upstream]] name to forward a passing 
 filters = ["my-filter"]  # optional: filter ids run in order (empty = pure pass-through)
 host = "example.com"     # optional: match only this authority (case-insensitive); omit = any host
 strip_prefix = "/api"    # optional: strip this prefix before forwarding (the chain saw the original)
+[route.upgrade]          # optional: absent = deny-by-default, no HTTP/1.1 Upgrade tunnelled
+protocols = ["websocket"] # required if the section is present; token allowlist, `h2c` rejected
+idle_timeout_ms = 300000  # optional (default 300000 = 5 min); 0 disables the idle timer
 ```
+
+`[route.upgrade]` opts a route into tunnelling `HTTP/1.1 Upgrade` (e.g. WebSocket): a listed token
+re-issues the handshake upstream and, on a verified `101`, splices a bidirectional byte tunnel with
+an activity-reset idle timeout (ADR 000048).
 
 ### `[[tls]]`
 

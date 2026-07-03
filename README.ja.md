@@ -23,7 +23,7 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 速度が要となる経路は native Rust のまま。リクエストのロジックはサンドボックス化された WASM コンポーネントとして走り、**ホストが明示的に貸した能力以外には何も触れられない** —— それを強制するのは規約ではなくサンドボックスである。
 
 > [!WARNING]
-> **現状: 初期開発段階。** 設計は確定済み（37 本の ADR・うち 35 が accepted）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・そして **fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS** を終端し、host・path-prefix・method・header・query を specificity 順で **routing**（weighted な **traffic split / canary** つき）し、ルートの filter chain をヘッダ **と** リクエスト body に対して回し、クライアント IP を edge モデルで伝播し、**healthy な upstream instance へロードバランシングする** —— round-robin・**weighted least-request（power-of-two-choices）**・**weighted Maglev consistent hashing** から選べ、active/passive **health check**・**outlier detection**・per-upstream の **circuit breaker**・二段（per-try ＋ overall）**timeout**・jittered **retry**・native L7 **rate-limit** の床が支える。セキュリティ堅牢化（[ADR 000027](docs/ADR/000027.md)）により route 選択は信頼できる認証境界になり（path は ingress で正規化し、encode された迂回は fail-closed で拒否）、host 保持の状態は per-filter quota で縛り、inbound のリソース上限を強制する。テスト一式は green で CI に載っている —— 読める・動かせる・フィルタを書ける基盤である。[ロードマップ](#ロードマップ)参照。
+> **現状: 初期開発段階。** 設計は確定済み（49 本の ADR・うち 48 が accepted）で、基盤は end-to-end で動く: `plecto:filter` 契約・フィルタをロードして実行する wasmtime ホスト・そして **fast path** —— **HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS** を終端し、host・path-prefix・method・header・query を specificity 順で **routing**（weighted な **traffic split / canary** つき）し、ルートの filter chain をヘッダ **と** リクエスト body に対して回し、クライアント IP を edge モデルで伝播し、**healthy な upstream instance へロードバランシングする** —— round-robin・**weighted least-request（power-of-two-choices）**・**weighted Maglev consistent hashing** から選べ、active/passive **health check**・**outlier detection**・per-upstream の **circuit breaker**・二段（per-try ＋ overall）**timeout**・jittered **retry**・native L7 **rate-limit** の床が支える。upstream への経路は **TLS+ALPN で再暗号化**でき（gRPC/HTTP-2 パススルー・custom CA）、hostname upstream は DNS を **定期的に再解決**してコンテナの再作成に追従する。per-route の **HTTP/1.1 `Upgrade` token allowlist** が WebSocket トンネルを end-to-end で成立させる。セキュリティ堅牢化（[ADR 000027](docs/ADR/000027.md)）により route 選択は信頼できる認証境界になり（path は ingress で正規化し、encode された迂回は fail-closed で拒否）、host 保持の状態は per-filter quota で縛り、inbound のリソース上限を強制する。出荷バイナリには SIGHUP hot reload・graceful shutdown・OTLP トレース export・operator CLI（`plecto validate` / `schema` / `--version`）が配線済みで、`v0.1.0` タグには署名付きアーティファクトの release パイプライン（cosign ＋ SBOM）自体も切られている。テスト一式は green で CI に載っている —— 読める・動かせる・フィルタを書ける基盤である。[ロードマップ](#ロードマップ)参照。
 
 ## なぜ Plecto か
 
@@ -36,7 +36,7 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 | 別プロセス（`ext_proc`・サイドカー） | ❌ | ✅ | ✅ | ✅ |
 | **WASM フィルタ — Plecto** | ✅ | ✅ | ✅ | ✅ |
 
-データプレーンのフィルタを WASM で動かすという発想は、**Envoy と proxy-wasm が切り拓き、約 10 年かけて実証**してきたものだ ―― その中核的な洞察に Plecto は多くを負っている。proxy-wasm は初期の WASM ABI（v0.2.1）を対象としており、その後 **Component Model と WIT** が型付き・多言語・合成可能な基盤として成熟した。Plecto は、それらの上にゲートウェイを一から築くとどうなるかを探る試みである。**Cloudflare の Pingora** をはじめとする高性能 Rust プロキシもまた、native なデータ経路がどれほど速くなり得るかを示してくれた。Plecto が特に焦点を当てるのは、**その native の速さと Component Model の extension plane を組み合わせる**こと ―― 自分で運用し、トラフィックも秘密も自分のインフラに留めたいチームのために、**データ主権**を第一原理として据える。
+データプレーンのフィルタを WASM で動かすという発想は **Envoy と proxy-wasm が切り拓いた**もの。proxy-wasm は初期の WASM ABI（v0.2.1）を対象としており、その後 **Component Model と WIT** が型付き・多言語・合成可能な基盤として成熟し、Plecto はその上にネイティブに築く。**Cloudflare の Pingora** のような高性能 Rust プロキシは native なデータ経路の速さを示す。Plecto の焦点は **その速さと Component Model の extension plane を組み合わせる**こと ―― 自分で運用し、トラフィックも秘密も自分のインフラに留めたいチームのために、**データ主権**を第一原理として据える。
 
 根拠と却下した代替案は [ADR 000001](docs/ADR/000001.md) を参照。
 
@@ -54,10 +54,10 @@ Plecto は、**相補関係にある二つの構成要素**を型付き [WIT](ht
 
 ## アーキテクチャ
 
-Plecto は速い **native の高速道路** ＋ **あなた自身のコードが走る検問所** という構成。高速道路（native
-Rust）が接続受付・TLS 終端・HTTP・ルーティング・LB を担う。検問所が **extension plane**：各リクエストは
-あなたの *フィルタ*——小さな sandbox 化された WASM プログラム——に渡され、それが **リクエストを検査して
-3つの判断のいずれかを返す**。ポリシーはこの判断に宿る。
+Plecto は速い **native の高速道路** ＋ **あなた自身のコードが走る検問所** という構成: 高速道路（native
+Rust）が接続受付・TLS 終端・HTTP・ルーティング・LB を担い、**extension plane** が各リクエストをあなたの
+*フィルタ*——小さな sandbox 化された WASM プログラム——に渡し、それが検査して3つの判断のいずれかを返す。
+ポリシーはこの判断に宿る。
 
 ```mermaid
 flowchart LR
@@ -88,9 +88,8 @@ flowchart LR
     decide <-->|"貸与された capability のみ呼べる"| state
 ```
 
-3つの判断がメンタルモデルの全て：**continue**（素通し）・**modify**（ヘッダ/body を書換えて通す）・
-**reject**（*その場で* クライアントへ応答する `401/403/429`＝**upstream に届かない**ので、悪性トラフィックは
-edge で落ちる）。フィルタは **stateless**：覚えておくべきもの（カウンタ・rate-limit bucket・キャッシュ）は
+**continue**（素通し）・**modify**（ヘッダ/body を書換えて通す）・**reject**（*その場で* `401/403/429` を
+返す＝**upstream に届かない**）——これがメンタルモデルの全て。フィルタは **stateless**：覚えておくべきものは
 host 側にあり、**明示的に貸与された host サービスだけ**を呼べる（deny-by-default）。
 
 フィルタは署名済み WASM component で、**同じ** component を「どれだけ信頼するか」で2通りに走らせられる——
@@ -114,7 +113,7 @@ flowchart TB
     fresh --> guards
 ```
 
-**判断の指針:** ユーザー固有のロジック・ポリシー・WAF・認証・書換 → WASM フィルタ。TLS・ルーティング・LB・コネクションプール・グローバルカウンタ → native Rust。この線引きはプロジェクトの統治原則であり、[ADR 000029](docs/ADR/000029.md) で「役割駆動」の配置基準として固定した —— native は横断的なデータプレーン関心事とグローバルカウンタにのみ育て、per-request のポリシーには育てない。WASM 税（データコピー＋ホストコール）はリクエスト判断ロジックにのみ課し、速い経路には課さない——pooled フィルタで **~2 µs/req** と実測（[performance](performance/README.md)）。
+**判断の指針:** ユーザー固有のロジック・ポリシー・WAF・認証・書換 → WASM フィルタ。TLS・ルーティング・LB・コネクションプール・グローバルカウンタ → native Rust —— [ADR 000029](docs/ADR/000029.md) が固定した「役割駆動」の配置基準で、native は横断的な関心事にのみ育ち、per-request のポリシーには育たない。WASM 税（データコピー＋ホストコール）はリクエスト判断ロジックにのみ課し、速い経路には課さない——pooled フィルタで **~2 µs/req** と実測（[performance](performance/README.md)）。
 
 ## いま gateway ができること
 
@@ -122,14 +121,13 @@ native fast path は「動くプロキシ」をとうに越えて成熟してい
 
 | 関心事 | いま |
 | --- | --- |
-| **Edge & HTTP** | HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC、Alt-Svc 広告）。TLS 終端＋SNI 証明書選択（rustls、証明書は manifest 宣言、fail-closed） — [13](docs/ADR/000013.md) · [14](docs/ADR/000014.md) · [15](docs/ADR/000015.md) · [16](docs/ADR/000016.md) |
-| **Routing** | host・path-prefix・method・header(exact)・query の照合を **specificity 順** で解決。weighted **traffic split / canary**。host-native の prefix strip。ingress 正規化で path を fail-closed な認証境界に — [13](docs/ADR/000013.md) · [27](docs/ADR/000027.md) · [34](docs/ADR/000034.md) |
-| **Load balancing** | per-upstream の **round-robin**（既定）・**weighted least-request**（power-of-two-choices）・**weighted Maglev** consistent hashing（header / source-IP affinity） — [17](docs/ADR/000017.md) · [24](docs/ADR/000024.md) · [35](docs/ADR/000035.md) |
-| **Resilience** | active **＋** passive の **health check**。**outlier detection**（misbehave した instance を eject）。per-upstream の **circuit breaker**（concurrency cap）。**二段 timeout**（per-try ＋ overall）。jittered backoff ＋ retry-on-5xx の **有界 retry** — [17](docs/ADR/000017.md) · [28](docs/ADR/000028.md) · [30](docs/ADR/000030.md) · [31](docs/ADR/000031.md) · [32](docs/ADR/000032.md) |
-| **Rate limiting** | native L7 token-bucket の床（**route** 単位 / **client-IP** 単位）。加えてフィルタに貸す per-filter の `host-ratelimit` — [26](docs/ADR/000026.md) · [33](docs/ADR/000033.md) |
-| **Extension plane** | `plecto:filter` chain をヘッダ **と** body に。型付き `decision`。trusted **pooled** / untrusted **fresh**。deny-by-default の host-API（kv · counter · log · clock · rate-limit）＋ per-filter / host-wide quota。**outbound HTTP**（ext_authz / JWKS / introspection）を同じゲート越しに per-filter allowlist ＋ IP ピン留め SSRF ガードで貸与（feature-gated）— [1](docs/ADR/000001.md) · [12](docs/ADR/000012.md) · [25](docs/ADR/000025.md) · [27](docs/ADR/000027.md) · [36](docs/ADR/000036.md) |
-| **Client IP** | edge モデル伝播 —— 受信した forwarding ヘッダ family を剥がし、chain 実行の前に実 peer から `X-Forwarded-For` / `X-Real-IP` を付け直す — [18](docs/ADR/000018.md) · [22](docs/ADR/000022.md) |
-| **Supply chain & ops** | OCI digest ピンのフィルタ。cosign 署名 ＋ SBOM↔component 検証。無停止 SIGHUP reload（`ArcSwap` 原子適用・all-or-nothing）。W3C トレース伝播 ＋ ホスト集計 RED メトリクス ＋ オプトイン access log — [6](docs/ADR/000006.md) · [7](docs/ADR/000007.md) · [8](docs/ADR/000008.md) · [9](docs/ADR/000009.md) |
+| **Edge & HTTP** | HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC、Alt-Svc 広告）。TLS 終端＋SNI 証明書選択、manifest 宣言、fail-closed — [ADR 13–16](docs/ADR/000013.md) |
+| **Routing & upgrade** | host・path-prefix・method・header・query の照合を **specificity 順** で解決。weighted **traffic split / canary**。ingress 正規化で path を fail-closed な認証境界に。per-route の **HTTP/1.1 `Upgrade`** トンネリングで WebSocket（`h2c` は拒否） — [34](docs/ADR/000034.md) · [48](docs/ADR/000048.md) |
+| **Load balancing & upstream** | per-upstream の **round-robin**（既定）・**weighted least-request**（P2C）・**weighted Maglev**。active＋passive health check、outlier detection、circuit breaker、二段 timeout、jittered retry。per-upstream **TLS+ALPN 再暗号化**（gRPC 対応）と **定期 DNS 再解決** — [17](docs/ADR/000017.md) · [35](docs/ADR/000035.md) · [42](docs/ADR/000042.md) · [44](docs/ADR/000044.md) |
+| **Rate limiting** | native L7 token-bucket の床（**route** 単位 / **client-IP** 単位）。加えてフィルタに貸す per-filter の `host-ratelimit` — [33](docs/ADR/000033.md) |
+| **Extension plane** | `plecto:filter` chain をヘッダ **と**、opt-in したフィルタには body にも回す（header-only なフィルタは zero-copy）。型付き `decision`。trusted **pooled** / untrusted **fresh**。deny-by-default の host-API ＋ per-filter / host-wide quota。feature-gated の **outbound HTTP**（SSRF ガード付き） — [1](docs/ADR/000001.md) · [25](docs/ADR/000025.md) · [38](docs/ADR/000038.md) |
+| **Client IP** | edge モデル伝播 —— chain 実行の前に実 peer から `X-Forwarded-For` / `X-Real-IP` を付け直す — [18](docs/ADR/000018.md) |
+| **Supply chain & ops** | cosign ＋ SBOM 検証済みのフィルタロード。無停止 SIGHUP reload ＋ graceful shutdown を出荷バイナリに配線。W3C トレース伝播・RED メトリクス・OTLP export。`plecto validate` / `schema` / `--version`。Plecto 自身のバイナリと container image も同じ署名付きアーティファクト規律に従う — [6](docs/ADR/000006.md) · [39](docs/ADR/000039.md) · [46](docs/ADR/000046.md) · [47](docs/ADR/000047.md) |
 
 ## フィルタ契約
 
@@ -155,44 +153,63 @@ interface host-log     { log: func(level: level, message: string); }
 // 跨がない。bucket 仕様（capacity/refill）は manifest で host 設定。フィルタは (key, cost) だけを渡すので、
 // untrusted フィルタは自分の制限を緩められない（ADR 000005 / 000026）。
 
+// 基本契約: header-only なフィルタ（auth・rate-limit・WAF・rewrite）はこの world を対象にする。host は
+// `on-request-body` の「不在」を、body を buffer せず素通しする合図として読む —— body に触れないフィルタは
+// zero-copy のまま（ADR 000038）。
 world filter {
-  // 貸与された能力のみ —— log · clock · kv · counter · rate-limit
   import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
-  export init: func();                                        // 重い・instance ごと一度
-  export on-request:      func(req: http-request)  -> request-decision;       // ホット経路（ヘッダ）
-  export on-request-body: func(body: list<u8>)     -> request-body-decision;  // body hook（ADR 000025）
-  export on-response:     func(resp: http-response) -> response-decision;     // ホット経路（ヘッダ）
+  export init: func();                                                // 重い・instance ごと一度
+  export on-request:  func(req: http-request)  -> request-decision;   // ホット経路（ヘッダ）
+  export on-response: func(resp: http-response) -> response-decision; // ホット経路（ヘッダ）
+}
+
+// body を読む契約: `filter` ＋ `on-request-body`。この export の「存在」こそが、host に body を buffer させ
+// このフックを走らせる合図になる（buffer-then-decide、ADR 000025）。
+world filter-body {
+  import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
+  export init: func();
+  export on-request:      func(req: http-request)  -> request-decision;
+  export on-request-body: func(body: list<u8>)     -> request-body-decision;  // buffer 済み body hook
+  export on-response:     func(resp: http-response) -> response-decision;
 }
 ```
 
-> v0.1.0 は当初 **sync・header-only** だったが、**request 側の body hook**（`on-request-body`。v1 は body を buffer 済みの `list<u8>` で受ける、[ADR 000025](docs/ADR/000025.md)）が end-to-end で動くようになり、ヘッダだけでなく body も変換・short-circuit できる —— fast path がどう buffer するかは[ロードマップ](#ロードマップ)を参照。**実験的・feature-gated** な `stream<u8>` body ワールド（[ADR 000020](docs/ADR/000020.md)）と `wasi:http` 型の再利用が次で、いずれも P3 ゲスト toolchain 待ちで gated。
+> v0.1.0 は当初 **sync・header-only** だったが、**request 側の body hook**（`on-request-body`。v1 は body を buffer 済みの `list<u8>` で受ける、[ADR 000025](docs/ADR/000025.md)）が end-to-end で動くようになり、`filter-body` を対象にしたフィルタはヘッダだけでなく body も変換・short-circuit できる。**実験的・feature-gated** な `stream<u8>` body ワールド（[ADR 000020](docs/ADR/000020.md)）と `wasi:http` 型の再利用が次で、いずれも P3 ゲスト toolchain 待ちで gated。
 
 ## フィルタを書く
 
-フィルタはワールドを実装したコンポーネントにすぎない。同梱の例（`examples/filters/filter-hello`、Rust）:
+フィルタはワールドを実装したコンポーネントにすぎない。同梱の例（`examples/filters/filter-quickstart`、Rust）:
 
 ```rust
 wit_bindgen::generate!({ path: "../../../wit", world: "filter" });
 
-struct FilterHello;
+struct FilterQuickstart;
 
-impl Guest for FilterHello {
+impl Guest for FilterQuickstart {
     fn init() {}
 
-    fn on_request(req: HttpRequest) -> RequestDecision {
-        host_log::log(host_log::Level::Info, "filter-hello: on-request");
-        if req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("x-plecto-block")) {
-            RequestDecision::ShortCircuit(HttpResponse { status: 403, /* … */ })
-        } else {
-            RequestDecision::Continue
-        }
+    fn on_request(_req: HttpRequest) -> RequestDecision {
+        RequestDecision::Continue
     }
 
-    fn on_response(_: HttpResponse) -> ResponseDecision { ResponseDecision::Continue }
+    fn on_response(_resp: HttpResponse) -> ResponseDecision {
+        // このフィルタが目に見える形でやる唯一のこと: ヘッダを1つ付け足して、
+        // `curl -i` で WASM フィルタが応答に触れたことを見せる。
+        ResponseDecision::Modified(ResponseEdit {
+            set_status: None,
+            set_headers: vec![Header { name: "x-plecto".into(), value: "hello-from-wasm".into() }],
+            remove_headers: vec![],
+        })
+    }
 }
 
-export!(FilterHello);
+export!(FilterQuickstart);
 ```
+
+これは基本の `filter` world を対象にしている —— header-only なので host は body を素通しする。body が要る
+フィルタ（`POST` の認証・WAF・body 書換）は `filter-body` を対象にし、export を1つ追加する。実用例フィルタは
+[`filter-apikey`](plecto/examples/filters/filter-apikey)（header-only）、`filter-body` の例は
+[`filter-hello`](plecto/examples/filters/filter-hello)（host 自身の conformance fixture）を参照。
 
 契約が WIT なので、**WASM コンポーネントへコンパイルできる言語ならどれでもフィルタを書ける** — Rust・Go（TinyGo）・JavaScript/TypeScript（`jco`）・Python（`componentize-py`）。polyglot フィルタ SDK は[ロードマップ](#ロードマップ)に載っている。
 
@@ -200,72 +217,57 @@ scaffold・ビルド・manifest フィールドリファレンス・署名・ロ
 
 ## 試す
 
-ツールチェーンと WASM ターゲットは [`plecto/rust-toolchain.toml`](plecto/rust-toolchain.toml) に
-ピン留めしてあるので、[`rustup`](https://rustup.rs/) が初回ビルド時に適切な Rust（edition 2024）と
-`wasm32-unknown-unknown` ターゲットを自動で用意する —— 手動の `rustup target add` は不要。
+ツールチェーンと WASM ターゲットは [`plecto/rust-toolchain.toml`](plecto/rust-toolchain.toml) にピン留め
+してあるので、[`rustup`](https://rustup.rs/) が初回ビルド時に自動で用意する（ツールチェーン外では一度だけ
+`rustup target add wasm32-unknown-unknown`）。
 
 ```bash
-# 全ビルド + テスト。host の build script が例フィルタを WASM コンポーネントへ
-# コンパイルし、テストがそれを wasmtime ホストにロードして契約を検証する。
 cd plecto
-cargo test --all
+cargo test --all   # 例フィルタを WASM コンポーネントへコンパイルし、wasmtime ホストにロードして
+                    # 契約を end-to-end で検証する
 ```
 
-（このツールチェーン外でビルドする場合は一度だけ: `rustup target add wasm32-unknown-unknown`。）
-
-テストはスライスを end-to-end で実証する: リクエストがホストを通って実フィルタ・コンポーネントへ流れ、型付き `decision` が往復し、フィルタは**貸与された能力だけ**に到達する（例コンポーネントは `plecto:filter/*` のみを import し、WASI・network・filesystem には一切アクセスしない）。
+例コンポーネントは `plecto:filter/*` のみを import し、WASI・network・filesystem には一切アクセスしない
+—— テストはこれで、フィルタが**貸与された能力だけ**に到達し、型付き `decision` が実コンポーネント越しに
+往復することを実証する。
 
 ### デモを動かす
 
-ユースケース別の自己完結デモが `examples/<name>/` に 9 つあり、5 分の `quickstart` から gateway が実際にやることまでの学習パスを成す（地図は [`examples/README.md`](plecto/examples/README.md)。各デモのディレクトリには `curl` と期待出力を明記した README がある）。どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、すべて fail-closed）を組み、小さな upstream を立て、実プロキシを serve し、起動時に貼り付け用の `curl` コマンドを表示する。
-
-手早く end-to-end で見るならガイド付きツアー —— デモを起動し、readiness を待ち、`curl` を流し、結果を可視化して、後片付けまで自動でやる:
+ユースケース別の自己完結デモが `examples/<name>/` に 9 つあり、どれも**本番ロードパス**（署名＋オフライン OCI レイアウト＋検証＋ロード、fail-closed）を組んで起動時に貼り付け用の `curl` コマンドを表示する。学習パスの完全版は [`examples/README.md`](plecto/examples/README.md)。手早い地図はこちら:
 
 ```bash
 cd plecto
-./examples/try.sh <name>      # または `all`。リポジトリ root からは `just demo <name>` でも可
-```
-
-自分で叩きたいなら、サーバを直接起動して、起動時に表示される `curl` レシピを使う:
-
-```bash
-cargo run -p plecto-server --example <name>   # Ctrl-C で停止
+./examples/try.sh <name>                      # ガイド付きツアー: 起動・curl・後片付けまで自動（または `all`）
+cargo run -p plecto-server --example <name>   # 自分で叩くなら直接起動、Ctrl-C で停止
 ```
 
 | `<name>` | 見せるもの |
 | --- | --- |
-| `quickstart` | **5 分の hello** —— 署名済み WASM フィルタが応答に `x-plecto: hello-from-wasm` を付与。`curl -i` 一発でサンドボックス・コンポーネントがトラフィックに触れた証拠が見える。まずここから。 |
-| `wasm-auth` | **実用 WASM フィルタ** —— 署名済みの API キー認証コンポーネント（`examples/filters/filter-apikey`）。鍵が無ければ 401、認証できれば呼び出し元の identity を付与し、per-user のリクエスト数を host KV で数える。Plecto の核。 |
-| `load-balancing` | 1 つの upstream を 3 instance に分散: healthy 集合の round-robin、active health probe、unhealthy 化での eject、全滅時の 503（ADR 000017）。least-request（P2C）と Maglev consistent hashing、circuit breaking、outlier detection は同じ upstream の per-upstream opt-in knob（ADR 000028 / 000032 / 000035）。 |
-| `filter-chain` | plain HTTP で filter chain: continue / modify（ヘッダ書換）/ short-circuit 403 / host-native rate limit。 |
-| `tls-http` | 同一ポートで TLS 終端＋HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）、`Alt-Svc` による h3 広告。 |
-| `hot-reload` | manifest を編集して `kill -HUP <pid>`、無停止で設定をアトミックに差し替え（壊れた編集は fail-closed）。 |
-| `canary` | **運用できるロールアウト** —— 90/10 の weighted traffic split（決定論的 apportionment）、社内テスターを v2 へ直行させる header-match route、SIGHUP による無停止の drain / promote（ADR 000034）。 |
-| `resilience` | **curl で見える故障の軸** —— instance の故障モードを実行中に切替: per-try timeout ＋別 instance への retry、overall deadline（504 `request-timeout`）、circuit breaker（503 `circuit-open`）、そしてクライアントが 200 を見続ける裏での outlier ejection（ADR 000023 / 000028 / 000031 / 000032）。 |
-| `production` | **運用の形そのもの** —— 実 `plecto` バイナリが deploy dir（`manifest.toml`＋trust root＋署名済み OCI layout、ターミナル 2 枚）を serve: 署名済み WASM 認証、native rate-limit floor、`least_request` LB、`/metrics` admin endpoint（ADR 000009 / 000033 / 000035）。 |
-
-初めてなら [`examples/README.md`](plecto/examples/README.md) から —— 5 分の `quickstart` から上記のリアルなユースケースまでの学習パス。あるいはまず `wasm-auth`: 貸与された host-API だけに触れるサンドボックス・コンポーネントとしてカスタムなリクエスト処理が走る様子 —— cosign 風署名＋SBOM 検証・型付き `decision`・host 保持の状態 —— が端から端まで見える。
+| `quickstart` | 5 分の hello —— 署名済み WASM フィルタが応答ヘッダを1つ付与。まずここから。 |
+| `wasm-auth` | 実用フィルタ —— 署名済み API キー認証、host KV、型付き decision。 |
+| `load-balancing` | 3 instance への round-robin、active health check、fail-closed な eject。 |
+| `filter-chain` | continue / modify / short-circuit / host-native rate limit を組み合わせる。 |
+| `tls-http` | 同一ポートで HTTP/1.1・HTTP/2（ALPN）・HTTP/3 の TLS 終端。 |
+| `hot-reload` | SIGHUP による無停止の config swap。壊れた編集は fail-closed のまま。 |
+| `canary` | 90/10 の weighted traffic split、header-match routing、SIGHUP drain/promote。 |
+| `resilience` | per-try timeout＋retry・circuit breaker・outlier ejection が curl から見える。 |
+| `production` | 実 `plecto` バイナリが本物の deploy dir を serve（ターミナル 2 枚）。 |
 
 ベンチマーク・ハーネス（`wasm-bench` / `edge-bench`）はデモではなく [`bench/harnesses/`](bench/) 配下にあり、[performance](performance/README.md) の数値を生む。
 
 ## ロードマップ
 
-Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/` の特定の設計判断を具体化する。
+Plecto は ADR ファーストで、マイルストーン単位に作る。着地済みの項目・次にやること・決定 ADR まで含めた詳細は [`docs/ROADMAP.md`](docs/ROADMAP.md)（英語）にあり、ここではスナップショットだけ:
 
-- **M0 — 基盤** ✅ *(完了)*
-  `plecto:filter@0.1.0` 契約、フィルタをロード&実行する wasmtime ホスト、deny-by-default の能力境界（log / clock / kv）、例フィルタ、E2E/conformance/unit テスト、CI。— [ADR 1](docs/ADR/000001.md) · [2](docs/ADR/000002.md) · [10](docs/ADR/000010.md)
-- **M1 — フィルタランタイムの堅牢化** ✅ *(着地)*
-  trusted / untrusted で生成戦略を分ける。trusted は固定容量のプールをリクエストごとに借りて返し（飽和時は上限付きで待ってから fail-closed、trap が続けばプール全体のブレーカーが開き、一定回数で recycle）、untrusted は毎回新しく生成する（線形メモリが構造的にまっさらなのでゼロ化が要らない）。状態は redb 上の host KV とアトミックカウンタに置き、token-bucket のレート制限はホスト側で持つ（bucket 仕様は manifest で host 設定・リクエストごとに key 付け —— untrusted フィルタが自分の制限を緩められない、[ADR 26](docs/ADR/000026.md)）。host 保持の状態には **per-filter ＋ host-wide の quota** を課し（超過は fail-closed、untrusted の `init` deadline も短縮 —— [ADR 27](docs/ADR/000027.md)）、epoch 計量とメモリ/テーブル上限も実装済み。trusted/untrusted を分けるのは性能のための選択ではなく、init とゼロ化を両立できないことによる必然。
-- **M2 — データ経路（fast path）** 🚧 *([ADR 29](docs/ADR/000029.md) の役割駆動モデルで成熟)*
-  tokio + hyper + quinn で書いた `plecto-server`。**HTTP/1.1・HTTP/2（ALPN）・HTTP/3（QUIC）** と **TLS**（rustls、証明書は manifest 宣言、不正なら fail-closed）を終端し、host・path-prefix・method・header・query を specificity 順で **routing**（weighted な **traffic split / canary**、[ADR 34](docs/ADR/000034.md)）し、その chain を `spawn_blocking` 経由で M1 のプールに載せて回す。upstream は per-upstream で **round-robin**・**weighted least-request（P2C）**・**weighted Maglev** consistent hashing を選んで **分散**する（[ADR 35](docs/ADR/000035.md)）。同じ upstream に resilience を重ねる: active/passive の **health check**（pessimistic 起動、全滅すれば 503 で fail-closed）、**outlier detection**（[ADR 32](docs/ADR/000032.md)）、per-upstream の **circuit breaker**（[ADR 28](docs/ADR/000028.md)）、**二段 timeout**（per-try ＋ overall、[ADR 31](docs/ADR/000031.md)）、jittered backoff ＋ retry-on-5xx の **有界 retry**（[ADR 30](docs/ADR/000030.md)）、route / client-IP 単位の native L7 **rate-limit** の床（[ADR 33](docs/ADR/000033.md)）。クライアント IP は edge モデルで `X-Forwarded-For` / `X-Real-IP` を実 peer から付け直す（[ADR 18](docs/ADR/000018.md) / [22](docs/ADR/000022.md)）。データ経路は **セキュリティ堅牢化済み**（[ADR 27](docs/ADR/000027.md)）: request path を ingress で一度だけ正規化して per-route filter を信頼できる認証境界にし（encode した区切り・dot-escape は fail-closed で拒否）、inbound のリソース上限（接続 cap・header-read timeout・body-read deadline・body-buffer 予算）を強制し、filter が触れていないヘッダのバイト列は **バイト等価**で通す。*次:* upstream TLS・EWMA/latency 系 LB・ring hash・header-presence / regex match。
-- **M4 — provenance & 無停止リロード** ✅ *(着地)*
-  OCI artifact によるフィルタ配布（オフライン image-layout・digest ピン）+ cosign 署名検証 + SBOM↔component バインド、宣言的マニフェストの content hash で整合する無停止リロード（`ArcSwap` 原子適用・all-or-nothing・SIGHUP 駆動）。残るのは*リモート*レジストリ取得経路（`wkg` 境界・設計上 out-of-band）。— [ADR 6](docs/ADR/000006.md) · [8](docs/ADR/000008.md)
-- **M5 — 可観測性 & オプトイン分散** 🚧 *(span/metrics の中核は着地・export は deferred)*
-  **着地:** ホスト伝播の W3C トレース文脈（受信 `traceparent` をプロキシ越しに継続）、フィルタ実行ごとの span（OpenTelemetry データモデル）、sync な `TelemetrySink`（in-memory + ホスト集計の RED メトリクス）。**deferred:** OTLP ネットワーク export（`wasi-otel` / SDK exporter — no-tokio 維持のため named-deferred）とオプトインの `foca`/`openraft` 設定合意。— [ADR 7](docs/ADR/000007.md) · [9](docs/ADR/000009.md)
-- **M3 — async & ボディ** 🚧 *(Stage 1 着地・Stage 2 進行中)*
-  M4・M5 がほぼ片付いたので、ここが次の主戦場。**Stage 1（着地）:** [wasmtime 46](https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0)（2026-06-22）が WASI 0.3 と Component Model async を既定で有効にし、host は guest のフックを `call_async` で wasmtime の fiber 上に走らせ、まだ sync の公開 API へ `block_on` で橋渡ししている。**Stage 2（進行中）:** **request 側の body hook が end-to-end で配線された** —— `on-request-body`（buffer-then-decide。v1 は body を buffer 済みの `list<u8>` で受ける）を契約・host・**fast path** に通し（プロキシは filter 付きルートの body を上限付きで buffer —— 16 MiB cap・超過は fail-closed 413 —— 一方 body 無しリクエストと filter 無しルートは zero-copy のまま）、conformance と E2E まで green（[ADR 25](docs/ADR/000025.md)）。さらに **実験的・feature-gated** な `stream<u8>` 増分が着地した: off-by-default の `streaming-body` feature の下で、別ワールド `plecto:filter-streaming` が async な `process-body(stream<u8>)` を host 上で駆動する（whole-body buffer 無し。server 側の配線は次の増分）—— 最小 WASI スライス越しで、`wasm32-wasip3` が Tier-2 に到達するまで default build からは外れる。プロキシ越しのヘッダ **バイト等価**（filter が触れないバイトの保存）も併せて着地。方向は [ADR 20](docs/ADR/000020.md) のとおり —— `wasi:http` へ収斂しても deny-by-default は型語彙と切り離して保つ。
-- **M6 — polyglot SDK & リファレンスフィルタ** 🚧 *(outbound capability は feature-gated で着地済み)*
-  Go / JS / Python のフィルタテンプレート、リファレンスの auth / rate-limit / WAF フィルタ。フィルタに貸せる能力面は deny-by-default のまま拡張中: **outbound HTTP が off-by-default の `outbound-http` feature 裏で着地**（[ADR 36](docs/ADR/000036.md)）—— フィルタは `wasi:http/outgoing-handler` 越しに ext_authz / JWKS / token-introspection / OPA を呼べ、operator の per-filter allowlist ＋ **IP ピン留め SSRF ガード**（解決後の全アドレスを分類・DNS rebinding を封鎖）で fail-closed かつ資源境界付きに囲う。default ビルドには `wasi:http` 収斂ゲートまで載せない。WAF は native ではなく拡張プレーンに置く（[ADR 37](docs/ADR/000037.md)）。
+| マイルストーン | 状態 | 内容 |
+| --- | --- | --- |
+| **M0** — 基盤 | ✅ 完了 | `plecto:filter@0.1.0` 契約、wasmtime ホスト、能力境界、CI |
+| **M1** — フィルタランタイムの堅牢化 | ✅ 着地 | trusted pool / untrusted fresh-per-request、redb KV、host-native レート制限、quota |
+| **M2** — データ経路（fast path） | 🚧 成熟中 | HTTP/1–3 ＋ TLS、routing / LB / resilience、upstream TLS ＋ 定期 DNS 再解決、WebSocket トンネリング |
+| **M3** — async & ボディ | 🚧 Stage 1–2 着地 | wasmtime-46 async、header/body world 分割、buffer-then-decide の body hook。`stream<u8>` は実験的 |
+| **M4** — provenance & 無停止リロード | ✅ 着地 | OCI ＋ cosign ＋ SBOM のフィルタロード、SIGHUP reload ＋ graceful shutdown、Plecto 自身の署名付き release |
+| **M5** — 可観測性 & オプトイン分散 | 🚧 大半着地 | W3C トレース伝播・RED メトリクス・OTLP export は着地、オプトインの設定合意は deferred |
+| **M6** — polyglot SDK & リファレンスフィルタ | 🚧 outbound 着地 | SSRF ガード付き outbound HTTP（feature-gated）。Go/JS/Python SDK とリファレンスフィルタは未着手 |
 
 ## リポジトリ構成
 
@@ -283,21 +285,23 @@ Plecto は ADR ファーストで作る。各マイルストーンは `docs/ADR/
 │       ├── <use-case>/        # デモ 9 種: cargo run -p plecto-server --example <name>
 │       └── filters/           # 例 plecto:filter guest（独立 workspace・build.rs が component 化）
 │           ├── filter-quickstart/ # 最簡スターター（応答に 1 ヘッダ付与）
-│           ├── filter-apikey/ # 実用例フィルタ: API キー認証ゲート（WASM コンポーネント）
-│           ├── filter-hello/  # host テストが読む conformance fixture（wasm32-unknown-unknown）
-│           ├── filter-template/ # 自作フィルタのコピー雛形（WIT を vendor 済み）
-│           ├── filter-streaming/ # 実験的 stream<u8> body フィルタ（feature-gated・wasm32-wasip2）
-│           └── filter-extauthz/ # SSRF ガード付き outbound で ext_authz（feature-gated）
+│           ├── filter-apikey/ # API キー認証ゲート（実用例）
+│           ├── filter-hello/  # host 自身の conformance fixture
+│           ├── filter-template/ # コピー雛形（WIT を vendor 済み）
+│           ├── filter-streaming/ # 実験的 stream<u8> フィルタ（feature-gated）
+│           └── filter-extauthz/ # outbound HTTP で ext_authz（feature-gated）
 ├── bench/                     # ベンチ・ハーネス + runbook（k6/oha; harnesses/, filters/, perf/）
 ├── performance/              # ベンチ結果の write-up（performance/README.md）
-├── docs/ADR/                  # Architecture Decision Records（000001–000037）
+├── docs/ADR/                  # Architecture Decision Records（000001–000049）
+├── CHANGELOG.md               # Keep a Changelog + pre-1.0 バージョニング方針
 ├── CLAUDE.md                  # プロジェクト規約・設計要約
-└── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）
+├── CONTEXT-MAP.md             # ドメイン用語集の地図（コンテキスト分割）
+└── Dockerfile                 # リファレンスの multi-stage build（distroless runtime）
 ```
 
 ## 設計判断（ADR）
 
-Plecto は重要な設計判断をすべて ADR に、Fork 形式（*判断 / 根拠 / 再検討条件*）で記録している。37 本（accepted 35・proposed 2）すべては [`docs/ADR/`](docs/ADR/) にあり、起点は [ADR 000001](docs/ADR/000001.md)（相補的な二つの構成要素）。各 ADR は土台にした判断へ相互リンクしている。
+Plecto は重要な設計判断をすべて ADR に、Fork 形式（*判断 / 根拠 / 再検討条件*）で記録している。49 本（accepted 48・proposed 1）すべては [`docs/ADR/`](docs/ADR/) にあり、起点は [ADR 000001](docs/ADR/000001.md)（相補的な二つの構成要素）。各 ADR は土台にした判断へ相互リンクしている。
 
 ## コントリビュート
 

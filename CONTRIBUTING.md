@@ -64,7 +64,7 @@ just demo-all            # every guided demo in turn
 | `just test` | `cargo test --all` |
 | `just fmt` | format the workspace |
 | `just lint` | fmt check + clippy |
-| `just demo NAME` | run a guided demo (`wasm-auth`, `load-balancing`, `filter-chain`, `tls-http`, `hot-reload`) |
+| `just demo NAME` | run a guided demo (`quickstart`, `wasm-auth`, `load-balancing`, `filter-chain`, `tls-http`, `hot-reload`, `canary`, `resilience`, `production`) |
 | `just example NAME` | run an example server directly (`cargo run -p plecto-server --example NAME`) |
 | `just build-filters` | build the example filter guests for `wasm32-unknown-unknown` |
 

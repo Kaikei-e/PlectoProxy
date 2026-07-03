@@ -18,8 +18,38 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-03
+
+The first tagged release. Everything below ships in `v0.1.0`; the highlights of the
+pre-release history are summarised first, the final pre-tag additions follow.
+
+### Highlights (initial release)
+
+- **Fast path**: HTTP/1.1, HTTP/2 (TLS+ALPN), HTTP/3 (QUIC, same port, Alt-Svc advertised);
+  rustls TLS termination with SNI selection and certificate hot reload.
+- **Routing**: host / path-prefix / method / header / query matching (most-specific wins),
+  weighted traffic splits (canary), prefix strip, fail-closed ingress path normalization.
+- **Resilience**: round-robin / weighted least-request (P2C) / weighted Maglev load balancing,
+  active + passive health checks (pessimistic start), outlier detection, per-upstream circuit
+  breaker, two-tier timeouts (per-try + overall), jittered bounded retries, native per-route
+  rate limiting.
+- **Extension plane**: `plecto:filter` WASM Component Model filters (any language), pooled
+  instances, deny-by-default capabilities (log / clock / KV / counter / rate-limit /
+  outbound-HTTP with SSRF guard), per-filter quotas and deadlines, cosign + SBOM
+  verify-then-load, fail-closed trap handling.
+- **Operations**: declarative TOML manifest (strict parse), SIGHUP hot reload + graceful
+  shutdown, Prometheus metrics + health/readiness admin endpoint, structured JSON logs,
+  opt-in access log, OTLP trace export, redb persistent filter state.
+
 ### Added
 
+- HTTP/1.1 Upgrade / WebSocket tunnelling (`[route.upgrade]`, ADR 000048): a per-route token
+  allowlist (the h2c-smuggling mitigation shape; `h2c` is rejected at validation) re-issues the
+  handshake upstream and splices a bidirectional tunnel on a verified 101, with an
+  activity-reset idle timeout (default 5 min, `0` disables) and drain-aware shutdown.
+- `plecto schema`: the manifest's JSON Schema (draft-07) on stdout, derived from the parsing
+  structs themselves — editor completion (taplo / Even Better TOML) and CI validation from one
+  generated artifact (ADR 000049).
 - Upstream TLS re-encryption (`[upstream.tls]`, ADR 000042): per-upstream rustls client with
   ALPN-negotiated HTTP/2 / HTTP/1.1, optional custom CA (`ca_path`), `TE: trailers` pass-through
   and response-trailer forwarding — gRPC now works end-to-end through the proxy. Health probes

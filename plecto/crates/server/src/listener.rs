@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use hyper::header::HeaderValue;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::Control;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -27,8 +26,8 @@ use crate::error::ServerError;
 use crate::h3::{build_h3_endpoint, serve_h3};
 use crate::health::serve_health_checks;
 use crate::metrics::ServerMetrics;
-use crate::upstream_client::HyperUpstreamClient;
-use crate::{MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, ServerState, admin, upstream_connector};
+use crate::upstream_client::UpstreamClients;
+use crate::{MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, ServerState, admin};
 
 /// Explicit cap on inbound request header lines. hyper's http1 default (~100) is documented
 /// as not API-stable, so pin it — as `MAX_CONCURRENT_STREAMS` already does for h2.
@@ -102,16 +101,7 @@ async fn serve_inner(
 
     let state = Arc::new(ServerState {
         control,
-        client: HyperUpstreamClient::new(
-            // The pool needs a timer for idle expiry to be actively enforced (without one,
-            // `pool_idle_timeout` degrades to a lazy checkout-time check), and the default
-            // max-idle-per-host is unbounded — cap what a burst can strand.
-            Client::builder(TokioExecutor::new())
-                .pool_timer(TokioTimer::new())
-                .pool_idle_timeout(Duration::from_secs(90))
-                .pool_max_idle_per_host(32)
-                .build(upstream_connector()),
-        ),
+        clients: UpstreamClients::new(),
         alt_svc,
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),

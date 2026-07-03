@@ -111,6 +111,51 @@ pub(crate) fn build_server_configs(
     }))
 }
 
+/// Build the rustls `ClientConfig` for one `[upstream.tls]` entry (ADR 000042): server
+/// certificate verification is ALWAYS on — against the manifest's CA bundle when `ca_path` is
+/// set (replacing, not extending, the webpki roots: an internal-CA deployment trusts exactly its
+/// CA), else against the webpki (Mozilla) roots. ALPN is left unset here BY CONTRACT: the fast
+/// path's HTTPS connector owns it (hyper-rustls rejects a pre-populated list) and advertises
+/// `[h2, http/1.1]` — the negotiation result, not manifest config, selects the upstream protocol.
+/// Built at load/reload like the server configs above, so a bad CA fails the build closed.
+pub(crate) fn build_upstream_client_config(
+    upstream_name: &str,
+    tls: &crate::manifest::UpstreamTls,
+    base_dir: &Path,
+) -> Result<Arc<rustls::ClientConfig>, ControlError> {
+    let mut roots = rustls::RootCertStore::empty();
+    match &tls.ca_path {
+        Some(ca_path) => {
+            let err = |reason: String| ControlError::UpstreamTlsCa {
+                upstream: upstream_name.to_string(),
+                path: ca_path.clone(),
+                reason,
+            };
+            let bytes = std::fs::read(base_dir.join(ca_path))
+                .map_err(|e| err(format!("read failed: {e}")))?;
+            let certs = CertificateDer::pem_slice_iter(&bytes)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| err(format!("bad CA PEM: {e}")))?;
+            if certs.is_empty() {
+                return Err(err("no certificates in CA PEM".to_string()));
+            }
+            let (added, _ignored) = roots.add_parsable_certificates(certs);
+            if added == 0 {
+                return Err(err("no usable root certificate in CA PEM".to_string()));
+            }
+        }
+        None => {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(provider_init_err)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
 /// A rustls provider/version init failure (not a per-cert fault) mapped to a fail-closed error.
 fn provider_init_err(e: rustls::Error) -> ControlError {
     ControlError::TlsCert {

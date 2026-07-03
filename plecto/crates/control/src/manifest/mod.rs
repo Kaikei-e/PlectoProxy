@@ -103,20 +103,28 @@ pub struct TlsCert {
 }
 
 /// A named upstream the fast-path server forwards a matched request to (ADR 000013 / 000017).
-/// One or more `addresses` (plain `host:port`, no scheme; forwarded over plain HTTP/1.1) are the
-/// upstream's instances; the fast path balances across the healthy ones per `lb_algorithm`. Every
-/// upstream carries an active-health-check policy (`health`) — required, because instances start
-/// pessimistic (unhealthy) and only a passing probe puts one into rotation (ADR 000017).
+/// One or more `addresses` (`host:port`, no scheme) are the upstream's instances; the fast path
+/// balances across the healthy ones per `lb_algorithm`. The forward leg is plain HTTP/1.1 unless
+/// `[upstream.tls]` is declared, which re-encrypts with rustls and lets ALPN negotiate h2 /
+/// http/1.1 (ADR 000042). Every upstream carries an active-health-check policy (`health`) —
+/// required, because instances start pessimistic (unhealthy) and only a passing probe puts one
+/// into rotation (ADR 000017).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
-    /// Each backend instance's `host:port` (no scheme; plain HTTP/1.1). Each entry is either a bare
-    /// string (`"127.0.0.1:9000"`, weight 1) or a weighted inline table (`{ address = "...",
-    /// weight = N }`) for heterogeneous instances (ADR 000035). Must be non-empty (validated at
-    /// build). The two forms mix in one list; a bare string and an explicit `weight = 1` are
-    /// equivalent (same content hash).
+    /// Each backend instance's `host:port` (no scheme — `[upstream.tls]` decides the scheme for
+    /// the whole upstream, ADR 000042). Each entry is either a bare string (`"127.0.0.1:9000"`,
+    /// weight 1) or a weighted inline table (`{ address = "...", weight = N }`) for heterogeneous
+    /// instances (ADR 000035). Must be non-empty (validated at build). The two forms mix in one
+    /// list; a bare string and an explicit `weight = 1` are equivalent (same content hash).
     pub addresses: Vec<AddressSpec>,
+    /// `[upstream.tls]` (ADR 000042): when present, the forward leg to every instance re-encrypts
+    /// with TLS and ALPN negotiates the protocol (h2 preferred, http/1.1 fallback). Absent = plain
+    /// HTTP/1.1 (the pre-000042 behaviour). There is no insecure/verify-off escape hatch —
+    /// verification failure keeps the instance out of rotation (fail-closed).
+    #[serde(default)]
+    pub tls: Option<UpstreamTls>,
     /// Per-upstream load-balancing algorithm (ADR 000035): `round_robin` (default), `least_request`
     /// (power-of-two-choices over per-instance active requests), or `maglev` (consistent hashing for
     /// session affinity). The chosen algorithm selects an instance from the healthy set; default
@@ -162,6 +170,20 @@ pub struct Upstream {
     /// `0` = disabled (the default).
     #[serde(default)]
     pub outlier_detection: OutlierDetection,
+}
+
+/// Upstream TLS re-encryption config (`[upstream.tls]`, ADR 000042). Presence of the section
+/// enables TLS to every instance of the upstream; server certificate verification is ALWAYS on
+/// (no insecure option — custom CA covers the self-signed / internal-CA case, fail-closed).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTls {
+    /// Manifest-relative path to a PEM bundle of CA certificates that REPLACES the webpki
+    /// (Mozilla) roots for this upstream — the internal-CA / self-signed deployment shape.
+    /// `None` = verify against the webpki roots. Only the path rides the content hash, like
+    /// `[[tls]]` cert paths (ADR 000014).
+    #[serde(default)]
+    pub ca_path: Option<String>,
 }
 
 /// Per-upstream load-balancing algorithm (ADR 000035). `round_robin` is the default and keeps the

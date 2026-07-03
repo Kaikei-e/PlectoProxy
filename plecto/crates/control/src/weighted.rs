@@ -198,25 +198,29 @@ mod tests {
     /// (unhealthy); when `healthy` we promote it with a success probe so `has_eligible()` is true.
     fn group(name: &str, healthy: bool) -> Arc<UpstreamGroup> {
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[Upstream {
-            name: name.to_string(),
-            addresses: vec![AddressSpec::Bare("127.0.0.1:9000".to_string())],
-            lb_algorithm: LbAlgorithm::RoundRobin,
-            hash: None,
-            health: HealthConfig {
-                path: "/healthz".to_string(),
-                interval_ms: 1000,
-                timeout_ms: 500,
-                healthy_threshold: 1,
-                unhealthy_threshold: 1,
-                port: None,
-            },
-            request_timeout_ms: 30_000,
-            max_retries: 1,
-            overall_timeout_ms: 0,
-            circuit_breaker: CircuitBreaker::default(),
-            outlier_detection: OutlierDetection::default(),
-        }])
+        reg.reconcile(
+            &[Upstream {
+                name: name.to_string(),
+                addresses: vec![AddressSpec::Bare("127.0.0.1:9000".to_string())],
+                lb_algorithm: LbAlgorithm::RoundRobin,
+                hash: None,
+                tls: None,
+                health: HealthConfig {
+                    path: "/healthz".to_string(),
+                    interval_ms: 1000,
+                    timeout_ms: 500,
+                    healthy_threshold: 1,
+                    unhealthy_threshold: 1,
+                    port: None,
+                },
+                request_timeout_ms: 30_000,
+                max_retries: 1,
+                overall_timeout_ms: 0,
+                circuit_breaker: CircuitBreaker::default(),
+                outlier_detection: OutlierDetection::default(),
+            }],
+            std::path::Path::new("."),
+        )
         .unwrap();
         let g = reg.group(name).unwrap();
         if healthy {

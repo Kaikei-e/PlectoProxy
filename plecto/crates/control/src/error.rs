@@ -142,4 +142,15 @@ pub enum ControlError {
         path: String,
         reason: String,
     },
+
+    /// An `[upstream.tls]` CA bundle could not be read or parsed, or yielded no usable root
+    /// (ADR 000042). Fail-closed at build, like `TlsCert`: a bad CA path aborts the build /
+    /// reload before the upstream registry mutates, so the forward leg never silently falls
+    /// back to unverified (or plaintext) forwarding.
+    #[error("upstream {upstream:?} TLS CA ({path:?}): {reason}")]
+    UpstreamTlsCa {
+        upstream: String,
+        path: String,
+        reason: String,
+    },
 }

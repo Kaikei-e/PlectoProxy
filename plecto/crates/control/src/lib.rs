@@ -73,6 +73,9 @@ pub use ratelimit::RateLimitDecision;
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
 pub use route::{RouteInfo, normalize_path};
+/// The rustls TLS client config the fast path re-encrypts upstream forward legs with
+/// (ADR 000042), re-exported for the same reason as [`TlsServerConfig`].
+pub use rustls::ClientConfig as TlsClientConfig;
 /// The rustls TLS server config the fast path terminates with (ADR 000014), re-exported so
 /// `plecto-server` names the same `rustls` type the control plane built.
 pub use rustls::ServerConfig as TlsServerConfig;
@@ -430,7 +433,7 @@ fn build_active(
     // duplicate names / empty address lists and preserves health for unchanged `(name, address)`
     // instances across the reload. After it returns Ok the build is infallible, so a rejected
     // reload never leaves the registry reconciled to a manifest whose `active` was not swapped in.
-    registry.reconcile(&manifest.upstreams)?;
+    registry.reconcile(&manifest.upstreams, base_dir)?;
     let mut routes = Vec::with_capacity(validated_routes.len());
     for route::ValidatedRoute { route: r, targets } in validated_routes {
         // Resolve the route's forwarding targets (already validated above) to their upstream

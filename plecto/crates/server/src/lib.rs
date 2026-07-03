@@ -61,7 +61,7 @@ use plecto_control::Control;
 use tokio::sync::Semaphore;
 
 use crate::metrics::ServerMetrics;
-use crate::upstream_client::HyperUpstreamClient;
+use crate::upstream_client::UpstreamClients;
 
 pub use listener::{DEFAULT_DRAIN_DEADLINE, serve, serve_with_shutdown};
 
@@ -128,12 +128,14 @@ pub(crate) const MAX_CONNECTIONS: usize = 10_000;
 /// pin it explicitly.
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 100;
 
-/// Shared per-server state: the control plane (filters, routes, reload), the upstream client, and
+/// Shared per-server state: the control plane (filters, routes, reload), the upstream clients, and
 /// the `Alt-Svc` header value advertising HTTP/3 (ADR 000016) — `Some` only when a QUIC listener is
 /// bound, and added to TCP (HTTP/1.1 + HTTP/2) responses to steer capable clients to h3.
 pub(crate) struct ServerState {
     control: Arc<Control>,
-    client: HyperUpstreamClient,
+    /// Per-security-context upstream clients (ADR 000042): one plain HTTP/1.1 client plus one
+    /// pooled TLS client per distinct `[upstream.tls]` config.
+    clients: UpstreamClients,
     alt_svc: Option<HeaderValue>,
     /// Global connection cap across TCP + QUIC: a permit is held for each connection's
     /// lifetime, so the server never serves more than `MAX_CONNECTIONS` at once.
@@ -151,14 +153,17 @@ pub(crate) struct ServerState {
     otlp: Option<Arc<plecto_control::otlp::OtlpBuffer>>,
 }
 
-/// An upstream HTTP connector with `TCP_NODELAY` set. A proxy must disable Nagle on its upstream
+/// An upstream TCP connector with `TCP_NODELAY` set. A proxy must disable Nagle on its upstream
 /// sockets: with Nagle on, a streamed request body sent in several writes stalls ~40 ms on the
 /// peer's delayed-ACK timer (surfaced by the body benchmark as a p99 cliff on large streamed
 /// bodies). Disabling Nagle on proxy/upstream sockets is standard practice across mature L7 proxies.
-/// Both the forwarding client and the health prober use it.
+/// Both the forwarding clients and the health prober use it — plain, and wrapped by the rustls
+/// connector for a TLS upstream (ADR 000042), which is why `enforce_http` is off (the wrapping
+/// `HttpsConnector` dials `https://` URIs through it).
 pub(crate) fn upstream_connector() -> HttpConnector {
     let mut c = HttpConnector::new();
     c.set_nodelay(true);
+    c.enforce_http(false);
     c
 }
 

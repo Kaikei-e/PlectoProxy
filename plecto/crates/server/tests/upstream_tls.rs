@@ -234,8 +234,7 @@ async fn get_when_ready(proxy: SocketAddr, path: &str) -> (StatusCode, HeaderMap
 async fn reencrypts_to_a_tls_upstream_and_negotiates_h2_via_alpn() {
     let cert = make_cert();
     let upstream = spawn_tls_upstream(&cert).await;
-    let control =
-        loaded_control(&manifest_toml(upstream.port(), &cert.cert_pem_path, "")).unwrap();
+    let control = loaded_control(&manifest_toml(upstream.port(), &cert.cert_pem_path, "")).unwrap();
     let proxy = spawn_proxy(Arc::new(control)).await;
 
     let (status, headers, body) = get_when_ready(proxy, "/api/hello").await;

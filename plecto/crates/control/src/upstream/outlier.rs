@@ -101,25 +101,29 @@ mod tests {
         max_pct: u32,
     ) -> Arc<UpstreamGroup> {
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[Upstream {
-            name: "u".to_string(),
-            addresses: addrs
-                .iter()
-                .map(|s| AddressSpec::Bare(s.to_string()))
-                .collect(),
-            lb_algorithm: LbAlgorithm::RoundRobin,
-            hash: None,
-            health: health(1, 1),
-            request_timeout_ms: 30_000,
-            max_retries: 0,
-            overall_timeout_ms: 0,
-            circuit_breaker: CircuitBreaker::default(),
-            outlier_detection: OutlierDetection {
-                consecutive_gateway_failures: consecutive,
-                base_ejection_time_ms: base_ms,
-                max_ejection_percent: max_pct,
-            },
-        }])
+        reg.reconcile(
+            &[Upstream {
+                name: "u".to_string(),
+                addresses: addrs
+                    .iter()
+                    .map(|s| AddressSpec::Bare(s.to_string()))
+                    .collect(),
+                lb_algorithm: LbAlgorithm::RoundRobin,
+                hash: None,
+                tls: None,
+                health: health(1, 1),
+                request_timeout_ms: 30_000,
+                max_retries: 0,
+                overall_timeout_ms: 0,
+                circuit_breaker: CircuitBreaker::default(),
+                outlier_detection: OutlierDetection {
+                    consecutive_gateway_failures: consecutive,
+                    base_ejection_time_ms: base_ms,
+                    max_ejection_percent: max_pct,
+                },
+            }],
+            std::path::Path::new("."),
+        )
         .unwrap();
         let g = reg.group("u").unwrap();
         for inst in &g.instances {

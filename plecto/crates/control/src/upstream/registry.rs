@@ -2,6 +2,7 @@
 //! `ActiveConfig` so health state survives a reload.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,13 +30,16 @@ impl UpstreamRegistry {
     }
 
     /// Reconcile the registry to `upstreams` (ADR 000017). Validation (duplicate name, empty
-    /// addresses, and the LB config — ADR 000035) runs FIRST against the whole list, so a bad
-    /// manifest leaves the running set untouched (all-or-nothing, like the rest of a reload). Then,
-    /// per upstream: build a new group whose instances reuse the existing `Arc<UpstreamInstance>` for
-    /// any unchanged `(name, address, weight)` *when the health policy is unchanged* (preserving
-    /// health), create a fresh pessimistic instance otherwise, build the LB state (a Maglev upstream
-    /// recomputes its table from the instance set), and drop upstreams no longer present.
-    pub fn reconcile(&self, upstreams: &[Upstream]) -> Result<(), ControlError> {
+    /// addresses, the LB config — ADR 000035 — and the `[upstream.tls]` CA load, ADR 000042) runs
+    /// FIRST against the whole list, so a bad manifest leaves the running set untouched
+    /// (all-or-nothing, like the rest of a reload). Then, per upstream: build a new group whose
+    /// instances reuse the existing `Arc<UpstreamInstance>` for any unchanged `(name, address,
+    /// weight)` *when the health policy and `[upstream.tls]` are unchanged* (a TLS change makes
+    /// prior probe results meaningless, so it re-probes from pessimistic like a health-policy
+    /// change), create a fresh pessimistic instance otherwise, build the LB state (a Maglev
+    /// upstream recomputes its table from the instance set), and drop upstreams no longer present.
+    /// `base_dir` resolves each `[upstream.tls] ca_path`, like the `[[tls]]` cert paths.
+    pub fn reconcile(&self, upstreams: &[Upstream], base_dir: &Path) -> Result<(), ControlError> {
         let mut seen = HashSet::new();
         for up in upstreams {
             if up.addresses.is_empty() {
@@ -50,17 +54,43 @@ impl UpstreamRegistry {
                     reason,
                 })?;
         }
+        // Build (or reuse) each upstream's TLS client config (ADR 000042) BEFORE any mutation —
+        // a bad CA file aborts the whole reconcile fail-closed. Reusing the prior group's `Arc`
+        // when `[upstream.tls]` is unchanged keeps its identity stable across reloads, so the
+        // fast path's per-config connection pool (keyed on that identity) survives.
+        let mut tls_clients: Vec<Option<Arc<rustls::ClientConfig>>> =
+            Vec::with_capacity(upstreams.len());
+        for up in upstreams {
+            let client = match &up.tls {
+                None => None,
+                Some(tls) => {
+                    let prev = self.group(&up.name);
+                    let reusable = prev
+                        .as_ref()
+                        .filter(|g| g.tls_manifest.as_ref() == Some(tls))
+                        .and_then(|g| g.tls_client.clone());
+                    match reusable {
+                        Some(cfg) => Some(cfg),
+                        None => Some(crate::tls::build_upstream_client_config(
+                            &up.name, tls, base_dir,
+                        )?),
+                    }
+                }
+            };
+            tls_clients.push(client);
+        }
 
         let mut groups = self
             .groups
             .lock()
             .map_err(|_| ControlError::UpstreamRegistryPoisoned)?;
         let mut next: HashMap<String, Arc<UpstreamGroup>> = HashMap::with_capacity(upstreams.len());
-        for up in upstreams {
+        for (up, tls_client) in upstreams.iter().zip(tls_clients) {
             let prev_any = groups.get(&up.name);
-            // reuse the prior group's instances only if the health policy is identical; a policy
-            // change re-probes the upstream from pessimistic (so new thresholds actually apply).
-            let prev = prev_any.filter(|g| g.health == up.health);
+            // reuse the prior group's instances only if the health policy AND the TLS config are
+            // identical; a change re-probes the upstream from pessimistic (new thresholds apply /
+            // old probe results were for a different security context).
+            let prev = prev_any.filter(|g| g.health == up.health && g.tls_manifest == up.tls);
             let instances: Vec<Arc<UpstreamInstance>> = up
                 .addresses
                 .iter()
@@ -124,6 +154,8 @@ impl UpstreamRegistry {
                     outlier_max_ejection_percent: up.outlier_detection.max_ejection_percent,
                     lb,
                     hash_key,
+                    tls_manifest: up.tls.clone(),
+                    tls_client,
                 }),
             );
         }
@@ -170,6 +202,7 @@ mod tests {
                 .collect(),
             lb_algorithm: LbAlgorithm::RoundRobin,
             hash: None,
+            tls: None,
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
@@ -182,15 +215,21 @@ mod tests {
     #[test]
     fn reconcile_preserves_unchanged_adds_new_drops_removed() {
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream("u", &["a:1", "b:2"], health(1, 3))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1", "b:2"], health(1, 3))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g0 = reg.group("u").unwrap();
         g0.instances[0].record_probe_success(); // a:1 becomes healthy
         assert!(g0.instances[0].is_healthy());
 
         // reload: drop b:2, keep a:1, add c:3 — same health policy
-        reg.reconcile(&[upstream("u", &["a:1", "c:3"], health(1, 3))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1", "c:3"], health(1, 3))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g1 = reg.group("u").unwrap();
         assert_eq!(g1.instances.len(), 2);
         assert!(
@@ -207,33 +246,142 @@ mod tests {
     #[test]
     fn reconcile_changing_health_policy_reprobes_from_pessimistic() {
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream("u", &["a:1"], health(1, 3))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1"], health(1, 3))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         reg.group("u").unwrap().instances[0].record_probe_success();
         assert!(reg.group("u").unwrap().instances[0].is_healthy());
 
         // same address, different health policy → fresh pessimistic instance, new thresholds apply
-        reg.reconcile(&[upstream("u", &["a:1"], health(2, 5))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1"], health(2, 5))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         assert!(
             !reg.group("u").unwrap().instances[0].is_healthy(),
             "a health-policy change re-probes the instance from pessimistic"
         );
     }
 
+    /// A CA PEM written to a temp dir (rcgen self-signed acts as the root), for `[upstream.tls]`.
+    fn write_ca_pem(dir: &std::path::Path) -> String {
+        let generated = rcgen::generate_simple_self_signed(vec!["ca.example".to_string()]).unwrap();
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, generated.cert.pem()).unwrap();
+        "ca.pem".to_string()
+    }
+
+    #[test]
+    fn reconcile_keeps_the_tls_client_arc_across_an_unchanged_reload() {
+        // ADR 000042: while `[upstream.tls]` is unchanged, the ClientConfig Arc must be REUSED —
+        // the fast path keys its per-config connection pool on the Arc's identity, so a stable
+        // Arc means a reload never cold-starts upstream connections.
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = write_ca_pem(dir.path());
+        let mut up = upstream("u", &["a:1"], health(1, 3));
+        up.tls = Some(crate::manifest::UpstreamTls {
+            ca_path: Some(ca_path),
+        });
+
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(std::slice::from_ref(&up), dir.path())
+            .unwrap();
+        let g0 = reg.group("u").unwrap();
+        assert_eq!(
+            g0.scheme(),
+            "https",
+            "an [upstream.tls] group forwards https"
+        );
+        let cfg0 = g0
+            .tls_client_config()
+            .cloned()
+            .expect("a TLS client config");
+
+        reg.reconcile(std::slice::from_ref(&up), dir.path())
+            .unwrap();
+        let g1 = reg.group("u").unwrap();
+        let cfg1 = g1
+            .tls_client_config()
+            .cloned()
+            .expect("a TLS client config");
+        assert!(
+            Arc::ptr_eq(&cfg0, &cfg1),
+            "an unchanged [upstream.tls] must reuse the same ClientConfig Arc across reloads"
+        );
+    }
+
+    #[test]
+    fn reconcile_tls_change_reprobes_from_pessimistic() {
+        // A TLS on/off (or CA) change makes prior probe results meaningless — the instance must
+        // start pessimistic again, exactly like a health-policy change (ADR 000042 / 000017).
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = write_ca_pem(dir.path());
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[upstream("u", &["a:1"], health(1, 3))], dir.path())
+            .unwrap();
+        reg.group("u").unwrap().instances[0].record_probe_success();
+        assert!(reg.group("u").unwrap().instances[0].is_healthy());
+
+        let mut up = upstream("u", &["a:1"], health(1, 3));
+        up.tls = Some(crate::manifest::UpstreamTls {
+            ca_path: Some(ca_path),
+        });
+        reg.reconcile(&[up], dir.path()).unwrap();
+        assert!(
+            !reg.group("u").unwrap().instances[0].is_healthy(),
+            "enabling [upstream.tls] must re-probe the instance from pessimistic"
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_a_bad_ca_path_before_any_mutation() {
+        // Fail-closed all-or-nothing (ADR 000042): an unreadable CA aborts the reconcile BEFORE
+        // the registry mutates, so the running (healthy) set stays live on a bad reload.
+        let dir = tempfile::tempdir().unwrap();
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(&[upstream("u", &["a:1"], health(1, 3))], dir.path())
+            .unwrap();
+        reg.group("u").unwrap().instances[0].record_probe_success();
+
+        let mut up = upstream("u", &["a:1"], health(1, 3));
+        up.tls = Some(crate::manifest::UpstreamTls {
+            ca_path: Some("missing-ca.pem".to_string()),
+        });
+        let err = reg.reconcile(&[up], dir.path());
+        assert!(
+            matches!(err, Err(ControlError::UpstreamTlsCa { .. })),
+            "a missing CA file must be a typed fail-closed error"
+        );
+        let g = reg.group("u").unwrap();
+        assert_eq!(g.scheme(), "http", "the running group is untouched");
+        assert!(
+            g.instances[0].is_healthy(),
+            "the running instance keeps its health after the rejected reconcile"
+        );
+    }
+
     #[test]
     fn reconcile_rejects_empty_addresses_and_duplicate_names() {
         let reg = UpstreamRegistry::new();
-        let empty = reg.reconcile(&[upstream("u", &[], health(1, 1))]);
+        let empty = reg.reconcile(
+            &[upstream("u", &[], health(1, 1))],
+            std::path::Path::new("."),
+        );
         assert!(matches!(
             empty,
             Err(ControlError::EmptyUpstreamAddresses(_))
         ));
 
-        let dup = reg.reconcile(&[
-            upstream("u", &["a:1"], health(1, 1)),
-            upstream("u", &["b:2"], health(1, 1)),
-        ]);
+        let dup = reg.reconcile(
+            &[
+                upstream("u", &["a:1"], health(1, 1)),
+                upstream("u", &["b:2"], health(1, 1)),
+            ],
+            std::path::Path::new("."),
+        );
         assert!(matches!(dup, Err(ControlError::DuplicateUpstream(_))));
     }
 }

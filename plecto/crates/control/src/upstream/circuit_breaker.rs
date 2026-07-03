@@ -75,6 +75,7 @@ mod tests {
                 .collect(),
             lb_algorithm: LbAlgorithm::RoundRobin,
             hash: None,
+            tls: None,
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
@@ -89,18 +90,22 @@ mod tests {
         // ADR 000028: `max_requests` bounds concurrent in-flight forwards to an upstream. At the cap
         // `try_acquire` returns None (the fast path fails closed 503); dropping a permit frees a slot.
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[Upstream {
-            name: "u".to_string(),
-            addresses: vec![AddressSpec::Bare("a:1".to_string())],
-            lb_algorithm: LbAlgorithm::RoundRobin,
-            hash: None,
-            health: health(1, 1),
-            request_timeout_ms: 30_000,
-            max_retries: 0,
-            overall_timeout_ms: 0,
-            circuit_breaker: CircuitBreaker { max_requests: 2 },
-            outlier_detection: OutlierDetection::default(),
-        }])
+        reg.reconcile(
+            &[Upstream {
+                name: "u".to_string(),
+                addresses: vec![AddressSpec::Bare("a:1".to_string())],
+                lb_algorithm: LbAlgorithm::RoundRobin,
+                hash: None,
+                tls: None,
+                health: health(1, 1),
+                request_timeout_ms: 30_000,
+                max_retries: 0,
+                overall_timeout_ms: 0,
+                circuit_breaker: CircuitBreaker { max_requests: 2 },
+                outlier_detection: OutlierDetection::default(),
+            }],
+            std::path::Path::new("."),
+        )
         .unwrap();
         let g = reg.group("u").unwrap();
 
@@ -124,8 +129,11 @@ mod tests {
         // The default (`max_requests == 0`) never rejects — a zero-cost no-op permit, no cap. The
         // `upstream` helper leaves the breaker at its default, so this also covers the common config.
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream("u", &["a:1"], health(1, 1))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1"], health(1, 1))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g = reg.group("u").unwrap();
         let permits: Vec<_> = (0..1000)
             .map(|_| g.try_acquire().expect("an unlimited breaker never rejects"))

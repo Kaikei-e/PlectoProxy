@@ -56,6 +56,9 @@ signal-hook = "0.3"
 # uses rustls-pki-types' `pem` module (re-exported by rustls). No tokio — control stays sync; the
 # async acceptor lives in plecto-server.
 rustls = { workspace = true }
+# webpki-roots: the Mozilla root store the upstream TLS client (ADR 000042) verifies against when
+# no `[upstream.tls] ca_path` names an internal CA. Compiled-in (no OS cert-store I/O at runtime).
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 # this crate's own integration tests load real fixture components via plecto-host's test_support

@@ -50,6 +50,24 @@ fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
     named
 }
 
+/// Did the client's `TE` header ask for trailers (RFC 9110 §10.1.4)? Tokens may carry parameters
+/// or weights (`trailers`, `gzip;q=0.5`), so each comma-separated token is compared by its bare
+/// name. Used by the forward path (ADR 000042) to re-issue exactly `te: trailers` on an
+/// h2-capable upstream leg — the gRPC proxy-compat signal — while every other TE value stays
+/// stripped as hop-by-hop.
+pub(crate) fn te_requests_trailers(map: &hyper::HeaderMap) -> bool {
+    map.get_all(hyper::header::TE).iter().any(|value| {
+        value.to_str().is_ok_and(|s| {
+            s.split(',').any(|token| {
+                token
+                    .split(';')
+                    .next()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("trailers"))
+            })
+        })
+    })
+}
+
 /// Forwarding / client-IP headers a client could spoof: RFC 7239 `Forwarded`, the de-facto
 /// `X-Forwarded-*`, and the de-facto client-IP family that many backends and CDNs trust (nginx's
 /// `X-Real-IP`, Akamai/Cloudflare `True-Client-IP`, `CF-Connecting-IP`, `Fastly-Client-IP`,
@@ -313,6 +331,33 @@ mod tests {
         // a normal end-to-end header is not hop-by-hop.
         assert!(!is_hop_by_hop("x-api-key"));
         assert!(!is_hop_by_hop("content-type"));
+    }
+
+    #[test]
+    fn te_requests_trailers_matches_the_token_not_the_whole_value() {
+        // RFC 9110 §10.1.4: TE is a comma-separated list whose tokens may carry parameters.
+        // The forward path re-issues `te: trailers` only when the client actually asked for
+        // trailers (ADR 000042) — never for other transfer codings.
+        for value in [
+            "trailers",
+            "Trailers",
+            "gzip, trailers",
+            "trailers;q=1",
+            "gzip;q=0.5, trailers",
+        ] {
+            let mut map = hyper::HeaderMap::new();
+            map.insert(hyper::header::TE, HeaderValue::from_str(value).unwrap());
+            assert!(te_requests_trailers(&map), "{value:?} requests trailers");
+        }
+        for value in ["gzip", "compress, deflate", "trailersx"] {
+            let mut map = hyper::HeaderMap::new();
+            map.insert(hyper::header::TE, HeaderValue::from_str(value).unwrap());
+            assert!(!te_requests_trailers(&map), "{value:?} must not match");
+        }
+        assert!(
+            !te_requests_trailers(&hyper::HeaderMap::new()),
+            "no TE header, no trailers request"
+        );
     }
 
     #[test]

@@ -318,8 +318,11 @@ async fn proxy_core_inner(
         upstream_path: &upstream_path,
         traceparent: &snapshot.traceparent(),
     };
+    // The client for this group's security context (ADR 000042): the shared plain client, or the
+    // pooled TLS client for its `[upstream.tls]` config. A cheap clone (shared pool inside).
+    let client = state.clients.for_group(&group);
     let upstream_resp = match forward_with_retry(
-        &state.client,
+        &client,
         &state.metrics,
         &group,
         pick,

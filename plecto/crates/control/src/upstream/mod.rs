@@ -95,6 +95,14 @@ pub struct UpstreamGroup {
     /// The request attribute a `Maglev` upstream hashes for affinity (ADR 000035); `None` for the
     /// other algorithms. The fast path reads this to project the hash key from a request.
     hash_key: Option<HashKeySource>,
+    /// The `[upstream.tls]` section this group was reconciled from (ADR 000042), kept for the
+    /// reuse comparison on reload: an unchanged section reuses `tls_client` (stable `Arc`, so the
+    /// fast path's per-config connection pool survives the reload), a changed one rebuilds it.
+    tls_manifest: Option<crate::manifest::UpstreamTls>,
+    /// The rustls client config the fast path re-encrypts this upstream's forward leg with
+    /// (ADR 000042): roots per `ca_path` (or webpki), ALPN `[h2, http/1.1]`. `None` = plain
+    /// HTTP/1.1. Built fail-closed at reconcile, like the server-side TLS configs.
+    tls_client: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl UpstreamGroup {
@@ -122,6 +130,23 @@ impl UpstreamGroup {
     /// The fast path reads this to project a [`HashInput`] from the request.
     pub fn hash_key_source(&self) -> Option<&HashKeySource> {
         self.hash_key.as_ref()
+    }
+
+    /// The scheme the fast path forwards (and health-probes) this upstream with (ADR 000042):
+    /// `https` when `[upstream.tls]` is declared, else `http`.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls_client.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    /// The rustls client config for this upstream's TLS forward leg (ADR 000042), or `None` for
+    /// plain HTTP/1.1. The `Arc` is stable across reloads while `[upstream.tls]` is unchanged, so
+    /// the fast path can key its per-config connection pool on the `Arc`'s identity.
+    pub fn tls_client_config(&self) -> Option<&Arc<rustls::ClientConfig>> {
+        self.tls_client.as_ref()
     }
 }
 

@@ -320,6 +320,7 @@ mod tests {
                 .collect(),
             lb_algorithm: LbAlgorithm::RoundRobin,
             hash: None,
+            tls: None,
             health: h,
             request_timeout_ms: 30_000,
             max_retries: 1,
@@ -339,11 +340,14 @@ mod tests {
         // ADR 000023: a retry must land on a DIFFERENT instance; when the failed one is the only
         // healthy member there is nothing to retry onto.
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream(
-            "pool",
-            &["127.0.0.1:9000", "127.0.0.1:9001"],
-            health(1, 3),
-        )])
+        reg.reconcile(
+            &[upstream(
+                "pool",
+                &["127.0.0.1:9000", "127.0.0.1:9001"],
+                health(1, 3),
+            )],
+            std::path::Path::new("."),
+        )
         .unwrap();
         let group = reg.group("pool").unwrap();
         // promote both (cold-start: one success each).
@@ -373,8 +377,11 @@ mod tests {
     #[test]
     fn round_robin_distributes_over_healthy_only() {
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 1))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1", "b:2", "c:3"], health(1, 1))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g = reg.group("u").unwrap();
 
         assert!(
@@ -403,8 +410,11 @@ mod tests {
         // The old forward-scan-from-cursor handed the dead instance's slot to its neighbour, so
         // `[a, b(down), c]` skewed a:c to ~1:2. Rotating over the healthy SET removes that.
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 1))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1", "b:2", "c:3"], health(1, 1))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g = reg.group("u").unwrap();
         g.instances[0].record_probe_success(); // a:1 healthy
         g.instances[2].record_probe_success(); // c:3 healthy, b:2 stays ejected
@@ -429,8 +439,11 @@ mod tests {
         // A reload must not reset the cursor to 0, or the first post-reload pick always lands on
         // the head of the rotation — an index-0 bias under frequent reloads.
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g0 = reg.group("u").unwrap();
         for i in 0..3 {
             g0.instances[i].record_probe_success(); // all three healthy
@@ -440,8 +453,11 @@ mod tests {
         assert_eq!(g0.pick(None).unwrap().address(), "b:2");
 
         // reload with the SAME upstream + health policy → instances and health are preserved
-        reg.reconcile(&[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))])
-            .unwrap();
+        reg.reconcile(
+            &[upstream("u", &["a:1", "b:2", "c:3"], health(1, 3))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let g1 = reg.group("u").unwrap();
         assert!(
             g1.instances.iter().all(|i| i.is_healthy()),
@@ -461,18 +477,22 @@ mod tests {
         hash: Option<HashConfig>,
     ) -> Arc<UpstreamGroup> {
         let reg = UpstreamRegistry::new();
-        reg.reconcile(&[Upstream {
-            name: "u".to_string(),
-            addresses,
-            lb_algorithm: algo,
-            hash,
-            health: health(1, 1),
-            request_timeout_ms: 30_000,
-            max_retries: 0,
-            overall_timeout_ms: 0,
-            circuit_breaker: CircuitBreaker::default(),
-            outlier_detection: OutlierDetection::default(),
-        }])
+        reg.reconcile(
+            &[Upstream {
+                name: "u".to_string(),
+                addresses,
+                lb_algorithm: algo,
+                hash,
+                tls: None,
+                health: health(1, 1),
+                request_timeout_ms: 30_000,
+                max_retries: 0,
+                overall_timeout_ms: 0,
+                circuit_breaker: CircuitBreaker::default(),
+                outlier_detection: OutlierDetection::default(),
+            }],
+            std::path::Path::new("."),
+        )
         .unwrap();
         let g = reg.group("u").unwrap();
         for inst in &g.instances {

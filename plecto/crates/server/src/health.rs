@@ -5,31 +5,28 @@
 //! instance task lifecycle to manage — and probes every instance whose `interval_ms` has elapsed. A
 //! brand-new instance (not yet seen) is probed immediately: that cold-start fast probe, with the
 //! first-success-promotes rule (ADR 000017), shrinks the pessimistic startup window to ~one probe
-//! RTT. Probes run on plain HTTP/1.1 (upstream TLS is deferred); each runs on its own task so a slow
-//! or timing-out probe never stalls the others.
+//! RTT. Probes follow the upstream's scheme (ADR 000042): plain HTTP/1.1, or TLS with the same
+//! verification the forward leg uses — so an upstream whose certificate cannot be verified never
+//! enters rotation (fail-closed). Each probe runs on its own task so a slow or timing-out probe
+//! never stalls the others.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use http_body_util::Empty;
 use hyper::Request;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 use plecto_control::{Control, HealthConfig, UpstreamInstance};
 
-use crate::upstream_connector;
+use crate::upstream_client::{HyperUpstreamClient, UpstreamClient, UpstreamClients};
 
 /// Run the health-check supervisor until the server stops (ADR 000017). Drives `GET {health.path}`
 /// to each upstream instance on its configured interval and feeds the result into the instance's
 /// shared health state, which `proxy_core`'s round-robin then reads.
 pub(crate) async fn serve_health_checks(control: Arc<Control>) {
-    // a dedicated plain-HTTP/1.1 client for probes (empty body), separate from the request path.
-    let client: Client<HttpConnector, Empty<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(upstream_connector());
+    // Dedicated per-scheme probe clients (empty bodies), separate from the request path's pools —
+    // a probe should validate the upstream, not ride (or disturb) a live traffic connection pool.
+    let clients = UpstreamClients::new();
     // per-(upstream, address) last-probe instant, so each instance is probed on ITS interval even
     // though one task drives them all. An instance not yet in the map is probed now (cold start).
     let mut last: HashMap<(String, String), Instant> = HashMap::new();
@@ -49,10 +46,13 @@ pub(crate) async fn serve_health_checks(control: Arc<Control>) {
                     .is_none_or(|t| now.duration_since(*t) >= interval);
                 if due {
                     last.insert(key.clone(), now);
-                    let client = client.clone();
+                    // The probe client matches the group's security context (ADR 000042): the
+                    // shared plain client, or the TLS client for its `[upstream.tls]` config.
+                    let client = clients.for_group(g);
+                    let scheme = g.scheme();
                     let inst = inst.clone();
                     let health = g.health.clone();
-                    tokio::spawn(async move { probe_once(&client, &health, &inst).await });
+                    tokio::spawn(async move { probe_once(&client, scheme, &health, &inst).await });
                 }
                 live.insert(key);
             }
@@ -63,23 +63,26 @@ pub(crate) async fn serve_health_checks(control: Arc<Control>) {
     }
 }
 
-/// Probe one instance once: `GET {health.path}` bounded by `timeout_ms`. A 2xx is a success; a
-/// non-2xx, a timeout, or a connect/transport error is a failure. Never panics (data-plane
-/// discipline) — a malformed address/path is simply a failed probe.
+/// Probe one instance once: `GET {health.path}` over the group's scheme (ADR 000042), bounded by
+/// `timeout_ms`. A 2xx is a success; a non-2xx, a timeout, or a connect/transport/TLS-verification
+/// error is a failure. Never panics (data-plane discipline) — a malformed address/path is simply a
+/// failed probe.
 async fn probe_once(
-    client: &Client<HttpConnector, Empty<Bytes>>,
+    client: &HyperUpstreamClient,
+    scheme: &str,
     health: &HealthConfig,
     inst: &UpstreamInstance,
 ) {
     let uri = format!(
-        "http://{}{}",
+        "{}://{}{}",
+        scheme,
         probe_address(inst.address(), health.port),
         health.path
     );
     let req = match Request::builder()
         .method("GET")
         .uri(&uri)
-        .body(Empty::<Bytes>::new())
+        .body(crate::body::empty_req())
     {
         Ok(req) => req,
         Err(_) => {

@@ -74,7 +74,14 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
         } else {
             body.take().unwrap_or_else(crate::body::empty_req)
         };
-        let uri = format!("http://{}{}", pick.address(), forward.upstream_path);
+        // The scheme is the GROUP's (ADR 000042): `https` re-encrypts via the TLS client the
+        // caller selected for this group, `http` keeps the plain pre-000042 leg.
+        let uri = format!(
+            "{}://{}{}",
+            group.scheme(),
+            pick.address(),
+            forward.upstream_path
+        );
         let mut builder = Request::builder().method(forward.method).uri(uri);
         copy_headers_preserving(
             builder.headers_mut(),
@@ -85,6 +92,18 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
             && let Ok(v) = HeaderValue::from_str(forward.traceparent)
         {
             h.insert("traceparent", v);
+        }
+        // TE: trailers pass-through (ADR 000042): on a TLS (h2-capable) leg, re-issue exactly
+        // `te: trailers` when the CLIENT asked for trailers — gRPC uses it to detect incompatible
+        // proxies (RFC 9113 §8.2.2 allows TE in h2 only with this value). The general hop-by-hop
+        // strip removed the inbound header, so this is a controlled re-issue, never a forward of
+        // arbitrary TE values; an `http` (h1-only) leg keeps stripping it, so a gRPC call to an
+        // h1 upstream fails visibly rather than half-working without trailers.
+        if group.scheme() == "https"
+            && crate::headers::te_requests_trailers(forward.original_headers)
+            && let Some(h) = builder.headers_mut()
+        {
+            h.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
         }
         let upstream_req = match builder.body(attempt_body) {
             Ok(req) => req,
@@ -219,7 +238,9 @@ mod tests {
         );
         let manifest = plecto_control::Manifest::from_toml(&toml).unwrap();
         let registry = plecto_control::UpstreamRegistry::new();
-        registry.reconcile(&manifest.upstreams).unwrap();
+        registry
+            .reconcile(&manifest.upstreams, std::path::Path::new("."))
+            .unwrap();
         let group = registry.group("test").unwrap();
         for inst in &group.instances {
             inst.record_probe_success();

@@ -254,7 +254,7 @@ cargo run -p plecto-server --example <name>   # or drive it yourself, Ctrl-C to 
 | `resilience` | Per-try timeout+retry, circuit breaker, outlier ejection — all visible from curl. |
 | `production` | The real `plecto` binary serving a full deploy dir, two terminals. |
 
-The benchmark harnesses (`wasm-bench`, `edge-bench`) are not demos — they live under [`bench/harnesses/`](bench/) and produce the numbers in [performance](performance/README.md).
+The benchmark harnesses (`bench-server`, `swap-bench`) are not demos — they live under [`bench/harnesses/`](bench/) and produce the numbers in [performance](performance/README.md).
 
 ## Roadmap
 

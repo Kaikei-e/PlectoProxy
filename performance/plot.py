@@ -8,12 +8,15 @@ Covers both planes documented in README.md:
     * latency_vs_concurrency.webp     — p50/p95/p99 vs VUs (log y)
     * rr_distribution.webp            — per-instance share under steady load
     * ejection_timeline.webp          — per-upstream traffic + 503/s over the fault run
+    * swap_timeline.webp              — per-instance traffic over an endpoint-set swap (ADR 000044)
+    * ceiling.webp                    — plain h1 keep-alive vs cold-connection throughput & p99
     * tls_vs_plain.webp               — TLS(h2) vs plain(h1) throughput & p99
 
   WASM extension plane
     * wasm_throughput.webp            — req/s by decision path (baseline/pooled/on-demand)
     * wasm_latency.webp               — per-request latency by decision path (log y)
     * wasm_shortcircuit.webp          — accept vs reject latency (short-circuit 401)
+    * ws_echo.webp                    — WebSocket echo throughput & latency vs message size (ADR 000048)
 
 Each figure is guarded — a missing CSV just skips it.
 
@@ -143,6 +146,44 @@ def ejection_timeline() -> None:
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
     ax.grid(axis="y", alpha=0.25)
     _save(fig, "ejection_timeline.webp")
+
+
+def swap_timeline() -> None:
+    # Unlike ejection's fixed a/b/c, a swap's label SET can change mid-run (c retires, d appears),
+    # so the instance columns are whatever swap.csv actually has (every column but t/failed).
+    rows = _read(DATA / "swap.csv")
+    if not rows:
+        raise FileNotFoundError("swap.csv is empty")
+    t = [int(r["t"]) for r in rows]
+    labels = [k for k in rows[0].keys() if k not in ("t", "failed")]
+    palette = [C_A, C_B, C_C, "#8E5CB0", "#4FA8A0"]
+    series = [[float(r[label]) for r in rows] for label in labels]
+    failed = [float(r["failed"]) for r in rows]
+
+    events = []
+    epath = DATA / "swap_events.csv"
+    if epath.exists():
+        events = [(int(r["t"]), r["label"]) for r in _read(epath)]
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.6))
+    ax.stackplot(t, *series, labels=[f"instance {l}" for l in labels],
+                 colors=palette[: len(labels)], alpha=0.9)
+    ax.plot(t, failed, color=C_FAIL, lw=2.2, label="failed / s")
+
+    top = max(max(sum(s[i] for s in series), failed[i]) for i in range(len(t))) if t else 1
+    for xt, lbl in events:
+        ax.axvline(xt, color="#444", ls="--", lw=1, alpha=0.6)
+        ax.text(xt + 0.4, top * 0.97, lbl, rotation=90, va="top", ha="left",
+                fontsize=7, color="#333")
+
+    ax.set_xlim(min(t), max(t))
+    ax.set_ylim(0, top * 1.08)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("requests / second")
+    ax.set_title("Endpoint-set swap under load (ADR 000044) — per-instance traffic & failures")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    ax.grid(axis="y", alpha=0.25)
+    _save(fig, "swap_timeline.webp")
 
 
 def tls_vs_plain() -> None:
@@ -337,9 +378,9 @@ def body_hook() -> None:
     _save(fig, "body.webp")
 
 
-# ------------------------------------------------------- connection churn
-def churn() -> None:
-    rows = {r["variant"]: r for r in _read(DATA / "churn.csv")}
+# ------------------------------------------------------- plain h1 ceiling (formerly "churn")
+def ceiling() -> None:
+    rows = {r["variant"]: r for r in _read(DATA / "ceiling.csv")}
     order = [("keep-alive", C_A), ("cold (TCP/req)", C_FAIL)]
     labels = [v for v, _ in order if v in rows]
     colors = [c for v, c in order if v in rows]
@@ -358,17 +399,45 @@ def churn() -> None:
     ax2.set_title("Tail latency")
     ax2.set_ylim(0, max(p99) * 1.18)
     ax2.grid(axis="y", alpha=0.3)
-    fig.suptitle("Connection churn: a TCP handshake per request vs a kept-alive connection",
+    fig.suptitle("Plain HTTP/1.1 ceiling: a TCP handshake per request vs a kept-alive connection",
                  fontsize=11)
     fig.tight_layout()
-    _save(fig, "churn.webp")
+    _save(fig, "ceiling.webp")
+
+
+# ------------------------------------------------------- WebSocket Upgrade tunnel (ADR 000048)
+def ws_echo() -> None:
+    rows = sorted(_read(DATA / "ws_echo.csv"), key=lambda r: int(r["size_bytes"]))
+    sizes = [int(r["size_bytes"]) for r in rows]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.0, 4.0))
+
+    mps = [float(r["messages_per_sec"]) for r in rows]
+    b1 = ax1.bar([f"{s // 1024}K" for s in sizes], mps, color=C_C, width=0.55)
+    ax1.bar_label(b1, fmt="%d", padding=3, fontsize=9)
+    ax1.set_ylabel("messages / second")
+    ax1.set_title("Echo throughput")
+    ax1.set_ylim(0, max(mps) * 1.18)
+    ax1.grid(axis="y", alpha=0.3)
+
+    p99 = [float(r["p99_ms"]) for r in rows]
+    b2 = ax2.bar([f"{s // 1024}K" for s in sizes], p99, color=C_B, width=0.55)
+    ax2.bar_label(b2, fmt="%.2f", padding=3, fontsize=9)
+    ax2.set_ylabel("p99 round-trip latency (ms)")
+    ax2.set_title("Tail latency")
+    ax2.set_ylim(0, max(p99) * 1.18)
+    ax2.grid(axis="y", alpha=0.3)
+
+    fig.suptitle("WebSocket Upgrade tunnel (ADR 000048): sustained echo, per-connection closed-loop",
+                 fontsize=10)
+    fig.tight_layout()
+    _save(fig, "ws_echo.webp")
 
 
 def main() -> None:
     figs = (throughput_vs_concurrency, latency_vs_concurrency, rr_distribution,
-            ejection_timeline, tls_vs_plain,
+            ejection_timeline, swap_timeline, ceiling, tls_vs_plain,
             wasm_throughput, wasm_latency, wasm_shortcircuit,
-            ratelimit_overhead, ratelimit_enforce, ratelimit_fairness, body_hook, churn)
+            ratelimit_overhead, ratelimit_enforce, ratelimit_fairness, body_hook, ws_echo)
     for fn in figs:
         try:
             fn()

@@ -17,7 +17,7 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::EpochTicker;
+use crate::engine::EpochTicker;
 
 mod bindings {
     wasmtime::component::bindgen!({

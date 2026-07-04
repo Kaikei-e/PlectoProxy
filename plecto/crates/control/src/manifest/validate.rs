@@ -246,3 +246,128 @@ impl FilterEntry {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{IsolationKind, RateLimitConfig};
+
+    #[test]
+    fn is_prime_is_correct() {
+        for p in [2u32, 3, 5, 97, 1009, 65537, 5_000_011] {
+            assert!(is_prime(p), "{p} is prime");
+        }
+        for c in [0u32, 1, 4, 9, 100, 1000, 65536] {
+            assert!(!is_prime(c), "{c} is not prime");
+        }
+    }
+
+    #[test]
+    fn invalid_filter_metering_is_rejected() {
+        // out-of-range metering / rate-limit values are rejected fail-closed at build.
+        let base = FilterEntry {
+            id: "x".to_string(),
+            source: "s".to_string(),
+            digest: "sha256:abc".to_string(),
+            isolation: IsolationKind::Untrusted,
+            init_deadline_ms: None,
+            request_deadline_ms: None,
+            max_memory_bytes: None,
+            ratelimit: None,
+            outbound: None,
+        };
+        assert!(base.validate().is_ok(), "defaults are valid");
+
+        assert!(
+            FilterEntry {
+                request_deadline_ms: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .is_err(),
+            "a zero request deadline is rejected"
+        );
+        assert!(
+            FilterEntry {
+                max_memory_bytes: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .is_err(),
+            "a zero memory cap is rejected"
+        );
+        assert!(
+            FilterEntry {
+                ratelimit: Some(RateLimitConfig {
+                    capacity: 10,
+                    refill_tokens: 1,
+                    refill_interval_ms: 0,
+                }),
+                ..base.clone()
+            }
+            .validate()
+            .is_err(),
+            "a refilling bucket with a zero interval is rejected"
+        );
+        assert!(
+            FilterEntry {
+                ratelimit: Some(RateLimitConfig {
+                    capacity: 10,
+                    refill_tokens: 0,
+                    refill_interval_ms: 0,
+                }),
+                ..base.clone()
+            }
+            .validate()
+            .is_ok(),
+            "a one-shot (no-refill) bucket is valid"
+        );
+    }
+
+    #[test]
+    fn invalid_state_config_is_rejected() {
+        // redb without a path (nowhere to persist) and memory with one (the operator likely
+        // meant redb) are both fail-closed at build — a half-set [state] must never silently
+        // run on memory.
+        assert!(
+            State {
+                backend: StateBackendKind::Redb,
+                path: Some("s.redb".into()),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            State::default().validate().is_ok(),
+            "absent [state] is valid (memory)"
+        );
+
+        assert!(
+            State {
+                backend: StateBackendKind::Redb,
+                path: None,
+            }
+            .validate()
+            .is_err(),
+            "redb without a path is rejected"
+        );
+        assert!(
+            State {
+                backend: StateBackendKind::Redb,
+                path: Some("  ".into()),
+            }
+            .validate()
+            .is_err(),
+            "redb with a blank path is rejected"
+        );
+        assert!(
+            State {
+                backend: StateBackendKind::Memory,
+                path: Some("s.redb".into()),
+            }
+            .validate()
+            .is_err(),
+            "memory with a path is rejected (the operator likely meant redb)"
+        );
+    }
+}

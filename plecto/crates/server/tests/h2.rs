@@ -20,7 +20,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
@@ -157,7 +157,7 @@ async fn drive_h2(
 ) -> H2Result {
     let mut roots = RootCertStore::empty();
     roots.add(root).unwrap();
-    let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let mut config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)

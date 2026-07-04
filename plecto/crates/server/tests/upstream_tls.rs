@@ -24,7 +24,7 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore};
@@ -90,7 +90,7 @@ impl hyper::body::Body for TrailersBody {
 /// (`grpc-status: 0`) so the pass-through can be asserted end-to-end.
 async fn spawn_tls_upstream(cert: &TestCert) -> SocketAddr {
     let mut config = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
-        ring::default_provider(),
+        aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()
@@ -295,7 +295,7 @@ async fn te_trailers_and_response_trailers_pass_through_on_the_h2_path() {
     // h2 client over TLS to the proxy (trailers need h2 on the downstream leg too).
     let mut roots = RootCertStore::empty();
     roots.add(downstream_cert.cert_der.clone()).unwrap();
-    let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let mut config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)

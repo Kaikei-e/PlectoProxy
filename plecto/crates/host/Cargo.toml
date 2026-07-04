@@ -72,8 +72,8 @@ ipnet = { workspace = true, optional = true }
 # ADR 000006 / 000036). The default build keeps the no-reactor pollster executor.
 tokio = { version = "1", optional = true, features = ["rt", "net", "time", "io-util", "macros", "sync"] }
 # outbound-http only: the SSRF-guarded connector we own instead of wasi-http's default one — hyper
-# client + rustls (ring, matching the workspace TLS stack) + webpki roots + body-size capping. All
-# optional; the default build links none of them.
+# client + rustls (aws_lc_rs, matching the workspace TLS stack, ADR 000051) + webpki roots +
+# body-size capping. All optional; the default build links none of them.
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }

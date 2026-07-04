@@ -126,7 +126,7 @@ tracing-subscriber = { workspace = true }
 tokio-rustls = { workspace = true }
 # hyper-rustls: the upstream HTTPS connector (ADR 000042). Re-encrypts the forward leg with the
 # ClientConfig control built (custom CA / webpki roots) and reports the ALPN result to the legacy
-# client's pool, so h2 upstreams multiplex automatically. ring provider, no aws-lc-rs/cmake.
+# client's pool, so h2 upstreams multiplex automatically. aws_lc_rs provider (ADR 000051).
 hyper-rustls = { workspace = true }
 # parking_lot: the non-poisoning read-mostly lock over the per-`[upstream.tls]`-config client
 # registry (ADR 000042) — same no-poison rationale as the rest of the workspace.

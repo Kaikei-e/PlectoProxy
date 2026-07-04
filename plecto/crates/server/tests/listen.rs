@@ -21,7 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore};
 use plecto_host::test_support::TestSigner;
@@ -146,7 +146,7 @@ async fn alt_svc_advertises_the_configured_port_override() {
     // HTTPS GET; the route 503s (dead upstream) but the Alt-Svc header is attached regardless.
     let mut roots = RootCertStore::empty();
     roots.add(generated.cert.der().clone()).unwrap();
-    let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)

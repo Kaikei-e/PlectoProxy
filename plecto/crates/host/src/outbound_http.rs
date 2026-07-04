@@ -338,8 +338,9 @@ where
 }
 
 /// Build a TLS stream to the pinned TCP socket, validating the certificate against the ORIGINAL
-/// hostname (SNI = `host`), not the pinned IP. Uses the workspace's ring provider explicitly, since
-/// with both ring and aws-lc-rs linked there is no single process-default provider.
+/// hostname (SNI = `host`), not the pinned IP. Uses the workspace's `aws_lc_rs` provider explicitly
+/// (ADR 000051) — the same backend as the control-plane TLS stack, so the binary links a single
+/// crypto provider instead of `ring` alongside the `sigstore` dependency's own aws-lc-rs.
 async fn tls_connect(
     host: &str,
     tcp: TcpStream,
@@ -356,7 +357,7 @@ async fn tls_connect(
         .map_err(|_| ErrorCode::TlsProtocolError)
 }
 
-/// A process-wide rustls client config (webpki roots, ring provider), built once.
+/// A process-wide rustls client config (webpki roots, aws_lc_rs provider), built once.
 fn client_config() -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
     static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     if let Some(cfg) = CFG.get() {
@@ -365,7 +366,7 @@ fn client_config() -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|_| ErrorCode::TlsProtocolError)?

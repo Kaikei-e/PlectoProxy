@@ -3,15 +3,16 @@
 //! host-less default; if neither matches, the handshake is refused (no cert to present), which is
 //! fail-closed. Building here (not in the server) means a bad cert aborts the whole build, so a
 //! failed reload never swaps in a TLS config that cannot serve, and the config rides `ActiveConfig`
-//! behind the same `ArcSwap` as the filter set. Sync rustls + the `ring` provider; the async
-//! acceptor lives in `plecto-server`.
+//! behind the same `ArcSwap` as the filter set. Sync rustls + the `aws_lc_rs` provider (ADR
+//! 000051 — one crypto backend shared with the QUIC config and the host's `sigstore` dependency);
+//! the async acceptor lives in `plecto-server`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use rustls::ServerConfig;
-use rustls::crypto::ring;
+use rustls::crypto::aws_lc_rs as provider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -87,7 +88,7 @@ pub(crate) fn build_server_configs(
     let resolver = Arc::new(SniResolver { by_host, default });
 
     // TCP: HTTP/1.1 + HTTP/2 via ALPN (h2 preferred, ADR 000015), TLS 1.2 + 1.3.
-    let mut tcp = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let mut tcp = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(provider_init_err)?
         .with_no_client_auth()
@@ -98,7 +99,7 @@ pub(crate) fn build_server_configs(
     // is left at its default 0, so the server refuses TLS early data. A gateway must not forward
     // early-data requests to upstreams that may not emit 425 (Too Early) (RFC 8470), so refusing it
     // outright is the only safe choice here.
-    let mut quic = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let mut quic = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(provider_init_err)?
         .with_no_client_auth()
@@ -148,11 +149,12 @@ pub(crate) fn build_upstream_client_config(
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(provider_init_err)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config =
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(provider_init_err)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     Ok(Arc::new(config))
 }
 
@@ -172,14 +174,15 @@ fn load_certified_key(entry: &TlsCert, base_dir: &Path) -> Result<CertifiedKey, 
         return Err(tls_err(entry, "no certificates in cert_path PEM"));
     }
     let key = read_key(entry, base_dir)?;
-    let signing_key = ring::sign::any_supported_type(&key)
+    let signing_key = provider::sign::any_supported_type(&key)
         .map_err(|e| tls_err(entry, &format!("unsupported private key: {e}")))?;
     let certified = CertifiedKey::new(cert_chain, signing_key);
     // `CertifiedKey::new` does NOT verify the private key matches the leaf certificate, so a
     // mismatched cert/key pair would build successfully and then fail EVERY TLS handshake at
     // runtime — contradicting this module's fail-closed-at-build contract. Verify here. `Unknown`
     // (the provider can't expose the key's SPKI) is not a mismatch — accept it, mirroring rustls'
-    // own `CertifiedKey::from_der`. The `ring` provider does expose it, so a real mismatch is caught.
+    // own `CertifiedKey::from_der`. The `aws_lc_rs` provider does expose it, so a real mismatch is
+    // caught.
     match certified.keys_match() {
         Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
         Err(e) => return Err(tls_err(entry, &format!("cert/key mismatch: {e}"))),

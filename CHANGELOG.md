@@ -18,6 +18,24 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-04
+
+### Added
+
+- `[upstream.tls] sni` (ADR 000050): pins the TLS verification name for a forwarded upstream leg
+  independently of the connected address — closes the gap where an IP-literal or DNS-expanded
+  (`resolve_interval_ms`, ADR 000044) upstream address sends no SNI and is verified against the
+  bare IP, which fails unless the certificate carries an IP SAN. `plecto validate` warns (never
+  rejects) when `sni` is absent on an upstream that may resolve to a bare IP.
+
+### Changed
+
+- TLS crypto provider consolidated on `aws-lc-rs` (ADR 000051), replacing `ring`, across
+  downstream TLS termination, upstream re-encryption, and QUIC/HTTP-3. `sigstore` (cosign
+  signature verification, ADR 000006 / 000047) already links aws-lc-rs unconditionally, so this
+  removes a second crypto backend rather than adding a new dependency, and gets X25519MLKEM768
+  preferred by default (rustls `prefer-post-quantum`) on both the TCP and QUIC paths.
+
 ## [0.1.0] - 2026-07-03
 
 The first tagged release. Everything below ships in `v0.1.0`; the highlights of the

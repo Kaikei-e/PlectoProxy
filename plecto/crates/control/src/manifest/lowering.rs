@@ -53,3 +53,46 @@ impl FilterEntry {
         opts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::RateLimitConfig;
+
+    #[test]
+    fn load_options_maps_isolation_and_overrides() {
+        let entry = FilterEntry {
+            id: "x".to_string(),
+            source: "s".to_string(),
+            digest: "sha256:abc".to_string(),
+            isolation: IsolationKind::Trusted,
+            init_deadline_ms: None,
+            request_deadline_ms: Some(40),
+            max_memory_bytes: Some(1024),
+            ratelimit: Some(RateLimitConfig {
+                capacity: 100,
+                refill_tokens: 10,
+                refill_interval_ms: 1000,
+            }),
+            outbound: None,
+        };
+        let opts = entry.load_options();
+
+        assert_eq!(opts.isolation, plecto_host::Isolation::Trusted);
+        assert_eq!(opts.request_deadline_ms, 40);
+        assert_eq!(opts.max_memory_bytes, 1024);
+        // an unset knob keeps the host default
+        assert_eq!(
+            opts.init_deadline_ms,
+            LoadOptions::trusted().init_deadline_ms
+        );
+        // the per-filter manifest bucket maps to the host-side spec (ADR 000026) — the filter
+        // cannot supply or override it.
+        let bucket = opts
+            .ratelimit_bucket
+            .expect("a manifest ratelimit maps to the host bucket");
+        assert_eq!(bucket.capacity, 100);
+        assert_eq!(bucket.refill_tokens, 10);
+        assert_eq!(bucket.refill_interval_ms, 1000);
+    }
+}

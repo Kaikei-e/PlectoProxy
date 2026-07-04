@@ -52,12 +52,17 @@ impl UpstreamRegistry {
                     name: up.name.clone(),
                     reason,
                 })?;
+            up.warn_missing_sni();
         }
         // Build (or reuse) each upstream's TLS client config (ADR 000042) BEFORE any mutation —
         // a bad CA file aborts the whole reconcile fail-closed. Reusing the prior group's `Arc`
         // when `[upstream.tls]` is unchanged keeps its identity stable across reloads, so the
-        // fast path's per-config connection pool (keyed on that identity) survives.
+        // fast path's per-config connection pool (keyed on that identity) survives. The `sni`
+        // override (ADR 000050) is cheap to parse (no I/O), so it is rebuilt fresh every
+        // reconcile rather than reuse-cached like the CA-derived `ClientConfig`.
         let mut tls_clients: Vec<Option<Arc<rustls::ClientConfig>>> =
+            Vec::with_capacity(upstreams.len());
+        let mut tls_snis: Vec<Option<rustls::pki_types::ServerName<'static>>> =
             Vec::with_capacity(upstreams.len());
         for up in upstreams {
             let client = match &up.tls {
@@ -77,6 +82,11 @@ impl UpstreamRegistry {
                 }
             };
             tls_clients.push(client);
+            let sni = match up.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
+                None => None,
+                Some(sni) => Some(crate::tls::parse_upstream_sni(&up.name, sni)?),
+            };
+            tls_snis.push(sni);
         }
 
         let mut groups = self
@@ -84,7 +94,7 @@ impl UpstreamRegistry {
             .lock()
             .map_err(|_| ControlError::UpstreamRegistryPoisoned)?;
         let mut next: HashMap<String, Arc<UpstreamGroup>> = HashMap::with_capacity(upstreams.len());
-        for (up, tls_client) in upstreams.iter().zip(tls_clients) {
+        for ((up, tls_client), tls_sni) in upstreams.iter().zip(tls_clients).zip(tls_snis) {
             let prev_any = groups.get(&up.name);
             // reuse the prior group's instances only if the health policy AND the TLS config are
             // identical; a change re-probes the upstream from pessimistic (new thresholds apply /
@@ -181,6 +191,7 @@ impl UpstreamRegistry {
                     hash_key,
                     tls_manifest: up.tls.clone(),
                     tls_client,
+                    tls_sni,
                 }),
             );
         }
@@ -312,6 +323,7 @@ mod tests {
         let mut up = upstream("u", &["a:1"], health(1, 3));
         up.tls = Some(crate::manifest::UpstreamTls {
             ca_path: Some(ca_path),
+            ..Default::default()
         });
 
         let reg = UpstreamRegistry::new();
@@ -356,6 +368,7 @@ mod tests {
         let mut up = upstream("u", &["a:1"], health(1, 3));
         up.tls = Some(crate::manifest::UpstreamTls {
             ca_path: Some(ca_path),
+            ..Default::default()
         });
         reg.reconcile(&[up], dir.path()).unwrap();
         assert!(
@@ -377,11 +390,66 @@ mod tests {
         let mut up = upstream("u", &["a:1"], health(1, 3));
         up.tls = Some(crate::manifest::UpstreamTls {
             ca_path: Some("missing-ca.pem".to_string()),
+            ..Default::default()
         });
         let err = reg.reconcile(&[up], dir.path());
         assert!(
             matches!(err, Err(ControlError::UpstreamTlsCa { .. })),
             "a missing CA file must be a typed fail-closed error"
+        );
+        let g = reg.group("u").unwrap();
+        assert_eq!(g.scheme(), "http", "the running group is untouched");
+        assert!(
+            g.endpoints().instances[0].is_healthy(),
+            "the running instance keeps its health after the rejected reconcile"
+        );
+    }
+
+    #[test]
+    fn reconcile_exposes_the_parsed_tls_sni_override() {
+        // ADR 000050: a declared `sni` is parsed and reachable via `tls_sni()`, independent of
+        // whether the upstream address is a hostname or an IP literal.
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = write_ca_pem(dir.path());
+        let mut up = upstream("u", &["10.0.0.9:1"], health(1, 3));
+        up.tls = Some(crate::manifest::UpstreamTls {
+            ca_path: Some(ca_path),
+            sni: Some("backend.internal".to_string()),
+        });
+
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(std::slice::from_ref(&up), dir.path())
+            .unwrap();
+        let g = reg.group("u").unwrap();
+        assert_eq!(
+            g.tls_sni().map(|n| n.to_str().to_string()),
+            Some("backend.internal".to_string()),
+            "the declared sni must be reachable for the connector to override with"
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_an_unparsable_tls_sni_before_any_mutation() {
+        // Fail-closed all-or-nothing (ADR 000050), like the CA-path check: a `sni` that parses as
+        // neither a DNS name nor an IP aborts the reconcile BEFORE the registry mutates, rather
+        // than letting every handshake to this upstream fail at request time.
+        let reg = UpstreamRegistry::new();
+        reg.reconcile(
+            &[upstream("u", &["a:1"], health(1, 3))],
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        reg.group("u").unwrap().endpoints().instances[0].record_probe_success();
+
+        let mut up = upstream("u", &["a:1"], health(1, 3));
+        up.tls = Some(crate::manifest::UpstreamTls {
+            ca_path: None,
+            sni: Some("not a valid sni!!".to_string()),
+        });
+        let err = reg.reconcile(&[up], std::path::Path::new("."));
+        assert!(
+            matches!(err, Err(ControlError::UpstreamTlsSni { .. })),
+            "an unparsable sni must be a typed fail-closed error, got {err:?}"
         );
         let g = reg.group("u").unwrap();
         assert_eq!(g.scheme(), "http", "the running group is untouched");

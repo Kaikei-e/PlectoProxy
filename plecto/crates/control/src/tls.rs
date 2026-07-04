@@ -158,6 +158,23 @@ pub(crate) fn build_upstream_client_config(
     Ok(Arc::new(config))
 }
 
+/// Parse one `[upstream.tls] sni` verification-name override into a rustls `ServerName` (ADR
+/// 000050). Fail-closed at build, like the CA bundle above: a name that parses as neither a DNS
+/// name nor an IP address aborts the reconcile before the registry mutates, rather than letting
+/// every TLS leg to this upstream fail at request time.
+pub(crate) fn parse_upstream_sni(
+    upstream_name: &str,
+    sni: &str,
+) -> Result<rustls::pki_types::ServerName<'static>, ControlError> {
+    rustls::pki_types::ServerName::try_from(sni.to_string()).map_err(|e| {
+        ControlError::UpstreamTlsSni {
+            upstream: upstream_name.to_string(),
+            sni: sni.to_string(),
+            reason: e.to_string(),
+        }
+    })
+}
+
 /// A rustls provider/version init failure (not a per-cert fault) mapped to a fail-closed error.
 fn provider_init_err(e: rustls::Error) -> ControlError {
     ControlError::TlsCert {

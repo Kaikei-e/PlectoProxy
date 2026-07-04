@@ -145,6 +145,11 @@ pub struct UpstreamGroup {
     /// (ADR 000042): roots per `ca_path` (or webpki), ALPN `[h2, http/1.1]`. `None` = plain
     /// HTTP/1.1. Built fail-closed at reconcile, like the server-side TLS configs.
     tls_client: Option<Arc<rustls::ClientConfig>>,
+    /// The `[upstream.tls] sni` verification-name override, parsed (ADR 000050): when set, the
+    /// fast path uses this — not the connected address — for both the SNI extension and
+    /// certificate-name verification on every TLS leg to this upstream. `None` = derive from the
+    /// address (the pre-000050 behaviour). Parsed fail-closed at reconcile alongside `tls_client`.
+    tls_sni: Option<rustls::pki_types::ServerName<'static>>,
 }
 
 impl UpstreamGroup {
@@ -189,6 +194,13 @@ impl UpstreamGroup {
     /// the fast path can key its per-config connection pool on the `Arc`'s identity.
     pub fn tls_client_config(&self) -> Option<&Arc<rustls::ClientConfig>> {
         self.tls_client.as_ref()
+    }
+
+    /// The `[upstream.tls] sni` verification-name override (ADR 000050), or `None` when the fast
+    /// path should derive the SNI / verification name from the connected address (the pre-000050
+    /// behaviour).
+    pub fn tls_sni(&self) -> Option<&rustls::pki_types::ServerName<'static>> {
+        self.tls_sni.as_ref()
     }
 
     /// A snapshot of the current endpoint set (instances + LB state). One atomic load; the

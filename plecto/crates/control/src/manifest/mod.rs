@@ -217,6 +217,15 @@ pub struct UpstreamTls {
     /// `[[tls]]` cert paths (ADR 000014).
     #[serde(default)]
     pub ca_path: Option<String>,
+    /// Verification-name override (ADR 000050): when set, every TLS leg to this upstream uses
+    /// `sni` for BOTH the SNI extension and certificate-name verification, instead of deriving it
+    /// from the connected address. Required to make an IP-literal `addresses` entry (or a
+    /// `resolve_interval_ms`-expanded one, ADR 000044) verify against a normal hostname
+    /// certificate: an IP endpoint sends no SNI and is verified against its bare IP by default,
+    /// which fails unless the certificate carries an IP SAN. `None` = derive from the address
+    /// (the pre-000050 behaviour). Only the name rides the content hash, like `ca_path`.
+    #[serde(default)]
+    pub sni: Option<String>,
 }
 
 /// Per-upstream load-balancing algorithm (ADR 000035). `round_robin` is the default and keeps the
@@ -1046,6 +1055,46 @@ filters = []
             v1.content_hash().unwrap(),
             v2.content_hash().unwrap(),
             "a chain change must flip the content hash"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_sni_defaults_absent_and_parses() {
+        // ADR 000050: absent `sni` = derive from the connected address (pre-000050 behaviour).
+        let without = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+[upstream.tls]
+"#,
+        )
+        .unwrap();
+        assert_eq!(without.upstreams[0].tls.as_ref().unwrap().sni, None);
+
+        // Present → the override is read, and it flips the content hash (a real config change).
+        let with = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "x"
+addresses = ["127.0.0.1:9000"]
+[upstream.health]
+path = "/healthz"
+[upstream.tls]
+sni = "backend.internal"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with.upstreams[0].tls.as_ref().unwrap().sni.as_deref(),
+            Some("backend.internal")
+        );
+        assert_ne!(
+            without.content_hash().unwrap(),
+            with.content_hash().unwrap(),
+            "declaring sni must flip the content hash"
         );
     }
 

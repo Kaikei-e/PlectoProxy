@@ -171,6 +171,31 @@ path_prefix = "/api"
     )
 }
 
+/// A filterless manifest for the ADR 000050 `sni`-override tests: unlike `manifest_toml` (which
+/// always addresses the upstream by the `localhost` hostname), the upstream address and an
+/// optional `sni` line are given explicitly, so a test can declare an IP-literal address.
+fn manifest_toml_with_address(upstream_addr: &str, ca_path: &str, sni_line: &str) -> String {
+    format!(
+        r#"
+[[upstream]]
+name = "echo"
+addresses = ["{upstream_addr}"]
+[upstream.tls]
+ca_path = "{ca_path}"
+{sni_line}
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+upstream = "echo"
+strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
+"#
+    )
+}
+
 fn loaded_control(toml: &str) -> Result<Control, plecto_control::ControlError> {
     let manifest = Manifest::from_toml(toml)?;
     let signer = TestSigner::new().unwrap();
@@ -270,6 +295,59 @@ async fn untrusted_upstream_cert_fails_closed() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+}
+
+/// The ADR 000050 motivating gap: the cert is issued for `localhost` only. An IP-literal upstream
+/// address sends no SNI and is verified against the bare IP — which the cert carries no SAN for —
+/// so the instance must never enter rotation (fail-closed, ADR 000042), exactly like an untrusted
+/// CA. This is the failure `sni` (next test) exists to fix.
+#[tokio::test]
+async fn ip_literal_upstream_without_sni_fails_closed_against_a_hostname_cert() {
+    let cert = make_cert();
+    let upstream = spawn_tls_upstream(&cert).await;
+    let control = loaded_control(&manifest_toml_with_address(
+        &upstream.to_string(),
+        &cert.cert_pem_path,
+        "",
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    for _ in 0..10 {
+        let (status, _, _) = http_get(proxy, "/api/hello").await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an IP-literal upstream verified against its bare IP must stay out of rotation \
+             without a matching certificate SAN"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// ADR 000050: declaring `sni = "localhost"` closes the gap above — every TLS leg to this
+/// upstream (health probe AND forwarded request, both built by the same `UpstreamClients`) uses
+/// it for BOTH the SNI extension and certificate verification instead of the connected IP.
+#[tokio::test]
+async fn sni_override_lets_an_ip_literal_upstream_verify_against_a_hostname_cert() {
+    let cert = make_cert();
+    let upstream = spawn_tls_upstream(&cert).await;
+    let control = loaded_control(&manifest_toml_with_address(
+        &upstream.to_string(),
+        &cert.cert_pem_path,
+        "sni = \"localhost\"",
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let (status, _, body) = get_when_ready(proxy, "/api/hello").await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sni must let an IP-literal upstream verify against the localhost cert"
+    );
+    assert_eq!(body, "tls-upstream-ok");
 }
 
 /// The gRPC prerequisite end-to-end (ADR 000042 decision 3): an h2 client sends `te: trailers`

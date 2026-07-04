@@ -115,10 +115,24 @@ fn pooled_builder() -> hyper_util::client::legacy::Builder {
 /// bug fails closed instead of silently going plaintext). ALPN advertises `[h2, http/1.1]`
 /// (control set it on the config; `enable_all_versions` keeps the connector in agreement), and
 /// hyper's legacy client picks up the negotiated protocol per pooled connection.
-fn build_tls_client(config: &TlsClientConfig) -> HyperUpstreamClient {
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+///
+/// `sni` (ADR 000050) overrides hyper-rustls' default server-name derivation (the forwarded URI's
+/// host, which is the connected address — an IP when addresses are IP literals or DNS-expanded,
+/// ADR 000044): when set, every TLS leg to this upstream uses `sni` for BOTH the SNI extension
+/// and certificate-name verification instead.
+fn build_tls_client(
+    config: &TlsClientConfig,
+    sni: Option<&rustls::pki_types::ServerName<'static>>,
+) -> HyperUpstreamClient {
+    let builder = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(config.clone())
-        .https_only()
+        .https_only();
+    let builder = match sni {
+        Some(name) => builder
+            .with_server_name_resolver(hyper_rustls::FixedServerNameResolver::new(name.clone())),
+        None => builder,
+    };
+    let connector = builder
         .enable_all_versions()
         .wrap_connector(upstream_connector());
     HyperUpstreamClient::Tls(pooled_builder().build(connector))
@@ -156,7 +170,7 @@ impl UpstreamClients {
         if let Some(client) = self.tls.read().get(&key) {
             return client.clone();
         }
-        let built = build_tls_client(config);
+        let built = build_tls_client(config, group.tls_sni());
         let mut map = self.tls.write();
         if map.len() >= MAX_TLS_CLIENTS {
             map.clear();

@@ -107,6 +107,32 @@ impl Upstream {
         }
         Ok(())
     }
+
+    /// Warn (ADR 000050) — never reject — when `[upstream.tls]` has no `sni` override while an
+    /// address is an IP literal or `resolve_interval_ms` is non-zero: the TLS leg then derives the
+    /// SNI / verification name from the connected IP, which sends no SNI extension and verifies
+    /// the certificate against the bare IP — failing every handshake unless the certificate
+    /// carries an IP SAN. An IP-SAN certificate is a legitimate deployment, so this only warns.
+    pub(crate) fn warn_missing_sni(&self) {
+        let Some(tls) = &self.tls else { return };
+        if tls.sni.is_some() {
+            return;
+        }
+        let has_ip_literal = self
+            .addresses
+            .iter()
+            .any(|a| a.address().parse::<std::net::SocketAddr>().is_ok());
+        if has_ip_literal || self.resolve_interval_ms > 0 {
+            tracing::warn!(
+                upstream = %self.name,
+                "[upstream.tls] has no `sni` while this upstream may resolve to a bare IP (an \
+                 IP-literal address, or resolve_interval_ms > 0 expanding a hostname to IPs); the \
+                 TLS leg sends no SNI and verifies the certificate against the IP, which fails \
+                 unless the certificate carries an IP SAN — declare `sni` to pin the verification \
+                 name (ADR 000050)"
+            );
+        }
+    }
 }
 
 /// Trial-division primality test for the Maglev `table_size` (ADR 000035). Build-time only and `M`

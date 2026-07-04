@@ -153,4 +153,15 @@ pub enum ControlError {
         path: String,
         reason: String,
     },
+
+    /// An `[upstream.tls] sni` verification-name override did not parse as a valid DNS name or IP
+    /// address (ADR 000050). Fail-closed at build, like `UpstreamTlsCa`: a bad `sni` aborts the
+    /// build / reload before the upstream registry mutates, rather than letting every handshake
+    /// to this upstream fail at request time.
+    #[error("upstream {upstream:?} TLS sni {sni:?}: {reason}")]
+    UpstreamTlsSni {
+        upstream: String,
+        sni: String,
+        reason: String,
+    },
 }

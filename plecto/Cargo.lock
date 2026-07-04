@@ -2312,6 +2312,7 @@ dependencies = [
  "prost",
  "quinn",
  "rcgen",
+ "rustls",
  "serde_json",
  "sha1",
  "tempfile",

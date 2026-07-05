@@ -24,6 +24,11 @@ base64 = "0.22"
 # rand: per-frame WS masking keys + the handshake nonce (RFC 6455 doesn't need cryptographic
 # strength here — just non-degenerate variation across frames/connections).
 rand = "0.8"
+# tokio-rustls (re-exporting rustls): the `tls` subcommand's client, measuring the TLS
+# decomposition's full vs resumed handshake rungs (ADR 000052) with explicit resumption control —
+# the split oha can't make (it shares one ClientConfig, so its cold connections silently resume).
+# Default features = the aws-lc-rs provider, matching the proxy's (ADR 000051).
+tokio-rustls = "0.26"
 
 [profile.release]
 lto = true

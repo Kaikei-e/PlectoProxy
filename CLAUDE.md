@@ -64,7 +64,9 @@ cargo fmt --all -- --check
 cargo build --target wasm32-unknown-unknown --release   # crates/host/build.rs が ComponentEncoder で component 化
 # 将来（body / stream<u8> / wasi:http 再利用, wasmtime 46 以降）: wasm32-wasip2 へ移行
 cargo build --target wasm32-wasip2 --release      # Rust filter（→ componentize）
-npx jco componentize <entry>.js --wit <world>.wit -o <out>.wasm   # JS filter
+# 多言語ゲスト（zero-WASI・検証済み）: MoonBit / JS (ComponentizeJS) / C (wasi-sdk)
+examples/filters/filter-hello-{moonbit,js,c}/build.sh   # 各 build.sh が WASI import ゼロを assert
+cargo test -p plecto-host --features polyglot-conformance --test polyglot   # 同一アサーションで検証
 ```
 
 ## 規約

@@ -223,8 +223,37 @@ returns.
 
 ## 7. Other languages
 
-Because the contract is WIT, a filter can be written in any language that targets a WASM component —
-Rust (this guide), Go (TinyGo), JavaScript/TypeScript (`jco`), or Python (`componentize-py`). The
-Rust path is the supported one today; first-class polyglot SDKs and reference filters (auth, rate
-limit, WAF) are on the [roadmap](../README.md#roadmap) (M6). The contract and the manifest are the
-same regardless of language; only the binding toolchain differs.
+Because the contract is WIT, a filter can be written in any language that targets a WASM component.
+The contract and the manifest are the same regardless of language; only the binding toolchain
+differs. The catch is not the language — it is **WASI**: the host's default Linker lends only the
+plecto host-API and deliberately links no `wasi:*` interfaces, so a filter component must arrive
+with **zero WASI imports** or instantiation fails on the unresolved imports. Three bundled examples
+(the filter-hello conformance subset, ported) show which toolchains can do that today, and CI runs
+the **same assertion suite** against all of them (`plecto/crates/host/tests/polyglot.rs`, job
+`polyglot-guests`):
+
+| Language | Example | Toolchain | Component size | Zero-WASI how |
+|---|---|---|---|---|
+| MoonBit | [`filter-hello-moonbit`](../plecto/examples/filters/filter-hello-moonbit) | `moon` + `wasm-tools` (`component embed --encoding utf16` + `component new`) | ~22 KB | pure core module, no adapter needed |
+| JavaScript/TypeScript | [`filter-hello-js`](../plecto/examples/filters/filter-hello-js) | ComponentizeJS (`npm run build`) | ~12 MB (StarlingMonkey engine constant) | `disableFeatures: ['random','stdio','clocks','http','fetch-event']` |
+| C | [`filter-hello-c`](../plecto/examples/filters/filter-hello-c) | `wit-bindgen c` + wasi-sdk (`--target=wasm32-wasip2 -mexec-model=reactor`) | ~66 KB | call no WASI API and no adapter is linked |
+
+Each example has a `build.sh` that builds the component and **fails the build if any `wasi:*`
+import appears** — run it, then verify against the host with:
+
+```bash
+cargo test -p plecto-host --features polyglot-conformance --test polyglot
+```
+
+Two more languages, for completeness:
+
+- **Python** works the same way (`componentize-py --stub-wasi` bundles CPython, ~17 MB). It passes
+  the same gate but is heavy for a per-request filter; no bundled example.
+- **Go is the one that cannot** (yet): TinyGo's `wasip2` target is built around the
+  `wasi:cli/command` world, so its components always import `wasi:cli`/`wasi:io`/`wasi:clocks` —
+  which the default Linker will not provide. Lending a minimal `WasiCtx` to such "fat" guests is a
+  deliberate, separate host decision (a new security surface flagged in ADR 000010); until it is
+  taken, Go filters cannot load. Big Go (the `gc` toolchain) has no Component Model support at all.
+
+First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain on the
+[roadmap](../README.md#roadmap) (M6).

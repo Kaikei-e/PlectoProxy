@@ -45,6 +45,19 @@ _Avoid_: body mode（曖昧）, body flag（点ではなく分類）
 **Body-transform filter**:
 ボディを `stream<u8>` で流しながら読む/変換するフィルタ。WASM 税（コピー）を負う側。
 
+**Zero-WASI guest**:
+`plecto:filter` の interface だけを import する（WASI import ゼロの）フィルタコンポーネント。
+デフォルトの deny-by-default Linker がそのまま instantiate できる唯一の形。Rust
+（wasm32-unknown-unknown）・MoonBit・C のほか、WASI 機能を無効化した JS（ComponentizeJS の
+disableFeatures）や Python（componentize-py --stub-wasi）もこの形にできる。
+_Avoid_: pure component（ComponentizeJS 固有の呼称）, header-only filter（body disposition の別軸）
+
+**Fat guest**:
+言語ランタイムが wasi 0.2 interface（`wasi:cli` / `wasi:io` / `wasi:clocks` …）の提供を前提とする
+ゲストコンポーネント。TinyGo が代表。host が最小 `WasiCtx` を能動的に貸さない限り instantiate に失敗し、
+現状の host は貸さない（貸すか否かは ADR 000010 が名指しした将来の判断）。
+_Avoid_: WASI guest（どの WASI をどこまで要るのかが出ない）
+
 **Trusted filter / Untrusted filter**:
 信頼できる自家製フィルタ（再利用可能インスタンスのプールを init-once で再利用）と、第三者製で
 per-request 新規生成＋ゼロ化を要するフィルタの区別。生成戦略と分離強度が変わり、ロード時の Isolation で

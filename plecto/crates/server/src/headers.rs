@@ -41,7 +41,13 @@ fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
         if let Ok(s) = value.to_str() {
             for token in s.split(',') {
                 let token = token.trim();
-                if !token.is_empty() {
+                // `close` / `keep-alive` are the overwhelmingly common tokens here and are
+                // connection-management directives, not header names to strip (no such header
+                // exists to drop) — skip the allocation + hash-insert for them on the hot path.
+                if !token.is_empty()
+                    && !token.eq_ignore_ascii_case("close")
+                    && !token.eq_ignore_ascii_case("keep-alive")
+                {
                     named.insert(token.to_ascii_lowercase());
                 }
             }

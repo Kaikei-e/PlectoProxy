@@ -10,6 +10,8 @@
 //!       --exec-at 15='cp swapped.toml plecto.toml && kill -HUP 12345' --out swap.csv
 //!   plecto-loadgen ws --mode echo --target ws://127.0.0.1:28085/ws --conns 50 --size 1024 \
 //!       --duration 30 --out ws_echo.csv
+//!   plecto-loadgen tls --mode resumed --target https://127.0.0.1:28443/ --ca cert.pem \
+//!       --duration 20 --workers 48 --out tls_resumed.csv
 //!
 //! `rr` fires N keep-alive GETs and tallies the `X-Instance` header (round-robin split to
 //! single-request precision). `ejection` holds a fixed open-loop arrival rate while a controller
@@ -23,6 +25,11 @@
 //! itself is allowed to change mid-run. `ws` drives Plecto's Upgrade-tunneled `/ws` route (ADR
 //! 000048): `handshake` paces open-loop connection attempts, `hold` opens N idle tunnels for an
 //! RSS read, `echo` sustains a per-connection request/response loop measuring throughput + latency.
+//! `tls` measures the handshake-per-request rungs of the TLS decomposition (ADR 000052) with
+//! EXPLICIT resumption control — `--mode full` disables client resumption (every connection pays
+//! the certificate + key-exchange handshake), `--mode resumed` shares one session cache so
+//! post-warmup connections resume via the server's stateless tickets; oha can't split these two
+//! (it shares one ClientConfig, so its cold connections silently resume once the server tickets).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -37,6 +44,11 @@ use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::client::Resumption;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
 
 mod ws;
 
@@ -523,6 +535,190 @@ async fn run_hold(a: HoldArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------- tls
+
+struct TlsArgs {
+    target: String,
+    mode: String,
+    ca: String,
+    duration: u64,
+    warmup: u64,
+    workers: u64,
+    out: String,
+}
+
+struct TlsTarget {
+    addr: String,
+    authority: String,
+    path: String,
+    sni: ServerName<'static>,
+}
+
+/// `https://` only — the other subcommands' plain-TCP `parse_target` stays https-free on purpose.
+/// (Host parsing is `rsplit_once(':')`, so bare IPv6 authorities are out of scope — bench targets
+/// are loopback IPv4.)
+fn parse_tls_target(url: &str) -> Result<TlsTarget, BoxError> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("tls target must be an https:// URL: {url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, addr) = match authority.rsplit_once(':') {
+        Some((host, _port)) => (host, authority.to_string()),
+        None => (authority, format!("{authority}:443")),
+    };
+    let sni = ServerName::try_from(host.to_string())
+        .map_err(|e| format!("bad SNI host in target {url}: {e}"))?;
+    Ok(TlsTarget {
+        addr,
+        authority: authority.to_string(),
+        path: path.to_string(),
+        sni,
+    })
+}
+
+/// One shared ClientConfig trusting exactly `--ca` (the bench's self-signed cert). `full` disables
+/// client resumption — rustls clients resume by default, and with ADR 000052's stateless tickets
+/// on the server a shared default config would silently turn cold connections into resumed ones
+/// (which is exactly what the `resumed` mode wants, and what oha cannot opt out of).
+fn tls_client_config(ca_path: &str, mode: &str) -> Result<Arc<ClientConfig>, BoxError> {
+    let certs = CertificateDer::pem_file_iter(ca_path)
+        .map_err(|e| format!("read {ca_path}: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("bad CA PEM in {ca_path}: {e}"))?;
+    let mut roots = RootCertStore::empty();
+    let (added, _ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(format!("no usable root certificate in {ca_path}").into());
+    }
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    if mode == "full" {
+        config.resumption = Resumption::disabled();
+    }
+    Ok(Arc::new(config))
+}
+
+/// One request on a FRESH connection: TCP connect + TLS handshake + GET, then close. Returns which
+/// handshake happened. The response read matters beyond realism: TLS 1.3 NewSessionTickets are
+/// post-handshake messages, so reading is what pulls them into the shared session cache for the
+/// next connection to offer.
+async fn tls_get_once(t: &TlsTarget, connector: &TlsConnector) -> Result<HandshakeKind, BoxError> {
+    let tcp = TcpStream::connect(&t.addr).await?;
+    tcp.set_nodelay(true)?;
+    let tls = connector.connect(t.sni.clone(), tcp).await?;
+    let kind = tls
+        .get_ref()
+        .1
+        .handshake_kind()
+        .ok_or("handshake kind unavailable after connect")?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::get(t.path.as_str())
+        .header(hyper::header::HOST, t.authority.as_str())
+        .body(Empty::<Bytes>::new())?;
+    let mut resp = sender.send_request(req).await?;
+    while let Some(frame) = resp.frame().await {
+        frame?;
+    }
+    Ok(kind)
+}
+
+/// Closed-loop per worker (oha's `-c N` shape): connect/handshake/GET back-to-back until
+/// `warmup + duration` elapses. Latencies + handshake-kind counts recorded only past warmup —
+/// in `resumed` mode the warmup is also what seeds the session cache with tickets.
+async fn tls_worker(
+    t: Arc<TlsTarget>,
+    config: Arc<ClientConfig>,
+    start: Instant,
+    warmup: u64,
+    duration: u64,
+) -> (Vec<f64>, u64, u64, u64) {
+    let connector = TlsConnector::from(config);
+    let mut latencies = Vec::new();
+    let (mut full, mut resumed, mut errors) = (0u64, 0u64, 0u64);
+    let end = start + Duration::from_secs(warmup + duration);
+    let warm_until = start + Duration::from_secs(warmup);
+    while Instant::now() < end {
+        let t0 = Instant::now();
+        let res = tls_get_once(&t, &connector).await;
+        if t0 < warm_until {
+            continue;
+        }
+        match res {
+            Ok(kind) => {
+                latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+                match kind {
+                    HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest => full += 1,
+                    HandshakeKind::Resumed => resumed += 1,
+                }
+            }
+            Err(_) => errors += 1,
+        }
+    }
+    (latencies, resumed, full, errors)
+}
+
+async fn run_tls(a: TlsArgs) -> Result<(), BoxError> {
+    let t = Arc::new(parse_tls_target(&a.target)?);
+    let config = tls_client_config(&a.ca, &a.mode)?;
+    let start = Instant::now();
+    let handles: Vec<_> = (0..a.workers)
+        .map(|_| {
+            tokio::spawn(tls_worker(
+                t.clone(),
+                config.clone(),
+                start,
+                a.warmup,
+                a.duration,
+            ))
+        })
+        .collect();
+
+    let mut all: Vec<f64> = Vec::new();
+    let (mut resumed, mut full, mut errors) = (0u64, 0u64, 0u64);
+    for h in handles {
+        let (lat, r, f, e) = h.await?;
+        all.extend(lat);
+        resumed += r;
+        full += f;
+        errors += e;
+    }
+    all.sort_by(f64::total_cmp);
+    let n = all.len();
+    let pct = |p: f64| -> f64 {
+        if n == 0 {
+            return 0.0;
+        }
+        let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
+        all[idx.min(n - 1)]
+    };
+    let (p50, p90, p99) = (pct(50.0), pct(90.0), pct(99.0));
+    let rps = n as f64 / a.duration.max(1) as f64;
+    // Both kind counts are always emitted, whatever the mode asked for: a `resumed` run that in
+    // fact took full handshakes (cold cache, key mismatch across a restart) must be visible in
+    // the CSV, not silently mislabeled.
+    let resumed_pct = 100.0 * resumed as f64 / (resumed + full).max(1) as f64;
+    let csv = format!(
+        "mode,workers,duration_s,requests,rps,full,resumed,resumed_pct,errors,p50_ms,p90_ms,p99_ms\n\
+         {},{},{},{n},{rps:.1},{full},{resumed},{resumed_pct:.1},{errors},{p50:.3},{p90:.3},{p99:.3}\n",
+        a.mode, a.workers, a.duration
+    );
+    std::fs::write(&a.out, csv)?;
+    println!(
+        "tls {}: {n} requests over {} s ({} workers) -> {rps:.0} req/s, \
+         full={full} resumed={resumed} ({resumed_pct:.1}% resumed), errors={errors}, \
+         p50={p50:.3}ms p99={p99:.3}ms",
+        a.mode, a.duration, a.workers
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------- ws
 
 struct WsArgs {
@@ -756,7 +952,9 @@ fn usage() -> ! {
          plecto-loadgen hold --target URL [--conns N] [--seconds S]\n  \
          plecto-loadgen ws --mode handshake|hold|echo --target ws://HOST:PORT/PATH \
          [--rate R] [--duration S] [--warmup S] [--workers W] [--conns N] [--seconds S] \
-         [--size BYTES] [--out FILE]"
+         [--size BYTES] [--out FILE]\n  \
+         plecto-loadgen tls --mode full|resumed --target https://HOST:PORT/PATH --ca PEM \
+         [--duration S] [--warmup S] [--workers W] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -913,6 +1111,40 @@ fn parse_ws(rest: &[String]) -> WsArgs {
     a
 }
 
+fn parse_tls(rest: &[String]) -> TlsArgs {
+    let mut a = TlsArgs {
+        target: "https://127.0.0.1:28443/".to_string(),
+        mode: String::new(),
+        ca: String::new(),
+        duration: 20,
+        warmup: 3,
+        workers: 48,
+        out: "tls_handshake.csv".to_string(),
+    };
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--mode" => a.mode = take(&mut it, flag),
+            "--target" => a.target = take(&mut it, flag),
+            "--ca" => a.ca = take(&mut it, flag),
+            "--duration" => a.duration = take_num(&mut it, flag).max(1),
+            "--warmup" => a.warmup = take_num(&mut it, flag),
+            "--workers" => a.workers = take_num(&mut it, flag).max(1),
+            "--out" => a.out = take(&mut it, flag),
+            _ => usage(),
+        }
+    }
+    if !["full", "resumed"].contains(&a.mode.as_str()) {
+        eprintln!("--mode is required: full|resumed");
+        std::process::exit(2)
+    }
+    if a.ca.is_empty() {
+        eprintln!("--ca PEM is required (the bench cert to trust)");
+        std::process::exit(2)
+    }
+    a
+}
+
 fn parse_hold(rest: &[String]) -> HoldArgs {
     let mut a = HoldArgs {
         target: "http://127.0.0.1:8080/".to_string(),
@@ -943,6 +1175,7 @@ async fn main() {
         "swap" => run_swap(parse_swap(rest)).await,
         "hold" => run_hold(parse_hold(rest)).await,
         "ws" => run_ws(parse_ws(rest)).await,
+        "tls" => run_tls(parse_tls(rest)).await,
         _ => usage(),
     };
     if let Err(e) = result {

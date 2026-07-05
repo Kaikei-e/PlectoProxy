@@ -5,17 +5,19 @@
 //! failed reload never swaps in a TLS config that cannot serve, and the config rides `ActiveConfig`
 //! behind the same `ArcSwap` as the filter set. Sync rustls + the `aws_lc_rs` provider (ADR
 //! 000051 — one crypto backend shared with the QUIC config and the host's `sigstore` dependency);
-//! the async acceptor lives in `plecto-server`.
+//! the async acceptor lives in `plecto-server`. Session resumption is stateless (ADR 000052): one
+//! process-lifetime ticket key (6h rotation / 12h window, node-local per ADR 000053), no stateful
+//! session cache, 0-RTT refused as an invariant.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustls::ServerConfig;
 use rustls::crypto::aws_lc_rs as provider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::{ClientHello, NoServerSessionStorage, ProducesTickets, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 use crate::error::ControlError;
@@ -38,6 +40,29 @@ impl ResolvesServerCert for SniResolver {
             .cloned()
             .or_else(|| self.default.clone())
     }
+}
+
+/// The process-lifetime session-ticket producer (ADR 000052): `aws_lc_rs::Ticketer` = rustls'
+/// `TicketRotator` over RFC 5077 §4 self-encrypted tickets, 6h key rotation with a 12h acceptance
+/// window (current + previous key). ONE instance for the whole process — shared by the TCP and
+/// QUIC configs (a ticket obtained over either resumes on both; both configs present the same
+/// certs via the shared `SniResolver`, so rustls' cross-config resumption caveat does not bite)
+/// and, critically, surviving manifest reloads: rebuilding the `ServerConfig`s must not invalidate
+/// outstanding tickets. Keys live in process memory only, node-local (ADR 000053) — never on disk,
+/// never in the manifest.
+fn shared_ticketer() -> Result<Arc<dyn ProducesTickets>, ControlError> {
+    static TICKETER: OnceLock<Arc<dyn ProducesTickets>> = OnceLock::new();
+    if let Some(ticketer) = TICKETER.get() {
+        return Ok(ticketer.clone());
+    }
+    // Fallible init outside `get_or_init` (which can't return errors): the race where two threads
+    // both construct is benign — one wins the OnceLock, the loser's keys are dropped unissued.
+    let fresh = provider::Ticketer::new().map_err(|e| ControlError::TlsCert {
+        host: None,
+        path: String::new(),
+        reason: format!("session-ticket key init: {e}"),
+    })?;
+    Ok(TICKETER.get_or_init(|| fresh).clone())
 }
 
 /// The TLS configs built from `[[tls]]`: the TCP config (HTTP/1.1 + HTTP/2 via ALPN, ADR 000015)
@@ -86,6 +111,8 @@ pub(crate) fn build_server_configs(
 
     // One resolver, shared by both configs (Arc clone): SNI selects the same cert over TCP and QUIC.
     let resolver = Arc::new(SniResolver { by_host, default });
+    // One ticket producer, ditto (ADR 000052): stateless TLS 1.3 resumption over both paths.
+    let ticketer = shared_ticketer()?;
 
     // TCP: HTTP/1.1 + HTTP/2 via ALPN (h2 preferred, ADR 000015), TLS 1.2 + 1.3.
     let mut tcp = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
@@ -98,13 +125,26 @@ pub(crate) fn build_server_configs(
     // QUIC: HTTP/3, ALPN `h3`, TLS 1.3 only (ADR 000016). 0-RTT stays disabled: `max_early_data_size`
     // is left at its default 0, so the server refuses TLS early data. A gateway must not forward
     // early-data requests to upstreams that may not emit 425 (Too Early) (RFC 8470), so refusing it
-    // outright is the only safe choice here.
+    // outright is the only safe choice here. The stateless ticketer below refuses it a second way
+    // (rustls only configures early data when the ticketer is DISabled) — but the invariant test
+    // pins `max_early_data_size == 0` on its own, so a rustls behavior change cannot reopen 0-RTT.
     let mut quic = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(provider_init_err)?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     quic.alpn_protocols = vec![b"h3".to_vec()];
+
+    // Stateless session resumption (ADR 000052), replacing the implicit rustls default (a
+    // 256-entry stateful cache whose tickets are lookup keys). The self-encrypted ticket carries
+    // the session; per-session server memory is ZERO and there is no cache-size knob to fall off —
+    // the same bounded-memory discipline as native rate limit (ADR 000033, CWE-770). TLS 1.2
+    // clients get RFC 5077 stateless tickets from the same producer; 1.2 session-ID resumption is
+    // gone with the cache, which is the point.
+    for config in [&mut tcp, &mut quic] {
+        config.ticketer = ticketer.clone();
+        config.session_storage = Arc::new(NoServerSessionStorage {});
+    }
 
     Ok(Some(TlsConfigs {
         tcp: Arc::new(tcp),
@@ -293,6 +333,56 @@ mod tests {
             configs.quic.alpn_protocols,
             vec![b"h3".to_vec()],
             "QUIC ALPN is h3 only"
+        );
+    }
+
+    #[test]
+    fn stateless_resumption_invariants() {
+        // ADR 000052's invariants, pinned per path so a rustls default change (or a refactor that
+        // touches only one config) cannot silently reintroduce the stateful cache or 0-RTT.
+        let (dir, entry) = default_cert_entry();
+        let configs = build_server_configs(&[entry], dir.path())
+            .unwrap()
+            .expect("a cert entry yields TCP + QUIC configs");
+        for (label, config) in [("tcp", &configs.tcp), ("quic", &configs.quic)] {
+            assert!(
+                config.ticketer.enabled(),
+                "{label}: stateless session tickets are issued (ADR 000052)"
+            );
+            assert_eq!(
+                config.ticketer.lifetime(),
+                12 * 60 * 60,
+                "{label}: 12h acceptance window (6h rotation, current + previous key)"
+            );
+            assert!(
+                !config.session_storage.can_cache(),
+                "{label}: no stateful session cache — per-session server memory stays zero"
+            );
+            assert_eq!(
+                config.max_early_data_size, 0,
+                "{label}: 0-RTT stays refused (ADR 000016 / RFC 8470), independent of the \
+                 ticketer-exclusivity rustls happens to enforce today"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_key_is_process_wide_across_paths_and_builds() {
+        // One ticket producer for TCP + QUIC (a ticket obtained over either resumes on both), and
+        // the SAME producer across rebuilds — a manifest reload must not invalidate outstanding
+        // tickets (ADR 000052: process-lifetime, node-local key).
+        let (dir, entry) = default_cert_entry();
+        let a = build_server_configs(std::slice::from_ref(&entry), dir.path())
+            .unwrap()
+            .unwrap();
+        let b = build_server_configs(&[entry], dir.path()).unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&a.tcp.ticketer, &a.quic.ticketer),
+            "TCP and QUIC share one ticket producer"
+        );
+        assert!(
+            Arc::ptr_eq(&a.tcp.ticketer, &b.tcp.ticketer),
+            "a rebuild (reload) keeps the process-lifetime ticket key"
         );
     }
 

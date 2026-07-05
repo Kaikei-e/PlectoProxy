@@ -48,8 +48,15 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
 | `rr` | round-robin の均等性 | `plecto-loadgen rr`（X-Instance 集計） | `rr.csv` | 1 req 精度で 1/3 ずつ |
 | `ejection` | health-eject + fail-closed（ADR 000017） | `plecto-loadgen ejection` | `ejection_*.csv` | ~1s 時定数・503 fail-closed・~1s 復帰 |
 | `swap` | endpoint-set の swap under load（ADR 000044、reload が health ではなくアドレス集合自体を変える） | `plecto-loadgen swap`（`--exec-at` で manifest 書換 + SIGHUP を時刻指定実行） | `swap.csv`, `swap_events.csv` | ejection と同じ ~1s 時定数で新集合に追従（同じ `ArcSwap` 差し替え経路） |
-| `tls` | TLS 終端の分解（h1/keepalive/handshake/h2） | oha | `tls.csv` | record-layer 安い・handshake 支配。`plain (h1)` 行は `ceiling.csv` を参照、測り直さない |
+| `tls` | TLS 終端の分解（h1/keepalive/full handshake/**resumed handshake**/h2、ADR 000052 で三点分解が完成） | oha（keepalive/h2）+ `plecto-loadgen tls --mode full\|resumed`（handshake ラング） | `tls.csv`, `tls_full.csv`, `tls_resumed.csv` | record-layer 安い・handshake 支配・resumed が full と keep-alive の中間に入る。`plain (h1)` 行は `ceiling.csv` を参照、測り直さない。resumed ラングは ADR 000051 の provider A/B と同一計測セッションで取る |
 | `footprint` | idle RSS + bytes/conn | `plecto-loadgen hold` | `footprint.txt` | conn あたり限界バイト |
+
+> **handshake ラングに oha は使えない（ADR 000052 以降）**: oha は 1 つの rustls ClientConfig を全接続で
+> 共有するため、stateless ticket が生きた proxy に対しては `--disable-keepalive` の cold connection が
+> warm 後に黙って resumed になり、full と resumed の判別不能な混合を測ってしまう（既存の
+> handshake/req 行の解釈にも同じ留保が付く——旧計測は暗黙の stateful cache 256 件が相手だった）。
+> `plecto-loadgen tls` は `--mode full` で client resumption を明示的に切り、`--mode resumed` で warmup が
+> チケットを播種し、CSV に実測の resumed% を出す（意図と違う handshake を黙って混ぜない）。
 
 ### Extension plane（WASM filter + host-API）
 

@@ -52,7 +52,8 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 > **Measurement history** (newest first). **2026-07-05** — re-measured after ADR 000052 (stateless
 > TLS 1.3 session resumption) plus three hot-path fixes landed alongside it: a control-plane
-> outlier-ejection race fix that also cut a per-request LB-pick allocation, a host quota-accounting
+> outlier-ejection race fix that also cut a per-request **route-lookup** allocation and the chain's
+> per-filter HashMap re-resolution (the LB *pick* path is untouched), a host quota-accounting
 > race fix + new untrusted-instance breaker, and fail-closed handling for a buffer-permit error. This
 > run fills the [TLS section](#tls-termination)'s previously-pending resumption gap with a clean
 > `plecto-loadgen tls --mode full|resumed` measurement, which confirms oha's `handshake/req` row was
@@ -94,11 +95,13 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 - A **cost ladder** isolates each cost by adjacent delta. The **irreducible dispatch floor** — a pure
   no-op WASM filter, pooled — is **≈ 4.0 µs/req (−49 % throughput)** over the native baseline; a
   **real filter's own work** (`filter-apikey`: header + host-KV + counter) adds **another
-  ~0.8 µs (−9 %)**; and running that filter **fresh-per-request** instead of pooled costs **~18×**
+  ~0.6–0.8 µs (−9 % this run)**; and running that filter **fresh-per-request** instead of pooled costs **~18×**
   throughput — the price of re-paying `init` every request, and the value of pooling. The **µs/req
-  is the portable figure**. A **fixed-rate tail run** (all rungs at the same below-knee 4.2k/s,
-  CO-corrected) puts honest latency on the same ladder: the pooled no-op adds **+0.39 ms p99**
-  over native, the real pooled filter +0.43 ms — while the fresh rungs live at **p99 626–738 ms**.
+  is the portable figure**. A **fixed-rate tail run** (all rungs at the same 4.2k/s, CO-corrected)
+  puts honest latency on the same ladder: the pooled no-op adds **+0.39 ms p99** over native, the
+  real pooled filter +0.43 ms — while the fresh rungs live at **p99 626–738 ms**, a kernel-side
+  mmap/munmap knee (TLB-shootdown IPIs, ~100× the pooled rate), not CPU queueing — measured and
+  dissected in [the ladder's tail note](#the-same-ladder-at-one-fixed-rate--honest-tails).
 - These macro deltas **reconcile with the criterion [micro-benchmarks](#0-micro-benchmarks-in-process-criterion)**:
   the pooled guest call is ~2.0 µs, and the remainder of the floor is the blocking-pool handoff the
   no-filter path skips entirely — the two layers agree.
@@ -418,18 +421,24 @@ run's own baseline.)*
 - **noop-pooled → noop-fresh** = the **per-request instantiation cost**, now cleanly isolated from any
   host work: throughput collapses **~18×** (123k → 7.0k). This is what pooling buys.
 - **noop-pooled → trusted** = a **real filter's own work** on top of the no-op (header parse +
-  host-KV lookup + counter): **−9 % (~0.8 µs)**. The apikey filter is cheap; the dispatch floor still
-  dominates it, though this margin roughly doubled vs the previous snapshot (~0.4 µs) — worth
-  watching on the next re-measurement, not yet a clear regression at this absolute size.
+  host-KV lookup + counter): **−9 % (~0.8 µs this run)**. The apikey filter is cheap; the dispatch
+  floor still dominates it. This margin read 0.4 µs in the previous snapshot and 0.8 µs here — a
+  repeated, interleaved A/B (2026-07-06, 5 pairs at 50 connections) measures it at **0.6 ± 0.2 µs**,
+  so the two snapshots are single draws from that spread, not a doubling. (The structural suspect
+  for any future growth is `charge_and_apply` — since the quota-race fix, the counter's backend
+  write happens inside the process-wide quota lock; at 50 connections any contention effect is
+  inside this noise band.)
 - **noop-fresh and ondemand are the same order of magnitude** (7.0k vs 7.2k req/s), confirming
   instantiation dominates the fresh path — the filter's per-request work is noise next to re-paying
   `init` (~29 µs) every request.
 
-### The same ladder at a fixed below-knee rate — honest tails
+### The same ladder at one fixed rate — honest tails
 
 > W1b — every rung offered the **same** fixed 4,189 req/s (60 % of the slowest rung's ceiling), 50
 > connections, oha `-q` + `--latency-correction` (coordinated-omission-safe). Identical offered
-> load, so the latency columns are directly comparable — and none of them is queueing-at-max-load.
+> load, so the latency columns are directly comparable. (One caveat, established below: this rate
+> is comfortably below the *pooled* rungs' knees but sits **on** the fresh rungs' effective knee —
+> their rows are real, but read them as at-the-knee tails, not steady-state ones.)
 
 | Route | achieved | p50 | p90 | p99 |
 | --- | --- | --- | --- | --- |
@@ -441,16 +450,34 @@ run's own baseline.)*
 
 At a rate every rung sustains, the pooled dispatch floor costs **+0.12 ms p50 / +0.39 ms p99** over
 native and the real pooled filter **+0.17 ms p50 / +0.43 ms p99** — sub-millisecond even at p99.
-The fresh rungs, which *survive* at this rate (they cannot at their ceilings), still live at
-**p99 626–738 ms**: per-request instantiation is not a tail you can operate behind, which is the
-pooling decision stated as a latency, not a throughput.
+The fresh rungs still live at **p99 626–738 ms** — per-request instantiation is not a tail you can
+operate behind — but that number demands its mechanism, because ~29 µs/req of measured
+instantiation cost at 4.2k/s is ~12 % of one core, and no CPU-queueing model turns that into a
+700 ms tail.
+
+> **The fresh tail is a kernel-side knee, not CPU queueing (measured 2026-07-06).** A fresh
+> instance is an mmap at instantiate and an munmap at drop, every request
+> (`Allocation::OnDemand`); munmap serializes on the process's `mmap_lock` and IPIs every core
+> running the process (TLB shootdown). `/proc/interrupts` deltas during fixed-rate runs: the fresh
+> rung takes **~31–35 TLB shootdowns/req vs ~0.3 pooled — ~100×**. The resulting tail is sharply
+> rate-dependent — p99 **1.4 ms at 1k/s, 4.7 ms at 2k/s, ~650 ms at 4.2k/s, ~1.2 s at 6k/s** (with
+> shootdowns/req itself doubling as concurrency rises) — a knee near ~4k/s, roughly *half* the
+> rung's closed-loop ceiling. W1b's fixed rate (60 % of the slowest ceiling) lands exactly on that
+> knee, which is why the fresh rows' absolute tails are chaotic across snapshots (440 → 738 ms
+> between runs; 83 ms vs 648 ms at the same rate on the same host minutes apart) while the pooled
+> rows stay stable. Avoiding precisely this per-request mmap/munmap churn is why wasmtime's pooling
+> allocator pre-maps slots and batches decommits — the trusted path rides that. Stated portably:
+> fresh-per-request has a clean-tail operating ceiling around ~2k/s on this host, and that — not
+> the 29 µs — is the pooling decision's real justification.
 
 **The µs/req deltas are the invariants to track for regressions, not the percentages** (which widen or
 shrink whenever the *baseline* moves). These macro deltas **reconcile with the in-process
-[micro-benchmarks](#0-micro-benchmarks-in-process-criterion)**: criterion clocks the pooled
-per-request call at ~2.0 µs; the remaining ~2 µs of the macro floor is the `spawn_blocking` handoff
-(sync wasmtime, `!Send` store) that a route with no filters skips entirely — and the fresh
-(instantiate + init + call) at ~29 µs matches the ladder's collapse.
+[micro-benchmarks](#0-micro-benchmarks-in-process-criterion)** — with one disclosed asymmetry:
+criterion clocks the pooled per-request call at ~2.0 µs, and the remaining ~2 µs of the macro floor
+is the `spawn_blocking` handoff (sync wasmtime, `!Send` store) that a route with no filters skips
+entirely. The fresh ~29 µs, by contrast, is the *uncontended* cost — criterion instantiates
+sequentially, so it never pays the `mmap_lock` contention or cross-core shootdowns the concurrent
+macro run exposes (the knee above). The layers agree once that kernel-side term is named.
 
 ## Short-circuit: rejecting bad traffic at the edge
 
@@ -496,6 +523,13 @@ only decides *whether* to consult the limiter and *on what key*. Driven through 
 > instance guarantees, not a multi-replica fleet. Behind a load balancer fanning out to N replicas,
 > the fleet's effective allowed rate scales with N unless the front LB pins a key to one replica; see
 > the [hardening guide](../docs/hardening.md) for the operational formula.
+>
+> **Scope: in-memory state backend.** These numbers (and every host-state number in this report) run
+> the default `[state] backend = "memory"`. With `backend = "redb"`, the backend write happens
+> **inside the process-wide quota lock** (`charge_and_apply` — the price of closing the CWE-770
+> accounting race), so every host-kv / counter / rate-limit call across all filters serializes
+> behind that disk write. Persistent-state throughput under concurrency is structurally different
+> and **unmeasured here**.
 
 ### Overhead — the cost of consulting the bucket
 

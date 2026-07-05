@@ -2,12 +2,12 @@
 //! honouring `decision` and applying `modified` edits; drive the response back in reverse.
 //! Fail-closed — a trapped / timed-out filter (`RunError`) never falls through to upstream.
 
-use plecto_host::{
-    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestDecision, RequestEdit,
-    RequestTrace, ResponseDecision, ResponseEdit,
-};
+use std::sync::Arc;
 
-use crate::ActiveConfig;
+use plecto_host::{
+    Header, HttpRequest, HttpResponse, LoadedFilter, RequestBodyDecision, RequestDecision,
+    RequestEdit, RequestTrace, ResponseDecision, ResponseEdit,
+};
 
 /// The result of driving a request through the chain.
 pub enum ChainOutcome {
@@ -29,17 +29,11 @@ pub enum RequestBodyOutcome {
 }
 
 pub(crate) fn dispatch_request(
-    active: &ActiveConfig,
-    chain: &[String],
+    chain: &[Arc<LoadedFilter>],
     mut request: HttpRequest,
     trace: &RequestTrace,
 ) -> ChainOutcome {
-    for id in chain {
-        // `build_active` validates chain ⊆ filters, so this is always `Some`; staying total
-        // (no indexing panic) honours the data-plane no-panic discipline (bp-rust).
-        let Some(filter) = active.filters.get(id) else {
-            continue;
-        };
+    for filter in chain {
         // `trace` parents each filter span (ADR 000009): the host times the call and emits the
         // span to its sink; we drive only the decision here.
         match filter.on_request(&request, trace) {
@@ -60,15 +54,11 @@ pub(crate) fn dispatch_request(
 /// fail-closed trap / deadline) stops the chain before upstream. The host already buffered the body;
 /// this only sequences the decisions.
 pub(crate) fn dispatch_request_body(
-    active: &ActiveConfig,
-    chain: &[String],
+    chain: &[Arc<LoadedFilter>],
     mut body: Vec<u8>,
     trace: &RequestTrace,
 ) -> RequestBodyOutcome {
-    for id in chain {
-        let Some(filter) = active.filters.get(id) else {
-            continue;
-        };
+    for filter in chain {
         match filter.on_request_body(&body, trace) {
             Ok((RequestBodyDecision::Continue(next), _logs)) => body = next,
             Ok((RequestBodyDecision::ShortCircuit(response), _logs)) => {
@@ -82,18 +72,14 @@ pub(crate) fn dispatch_request_body(
 }
 
 pub(crate) fn dispatch_response(
-    active: &ActiveConfig,
-    chain: &[String],
+    chain: &[Arc<LoadedFilter>],
     mut response: HttpResponse,
     trace: &RequestTrace,
 ) -> HttpResponse {
     // The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
     // `response-decision` has no short-circuit, so the chain only continues or rewrites. The
     // same `trace` as the request side, so request + response spans share one trace (ADR 000009).
-    for id in chain.iter().rev() {
-        let Some(filter) = active.filters.get(id) else {
-            continue;
-        };
+    for filter in chain.iter().rev() {
         match filter.on_response(&response, trace) {
             Ok((ResponseDecision::Continue, _logs)) => {}
             Ok((ResponseDecision::Modified(edit), _logs)) => {

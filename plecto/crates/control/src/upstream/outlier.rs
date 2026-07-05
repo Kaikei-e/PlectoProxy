@@ -46,6 +46,17 @@ impl UpstreamGroup {
 
         // Threshold reached. Honour the ejection cap: never eject so many that the pool drops below
         // its working minimum (`100 - max_ejection_percent`). Integer math, no float.
+        //
+        // The count-check-eject sequence below reads GROUP-WIDE state (how many peer instances are
+        // currently ejected) — that must be serialized across every instance in the group, not just
+        // guarded by this instance's own `counters` lock, or two instances crossing their threshold
+        // in the same instant (a correlated backend blip) could each observe "cap not yet reached"
+        // and both eject, silently exceeding `max_ejection_percent`.
+        let Ok(_decision) = self.outlier_decision.lock() else {
+            // a poisoned decision lock means a thread panicked mid-transition; fail safe (no eject).
+            c.consecutive_gw_fail = 0;
+            return false;
+        };
         let now_ms = now_millis();
         let endpoints = self.endpoints();
         let already_ejected = endpoints
@@ -62,7 +73,9 @@ impl UpstreamGroup {
             return false;
         }
 
-        // Eject for `base · 2^min(eject_count, cap)` — exponential backoff, bounded.
+        // Eject for `base · 2^min(eject_count, cap)` — exponential backoff, bounded. Still under
+        // `outlier_decision`: the store below is what `already_ejected` observes on the next racing
+        // instance's count, so it must land before the lock releases.
         let shift = c.outlier_eject_count.min(OUTLIER_BACKOFF_SHIFT_CAP);
         let window = self.outlier_base_ejection.saturating_mul(1u32 << shift);
         instance.outlier_ejected_until_ms.store(
@@ -188,6 +201,49 @@ mod tests {
             "b is NOT ejected — a 2nd ejection (2/3) would exceed the 50% cap"
         );
         assert!(!b.is_outlier_ejected(now_millis()), "b stays in rotation");
+    }
+
+    #[test]
+    fn concurrent_threshold_crossings_never_exceed_max_ejection_percent() {
+        // Regression test: two instances crossing their failure threshold in the same instant
+        // (a correlated backend blip) must not both read "cap not yet reached" and both eject —
+        // `outlier_decision` serializes the count-check-eject sequence across the whole group.
+        use std::sync::Barrier;
+        use std::thread;
+
+        // 4 instances, 50% cap → at most 2 may ever be ejected at once, no matter how many
+        // threads cross the threshold at the same instant.
+        let g = outlier_group(&["a:1", "b:2", "c:3", "d:4"], 1, 60_000, 50);
+        let instances = g.endpoints().instances.clone();
+        let barrier = Arc::new(Barrier::new(instances.len()));
+
+        let handles: Vec<_> = instances
+            .iter()
+            .cloned()
+            .map(|inst| {
+                let g = g.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    b.wait();
+                    g.record_outcome(&inst, true)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let now = now_millis();
+        let actually_ejected = instances
+            .iter()
+            .filter(|i| i.is_outlier_ejected(now))
+            .count();
+        assert!(
+            actually_ejected * 100 <= 50 * instances.len(),
+            "at most 50% of the pool may be ejected even under a 4-way simultaneous threshold \
+             crossing, got {actually_ejected}/{}",
+            instances.len()
+        );
     }
 
     #[test]

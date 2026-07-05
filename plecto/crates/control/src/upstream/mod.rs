@@ -134,6 +134,15 @@ pub struct UpstreamGroup {
     outlier_consecutive: u32,
     outlier_base_ejection: Duration,
     outlier_max_ejection_percent: u32,
+    /// Serializes the ejection DECISION (count already-ejected, check `max_ejection_percent`,
+    /// eject) across every instance in this group. Each instance's failure-streak bookkeeping
+    /// lives under that instance's own `counters` lock, but the cap check reads *group-wide*
+    /// state (how many peers are currently ejected) — without a group-wide lock around the
+    /// whole check-then-eject sequence, two instances crossing their threshold in the same
+    /// instant (e.g. a correlated backend blip) can each read "cap not yet reached" and both
+    /// eject, silently exceeding `max_ejection_percent`. Held only across this rare (threshold-
+    /// crossing) path, not the common per-request success/failure bookkeeping.
+    outlier_decision: std::sync::Mutex<()>,
     /// The request attribute a `Maglev` upstream hashes for affinity (ADR 000035); `None` for the
     /// other algorithms. The fast path reads this to project the hash key from a request.
     hash_key: Option<HashKeySource>,

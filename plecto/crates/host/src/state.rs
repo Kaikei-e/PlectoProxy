@@ -245,26 +245,42 @@ impl host_kv::Host for HostState {
             return;
         }
         let nskey = self.ns_key(TAG_KV, &key);
+        let kv_read = self.kv.clone();
+        let kv_write = self.kv.clone();
+        let read_nskey = nskey.clone();
+        let key_len = key.len();
+        let value_len = value.len();
         // Charge the byte delta vs. any existing value (a new key also charges its key bytes + 1
-        // entry). The read-before-write keeps the byte accounting exact for variable-size values.
-        let (entries_delta, bytes_delta) = match self.kv.get(&nskey).map(|v| v.len()) {
-            None => (1isize, (key.len() + value.len()) as isize),
-            Some(old) => (0isize, value.len() as isize - old as isize),
-        };
-        if !self
-            .quota
-            .admit(&self.kv_prefix, entries_delta, bytes_delta)
-        {
-            return;
-        }
-        self.kv.set(&nskey, value);
+        // entry), then write — atomically with the quota decision (`KvQuota::charge_and_apply`),
+        // so a concurrent `set` on the same key (the pool runs many instances of one filter at
+        // once) cannot race the read-old-value step against this call's write.
+        self.quota.charge_and_apply(
+            &self.kv_prefix,
+            move || match kv_read.get(&read_nskey).map(|v| v.len()) {
+                None => (1isize, (key_len + value_len) as isize),
+                Some(old) => (0isize, value_len as isize - old as isize),
+            },
+            move || kv_write.set(&nskey, value),
+        );
     }
     fn delete(&mut self, key: String) {
         let nskey = self.ns_key(TAG_KV, &key);
-        if let Some(old) = self.kv.get(&nskey).map(|v| v.len()) {
-            self.kv.delete(&nskey);
-            self.quota.release(&self.kv_prefix, 1, key.len() + old);
-        }
+        let kv_read = self.kv.clone();
+        let kv_write = self.kv.clone();
+        let read_nskey = nskey.clone();
+        let key_len = key.len();
+        // Read-then-release must be atomic with the quota decision too: two concurrent deletes
+        // of the same key must not both observe `Some(old)` and both release — the second must
+        // see the first's delete has already happened and release nothing (see
+        // `KvQuota::charge_and_apply` doc for the race this closes).
+        self.quota.charge_and_apply(
+            &self.kv_prefix,
+            move || match kv_read.get(&read_nskey).map(|v| v.len()) {
+                Some(old) => (-1isize, -((key_len + old) as isize)),
+                None => (0isize, 0isize),
+            },
+            move || kv_write.delete(&nskey),
+        );
     }
 }
 
@@ -275,16 +291,29 @@ impl host_counter::Host for HostState {
         if delta == 0 {
             return self.kv.increment(&nskey, 0);
         }
+        let kv_read = self.kv.clone();
+        let kv_write = self.kv.clone();
+        let read_nskey = nskey.clone();
+        let key_len = key.len();
         // A counter is a fixed 8-byte value: only a NEW key grows the store, so charge one entry
-        // when first created and fail closed (report the current value, do not create) over quota.
-        if self.kv.get(&nskey).is_none()
-            && !self
-                .quota
-                .admit(&self.kv_prefix, 1, (key.len() + 8) as isize)
-        {
-            return 0;
-        }
-        self.kv.increment(&nskey, delta)
+        // when first created and fail closed (report the current value, do not create) over quota
+        // — atomically with the increment itself (`KvQuota::charge_and_apply`), so two concurrent
+        // first-writes to the same new key cannot both observe "absent" and both charge an entry
+        // for what ends up being one logical key (the pool runs many concurrent instances of the
+        // same filter, all sharing this backend + quota).
+        self.quota
+            .charge_and_apply(
+                &self.kv_prefix,
+                move || {
+                    if kv_read.get(&read_nskey).is_none() {
+                        (1isize, (key_len + 8) as isize)
+                    } else {
+                        (0isize, 0isize)
+                    }
+                },
+                move || kv_write.increment(&nskey, delta),
+            )
+            .unwrap_or(0)
     }
     fn get(&mut self, key: String) -> i64 {
         // increment-by-zero is an atomic read of the current value (and the canonical
@@ -306,24 +335,38 @@ impl host_ratelimit::Host for HostState {
             };
         };
         let nskey = self.ns_key(TAG_RATELIMIT, &key);
+        let kv_read = self.kv.clone();
+        let kv_write = self.kv.clone();
+        let read_nskey = nskey.clone();
+        let key_len = key.len();
+        let now_ms = self.now_ms;
         // A bucket is a fixed 16-byte value: charge one entry when first created. Over quota a
         // filter cannot mint unbounded distinct-key buckets — deny (fail-closed), do not create.
-        if self.kv.get(&nskey).is_none()
-            && !self
-                .quota
-                .admit(&self.kv_prefix, 1, (key.len() + 16) as isize)
-        {
-            return host_ratelimit::Acquire {
+        // Reserving the entry and acquiring the bucket happen atomically
+        // (`KvQuota::charge_and_apply`), so two concurrent first-acquires on the same new key
+        // cannot both observe "absent" and both charge an entry for one logical bucket.
+        let result = self.quota.charge_and_apply(
+            &self.kv_prefix,
+            move || {
+                if kv_read.get(&read_nskey).is_none() {
+                    (1isize, (key_len + 16) as isize)
+                } else {
+                    (0isize, 0isize)
+                }
+            },
+            move || kv_write.try_acquire(&nskey, cost, spec, now_ms),
+        );
+        match result {
+            Some(r) => host_ratelimit::Acquire {
+                allowed: r.allowed,
+                remaining: r.remaining,
+                retry_after_ms: r.retry_after_ms,
+            },
+            None => host_ratelimit::Acquire {
                 allowed: false,
                 remaining: 0,
                 retry_after_ms: 0,
-            };
-        }
-        let r = self.kv.try_acquire(&nskey, cost, spec, self.now_ms);
-        host_ratelimit::Acquire {
-            allowed: r.allowed,
-            remaining: r.remaining,
-            retry_after_ms: r.retry_after_ms,
+            },
         }
     }
 }
@@ -543,6 +586,76 @@ mod tests {
         );
         KvHost::set(&mut s, "ok".into(), vec![0u8; 128]);
         assert_eq!(KvHost::get(&mut s, "ok".into()), Some(vec![0u8; 128]));
+    }
+
+    #[test]
+    fn concurrent_delete_of_the_same_key_releases_quota_exactly_once() {
+        // Regression test: the trusted pool runs many concurrent instances of one filter, all
+        // sharing one backend + one KvQuota. A get-then-delete-then-release sequence done as
+        // three independent lock acquisitions lets N concurrent deletes of the SAME key all
+        // observe `Some(old)` and all release budget for a key that only existed once —
+        // permanently under-counting real usage. `KvQuota::charge_and_apply` closes this by
+        // making the whole read-decide-release sequence one atomic unit per call.
+        use std::sync::Barrier;
+        use std::thread;
+
+        let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
+        let quota = Arc::new(KvQuota::new());
+        let prefix = "f\u{1f}".to_string();
+
+        let mut seed = HostState::new(
+            shared.clone(),
+            prefix.clone(),
+            DEFAULT_MAX_MEMORY_BYTES,
+            None,
+            quota.clone(),
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+        );
+        // Two distinct keys in the same namespace: "k1" (raced on below) and "k2" (untouched —
+        // its surviving budget is the tell-tale that a double-release didn't over-free the ns).
+        KvHost::set(&mut seed, "k1".into(), vec![0u8; 100]);
+        KvHost::set(&mut seed, "k2".into(), vec![0u8; 100]);
+        assert_eq!(
+            quota.usage_for_test(&prefix),
+            (2, 2 * (2 + 100)),
+            "both keys charged once each"
+        );
+
+        const RACERS: usize = 8;
+        let barrier = Arc::new(Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let kv = shared.clone();
+                let q = quota.clone();
+                let p = prefix.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    let mut s = HostState::new(
+                        kv,
+                        p,
+                        DEFAULT_MAX_MEMORY_BYTES,
+                        None,
+                        q,
+                        #[cfg(feature = "outbound-http")]
+                        outbound_http::PlectoHttpHooks::deny_all(),
+                    );
+                    b.wait();
+                    KvHost::delete(&mut s, "k1".into());
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one release happened for "k1"; "k2" is untouched — the namespace must show
+        // precisely k2's own accounting, not zeroed-out-by-clamping evidence of over-release.
+        assert_eq!(
+            quota.usage_for_test(&prefix),
+            (1, 2 + 100),
+            "k1's single release must not consume k2's untouched budget"
+        );
     }
 
     #[test]

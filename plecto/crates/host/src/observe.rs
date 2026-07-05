@@ -353,10 +353,17 @@ impl TelemetrySink for NoopSink {
     }
 }
 
-/// A reference / test sink that retains every span in memory.
+/// Cap on spans `InMemorySink` retains (CWE-770). This is a reference/test sink, not a
+/// production choice, but nothing in the type system stops a caller from wiring it into a live
+/// host's `TelemetrySink` — an unbounded `Vec` here would grow without limit under sustained
+/// request volume until the process runs out of memory. At capacity the oldest span is dropped
+/// to admit the newest (FIFO), mirroring `OtlpBuffer`'s bounded-queue discipline.
+const MAX_RETAINED_SPANS: usize = 10_000;
+
+/// A reference / test sink that retains up to `MAX_RETAINED_SPANS` spans in memory.
 #[derive(Debug, Default)]
 pub struct InMemorySink {
-    spans: Mutex<Vec<FilterSpan>>,
+    spans: Mutex<std::collections::VecDeque<FilterSpan>>,
 }
 
 impl InMemorySink {
@@ -366,7 +373,7 @@ impl InMemorySink {
 
     /// A snapshot of every span captured so far.
     pub fn spans(&self) -> Vec<FilterSpan> {
-        self.spans.lock().clone()
+        self.spans.lock().iter().cloned().collect()
     }
 
     pub fn len(&self) -> usize {
@@ -380,7 +387,11 @@ impl InMemorySink {
 
 impl TelemetrySink for InMemorySink {
     fn export(&self, span: &FilterSpan) {
-        self.spans.lock().push(span.clone());
+        let mut spans = self.spans.lock();
+        if spans.len() >= MAX_RETAINED_SPANS {
+            spans.pop_front();
+        }
+        spans.push_back(span.clone());
     }
 }
 
@@ -596,6 +607,42 @@ mod tests {
             got[0].events.len(),
             1,
             "the host-log line became a span event"
+        );
+    }
+
+    #[test]
+    fn in_memory_sink_drops_oldest_past_the_retention_cap() {
+        // Regression test (CWE-770): nothing in the type system stops a caller from wiring this
+        // reference sink into a live host, so it must not grow without bound under sustained
+        // export volume — it drops the oldest span, not the newest, to admit each new one.
+        let trace = RequestTrace::root();
+        let span_named = |name: &str| {
+            build_filter_span(
+                &trace,
+                name,
+                Isolation::Trusted,
+                Hook::OnRequest,
+                SpanOutcome::Continue,
+                SystemTime::now(),
+                Duration::from_micros(1),
+                &[],
+            )
+        };
+        let sink = InMemorySink::new();
+        for i in 0..(MAX_RETAINED_SPANS + 10) {
+            sink.export(&span_named(&i.to_string()));
+        }
+        assert_eq!(sink.len(), MAX_RETAINED_SPANS, "retention is capped");
+        let got = sink.spans();
+        assert_eq!(
+            got.first().unwrap().name,
+            "10",
+            "the oldest 10 spans were evicted, FIFO"
+        );
+        assert_eq!(
+            got.last().unwrap().name,
+            (MAX_RETAINED_SPANS + 9).to_string(),
+            "the newest span is retained"
         );
     }
 }

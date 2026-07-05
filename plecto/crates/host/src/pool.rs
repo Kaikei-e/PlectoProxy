@@ -25,7 +25,46 @@ pub(crate) struct LoadedInner<R: FilterRuntime> {
     /// Where this filter's per-execution spans go (cloned from the `Host` at load).
     pub(crate) sink: Arc<dyn TelemetrySink>,
     pub(crate) isolation: Isolation,
+    /// Circuit breaker for the untrusted lifecycle (`run_fresh`), mirroring `TrustedPool`'s
+    /// pool-wide breaker but scoped to this filter: every untrusted call pays a fresh
+    /// `instantiate_initialized()` (init under the generous `init_deadline_ms`, not the tight
+    /// per-request one) with no pool to amortize across. Without this, a filter whose `init`
+    /// deterministically traps forces the host to re-pay that full init budget on every single
+    /// incoming request forever — bounded per-call by the epoch deadline, but with zero backoff
+    /// across calls, exactly the repeated-cost DoS shape the trusted pool's breaker exists to stop.
+    untrusted_breaker: Mutex<TrapBreaker>,
 }
+
+/// Consecutive traps before a circuit breaker opens a cooldown; shared shape for both the
+/// pool-wide trusted breaker and the per-filter untrusted breaker.
+#[derive(Default)]
+struct TrapBreaker {
+    consecutive_traps: u32,
+    cooldown_until_ms: u64,
+}
+
+impl TrapBreaker {
+    fn record_trap(&mut self) {
+        self.consecutive_traps = self.consecutive_traps.saturating_add(1);
+        if self.consecutive_traps >= UNTRUSTED_TRAP_BREAKER_THRESHOLD {
+            self.cooldown_until_ms = wall_now_ms().saturating_add(UNTRUSTED_TRAP_COOLDOWN_MS);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.consecutive_traps = 0;
+        self.cooldown_until_ms = 0;
+    }
+}
+
+/// Consecutive untrusted-lifecycle failures (instantiate/init OR the call itself trapping)
+/// before the per-filter breaker opens a cooldown. Same threshold as the trusted pool's breaker
+/// — a handful of traps still self-heal (the next call tries fresh); only a deterministically
+/// broken filter reaches it.
+const UNTRUSTED_TRAP_BREAKER_THRESHOLD: u32 = 3;
+/// How long the untrusted breaker stays open once tripped: during it, calls fail closed cheaply
+/// (`RunError::Unavailable`) without paying `instantiate_initialized()` at all.
+const UNTRUSTED_TRAP_COOLDOWN_MS: u64 = 500;
 
 /// Releases a reserved/held `live` pool slot on unwind. Armed while a checked-out instance (or a
 /// reserved build slot) is outside the pool's bookkeeping; the normal return paths disarm it and
@@ -50,6 +89,22 @@ impl<I> Drop for LiveSlotGuard<'_, I> {
 }
 
 impl<R: FilterRuntime> LoadedInner<R> {
+    /// Build a `LoadedInner` with a fresh (untripped) untrusted-lifecycle breaker.
+    pub(crate) fn new(
+        runtime: R,
+        filter_id: String,
+        sink: Arc<dyn TelemetrySink>,
+        isolation: Isolation,
+    ) -> Self {
+        Self {
+            runtime,
+            filter_id,
+            sink,
+            isolation,
+            untrusted_breaker: Mutex::new(TrapBreaker::default()),
+        }
+    }
+
     /// Check out a trusted instance from the pool (ADR 000012): reuse an idle one, lazily build
     /// a fresh one while under `cap`, or — when every instance is checked out — wait up to the
     /// pool's `checkout_timeout` for one to free and then fail **closed** (`Unavailable`).
@@ -113,21 +168,34 @@ impl<R: FilterRuntime> LoadedInner<R> {
     /// The untrusted lifecycle: instantiate fresh + init, run one call, map errors, take logs.
     /// Exactly mirrors `run_pooled`'s post-call bookkeeping — the only difference between the two
     /// lifecycles is whether the instance comes from the pool or is built fresh right here.
+    /// Guarded by a per-filter breaker (`untrusted_breaker`): a deterministically failing filter
+    /// fails closed cheaply during its cooldown instead of re-paying `instantiate_initialized()`
+    /// (the generous init budget) on every single incoming request.
     fn run_fresh<T>(
         &self,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
     ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
-        let mut inst = self
-            .runtime
-            .instantiate_initialized()
-            .map_err(RunError::Instantiate)?;
+        if wall_now_ms() < self.untrusted_breaker.lock().cooldown_until_ms {
+            return Err(RunError::Unavailable);
+        }
+        let mut inst = match self.runtime.instantiate_initialized() {
+            Ok(inst) => inst,
+            Err(e) => {
+                self.untrusted_breaker.lock().record_trap();
+                return Err(RunError::Instantiate(e));
+            }
+        };
         self.runtime.set_request_deadline(&mut inst);
         match call(&mut inst) {
             Ok(value) => {
                 let logs = self.runtime.take_logs(&mut inst);
+                self.untrusted_breaker.lock().clear();
                 Ok((value, logs))
             }
-            Err(e) => Err(RunError::from_call(e)),
+            Err(e) => {
+                self.untrusted_breaker.lock().record_trap();
+                Err(RunError::from_call(e))
+            }
         }
     }
 
@@ -338,12 +406,12 @@ mod pool_tests {
     }
 
     fn fake_inner(runtime: FakeRuntime) -> LoadedInner<FakeRuntime> {
-        LoadedInner {
+        LoadedInner::new(
             runtime,
-            filter_id: "test".to_string(),
-            sink: Arc::new(NoopSink),
-            isolation: Isolation::Trusted,
-        }
+            "test".to_string(),
+            Arc::new(NoopSink),
+            Isolation::Trusted,
+        )
     }
 
     #[test]
@@ -476,6 +544,51 @@ mod pool_tests {
             inner.runtime.instantiate_calls(),
             3,
             "the untrusted lifecycle instantiates fresh + re-inits on every single call"
+        );
+    }
+
+    #[test]
+    fn untrusted_lifecycle_opens_circuit_breaker_after_consecutive_traps_and_cools_down_then_self_heals()
+     {
+        // Regression test: without a breaker, a filter whose call deterministically traps would
+        // force `run_fresh` to re-pay `instantiate_initialized()` (the generous init budget) on
+        // every single request forever. The per-filter breaker must fail closed cheaply instead,
+        // without even attempting to instantiate, once tripped — mirroring the trusted pool's
+        // pool-wide breaker test above.
+        let runtime = FakeRuntime::new();
+        let inner = fake_inner(runtime);
+
+        for _ in 0..UNTRUSTED_TRAP_BREAKER_THRESHOLD {
+            let result = inner.run_hook(None, |_inst: &mut FakeInstance| {
+                wasmtime::Result::<()>::Err(wasmtime::Error::msg("simulated trap"))
+            });
+            assert!(
+                matches!(result, Err(RunError::Trap(_))),
+                "expected a Trap before the breaker opens, got {result:?}"
+            );
+        }
+
+        let calls_before_open = inner.runtime.instantiate_calls();
+        let result = inner.run_hook(None, |_inst: &mut FakeInstance| -> wasmtime::Result<()> {
+            panic!("must not be called while the untrusted breaker is open")
+        });
+        assert!(
+            matches!(result, Err(RunError::Unavailable)),
+            "the per-filter untrusted breaker should be open"
+        );
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            calls_before_open,
+            "a call during the cooldown must not pay instantiate_initialized at all"
+        );
+
+        std::thread::sleep(Duration::from_millis(UNTRUSTED_TRAP_COOLDOWN_MS + 20));
+        let result = inner.run_hook(None, |inst: &mut FakeInstance| {
+            Ok::<_, wasmtime::Error>(inst.id)
+        });
+        assert!(
+            result.is_ok(),
+            "the untrusted lifecycle should self-heal once the cooldown elapses, got {result:?}"
         );
     }
 }

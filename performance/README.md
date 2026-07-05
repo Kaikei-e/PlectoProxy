@@ -373,6 +373,17 @@ new baseline for the `aws-lc-rs` path, not directly comparable to earlier `ring`
 The **ratios hold**, though — kept-alive TLS costs ~51 % of plaintext under either provider, within
 this report's usual host-noise spread of the same measurement.)*
 
+> **Pending re-measurement (ADR 000052, stateless session resumption).** The proxy now issues
+> stateless TLS 1.3 session tickets (one process-lifetime key, 6 h rotation), so the table above is
+> missing the rung most real traffic rides: the **resumed handshake**, between `handshake/req`
+> (worst) and `keep-alive` (best). Two caveats travel with the change: (a) the `handshake/req` row
+> was measured with oha, which shares one rustls `ClientConfig` across connections — against the
+> new server its cold connections silently resume once warm, so that row can no longer be
+> reproduced with oha; (b) the row's historical value was taken against the then-implicit stateful
+> cache (256 sessions). The next measurement session takes both rungs with
+> `plecto-loadgen tls --mode full|resumed` (explicit client-resumption control, observed resumed %
+> in the CSV), in the same session as ADR 000051's provider A/B.
+
 ---
 
 # 2. WASM extension plane

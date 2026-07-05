@@ -42,6 +42,19 @@ _Avoid_: restart, hot restart（プロセス再起動を含意）
 （operator が編集済みマニフェストの取り込みを明示 push する慣習）。
 _Avoid_: config push（設定を運ぶ含意で、xDS 的動的 push と混同）
 
+## TLS 終端
+
+**Stateless resumption（ステートレス再開）**:
+自己暗号化されたセッションチケットだけで TLS セッションを再開する方式。サーバはセッションごとの状態を
+一切持たず、チケットを封緘する鍵だけを保持する（ADR 000052）。0-RTT（early data）は別概念で、Plecto では
+常に拒否。
+_Avoid_: session cache（サーバ側にセッション状態を残す stateful 方式の含意）, 0-RTT（再開とは別の概念）
+
+**チケット鍵（session ticket key）**:
+セッションチケットを封緘する、ノードローカル・プロセス寿命の鍵。定期ローテーションされ、ディスクにも
+manifest にも置かれない。reload では失効しない（プロセス寿命）。
+_Avoid_: shared key / cluster key（レプリカ間共有の含意——ノードローカル宣言 [ADR 000053] に反する）
+
 ## 分散（opt-in）
 
 **Distribution (opt-in)**:

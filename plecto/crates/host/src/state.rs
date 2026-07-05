@@ -245,6 +245,7 @@ impl host_kv::Host for HostState {
             return;
         }
         let nskey = self.ns_key(TAG_KV, &key);
+        let stripe_key = nskey.clone();
         let kv_read = self.kv.clone();
         let kv_write = self.kv.clone();
         let read_nskey = nskey.clone();
@@ -256,6 +257,7 @@ impl host_kv::Host for HostState {
         // once) cannot race the read-old-value step against this call's write.
         self.quota.charge_and_apply(
             &self.kv_prefix,
+            &stripe_key,
             move || match kv_read.get(&read_nskey).map(|v| v.len()) {
                 None => (1isize, (key_len + value_len) as isize),
                 Some(old) => (0isize, value_len as isize - old as isize),
@@ -265,6 +267,7 @@ impl host_kv::Host for HostState {
     }
     fn delete(&mut self, key: String) {
         let nskey = self.ns_key(TAG_KV, &key);
+        let stripe_key = nskey.clone();
         let kv_read = self.kv.clone();
         let kv_write = self.kv.clone();
         let read_nskey = nskey.clone();
@@ -275,6 +278,7 @@ impl host_kv::Host for HostState {
         // `KvQuota::charge_and_apply` doc for the race this closes).
         self.quota.charge_and_apply(
             &self.kv_prefix,
+            &stripe_key,
             move || match kv_read.get(&read_nskey).map(|v| v.len()) {
                 Some(old) => (-1isize, -((key_len + old) as isize)),
                 None => (0isize, 0isize),
@@ -291,6 +295,7 @@ impl host_counter::Host for HostState {
         if delta == 0 {
             return self.kv.increment(&nskey, 0);
         }
+        let stripe_key = nskey.clone();
         let kv_read = self.kv.clone();
         let kv_write = self.kv.clone();
         let read_nskey = nskey.clone();
@@ -304,6 +309,7 @@ impl host_counter::Host for HostState {
         self.quota
             .charge_and_apply(
                 &self.kv_prefix,
+                &stripe_key,
                 move || {
                     if kv_read.get(&read_nskey).is_none() {
                         (1isize, (key_len + 8) as isize)
@@ -335,6 +341,7 @@ impl host_ratelimit::Host for HostState {
             };
         };
         let nskey = self.ns_key(TAG_RATELIMIT, &key);
+        let stripe_key = nskey.clone();
         let kv_read = self.kv.clone();
         let kv_write = self.kv.clone();
         let read_nskey = nskey.clone();
@@ -347,6 +354,7 @@ impl host_ratelimit::Host for HostState {
         // cannot both observe "absent" and both charge an entry for one logical bucket.
         let result = self.quota.charge_and_apply(
             &self.kv_prefix,
+            &stripe_key,
             move || {
                 if kv_read.get(&read_nskey).is_none() {
                     (1isize, (key_len + 16) as isize)

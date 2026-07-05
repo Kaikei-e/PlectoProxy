@@ -297,6 +297,56 @@ mod tests {
     }
 
     #[test]
+    fn stateless_resumption_invariants() {
+        // ADR 000052's invariants, pinned per path so a rustls default change (or a refactor that
+        // touches only one config) cannot silently reintroduce the stateful cache or 0-RTT.
+        let (dir, entry) = default_cert_entry();
+        let configs = build_server_configs(&[entry], dir.path())
+            .unwrap()
+            .expect("a cert entry yields TCP + QUIC configs");
+        for (label, config) in [("tcp", &configs.tcp), ("quic", &configs.quic)] {
+            assert!(
+                config.ticketer.enabled(),
+                "{label}: stateless session tickets are issued (ADR 000052)"
+            );
+            assert_eq!(
+                config.ticketer.lifetime(),
+                12 * 60 * 60,
+                "{label}: 12h acceptance window (6h rotation, current + previous key)"
+            );
+            assert!(
+                !config.session_storage.can_cache(),
+                "{label}: no stateful session cache — per-session server memory stays zero"
+            );
+            assert_eq!(
+                config.max_early_data_size, 0,
+                "{label}: 0-RTT stays refused (ADR 000016 / RFC 8470), independent of the \
+                 ticketer-exclusivity rustls happens to enforce today"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_key_is_process_wide_across_paths_and_builds() {
+        // One ticket producer for TCP + QUIC (a ticket obtained over either resumes on both), and
+        // the SAME producer across rebuilds — a manifest reload must not invalidate outstanding
+        // tickets (ADR 000052: process-lifetime, node-local key).
+        let (dir, entry) = default_cert_entry();
+        let a = build_server_configs(std::slice::from_ref(&entry), dir.path())
+            .unwrap()
+            .unwrap();
+        let b = build_server_configs(&[entry], dir.path()).unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&a.tcp.ticketer, &a.quic.ticketer),
+            "TCP and QUIC share one ticket producer"
+        );
+        assert!(
+            Arc::ptr_eq(&a.tcp.ticketer, &b.tcp.ticketer),
+            "a rebuild (reload) keeps the process-lifetime ticket key"
+        );
+    }
+
+    #[test]
     fn no_tls_entries_yields_none() {
         assert!(
             build_server_configs(&[], std::path::Path::new("."))

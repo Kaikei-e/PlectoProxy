@@ -16,7 +16,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
+use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore, crypto::aws_lc_rs};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
@@ -176,6 +176,54 @@ async fn https_get(
     )
 }
 
+/// A client config with a live session cache (rustls client default: tickets accepted + cached),
+/// built once so callers can SHARE it across connections — a second connection then offers the
+/// first's session ticket, which is what the resumption tests below exercise.
+fn resuming_client_config(root: CertificateDer<'static>) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.add(root).unwrap();
+    Arc::new(
+        ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// One HTTPS GET on a FRESH connection using the shared `config`, returning the handshake kind
+/// (Full vs Resumed) with the status. The GET matters even when only the kind is asserted: TLS 1.3
+/// NewSessionTickets are post-handshake messages, so the response read is what pulls them into the
+/// client's session cache for the next connection to offer.
+async fn https_get_kind(
+    proxy: SocketAddr,
+    config: Arc<ClientConfig>,
+    path: &str,
+) -> (StatusCode, HandshakeKind) {
+    let connector = TlsConnector::from(config);
+    let tcp = TcpStream::connect(proxy).await.unwrap();
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let kind = tls.get_ref().1.handshake_kind().unwrap();
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let (parts, body) = resp.into_parts();
+    let _ = body.collect().await.unwrap();
+    (parts.status, kind)
+}
+
 #[tokio::test]
 async fn terminates_tls_then_routes_and_forwards() {
     let cert = make_cert();
@@ -214,6 +262,66 @@ async fn terminates_tls_then_routes_and_forwards() {
         alt_svc.as_deref(),
         Some(format!("h3=\":{port}\"; ma=86400").as_str()),
         "TCP responses advertise h3 on the same port via Alt-Svc"
+    );
+}
+
+#[tokio::test]
+async fn second_connection_resumes_with_stateless_ticket() {
+    // ADR 000052: TLS 1.3 stateless resumption. A client that cached the first connection's
+    // session ticket must complete the second handshake as Resumed — skipping the certificate +
+    // signature work that makes the full handshake the TLS path's dominant cost. The HTTP status
+    // is irrelevant here (the handshake completes either way); only the handshake kind is pinned.
+    let cert = make_cert();
+    let upstream = spawn_upstream().await;
+    let tls_block = format!(
+        "\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
+        cert.cert_path, cert.key_path
+    );
+    let control = loaded_control(&manifest_toml(upstream, "{digest}", &tls_block)).unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+    let config = resuming_client_config(cert.cert_der.clone());
+
+    let (_, first) = https_get_kind(proxy, config.clone(), "/api/hello").await;
+    assert_eq!(
+        first,
+        HandshakeKind::Full,
+        "an empty client session cache means the first handshake is full"
+    );
+    let (_, second) = https_get_kind(proxy, config, "/api/hello").await;
+    assert_eq!(
+        second,
+        HandshakeKind::Resumed,
+        "the second connection offers the first's ticket and resumes"
+    );
+}
+
+#[tokio::test]
+async fn ticket_resumes_across_config_rebuilds() {
+    // ADR 000052: the ticket key is PROCESS-lifetime, not config-lifetime. A manifest reload
+    // rebuilds the ServerConfigs; tickets issued before the reload must still resume after it —
+    // otherwise every SIGHUP silently degrades the fleet to full handshakes. Two independently
+    // loaded Controls are a reload in miniature (and also stand in for the stateful default this
+    // ADR removes: a per-config session CACHE cannot resume across builds, a shared stateless
+    // ticket KEY can). The client caches the ticket under SNI "localhost", so it offers it to
+    // the second proxy even though the port differs.
+    let cert = make_cert();
+    let upstream = spawn_upstream().await;
+    let tls_block = format!(
+        "\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
+        cert.cert_path, cert.key_path
+    );
+    let toml = manifest_toml(upstream, "{digest}", &tls_block);
+    let proxy_a = spawn_proxy(Arc::new(loaded_control(&toml).unwrap())).await;
+    let proxy_b = spawn_proxy(Arc::new(loaded_control(&toml).unwrap())).await;
+    let config = resuming_client_config(cert.cert_der.clone());
+
+    let (_, first) = https_get_kind(proxy_a, config.clone(), "/api/hello").await;
+    assert_eq!(first, HandshakeKind::Full);
+    let (_, cross) = https_get_kind(proxy_b, config, "/api/hello").await;
+    assert_eq!(
+        cross,
+        HandshakeKind::Resumed,
+        "a ticket from before the rebuild resumes after it (process-lifetime key, ADR 000052)"
     );
 }
 

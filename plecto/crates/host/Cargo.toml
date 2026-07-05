@@ -23,6 +23,11 @@ bench = false
 # under `examples/filters/` / `bench/filters/`. This crate's own `[dev-dependencies]` turn it on for
 # `cargo test`/`--examples`/`cargo bench`; dependent crates do the same in their own dev-dependencies.
 test-support = []
+# Polyglot conformance (tests/polyglot.rs): runs the SAME contract assertions against the non-Rust
+# example filters (MoonBit / JS / C — all zero-WASI components built OUTSIDE cargo by their own
+# toolchains, see examples/filters/filter-hello-*/build.sh). OFF by default so `cargo test` never
+# requires those toolchains; CI's polyglot-guests job builds the components first, then enables this.
+polyglot-conformance = []
 # Experimental streaming body filter (direction_0003 gates 1+2). OFF by default: the shipped
 # plecto:filter@0.1.0 path and the default build are untouched. When on, it pulls a minimally-sliced
 # WASI (wasi:http/proxy interfaces — no fs/sockets/env) and drives an async `stream<u8>` body filter

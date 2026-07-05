@@ -1,0 +1,4 @@
+--- host-ratelimit: the token bucket stays HOST-NATIVE (ADR 000005). The hot-path
+--- refill + counting never cross the WASM boundary; the filter only DECIDES to
+--- consult the limiter and on what key. This is the fast-path/extension-plane
+--- split applied to rate limiting.

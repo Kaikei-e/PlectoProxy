@@ -1,0 +1,2 @@
+--- host-counter: atomic named counters (ADR 000004). Shape mirrors
+--- wasi:keyvalue/atomics so polyglot filters meet a familiar contract.

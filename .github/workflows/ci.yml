@@ -108,6 +108,54 @@ jobs:
           workspaces: plecto/examples/filters/filter-hello
       - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+  # Polyglot guests: build the non-Rust example filters (MoonBit / JS / C — all zero-WASI
+  # components, each by its own toolchain) and run the SAME conformance assertions against
+  # them (crates/host/tests/polyglot.rs). This is the falsifiable form of the polyglot claim;
+  # without this job the examples would bit-rot silently. Tool tarballs are sha256-pinned
+  # (supply-chain stance, A08); MoonBit only distributes `latest`, so it installs unpinned —
+  # pin it too once versioned artifacts are published.
+  polyglot-guests:
+    name: polyglot guests (MoonBit / JS / C)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
+          # build.rs still componentizes the Rust test fixtures during `cargo test`.
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: plecto-polyglot
+          cache-on-failure: true
+          workspaces: plecto
+      - name: Install wasm-tools / wit-bindgen / wasi-sdk (sha256-pinned)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
+          echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
+          curl -sSL -o wit-bindgen.tar.gz https://github.com/bytecodealliance/wit-bindgen/releases/download/v0.58.0/wit-bindgen-0.58.0-x86_64-linux.tar.gz
+          echo "16831a7b18fed12f1b1ece26e458adb0c6c9ce0c7f3308e3f2fb7770f990a618  wit-bindgen.tar.gz" | sha256sum -c -
+          curl -sSL -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz
+          echo "0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce  wasi-sdk.tar.gz" | sha256sum -c -
+          tar xzf wasm-tools.tar.gz && tar xzf wit-bindgen.tar.gz && tar xzf wasi-sdk.tar.gz
+          echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wit-bindgen-0.58.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "WASI_SDK_PATH=${{ runner.temp }}/wasi-sdk-33.0-x86_64-linux" >> "$GITHUB_ENV"
+      - name: Install MoonBit
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
+      - name: Build the three guests (each asserts zero WASI imports)
+        run: |
+          ./examples/filters/filter-hello-c/build.sh
+          ./examples/filters/filter-hello-moonbit/build.sh
+          ./examples/filters/filter-hello-js/build.sh
+      - name: Same contract, same assertions, three languages
+        run: cargo test -p plecto-host --features polyglot-conformance --test polyglot
+
   # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).
   # A security vulnerability, unmaintained crate, or yanked version fails CI — supply-chain
   # integrity is a security gate, not a courtesy check. Policy is the curated `plecto/deny.toml`

@@ -271,7 +271,18 @@ async fn proxy_core_inner(
         // Bound concurrent buffered-body memory and the time spent reading one body
         // (slow-body slowloris): hold a buffer permit and read under a deadline. Over the
         // size cap → 413, over the time budget → 408 — both fail closed (never an unbounded buffer).
-        let _buf_permit = state.body_buffer_limit.clone().acquire_owned().await.ok();
+        // An acquire error (the semaphore closed) must fail closed too, not silently proceed
+        // without a permit — that would bypass the concurrency cap entirely for this request.
+        let _buf_permit = match state.body_buffer_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Ok(synth(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &fault::BODY_BUFFER_UNAVAILABLE,
+                    b"body buffer unavailable",
+                ));
+            }
+        };
         let buffered = match tokio::time::timeout(
             INBOUND_BODY_READ_TIMEOUT,
             buffer_request_body(b, MAX_REQUEST_BODY_BUFFER),

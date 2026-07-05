@@ -128,9 +128,11 @@ pub struct OtlpBuffer {
 impl OtlpBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::with_capacity(
-                capacity.min(DEFAULT_QUEUE_CAPACITY),
-            )),
+            // Pre-allocate the FULL configured capacity, not `DEFAULT_QUEUE_CAPACITY` — `push`
+            // enforces `capacity` itself (below), so under-allocating here just means the queue
+            // reallocates mid-flight the first time a burst pushes it past 2048, for any operator
+            // who configured a larger capacity to ride out a longer collector outage.
+            queue: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
             dropped: AtomicU64::new(0),
             drop_logged: AtomicBool::new(false),

@@ -27,6 +27,8 @@ pub(crate) mod fault {
         HeaderValue::from_static("no-healthy-upstream");
     pub(crate) static BODY_TOO_LARGE: HeaderValue = HeaderValue::from_static("body-too-large");
     pub(crate) static BODY_TIMEOUT: HeaderValue = HeaderValue::from_static("body-timeout");
+    pub(crate) static BODY_BUFFER_UNAVAILABLE: HeaderValue =
+        HeaderValue::from_static("body-buffer-unavailable");
     pub(crate) static CIRCUIT_OPEN: HeaderValue = HeaderValue::from_static("circuit-open");
     pub(crate) static REQUEST_TIMEOUT: HeaderValue = HeaderValue::from_static("request-timeout");
     pub(crate) static UPSTREAM_TIMEOUT: HeaderValue = HeaderValue::from_static("upstream-timeout");

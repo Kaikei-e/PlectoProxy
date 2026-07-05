@@ -42,12 +42,12 @@ impl ConfigSnapshot {
     /// Drive a request through the **default** `[chain]` (the chain-only convenience). The
     /// fast-path server uses [`ConfigSnapshot::find_route`] + [`ConfigSnapshot::dispatch_request`].
     pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        chain::dispatch_request(&self.config, &self.config.chain, request, &self.trace)
+        chain::dispatch_request(&self.config.resolved_chain, request, &self.trace)
     }
 
     /// Drive a response back through the default `[chain]` in reverse.
     pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
-        chain::dispatch_response(&self.config, &self.config.chain, response, &self.trace)
+        chain::dispatch_response(&self.config.resolved_chain, response, &self.trace)
     }
 
     /// Match a request to a route by its `[route.match]` dimensions — host, path prefix, method,
@@ -85,7 +85,7 @@ impl ConfigSnapshot {
     /// fail-closed 404 rather than panicking (data-plane no-panic, bp-rust).
     pub fn dispatch_request(&self, route: usize, request: HttpRequest) -> ChainOutcome {
         match self.config.routes.get(route) {
-            Some(r) => chain::dispatch_request(&self.config, &r.filters, request, &self.trace),
+            Some(r) => chain::dispatch_request(&r.resolved_chain, request, &self.trace),
             None => ChainOutcome::Respond(no_route_response()),
         }
     }
@@ -95,7 +95,7 @@ impl ConfigSnapshot {
     /// route with filters and a non-empty body; a stale index forwards the body unchanged.
     pub fn dispatch_request_body(&self, route: usize, body: Vec<u8>) -> RequestBodyOutcome {
         match self.config.routes.get(route) {
-            Some(r) => chain::dispatch_request_body(&self.config, &r.filters, body, &self.trace),
+            Some(r) => chain::dispatch_request_body(&r.resolved_chain, body, &self.trace),
             None => RequestBodyOutcome::Forward(body),
         }
     }
@@ -104,7 +104,7 @@ impl ConfigSnapshot {
     /// the request side, on the same (cloned) snapshot, so both halves run one route's chain.
     pub fn dispatch_response(&self, route: usize, response: HttpResponse) -> HttpResponse {
         match self.config.routes.get(route) {
-            Some(r) => chain::dispatch_response(&self.config, &r.filters, response, &self.trace),
+            Some(r) => chain::dispatch_response(&r.resolved_chain, response, &self.trace),
             None => response,
         }
     }

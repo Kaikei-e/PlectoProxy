@@ -102,7 +102,11 @@ pub use plecto_host::otlp;
 /// separate lock.
 pub(crate) struct ActiveConfig {
     pub(crate) filters: HashMap<String, Arc<LoadedFilter>>,
-    pub(crate) chain: Vec<String>,
+    /// The manifest's default `[chain]`, resolved to the loaded filter in order — built once per
+    /// reload so the default-chain convenience (`ConfigSnapshot::on_request` / `on_response`)
+    /// never re-hashes a filter id against `filters` on every request (mirrors
+    /// `CompiledRoute::resolved_chain`).
+    pub(crate) resolved_chain: Vec<Arc<LoadedFilter>>,
     /// Compiled routing table (ADR 000013): empty unless the manifest declares `[[route]]`.
     /// The fast-path server matches against these; the chain-only `on_request` ignores them.
     pub(crate) routes: Vec<route::CompiledRoute>,
@@ -550,9 +554,19 @@ fn build_active(
                 .filters
                 .iter()
                 .any(|id| filters.get(id).is_some_and(|f| f.reads_body())),
+            // present: `validate_routes` already checked every id against `filter_ids` above, so
+            // this is always `Some` — `filter_map` stays total (no indexing/unwrap panic) rather
+            // than asserting an invariant that's already enforced one step earlier.
+            resolved_chain: r
+                .filters
+                .iter()
+                .filter_map(|id| filters.get(id).cloned())
+                .collect(),
             filters: r.filters.clone(),
             backends: Arc::new(backends),
-            strip_prefix: r.strip_prefix.clone(),
+            // Built once per reload (unlike the per-request `RouteInfo` clone in `snapshot.rs`),
+            // so allocating here to convert into the per-request-cheap `Arc<str>` is fine.
+            strip_prefix: r.strip_prefix.as_deref().map(Arc::from),
             // Build the native limiter (ADR 000033) — `rate`/`burst` were validated non-zero above.
             // A fresh limiter per build means a reload resets the node-local buckets (ephemeral).
             rate_limit: r
@@ -566,9 +580,16 @@ fn build_active(
         });
     }
 
+    let resolved_chain = manifest
+        .chain
+        .filters
+        .iter()
+        .filter_map(|id| filters.get(id).cloned())
+        .collect();
+
     Ok(ActiveConfig {
         filters,
-        chain: manifest.chain.filters.clone(),
+        resolved_chain,
         routes,
         tls,
         quic_tls,

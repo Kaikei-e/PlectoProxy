@@ -188,6 +188,7 @@ impl UpstreamRegistry {
                         up.outlier_detection.base_ejection_time_ms,
                     ),
                     outlier_max_ejection_percent: up.outlier_detection.max_ejection_percent,
+                    outlier_decision: std::sync::Mutex::new(()),
                     hash_key,
                     tls_manifest: up.tls.clone(),
                     tls_client,

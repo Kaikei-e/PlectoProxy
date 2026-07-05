@@ -6,6 +6,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -14,8 +15,20 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::ServerState;
+
+/// Cap on concurrent admin connections. The admin endpoint is opt-in, internal-only (never a
+/// data-plane client), and low-volume (a Prometheus scraper / orchestrator probe) — far lower
+/// than the data plane's `MAX_CONNECTIONS`, just enough to bound worst-case fan-out rather than
+/// leave the accept loop fully unbounded.
+const MAX_ADMIN_CONNECTIONS: usize = 64;
+/// Same slowloris hardening as the data-plane listener (`listener.rs`): hyper's http1 header-read
+/// timeout is inert unless a timer is configured, and the header-count default is undocumented,
+/// so both are pinned explicitly here too.
+const ADMIN_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const ADMIN_MAX_HEADERS: usize = 100;
 
 /// Bind `addr` and serve `/metrics`, `/healthz`, `/readyz` until the listener errors. A bind
 /// failure disables the admin endpoint (logged) WITHOUT taking down the data plane — observability
@@ -29,6 +42,7 @@ pub(crate) async fn serve_admin(state: Arc<ServerState>, addr: SocketAddr) {
         }
     };
     tracing::info!(%addr, "admin endpoint listening (/metrics /healthz /readyz)");
+    let conn_limit = Arc::new(Semaphore::new(MAX_ADMIN_CONNECTIONS));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -37,11 +51,23 @@ pub(crate) async fn serve_admin(state: Arc<ServerState>, addr: SocketAddr) {
                 continue;
             }
         };
+        // Bound worst-case fan-out (slowloris / connection-flood): block accepting the NEXT
+        // connection until a permit frees, rather than spawning unboundedly. `Semaphore` is never
+        // closed here, so `Err` is unreachable — matched anyway (data-plane no-panic, bp-rust).
+        let Ok(permit) = conn_limit.clone().acquire_owned().await else {
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _permit = permit; // held for the connection's lifetime; releases on drop
             let io = TokioIo::new(stream);
             let service = service_fn(move |req| admin_handle(state.clone(), req));
             if let Err(e) = hyper::server::conn::http1::Builder::new()
+                // header_read_timeout only fires with a timer configured (hyper's timer-less
+                // default is inert) — same pattern as the data-plane listener.
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(ADMIN_HEADER_READ_TIMEOUT)
+                .max_headers(ADMIN_MAX_HEADERS)
                 .serve_connection(io, service)
                 .await
             {

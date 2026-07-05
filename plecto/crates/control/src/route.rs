@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use plecto_host::Header;
+use plecto_host::{Header, LoadedFilter};
 
 use crate::error::ControlError;
 use crate::manifest::Route;
@@ -23,7 +23,7 @@ use crate::weighted::{self, WeightedBackends};
 /// a single upstream or a weighted split — is resolved to a [`WeightedBackends`] whose groups are
 /// shared (`Arc`) with the upstream registry, so the actual instance is chosen by round-robin over
 /// the healthy set at forward time, not here (ADR 000017 / 000024).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CompiledRoute {
     /// Lower-cased authority to match, or `None` for any host.
     pub(crate) host: Option<String>,
@@ -37,8 +37,15 @@ pub(crate) struct CompiledRoute {
     /// Query-parameter matches (ADR 000034): `(name, exact value)`, ANDed. Name is case-sensitive
     /// (Gateway-API semantics, asymmetric with headers).
     pub(crate) query: Vec<(String, String)>,
-    /// This route's inline chain (filter ids, in order).
+    /// This route's inline chain (filter ids, in order). Kept for validation / introspection
+    /// (`validate_routes`, `has_filters`); per-request dispatch uses `resolved_chain` instead so
+    /// it never re-hashes these ids against `ActiveConfig::filters`.
     pub(crate) filters: Vec<String>,
+    /// `filters` resolved to the loaded filter, in order — built once per reload (`build_active`
+    /// already has the id → `Arc<LoadedFilter>` map in scope there). `chain::dispatch_request` /
+    /// `dispatch_request_body` / `dispatch_response` run this directly instead of doing a
+    /// `HashMap::get` per filter id on every single request.
+    pub(crate) resolved_chain: Vec<Arc<LoadedFilter>>,
     /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
     /// 000038). Precomputed at build from the loaded filters so per-request buffering is a single
     /// bool check. `false` (all filters header-only) keeps the body on the zero-copy stream path.
@@ -47,13 +54,39 @@ pub(crate) struct CompiledRoute {
     /// one-element set). The fast path picks a group via [`WeightedBackends::pick`], then the group
     /// picks a healthy instance. `Arc`-shared so the split cursor persists across a config generation.
     pub(crate) backends: Arc<WeightedBackends>,
-    pub(crate) strip_prefix: Option<String>,
+    /// `Arc<str>`, not `String`: `snapshot.rs`'s `find_route` clones this into a fresh
+    /// [`RouteInfo`] on every single request — the same reason `backends` above is `Arc`-shared
+    /// rather than deep-cloned. An owned `String` here would allocate on every request for any
+    /// route with a `strip_prefix` configured; an `Arc<str>` clone is an atomic refcount bump.
+    pub(crate) strip_prefix: Option<Arc<str>>,
     /// This route's native rate limiter (ADR 000033), or `None` for unlimited (the default). Shared
     /// (`Arc`) so every request on the route consults the same token buckets within a config
     /// generation; a reload builds a fresh limiter (the node-local buckets reset).
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
     /// This route's Upgrade opt-in (ADR 000048), or `None` for deny-by-default (strip as today).
     pub(crate) upgrade: Option<Arc<UpgradeConfig>>,
+}
+
+// Manual `Debug`: `LoadedFilter` (behind `resolved_chain`'s `Arc`) doesn't implement it, so this
+// can't be `#[derive(Debug)]`. Reports `resolved_chain` by length — the same information `filters`
+// (the id list, printed in full) already carries, just resolved.
+impl std::fmt::Debug for CompiledRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledRoute")
+            .field("host", &self.host)
+            .field("path_prefix", &self.path_prefix)
+            .field("method", &self.method)
+            .field("headers", &self.headers)
+            .field("query", &self.query)
+            .field("filters", &self.filters)
+            .field("resolved_chain_len", &self.resolved_chain.len())
+            .field("reads_body", &self.reads_body)
+            .field("backends", &self.backends)
+            .field("strip_prefix", &self.strip_prefix)
+            .field("rate_limit", &self.rate_limit)
+            .field("upgrade", &self.upgrade)
+            .finish()
+    }
 }
 
 /// A route's compiled `[route.upgrade]` (ADR 000048): the lower-cased token allowlist and the
@@ -212,7 +245,9 @@ pub(crate) struct RequestParts<'a> {
 pub struct RouteInfo {
     pub index: usize,
     pub(crate) backends: Arc<WeightedBackends>,
-    pub strip_prefix: Option<String>,
+    /// `Arc<str>` so building this per-request `RouteInfo` from the compiled route (`find_route`,
+    /// called on every request) is an atomic refcount bump, not a heap allocation.
+    pub strip_prefix: Option<Arc<str>>,
     /// Whether this route has any filters (drives the header-side chain dispatch).
     pub has_filters: bool,
     /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
@@ -529,6 +564,7 @@ mod tests {
             headers: vec![],
             query: vec![],
             filters: vec![],
+            resolved_chain: vec![],
             reads_body: false,
             backends: backends(upstream),
             strip_prefix: None,

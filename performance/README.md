@@ -516,6 +516,12 @@ The refill + counting stay host-side (the WASM boundary is not crossed on the ho
 only decides *whether* to consult the limiter and *on what key*. Driven through `bench/harnesses/bench-server`
 (`filter-hello`, pooled); a `429` carries `retry-after-ms`.
 
+> **Scope: single node.** Every run below drives one `plecto` instance. The bucket is **node-local**
+> ([ADR 000053](../docs/ADR/000053.md)) — the enforcement and fairness numbers describe what one
+> instance guarantees, not a multi-replica fleet. Behind a load balancer fanning out to N replicas,
+> the fleet's effective allowed rate scales with N unless the front LB pins a key to one replica; see
+> the [hardening guide](../docs/hardening.md) for the operational formula.
+
 ### Overhead — the cost of consulting the bucket
 
 > R1 — 50 VUs, 0 ms backend, a **never-deny** bucket spread across 1000 keys (k6). `/baseline` vs

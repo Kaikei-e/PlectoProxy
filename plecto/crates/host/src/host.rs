@@ -244,12 +244,12 @@ impl Host {
             }
         };
 
-        let inner = LoadedInner {
+        let inner = LoadedInner::new(
             runtime,
-            filter_id: filter_id.to_string(),
-            sink: self.sink.clone(),
-            isolation: opts.isolation,
-        };
+            filter_id.to_string(),
+            self.sink.clone(),
+            opts.isolation,
+        );
 
         Ok(LoadedFilter { inner, trusted })
     }

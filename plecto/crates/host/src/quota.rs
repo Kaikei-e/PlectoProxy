@@ -156,4 +156,62 @@ mod tests {
             "freed budget is reusable after a release"
         );
     }
+
+    #[test]
+    fn a_stalled_apply_on_one_key_does_not_block_other_keys() {
+        // charge_and_apply runs the backend write (`apply`) under the lock that makes the
+        // read-decide-write sequence atomic. That atomicity is only needed PER KEY — but a
+        // single process-wide lock over-delivers it: a slow backend write on one key (a redb
+        // disk commit, a parked thread) stalls every host-state call of every filter. This
+        // test pins the intended scope: while one call's `apply` is parked, a call for a
+        // DIFFERENT key must still complete.
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::thread;
+        use std::time::Duration;
+
+        let q = Arc::new(KvQuota::new());
+        // Two barriers handshake with the stalled call: `entered` proves its `apply` is
+        // running (holding whatever lock the implementation wraps around it); `release` lets
+        // it finish.
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let stalled = {
+            let q = q.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            thread::spawn(move || {
+                q.charge_and_apply(
+                    "ns-a",
+                    || (1, 100),
+                    || {
+                        entered.wait();
+                        release.wait();
+                    },
+                );
+            })
+        };
+        entered.wait();
+
+        // With the stalled apply still parked, a different key's mutation must go through.
+        let (tx, rx) = mpsc::channel();
+        let other = {
+            let q = q.clone();
+            thread::spawn(move || {
+                q.charge_and_apply("ns-b", || (1, 100), || ());
+                let _ = tx.send(());
+            })
+        };
+        let completed = rx.recv_timeout(Duration::from_secs(2));
+
+        // Unblock the stalled call before asserting, so a failing run tears down cleanly.
+        release.wait();
+        stalled.join().unwrap();
+        other.join().unwrap();
+
+        assert!(
+            completed.is_ok(),
+            "a stalled backend write on one key must not block an unrelated key's call"
+        );
+    }
 }

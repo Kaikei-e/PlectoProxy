@@ -82,8 +82,9 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   **~49 % throughput vs plaintext** (h1 keep-alive ~119k vs plain ~242k): the TLS path is
   **crypto-bound**, so the native-path optimisations don't reach it. A clean, resumption-isolated
   measurement puts a **true full handshake at ~22.1k/s** vs **~29.8k/s with client resumption
-  enabled (93 % resumed)** — a **~35 % throughput gain** from skipping the ECDHE exchange (see
-  [TLS](#tls-termination)).
+  enabled (93 % resumed)** — a **~35 % throughput gain** from skipping the certificate chain and
+  signature generation/verification (ECDHE still runs every time — rustls only offers `psk_dhe_ke`,
+  never plain `psk_ke`, so resumption keeps forward secrecy; see [TLS](#tls-termination)).
 - A **kept-alive** connection serves **~242k req/s**; forcing a **TCP handshake per request** costs
   **~52 % throughput and +0.80 ms p99** — connection reuse is load-bearing (see
   [the plain HTTP/1.1 ceiling](#plain-http11-ceiling)).
@@ -360,8 +361,13 @@ each rung explicit resumption control instead:
 
 A true full handshake (22.1k/s) is **~17 % slower** than the old `handshake/req` row (26.5k/s) —
 confirming it really was partly resumed. Enabling client resumption recovers **~35 % throughput**
-over a true full handshake by skipping the ECDHE exchange and certificate verification on most
-connections; the residual 7 % full handshakes are cold-cache misses under concurrent load.
+over a true full handshake — **≈11.7 µs/connection** (45.3 → 33.6 µs). That saving is the
+certificate chain + signature generation/verification, **not** the ECDHE exchange: rustls's client
+hardcodes `psk_dhe_ke` and never offers plain `psk_ke` (`client/hs.rs`, RFC 8446 §4.2.9 — "such
+connections don't have forward secrecy"), so every resumed handshake here still runs a fresh ECDHE
+exchange for forward secrecy. The ~11.7 µs matches that: skipping only the asymmetric
+sign/verify + cert bytes is a much smaller saving than skipping ECDHE too would be. The residual
+7 % full handshakes are cold-cache misses under concurrent load.
 
 ---
 

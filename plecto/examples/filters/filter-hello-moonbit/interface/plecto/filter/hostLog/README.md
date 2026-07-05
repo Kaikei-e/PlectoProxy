@@ -1,0 +1,2 @@
+--- host-API: deny-by-default capabilities (ADR 000006). One capability per
+--- interface; a filter touches only what the host explicitly lends it.

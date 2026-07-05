@@ -1,0 +1,12 @@
+{
+  "name": "filter-hello-js",
+  "private": true,
+  "type": "module",
+  "description": "filter-hello conformance subset as a zero-WASI plecto:filter component (ComponentizeJS)",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.21.0"
+  }
+}

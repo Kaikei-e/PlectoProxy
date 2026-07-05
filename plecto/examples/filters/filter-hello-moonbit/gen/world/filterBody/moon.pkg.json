@@ -1,0 +1,9 @@
+{
+  "warn-list": "-44",
+  "import": [
+    { "path" : "plecto/filter/interface/plecto/filter/types", "alias" : "types" },
+    { "path" : "plecto/filter/interface/plecto/filter/hostLog", "alias" : "hostLog" },
+    { "path" : "plecto/filter/interface/plecto/filter/hostCounter", "alias" : "hostCounter" },
+    { "path" : "plecto/filter/interface/plecto/filter/hostRatelimit", "alias" : "hostRatelimit" }
+  ]
+}

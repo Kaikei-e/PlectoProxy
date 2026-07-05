@@ -1,0 +1,23 @@
+{
+      "warn-list": "-44",
+      "import": [
+      { "path" : "plecto/filter/gen/world/filterBody", "alias" : "filterBody" }
+      ],
+      "link": {
+            "wasm": {
+                  "export-memory-name": "memory",
+                  "heap-start-address": 16,
+                  "exports": [
+                  "mbt_ffi_cabi_realloc:cabi_realloc",
+                  "wasmExportInit:init",
+                  "wasmExportOnRequest:on-request",
+                  "wasmExportOnRequestBody:on-request-body",
+                  "wasmExportOnRequestBodyPostReturn:cabi_post_on-request-body",
+                  "wasmExportOnRequestPostReturn:cabi_post_on-request",
+                  "wasmExportOnResponse:on-response",
+                  "wasmExportOnResponsePostReturn:cabi_post_on-response"
+                  ]
+            }
+      }
+
+}

@@ -212,7 +212,7 @@ A filter that needs the body targets `filter-body` and adds one export — see
 [`filter-apikey`](plecto/examples/filters/filter-apikey) (header-only) or
 [`filter-hello`](plecto/examples/filters/filter-hello) (`filter-body`, the host's own conformance fixture).
 
-Because the contract is WIT, **any language that compiles to a WASM component can write a filter** — Rust, Go (TinyGo), JavaScript/TypeScript (`jco`), or Python (`componentize-py`). Polyglot filter SDKs are on the [roadmap](#roadmap).
+Because the contract is WIT, **any language that compiles to a WASM component can write a filter** — and three bundled examples prove it: the same conformance subset ported to **MoonBit** (~22 KB), **JavaScript/TypeScript** (ComponentizeJS, ~12 MB engine constant), and **C** (wasi-sdk), each building to a **zero-WASI component** that the unchanged deny-by-default host loads and runs through the same assertion suite as the Rust fixture (`plecto/crates/host/tests/polyglot.rs`, CI job `polyglot-guests`). Python fits the same shape (`componentize-py --stub-wasi`, ~17 MB — works, but heavy for a filter). The one exception today is **Go**: TinyGo's `wasip2` target hard-wires `wasi:cli` imports that the default Linker deliberately does not provide, so Go waits on a host-side minimal-WASI decision. Per-language recipes: [Writing a filter §7](docs/writing-a-filter.md#7-other-languages); polyglot filter SDKs remain on the [roadmap](#roadmap).
 
 A complete how-to — scaffold, build, the manifest field reference, signing, and local testing — is in [**Writing a filter**](docs/writing-a-filter.md). A copy-ready starting point with the contract already vendored lives in [`examples/filters/filter-template`](plecto/examples/filters/filter-template).
 
@@ -268,7 +268,7 @@ Plecto is built ADR-first, milestone by milestone. The full detail — landed it
 | **M3** — Async & bodies | 🚧 Stages 1–2 landed | wasmtime-46 async, header/body-world split, buffer-then-decide body hook; `stream<u8>` is experimental |
 | **M4** — Provenance & zero-downtime reload | ✅ landed | OCI + cosign + SBOM filter loading, SIGHUP reload + graceful shutdown, signed releases of Plecto itself |
 | **M5** — Observability & opt-in distribution | 🚧 mostly landed | W3C trace propagation, RED metrics, OTLP export landed; opt-in config consensus deferred |
-| **M6** — Polyglot SDKs & reference filters | 🚧 outbound landed | SSRF-guarded outbound HTTP (feature-gated); Go/JS/Python SDKs and reference filters pending |
+| **M6** — Polyglot SDKs & reference filters | 🚧 examples landed | MoonBit/JS/C example filters + one shared conformance suite (CI-gated); SSRF-guarded outbound HTTP (feature-gated); SDKs and Go (needs minimal-WASI linker) pending |
 
 ## Project layout
 

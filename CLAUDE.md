@@ -1,8 +1,9 @@
 # CLAUDE.md — Plecto
 
-このファイルは Claude Code 用のプロジェクト規約であり、設計の要約と source of truth。設計判断の根拠
-（Tenets / Fork 1–10 / stack / 未解決の問い）の詳細はリポジトリ内の founding design document（現在ドラフト段階）に
-あるが、本ファイルが単体で完結するよう要点を内包する。確定後にこの行からリンクする。
+このファイルは Claude Code 用のプロジェクト規約であり、設計の要約と source of truth。設計思想の原典は
+[docs/design-principles.md](docs/design-principles.md)（英語・正）/ [docs/design-principles.ja.md](docs/design-principles.ja.md)
+（日本語・同期）——原則（P1–P12）・アーキテクチャ方針・配置決定木・非目標・進化の条件を三層で定礎する。
+個別判断の一次記録は `docs/ADR/`、契約の正文は `wit/`（序列は原典第7章）。本ファイルは単体で完結するよう要点を内包する。
 
 ## Plecto とは
 
@@ -23,9 +24,9 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 
 ```
 / (git root = GitHub: Kaikei-e/Plecto)
-├── (founding design doc)      ← 設計の源泉（ドラフト・確定後に命名）
 ├── CLAUDE.md                  ← このファイル
 ├── CONTEXT-MAP.md             ← ドメイン用語集の地図（コンテキスト分割・全体横断語彙）
+├── docs/design-principles.md  ← 設計思想の原典（EN 正 / .ja.md 同期。原則・方針・指針の三層）
 ├── docs/ADR/                  ← Architecture Decision Records（NNNNNN.md, 6桁）
 └── plecto/                    ← Rust workspace（fast path / host / control）
     ├── wit/                   ← plecto:filter ワールド（契約・contract-first）

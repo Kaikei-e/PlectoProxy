@@ -93,6 +93,17 @@ fn main() {
             "FILTER_EXTAUTHZ_COMPONENT",
         );
     }
+
+    // Outbound TCP capability (ADR 000060, feature `outbound-tcp`, OFF by default): the TCP-gate
+    // guest imports wasi:sockets, so it builds for wasm32-wasip2.
+    if std::env::var("CARGO_FEATURE_OUTBOUND_TCP").is_ok() {
+        build_wasip2_component(
+            &cargo,
+            &filters.join("filter-tcp-gate"),
+            "filter_tcp_gate",
+            "FILTER_TCP_GATE_COMPONENT",
+        );
+    }
 }
 
 /// Build one guest crate for `wasm32-wasip2`, which already emits a Component Model component (the

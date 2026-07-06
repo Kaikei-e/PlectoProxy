@@ -15,10 +15,12 @@ use crate::filter::LoadedFilter;
 use crate::observe;
 #[cfg(feature = "outbound-http")]
 use crate::outbound_http;
+#[cfg(feature = "outbound-tcp")]
+use crate::outbound_tcp;
 use crate::pool::{LoadedInner, TrustedPool};
 use crate::quota::KvQuota;
 use crate::runtime::{FilterRuntime, WasmtimeRuntime};
-#[cfg(feature = "outbound-http")]
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 use crate::state::add_cli_runtime;
 use crate::state::{HostState, KV_NS_DELIM};
 use crate::{Isolation, KvBackend, LoadOptions, MemoryBackend, NoopSink, SignedArtifact};
@@ -41,10 +43,11 @@ pub struct Host {
     /// Where loaded filters emit their per-execution spans (ADR 000009). Default `NoopSink`
     /// (observability off); cloned into each filter at `load`, so set it before loading.
     sink: Arc<dyn TelemetrySink>,
-    /// Shared tokio runtime that drives outbound-using filters (ADR 000036): their guest calls block
-    /// on real socket I/O, which the no-reactor pollster executor cannot service. Cloned into each
-    /// outbound filter at `load`; unused by (and invisible to) filters without an outbound policy.
-    #[cfg(feature = "outbound-http")]
+    /// Shared tokio runtime that drives outbound-using filters (ADR 000036 / 000060): their guest
+    /// calls block on real socket I/O, which the no-reactor pollster executor cannot service.
+    /// Cloned into each outbound filter at `load`; unused by (and invisible to) filters without an
+    /// outbound policy.
+    #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
     outbound_rt: Arc<tokio::runtime::Runtime>,
     /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
     _epoch_ticker: EpochTicker,
@@ -78,7 +81,7 @@ impl Host {
         // arbitrary worker threads, so `block_on` must be safe to call concurrently from several
         // threads — a current-thread runtime serializes/contends there. Two workers suffice (outbound
         // is I/O-bound, not CPU-bound) and bound the extra thread count (security-auditor F-001).
-        #[cfg(feature = "outbound-http")]
+        #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
         let outbound_rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -92,7 +95,7 @@ impl Host {
             kv_quota: Arc::new(KvQuota::new()),
             trust,
             sink: Arc::new(NoopSink),
-            #[cfg(feature = "outbound-http")]
+            #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
             outbound_rt,
             _epoch_ticker,
         })
@@ -184,22 +187,82 @@ impl Host {
         // No WASI is added — unless this filter has an outbound policy (below).
         Filter::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)?;
 
-        // Outbound HTTP (ADR 000036): only when the operator lent this filter an allowlist do we add
-        // the MINIMAL WASI base (io / clocks / random / stdio — NO fs, NO sockets, NO cli) plus
-        // `wasi:http/outgoing-handler`, still deny-by-default (every call is gated by the SSRF-guarded
-        // hooks). A filter without a policy links no WASI at all, exactly as before.
+        // Outbound capabilities (ADR 000036 HTTP / ADR 000060 TCP): only when the operator lent
+        // this filter an allowlist do we add the MINIMAL WASI base (io / clocks / random / stdio +
+        // the inert wasi:cli runtime slice — NO fs, NO cli args/env of substance) plus the
+        // capability's own interfaces, still deny-by-default (every call is gated by the
+        // SSRF-guarded hooks / the vetted lookup + connect check). A filter without a policy links
+        // no WASI at all, exactly as before.
         #[cfg(feature = "outbound-http")]
-        let outbound = if let Some(policy) = opts.outbound_http.clone() {
-            wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
-            // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
-            // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem, NO sockets — the
-            // capability boundary that matters (mirrors the streaming path, security audit F-002).
-            add_cli_runtime(&mut linker)?;
+        let outbound = opts
+            .outbound_http
+            .clone()
+            .map(outbound_http::OutboundState::new);
+        #[cfg(feature = "outbound-tcp")]
+        let outbound_tcp = opts.outbound_tcp.clone().map(|policy| {
+            let resolver = {
+                #[cfg(feature = "test-support")]
+                match opts.outbound_tcp_static_resolver.clone() {
+                    Some(map) => crate::resolver::Resolver::Static(map),
+                    None => crate::resolver::Resolver::System,
+                }
+                #[cfg(not(feature = "test-support"))]
+                crate::resolver::Resolver::System
+            };
+            outbound_tcp::OutboundTcpState::new(policy, resolver)
+        });
+        #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+        {
+            let mut needs_wasi_base = false;
+            #[cfg(feature = "outbound-http")]
+            {
+                needs_wasi_base |= outbound.is_some();
+            }
+            #[cfg(feature = "outbound-tcp")]
+            {
+                needs_wasi_base |= outbound_tcp.is_some();
+            }
+            if needs_wasi_base {
+                wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
+                // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
+                // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem — the
+                // capability boundary that matters (mirrors the streaming path, audit F-002).
+                add_cli_runtime(&mut linker)?;
+            }
+        }
+        #[cfg(feature = "outbound-http")]
+        if outbound.is_some() {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-            Some(outbound_http::OutboundState::new(policy))
-        } else {
-            None
-        };
+        }
+        // Outbound TCP (ADR 000060): the `wasi:sockets` TCP-connect slice ONLY — network /
+        // instance-network / tcp-create-socket / tcp behind the Store's socket_addr_check, plus
+        // the host's OWN vetted ip-name-lookup (the upstream one has no hostname filter). The UDP
+        // interfaces are never linked: the capability's absence, not a runtime deny.
+        #[cfg(feature = "outbound-tcp")]
+        if outbound_tcp.is_some() {
+            use wasmtime_wasi::p2::bindings::sockets;
+            use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
+            let getter = <HostState as WasiSocketsView>::sockets;
+            let net_opts = sockets::network::LinkOptions::default();
+            sockets::network::add_to_linker::<HostState, WasiSockets>(
+                &mut linker,
+                &net_opts,
+                getter,
+            )?;
+            sockets::instance_network::add_to_linker::<HostState, WasiSockets>(
+                &mut linker,
+                getter,
+            )?;
+            sockets::tcp_create_socket::add_to_linker::<HostState, WasiSockets>(
+                &mut linker,
+                getter,
+            )?;
+            sockets::tcp::add_to_linker::<HostState, WasiSockets>(&mut linker, getter)?;
+            sockets::ip_name_lookup::add_to_linker::<HostState, outbound_tcp::PlectoTcpLookup>(
+                &mut linker,
+                HostState::tcp_lookup,
+            )?;
+        }
 
         let pre = FilterPre::new(linker.instantiate_pre(&component)?)?;
         // Zero-copy body bypass (ADR 000038 / ADR 000005 mechanism 2): a filter that inspects or
@@ -219,10 +282,23 @@ impl Host {
             max_memory_bytes: opts.max_memory_bytes,
             ratelimit_bucket: opts.ratelimit_bucket,
             kv_quota: self.kv_quota.clone(),
-            #[cfg(feature = "outbound-http")]
-            rt: outbound.is_some().then(|| self.outbound_rt.clone()),
+            #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+            rt: {
+                let mut needs_rt = false;
+                #[cfg(feature = "outbound-http")]
+                {
+                    needs_rt |= outbound.is_some();
+                }
+                #[cfg(feature = "outbound-tcp")]
+                {
+                    needs_rt |= outbound_tcp.is_some();
+                }
+                needs_rt.then(|| self.outbound_rt.clone())
+            },
             #[cfg(feature = "outbound-http")]
             outbound,
+            #[cfg(feature = "outbound-tcp")]
+            outbound_tcp,
         };
 
         let trusted = match opts.isolation {

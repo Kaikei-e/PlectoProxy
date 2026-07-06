@@ -29,13 +29,14 @@ use serde::{Deserialize, Serialize};
 use crate::error::ControlError;
 
 pub use chain::Chain;
-pub use filter_entry::{FilterEntry, IsolationKind, OutboundHttpConfig};
-// `AllowDest` / `RateLimitConfig` are schema fields reached through `OutboundHttpConfig` /
-// `FilterEntry` rather than by name elsewhere in this crate today; `SchemeKind` is only named
-// via `crate::manifest::X` from the `outbound-http`-gated half of `lowering.rs`. Re-exported
-// anyway so `crate::manifest::X` keeps resolving for every schema type (module doc above).
+pub use filter_entry::{FilterEntry, IsolationKind, OutboundHttpConfig, OutboundTcpConfig};
+// `AllowDest` / `TcpAllowDest` / `RateLimitConfig` are schema fields reached through
+// `OutboundHttpConfig` / `OutboundTcpConfig` / `FilterEntry` rather than by name elsewhere in this
+// crate today; `SchemeKind` is only named via `crate::manifest::X` from the `outbound-http`-gated
+// half of `lowering.rs`. Re-exported anyway so `crate::manifest::X` keeps resolving for every
+// schema type (module doc above).
 #[allow(unused_imports)]
-pub use filter_entry::{AllowDest, RateLimitConfig, SchemeKind};
+pub use filter_entry::{AllowDest, RateLimitConfig, SchemeKind, TcpAllowDest};
 pub use listen::{Listen, ProxyProtocolTrust};
 // `ProxyProtocol` / `Drain` are schema fields reached through `Listen` rather than by name
 // elsewhere in this crate; re-exported for the same schema-type completeness reason as

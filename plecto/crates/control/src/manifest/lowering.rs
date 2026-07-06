@@ -50,6 +50,24 @@ impl FilterEntry {
                 ob.max_concurrent,
             );
         }
+        #[cfg(feature = "outbound-tcp")]
+        if let Some(ob) = &self.outbound_tcp {
+            // Validated already (`validate`): non-empty allowlist, non-zero ports, parsing CIDRs.
+            let allow = ob
+                .allow
+                .iter()
+                .map(|d| plecto_host::TcpAllowEntry {
+                    host: d.host.clone(),
+                    port: d.port,
+                })
+                .collect();
+            opts = opts.with_outbound_tcp(
+                allow,
+                ob.allow_private.clone(),
+                ob.max_connections,
+                ob.io_deadline_ms,
+            );
+        }
         opts
     }
 }
@@ -75,6 +93,7 @@ mod tests {
                 refill_interval_ms: 1000,
             }),
             outbound_http: None,
+            outbound_tcp: None,
         };
         let opts = entry.load_options();
 

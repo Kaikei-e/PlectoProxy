@@ -75,7 +75,7 @@ impl LoadedFilter {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner
                 .runtime
-                .drive(inst.filter.call_on_request(&mut inst.store, req))
+                .drive_call(inst.filter.call_on_request(&mut inst.store, req))
         })
     }
 
@@ -189,7 +189,7 @@ impl LoadedFilter {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner
                 .runtime
-                .drive(inst.filter.call_on_response(&mut inst.store, resp))
+                .drive_call(inst.filter.call_on_response(&mut inst.store, resp))
         })
     }
 }

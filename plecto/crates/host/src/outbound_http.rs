@@ -39,6 +39,7 @@ use wasmtime_wasi_http::p2::types::{
 use wasmtime_wasi_http::p2::{HttpResult, WasiHttpHooks, hyper_request_error};
 
 use crate::outbound::{AddrVerdict, OutboundPolicy, Scheme};
+use crate::resolver::Resolver;
 
 /// Per-filter outbound state, held by the loaded filter and shared across its requests. The
 /// semaphore lives here so the per-filter concurrency cap is genuinely shared, not per-request.
@@ -376,30 +377,6 @@ fn client_config() -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
     // Build-then-store-then-fetch in one step: no separate "set, then unwrap the get" — a losing
     // racer's freshly-built `cfg` is simply discarded in favour of whichever thread's `set` won.
     Ok(CFG.get_or_init(|| cfg).clone())
-}
-
-/// DNS resolver seam: the system resolver in production; a static map in tests so the
-/// resolve→classify→pin decision can be exercised deterministically without real DNS.
-enum Resolver {
-    System,
-    #[cfg(test)]
-    Static(std::collections::HashMap<String, Vec<std::net::IpAddr>>),
-}
-
-impl Resolver {
-    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        match self {
-            Resolver::System => tokio::net::lookup_host((host, port))
-                .await
-                .map(|it| it.collect())
-                .map_err(|_| ()),
-            #[cfg(test)]
-            Resolver::Static(map) => Ok(map
-                .get(host)
-                .map(|ips| ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
-                .unwrap_or_default()),
-        }
-    }
 }
 
 /// An empty outgoing body for requests without one (test helper).

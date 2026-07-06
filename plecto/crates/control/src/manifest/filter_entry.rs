@@ -81,6 +81,40 @@ pub struct OutboundHttpConfig {
     pub max_concurrent: Option<u32>,
 }
 
+/// One allowed outbound TCP destination — an exact `(host, port)` pair (ADR 000060). Unlike HTTP's
+/// [`AllowDest`] there is no scheme and no default port: a raw TCP endpoint (Redis, memcached) has
+/// no scheme to derive one from, so the operator states the port explicitly.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TcpAllowDest {
+    /// Exact host — a DNS name (matched case-insensitively) or an IP literal.
+    pub host: String,
+    /// Destination port (required — raw TCP has no scheme default).
+    pub port: u16,
+}
+
+/// A filter's outbound TCP policy (ADR 000060), declared as `[filter.outbound_tcp]`. Lends the
+/// `wasi:sockets` TCP-connect vocabulary behind the same three checks as outbound HTTP: the
+/// deny-by-default allowlist, the SSRF guard on host-resolved addresses (name-lookup vetting +
+/// IP pin), and host-clamped resource bounds. UDP and listen are never lent.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundTcpConfig {
+    /// The exact destinations this filter may connect to. Must be non-empty when present.
+    pub allow: Vec<TcpAllowDest>,
+    /// Private/ULA CIDRs (e.g. `"10.1.0.0/16"`) this filter may reach despite the SSRF
+    /// private-range block. Empty (default) leaves all private space blocked.
+    #[serde(default)]
+    pub allow_private: Vec<String>,
+    /// Per-request budget of TCP connects (a connection held across requests costs only its
+    /// opening request). Host default/ceiling apply when omitted/exceeded.
+    pub max_connections: Option<u32>,
+    /// Wall-clock ceiling (ms) on each guest hook call for this filter — the host-side I/O
+    /// deadline epoch interruption cannot provide while the guest blocks in socket I/O
+    /// (connect *and* read hangs). Host default/ceiling apply when omitted/exceeded.
+    pub io_deadline_ms: Option<u64>,
+}
+
 /// One filter to load, pinned by OCI digest.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +145,12 @@ pub struct FilterEntry {
     /// rejected at validate (fail-closed).
     #[serde(default)]
     pub outbound_http: Option<OutboundHttpConfig>,
+    /// This filter's outbound TCP policy (ADR 000060), `[filter.outbound_tcp]`: the wasi:sockets
+    /// lend behind the same deny-by-default allowlist + SSRF floor shape as outbound HTTP. Absent =
+    /// no outbound TCP capability. Requires the `outbound-tcp` build; otherwise a present section
+    /// is rejected at validate (fail-closed).
+    #[serde(default)]
+    pub outbound_tcp: Option<OutboundTcpConfig>,
 }
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
@@ -264,6 +304,134 @@ max_concurrent = 100000
             let m = Manifest::from_toml(&toml).unwrap();
             assert!(m.filters[0].validate().is_err(), "{why} must be rejected");
         }
+    }
+
+    const OUTBOUND_TCP_TOML: &str = r#"
+[[filter]]
+id = "ratelimit-redis"
+source = "oci/ratelimit-redis"
+digest = "sha256:abc"
+
+[filter.outbound_tcp]
+allow = [{ host = "redis.internal", port = 6379 }]
+allow_private = ["10.1.0.0/16"]
+max_connections = 2
+io_deadline_ms = 1500
+"#;
+
+    #[test]
+    fn outbound_tcp_section_parses() {
+        let m = Manifest::from_toml(OUTBOUND_TCP_TOML).unwrap();
+        let ob = m.filters[0]
+            .outbound_tcp
+            .as_ref()
+            .expect("outbound_tcp present");
+        assert_eq!(ob.allow.len(), 1);
+        assert_eq!(ob.allow[0].host, "redis.internal");
+        assert_eq!(ob.allow[0].port, 6379);
+        assert_eq!(ob.allow_private, vec!["10.1.0.0/16".to_string()]);
+        assert_eq!(ob.max_connections, Some(2));
+        assert_eq!(ob.io_deadline_ms, Some(1500));
+    }
+
+    #[test]
+    fn outbound_tcp_port_is_required() {
+        // No scheme → no default port; an entry without one must fail to parse, not silently
+        // default.
+        let toml = r#"
+[[filter]]
+id = "x"
+source = "s"
+digest = "sha256:abc"
+[filter.outbound_tcp]
+allow = [{ host = "redis.internal" }]
+"#;
+        assert!(Manifest::from_toml(toml).is_err(), "port is mandatory");
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    #[test]
+    fn outbound_tcp_validates_and_lowers_to_policy() {
+        let m = Manifest::from_toml(OUTBOUND_TCP_TOML).unwrap();
+        let entry = &m.filters[0];
+        entry.validate().expect("valid outbound_tcp section");
+
+        let opts = entry.load_options();
+        let policy = opts
+            .outbound_tcp
+            .expect("outbound_tcp lowered into LoadOptions");
+        assert_eq!(policy.allow.len(), 1);
+        assert!(policy.allows_name("REDIS.internal")); // DNS case-insensitive
+        assert!(!policy.allows_name("evil.internal"));
+        // allow_private opt-in reaches the shared SSRF classifier; the floor stays closed
+        assert_eq!(
+            policy.classify("10.1.2.3".parse().unwrap()),
+            plecto_host::AddrVerdict::Allowed
+        );
+        assert_eq!(
+            policy.classify("169.254.169.254".parse().unwrap()),
+            plecto_host::AddrVerdict::BlockedReserved
+        );
+        assert_eq!(policy.max_connections, 2);
+        assert_eq!(policy.io_deadline, std::time::Duration::from_millis(1500));
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    #[test]
+    fn outbound_tcp_clamps_oversized_values() {
+        let toml = r#"
+[[filter]]
+id = "x"
+source = "s"
+digest = "sha256:abc"
+[filter.outbound_tcp]
+allow = [{ host = "redis.internal", port = 6379 }]
+max_connections = 100000
+io_deadline_ms = 999999999
+"#;
+        let m = Manifest::from_toml(toml).unwrap();
+        let policy = m.filters[0].load_options().outbound_tcp.unwrap();
+        assert!(policy.max_connections <= 64);
+        assert!(policy.io_deadline <= std::time::Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    #[test]
+    fn outbound_tcp_rejects_bad_config() {
+        let cases = [
+            ("allow = []", "empty allowlist"),
+            ("allow = [{ host = \"a\", port = 0 }]", "port 0"),
+            (
+                "allow = [{ host = \"a\", port = 6379 }]\nallow_private = [\"not-a-cidr\"]",
+                "bad CIDR",
+            ),
+            (
+                "allow = [{ host = \"a\", port = 6379 }]\nmax_connections = 0",
+                "zero connect budget",
+            ),
+            (
+                "allow = [{ host = \"a\", port = 6379 }]\nio_deadline_ms = 0",
+                "zero io deadline",
+            ),
+        ];
+        for (body, why) in cases {
+            let toml = format!(
+                "[[filter]]\nid = \"x\"\nsource = \"s\"\ndigest = \"sha256:abc\"\n[filter.outbound_tcp]\n{body}\n"
+            );
+            let m = Manifest::from_toml(&toml).unwrap();
+            assert!(m.filters[0].validate().is_err(), "{why} must be rejected");
+        }
+    }
+
+    #[cfg(not(feature = "outbound-tcp"))]
+    #[test]
+    fn outbound_tcp_rejected_without_feature() {
+        // A manifest that asks for outbound TCP must fail closed on a build that cannot provide it.
+        let m = Manifest::from_toml(OUTBOUND_TCP_TOML).unwrap();
+        assert!(
+            m.filters[0].validate().is_err(),
+            "outbound_tcp requires the outbound-tcp build"
+        );
     }
 
     #[cfg(not(feature = "outbound-http"))]

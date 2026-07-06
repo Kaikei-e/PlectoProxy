@@ -92,10 +92,16 @@ jobs:
             plecto
             plecto/examples/filters/filter-hello
             plecto/examples/filters/filter-streaming
+            plecto/examples/filters/filter-extauthz
+            plecto/examples/filters/filter-tcp-gate
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
       # Experimental streaming body filter (OFF by default): exercise it so it cannot bit-rot.
       - run: cargo test -p plecto-host --features streaming-body
+      # Outbound TCP capability (ADR 000060, OFF by default): the E2E suite pins the invariants
+      # (SSRF floor unopenable / IP pin / connect budget) — run it, don't just compile it.
+      - run: cargo test -p plecto-host --features outbound-tcp
+      - run: cargo test -p plecto-control --features outbound-tcp
       - run: cargo build --release
 
   # Lint the excluded WASM guest against its real target.

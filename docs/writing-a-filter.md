@@ -267,6 +267,17 @@ import appears** — run it, then verify against the host with:
 cargo test -p plecto-host --features polyglot-conformance --test polyglot
 ```
 
+One deliberate exception to the zero-WASI rule: a filter the manifest lends an **outbound
+capability** to (`[filter.outbound_http]`, ADR 000036, or `[filter.outbound_tcp]`, ADR 000060) is
+no longer zero-WASI. Such a filter builds for `wasm32-wasip2` and imports `wasi:*` interfaces
+(`wasi:http/outgoing-handler`, or the `wasi:sockets` TCP-connect vocabulary, plus the `wasi:io`
+base they pull in), and the host links exactly those slices — only for that filter, only behind
+the declared allowlist + SSRF guard, and only on a build with the matching off-by-default cargo
+feature (`outbound-http` / `outbound-tcp`). Everything else here still applies: a filter with no
+outbound section in the manifest gets the default Linker and must arrive with zero WASI imports.
+See `filter-extauthz` (HTTP) and `filter-tcp-gate` (TCP) under `plecto/examples/filters/` for the
+two shapes.
+
 Two more languages, for completeness:
 
 - **Python** works the same way (`componentize-py --stub-wasi` bundles CPython, ~17 MB). It passes

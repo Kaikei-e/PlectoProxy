@@ -4,7 +4,7 @@
 
 use super::{
     FilterEntry, HashKeyKind, LbAlgorithm, MAX_HASH_TABLE_SIZE, MAX_INSTANCE_WEIGHT,
-    OutboundHttpConfig, State, StateBackendKind, Upstream,
+    OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
 };
 use crate::error::ControlError;
 
@@ -190,6 +190,9 @@ impl FilterEntry {
         if let Some(ob) = &self.outbound_http {
             self.validate_outbound_http(ob)?;
         }
+        if let Some(ob) = &self.outbound_tcp {
+            self.validate_outbound_tcp(ob)?;
+        }
         Ok(())
     }
 
@@ -253,6 +256,56 @@ impl FilterEntry {
         }
         Ok(())
     }
+
+    /// Validate an outbound_tcp section (ADR 000060) — the same fail-closed rule as outbound_http:
+    /// a build without the `outbound-tcp` feature cannot lend `wasi:sockets`, so a declared section
+    /// is rejected outright rather than silently ignored.
+    #[cfg(not(feature = "outbound-tcp"))]
+    fn validate_outbound_tcp(&self, _ob: &OutboundTcpConfig) -> Result<(), ControlError> {
+        Err(ControlError::InvalidFilterConfig {
+            id: self.id.clone(),
+            reason: "outbound_tcp requested but this build lacks the `outbound-tcp` feature"
+                .to_string(),
+        })
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    fn validate_outbound_tcp(&self, ob: &OutboundTcpConfig) -> Result<(), ControlError> {
+        let bad = |reason: String| ControlError::InvalidFilterConfig {
+            id: self.id.clone(),
+            reason,
+        };
+        if ob.allow.is_empty() {
+            return Err(bad(
+                "outbound_tcp.allow must list at least one destination".into()
+            ));
+        }
+        for dest in &ob.allow {
+            if dest.host.trim().is_empty() {
+                return Err(bad("outbound_tcp.allow entry has an empty host".into()));
+            }
+            if dest.port == 0 {
+                return Err(bad(format!(
+                    "outbound_tcp.allow host {} has port 0",
+                    dest.host
+                )));
+            }
+        }
+        for cidr in &ob.allow_private {
+            cidr.parse::<ipnet::IpNet>().map_err(|e| {
+                bad(format!(
+                    "outbound_tcp.allow_private has invalid CIDR {cidr:?}: {e}"
+                ))
+            })?;
+        }
+        if ob.max_connections == Some(0) {
+            return Err(bad("outbound_tcp.max_connections must be non-zero".into()));
+        }
+        if ob.io_deadline_ms == Some(0) {
+            return Err(bad("outbound_tcp.io_deadline_ms must be non-zero".into()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +336,7 @@ mod tests {
             max_memory_bytes: None,
             ratelimit: None,
             outbound_http: None,
+            outbound_tcp: None,
         };
         assert!(base.validate().is_ok(), "defaults are valid");
 

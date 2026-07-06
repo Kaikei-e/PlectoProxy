@@ -18,6 +18,70 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-06
+
+### Added
+
+- PROXY protocol v2 reception (ADR 000057), opt-in per listener via `[listen.proxy_protocol]`
+  with a required trusted-CIDR list: a v2 header arriving from a trusted load balancer restores
+  the real client IP end to end (including before a TLS handshake), feeding the edge client-IP
+  model, rate limiting and access logs. A missing, malformed or untrusted header cuts the
+  connection fail-closed; traffic from peers outside the trusted CIDRs passes through unchanged.
+- Polyglot filter examples proving the any-language claim: MoonBit, JavaScript (ComponentizeJS)
+  and C (wasi-sdk) guests, each built to a zero-WASI header-only component and verified by the
+  same conformance assertions as the Rust fixture (the `polyglot-conformance` test suite).
+- Fuzzing scaffold: cargo-fuzz, with a first target on the PROXY protocol v2 parser.
+
+### Changed
+
+- Buffered request bodies now count as replayable for upstream retries (ADR 000058). On a
+  `filter-body` route the body is already fully buffered, so a retry re-sends it instead of
+  giving up: a connect failure (the upstream never received the request) retries for any
+  method, a per-try timeout or gateway-class 5xx (502–504) retries idempotent methods only —
+  the retry decision table itself is unchanged. Re-sends share one reference-counted buffer
+  (no memory copy), stay inside the existing bounded-retry budget (max retries, jittered
+  backoff, overall deadline), and the streaming (non-buffered) path behaves exactly as before.
+
+## [0.1.3] - 2026-07-06
+
+### Fixed
+
+- Filter state quotas: `KvQuota`'s read-decide-write accounting is striped across 64
+  hash-picked per-key locks (stripe seed per instance, so a tenant cannot precompute keys that
+  pile onto another tenant's stripe) — one stalled `charge_and_apply` (e.g. a slow persistent
+  write) no longer blocks unrelated keys. The namespace/global tallies moved to their own lock
+  whose critical section is pure arithmetic: no backend I/O ever runs under a shared lock.
+  Same-key atomicity (the accounting-race fix from 0.1.2) is preserved.
+
+## [0.1.2] - 2026-07-06
+
+### Added
+
+- Stateless TLS 1.3 session resumption (ADR 000052): RFC 5077-style self-encrypted session
+  tickets from one process-lifetime ticketer (6 h key rotation / 12 h acceptance window),
+  shared by the TCP and QUIC server configs and across manifest reloads — a reload never
+  invalidates outstanding tickets, per-session server memory is zero, and 0-RTT stays
+  rejected.
+- `plecto-loadgen tls`: full-handshake vs resumed-handshake benchmark rungs for the TLS
+  termination path.
+
+### Fixed
+
+- server: a request-body buffer-permit acquisition error now fails closed (503) instead of
+  silently proceeding without a permit (a latent bypass of the buffered-body concurrency cap);
+  the admin (metrics/health) listener gained the same connection cap and header-read hardening
+  the data-plane listener already had.
+- control: closed a TOCTOU race in outlier detection where two instances crossing their
+  failure threshold in the same instant could both eject and exceed `max_ejection_percent`;
+  cut a per-request heap allocation and repeated per-request filter-list resolution on the
+  routing hot path.
+- host: per-filter quota accounting (`host-kv` / `host-counter` / `host-ratelimit`) is atomic
+  under concurrency, closing a race where concurrent same-key calls could double-charge or
+  double-release budget and drift the quota cap; the untrusted filter lifecycle gained a
+  per-filter circuit breaker so a deterministically failing init stops re-paying its full init
+  budget on every request; the in-memory trace sink's retained spans are bounded (FIFO
+  eviction).
+
 ## [0.1.1] - 2026-07-04
 
 ### Added

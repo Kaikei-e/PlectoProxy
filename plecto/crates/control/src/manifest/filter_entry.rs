@@ -53,9 +53,10 @@ pub struct AllowDest {
     pub scheme: SchemeKind,
 }
 
-/// A filter's outbound HTTP policy (ADR 000036), declared as `[filter.outbound]`. The operator owns
-/// it — an untrusted filter cannot supply, widen, or override it (the `wasi:http/outgoing-handler`
-/// import carries only the request). Absent = the filter is lent no outbound capability.
+/// A filter's outbound HTTP policy (ADR 000036), declared as `[filter.outbound_http]`. The operator
+/// owns it — an untrusted filter cannot supply, widen, or override it (the
+/// `wasi:http/outgoing-handler` import carries only the request). Absent = the filter is lent no
+/// outbound HTTP capability.
 ///
 /// `allow` is deny-by-default: only listed destinations are reachable. `allow_private` opts specific
 /// RFC1918 / ULA CIDRs past the SSRF guard's private-range block (for internal ext_authz); it never
@@ -63,7 +64,7 @@ pub struct AllowDest {
 /// sizes are host-clamped.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct OutboundConfig {
+pub struct OutboundHttpConfig {
     /// The exact destinations this filter may call. Must be non-empty when the section is present.
     pub allow: Vec<AllowDest>,
     /// Private/ULA CIDRs (e.g. `"10.1.0.0/16"`) this filter may reach despite the SSRF private-range
@@ -105,11 +106,11 @@ pub struct FilterEntry {
     /// has no limiter (its `try-acquire` fails closed). Operator-configured so an untrusted filter
     /// cannot override its own limit.
     pub ratelimit: Option<RateLimitConfig>,
-    /// This filter's outbound HTTP policy (ADR 000036), `[filter.outbound]`. Absent = no outbound
-    /// capability. Requires the `outbound-http` build; otherwise a present section is rejected at
-    /// validate (fail-closed).
+    /// This filter's outbound HTTP policy (ADR 000036), `[filter.outbound_http]`. Absent = no
+    /// outbound HTTP capability. Requires the `outbound-http` build; otherwise a present section is
+    /// rejected at validate (fail-closed).
     #[serde(default)]
-    pub outbound: Option<OutboundConfig>,
+    pub outbound_http: Option<OutboundHttpConfig>,
 }
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
@@ -163,7 +164,7 @@ id = "extauthz"
 source = "oci/extauthz"
 digest = "sha256:abc"
 
-[filter.outbound]
+[filter.outbound_http]
 allow = [
   { host = "authz.example.com", port = 8443, scheme = "https" },
   { host = "jwks.example.com" },
@@ -175,7 +176,10 @@ connect_timeout_ms = 1500
     #[test]
     fn outbound_section_parses() {
         let m = Manifest::from_toml(OUTBOUND_TOML).unwrap();
-        let ob = m.filters[0].outbound.as_ref().expect("outbound present");
+        let ob = m.filters[0]
+            .outbound_http
+            .as_ref()
+            .expect("outbound_http present");
         assert_eq!(ob.allow.len(), 2);
         assert_eq!(ob.allow[0].host, "authz.example.com");
         assert_eq!(ob.allow[0].port, Some(8443));
@@ -193,7 +197,9 @@ connect_timeout_ms = 1500
         entry.validate().expect("valid outbound section");
 
         let opts = entry.load_options();
-        let policy = opts.outbound.expect("outbound lowered into LoadOptions");
+        let policy = opts
+            .outbound_http
+            .expect("outbound_http lowered into LoadOptions");
         assert_eq!(policy.allow.len(), 2);
         // exact allowlist matching + scheme default port
         assert!(policy.allows(plecto_host::Scheme::Https, "authz.example.com", 8443));
@@ -223,13 +229,13 @@ connect_timeout_ms = 1500
 id = "x"
 source = "s"
 digest = "sha256:abc"
-[filter.outbound]
+[filter.outbound_http]
 allow = [{ host = "a.example.com" }]
 total_timeout_ms = 999999999
 max_concurrent = 100000
 "#;
         let m = Manifest::from_toml(toml).unwrap();
-        let policy = m.filters[0].load_options().outbound.unwrap();
+        let policy = m.filters[0].load_options().outbound_http.unwrap();
         assert!(policy.total_timeout <= std::time::Duration::from_secs(30));
         assert!(policy.max_concurrent <= 64);
     }
@@ -253,7 +259,7 @@ max_concurrent = 100000
         ];
         for (body, why) in cases {
             let toml = format!(
-                "[[filter]]\nid = \"x\"\nsource = \"s\"\ndigest = \"sha256:abc\"\n[filter.outbound]\n{body}\n"
+                "[[filter]]\nid = \"x\"\nsource = \"s\"\ndigest = \"sha256:abc\"\n[filter.outbound_http]\n{body}\n"
             );
             let m = Manifest::from_toml(&toml).unwrap();
             assert!(m.filters[0].validate().is_err(), "{why} must be rejected");
@@ -267,7 +273,7 @@ max_concurrent = 100000
         let m = Manifest::from_toml(OUTBOUND_TOML).unwrap();
         assert!(
             m.filters[0].validate().is_err(),
-            "outbound requires the outbound-http build"
+            "outbound_http requires the outbound-http build"
         );
     }
 }

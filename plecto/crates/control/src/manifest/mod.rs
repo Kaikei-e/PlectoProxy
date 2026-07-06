@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::ControlError;
 
 pub use chain::Chain;
-pub use filter_entry::{FilterEntry, IsolationKind, OutboundConfig};
-// `AllowDest` / `RateLimitConfig` are schema fields reached through `OutboundConfig` /
+pub use filter_entry::{FilterEntry, IsolationKind, OutboundHttpConfig};
+// `AllowDest` / `RateLimitConfig` are schema fields reached through `OutboundHttpConfig` /
 // `FilterEntry` rather than by name elsewhere in this crate today; `SchemeKind` is only named
 // via `crate::manifest::X` from the `outbound-http`-gated half of `lowering.rs`. Re-exported
 // anyway so `crate::manifest::X` keeps resolving for every schema type (module doc above).

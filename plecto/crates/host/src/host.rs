@@ -189,7 +189,7 @@ impl Host {
         // `wasi:http/outgoing-handler`, still deny-by-default (every call is gated by the SSRF-guarded
         // hooks). A filter without a policy links no WASI at all, exactly as before.
         #[cfg(feature = "outbound-http")]
-        let outbound = if let Some(policy) = opts.outbound.clone() {
+        let outbound = if let Some(policy) = opts.outbound_http.clone() {
             wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
             // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
             // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem, NO sockets — the

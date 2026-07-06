@@ -129,11 +129,11 @@ pub struct LoadOptions {
     /// `[filter.ratelimit]`, ADR 000026). `None` = the filter has no limiter (its `try-acquire`
     /// fails closed). Host-configured so an untrusted filter cannot override its own limit.
     pub ratelimit_bucket: Option<Bucket>,
-    /// This filter's outbound HTTP policy (manifest `[filter.outbound]`, ADR 000036): the
+    /// This filter's outbound HTTP policy (manifest `[filter.outbound_http]`, ADR 000036): the
     /// deny-by-default allowlist + SSRF opt-in + resource bounds enforced at the `wasi:http`
-    /// send seam. `None` = the filter is lent no outbound capability (the default).
+    /// send seam. `None` = the filter is lent no outbound HTTP capability (the default).
     #[cfg(feature = "outbound-http")]
-    pub outbound: Option<outbound::OutboundPolicy>,
+    pub outbound_http: Option<outbound::OutboundPolicy>,
 }
 
 impl Default for LoadOptions {
@@ -149,7 +149,7 @@ impl Default for LoadOptions {
             max_requests_per_instance: DEFAULT_MAX_REQUESTS_PER_INSTANCE,
             ratelimit_bucket: None,
             #[cfg(feature = "outbound-http")]
-            outbound: None,
+            outbound_http: None,
         }
     }
 }
@@ -218,7 +218,7 @@ impl LoadOptions {
     /// options are clamped again at the send seam. The filter cannot supply or widen any of this.
     #[cfg(feature = "outbound-http")]
     #[allow(clippy::too_many_arguments)]
-    pub fn with_outbound(
+    pub fn with_outbound_http(
         mut self,
         allow: Vec<outbound::AllowEntry>,
         allow_private: Vec<String>,
@@ -234,7 +234,7 @@ impl LoadOptions {
             .iter()
             .filter_map(|c| c.parse::<ipnet::IpNet>().ok())
             .collect();
-        self.outbound = Some(outbound::OutboundPolicy {
+        self.outbound_http = Some(outbound::OutboundPolicy {
             allow,
             allow_private,
             connect_timeout: Duration::from_millis(clamp_ms(

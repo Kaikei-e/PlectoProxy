@@ -27,7 +27,7 @@ impl FilterEntry {
             opts = opts.with_ratelimit_bucket(rl.capacity, rl.refill_tokens, rl.refill_interval_ms);
         }
         #[cfg(feature = "outbound-http")]
-        if let Some(ob) = &self.outbound {
+        if let Some(ob) = &self.outbound_http {
             // Validated already (`validate`), so the CIDR parses and the allowlist is non-empty.
             let allow = ob
                 .allow
@@ -41,7 +41,7 @@ impl FilterEntry {
                     port: d.port.unwrap_or_else(|| d.scheme.default_port()),
                 })
                 .collect();
-            opts = opts.with_outbound(
+            opts = opts.with_outbound_http(
                 allow,
                 ob.allow_private.clone(),
                 ob.connect_timeout_ms,
@@ -74,7 +74,7 @@ mod tests {
                 refill_tokens: 10,
                 refill_interval_ms: 1000,
             }),
-            outbound: None,
+            outbound_http: None,
         };
         let opts = entry.load_options();
 

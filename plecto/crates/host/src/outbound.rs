@@ -66,7 +66,7 @@ pub enum AddrVerdict {
 }
 
 /// The per-filter outbound policy the host enforces at the `send_request` seam. Built from the
-/// manifest `[filter.outbound]` section via `LoadOptions` (values already clamped to host maxima).
+/// manifest `[filter.outbound_http]` section via `LoadOptions` (values already clamped to host maxima).
 #[derive(Debug, Clone)]
 pub struct OutboundPolicy {
     /// Exact allowed destinations. Empty means the filter can reach nothing (deny-by-default).

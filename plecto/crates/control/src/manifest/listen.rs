@@ -55,8 +55,8 @@ impl ProxyProtocolTrust {
     /// how a dual-stack accept reports an IPv4 client) is collapsed to its IPv4 form first, so
     /// a v4 CIDR matches it.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let _ = ip;
-        false // stub (RED)
+        let canonical = ip.to_canonical();
+        self.nets.iter().any(|net| net.contains(&canonical))
     }
 }
 
@@ -69,8 +69,29 @@ impl Listen {
     /// Parse `[listen.proxy_protocol]` into its runtime form — `None` when the section is
     /// absent (PROXY v2 off), an error when it is present but empty or unparseable.
     pub(crate) fn proxy_protocol_trust(&self) -> Result<Option<ProxyProtocolTrust>, ControlError> {
-        let _ = &self.proxy_protocol;
-        Ok(None) // stub (RED)
+        let Some(pp) = &self.proxy_protocol else {
+            return Ok(None);
+        };
+        if pp.trusted.is_empty() {
+            return Err(ControlError::InvalidListenConfig(
+                "proxy_protocol.trusted must list at least one CIDR — enabling PROXY v2 without \
+                 declaring the load balancers would trust every peer"
+                    .to_string(),
+            ));
+        }
+        let nets = pp
+            .trusted
+            .iter()
+            .map(|s| {
+                s.parse::<IpNet>().map_err(|e| {
+                    ControlError::InvalidListenConfig(format!(
+                        "proxy_protocol.trusted has invalid CIDR {s:?}: {e} (a single host \
+                         needs an explicit prefix, e.g. \"{s}/32\")"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ProxyProtocolTrust { nets: nets.into() }))
     }
 }
 

@@ -159,6 +159,10 @@ pub struct Control {
     /// The data-plane listener config (`[listen]`), captured at construction like
     /// `observability`: the listener binds once at startup, so a reload does not re-bind.
     listen: manifest::Listen,
+    /// The parsed `[listen.proxy_protocol]` trust (ADR 000057), captured at construction like
+    /// `listen` itself: the TCP listener consults it once at startup, so a reload does not
+    /// change it. `None` = PROXY v2 reception off (the default).
+    proxy_protocol: Option<manifest::ProxyProtocolTrust>,
     /// The OTLP span buffer (ADR 000040), present iff `[observability] otlp_endpoint` is set:
     /// fanned in beside the sinks above at `Host` construction, drained by the fast path's
     /// export pump. Like the admin listener, it binds once at startup — a reload swaps only the
@@ -189,6 +193,7 @@ impl Control {
             filter_metrics,
             observability: manifest.observability.clone(),
             listen: manifest.listen.clone(),
+            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
             otlp,
         })
     }
@@ -226,6 +231,7 @@ impl Control {
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
             listen: manifest.listen.clone(),
+            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
             otlp,
         })
     }
@@ -254,6 +260,7 @@ impl Control {
             filter_metrics,
             observability: manifest.observability.clone(),
             listen: manifest.listen.clone(),
+            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
             otlp,
         })
     }
@@ -288,6 +295,7 @@ impl Control {
             filter_metrics: Arc::new(MetricsSink::new()),
             observability: manifest.observability.clone(),
             listen: manifest.listen.clone(),
+            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
             otlp,
         })
     }
@@ -322,6 +330,7 @@ pub fn validate_manifest(manifest: &Manifest, base_dir: &Path) -> Result<String,
     }
     TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
     manifest.state.validate()?;
+    manifest.listen.validate()?;
     let mut filter_ids: HashSet<&str> = HashSet::with_capacity(manifest.filters.len());
     for entry in &manifest.filters {
         if !filter_ids.insert(entry.id.as_str()) {

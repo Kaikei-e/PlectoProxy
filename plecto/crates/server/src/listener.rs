@@ -165,6 +165,16 @@ async fn serve_inner(
         }
     }
 
+    // PROXY protocol v2 (ADR 000057): read once at startup, like the bind itself — `[listen]`
+    // is fixed for the process lifetime, a reload does not change it. `Some` = every trusted
+    // peer must present a v2 header (and only trusted peers may), `None` = feature off.
+    let proxy_trust = state.control.proxy_protocol_trust();
+    if proxy_trust.is_some() {
+        tracing::info!(
+            "PROXY protocol v2 enabled on the TCP listener (the h3/UDP listener is not covered — ADR 000057)"
+        );
+    }
+
     // Connection tasks live in a JoinSet so the drain deadline can cut the stragglers
     // (`abort_all`). Finished tasks are reaped opportunistically in the accept loop below.
     let mut conns = JoinSet::new();
@@ -182,7 +192,7 @@ async fn serve_inner(
                 Err(_) => return Ok(()), // semaphore closed → stop serving
             },
         };
-        let (stream, peer) = tokio::select! {
+        let (mut stream, peer) = tokio::select! {
             _ = &mut shutdown => break,
             Some(_) = conns.join_next() => continue, // the permit is re-acquired next iteration
             accepted = listener.accept() => match accepted {
@@ -202,8 +212,32 @@ async fn serve_inner(
         // connections, while in-flight ones keep the cert they negotiated with. `None` → plain.
         let tls = state.control.tls_config();
         let drain = drain_rx.clone();
+        let proxy_trust = proxy_trust.clone();
         conns.spawn(async move {
             let _permit = permit; // released when this connection task ends
+            // PROXY v2 (ADR 000057) sits below TLS: consume (trusted) or peek (untrusted) the
+            // header BEFORE the handshake, and let the restored peer replace `peer` for every
+            // downstream consumer (rate-limit key, X-Forwarded-*, Maglev SourceIp, access log).
+            // Any receipt-rule violation cuts the connection (fail-closed), with the fault code.
+            let peer = match &proxy_trust {
+                Some(trust) => {
+                    match crate::proxy_protocol::resolve_peer(
+                        &mut stream,
+                        peer,
+                        trust,
+                        INBOUND_HEADER_READ_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(fault) => {
+                            tracing::warn!(peer = %peer, fault = %fault, "proxy-protocol: connection rejected");
+                            return;
+                        }
+                    }
+                }
+                None => peer,
+            };
             match tls {
                 Some(cfg) => match TlsAcceptor::from(cfg).accept(stream).await {
                     Ok(tls_stream) => {

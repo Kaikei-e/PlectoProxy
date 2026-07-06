@@ -69,10 +69,88 @@ pub enum ProxyV2Error {
 }
 
 /// Parse a PROXY protocol v2 header from the start of `buf` — pure and total: no I/O, no
-/// panics on any input (the fuzz target's invariant, P11).
+/// panics on any input (the fuzz target's invariant, P11). Errors take precedence over
+/// `Incomplete` as soon as the offending byte is visible, so a bad peer is cut without
+/// waiting for bytes that would change nothing.
 pub fn parse_proxy_v2(buf: &[u8]) -> Result<Parsed, ProxyV2Error> {
-    let _ = buf;
-    Err(ProxyV2Error::BadSignature) // stub (RED)
+    // Compare only the bytes present: a mismatch anywhere is final, a strict prefix is not.
+    let sig_seen = buf.len().min(SIGNATURE.len());
+    if buf.get(..sig_seen) != SIGNATURE.get(..sig_seen) {
+        return Err(ProxyV2Error::BadSignature);
+    }
+    let (Some(&ver_cmd), Some(&fam_proto), Some(len_hi), Some(len_lo)) = (
+        buf.get(12),
+        buf.get(13),
+        buf.get(14).copied(),
+        buf.get(15).copied(),
+    ) else {
+        return Ok(Parsed::Incomplete { needed: PREFIX_LEN });
+    };
+    if ver_cmd >> 4 != 0x2 {
+        return Err(ProxyV2Error::BadVersion(ver_cmd));
+    }
+    let declared = usize::from(u16::from_be_bytes([len_hi, len_lo]));
+    if declared > MAX_DECLARED_LEN {
+        return Err(ProxyV2Error::DeclaredLenTooLarge { declared });
+    }
+    let needed = PREFIX_LEN + declared;
+    match ver_cmd & 0x0F {
+        // LOCAL: use the real endpoints; family is ignored, but the declared bytes must still
+        // be consumed (spec: "must not assume zero is presented for LOCAL connections").
+        0x0 => {
+            if buf.len() < needed {
+                return Ok(Parsed::Incomplete { needed });
+            }
+            Ok(Parsed::Complete {
+                decision: ProxyV2::Local,
+                consumed: needed,
+            })
+        }
+        // PROXY: only TCP over IPv4/IPv6 (ADR 000057); anything else is a fault, not a fallback.
+        0x1 => {
+            let need = match fam_proto {
+                0x11 => 12, // AF_INET,  STREAM: src(4) dst(4) src-port(2) dst-port(2)
+                0x21 => 36, // AF_INET6, STREAM: src(16) dst(16) src-port(2) dst-port(2)
+                other => return Err(ProxyV2Error::UnsupportedFamilyProtocol(other)),
+            };
+            if declared < need {
+                return Err(ProxyV2Error::AddressBlockTooShort { declared, need });
+            }
+            if buf.len() < needed {
+                return Ok(Parsed::Incomplete { needed });
+            }
+            let block = buf.get(PREFIX_LEN..PREFIX_LEN + need).unwrap_or(&[]);
+            let src = match fam_proto {
+                0x11 => parse_src_v4(block),
+                _ => parse_src_v6(block),
+            };
+            // `block` is exactly `need` bytes here, so the sub-slices below always exist; the
+            // defensive `None` arm keeps the function total without a data-plane panic (P11).
+            let Some(src) = src else {
+                return Err(ProxyV2Error::AddressBlockTooShort { declared, need });
+            };
+            Ok(Parsed::Complete {
+                decision: ProxyV2::Proxy { src },
+                consumed: needed,
+            })
+        }
+        _ => Err(ProxyV2Error::BadCommand(ver_cmd)),
+    }
+}
+
+/// Source `SocketAddr` out of a 12-byte IPv4 address block (addresses then ports, all
+/// network byte order).
+fn parse_src_v4(block: &[u8]) -> Option<SocketAddr> {
+    let ip: [u8; 4] = block.get(0..4)?.try_into().ok()?;
+    let port: [u8; 2] = block.get(8..10)?.try_into().ok()?;
+    Some(SocketAddr::from((ip, u16::from_be_bytes(port))))
+}
+
+/// Source `SocketAddr` out of a 36-byte IPv6 address block.
+fn parse_src_v6(block: &[u8]) -> Option<SocketAddr> {
+    let ip: [u8; 16] = block.get(0..16)?.try_into().ok()?;
+    let port: [u8; 2] = block.get(32..34)?.try_into().ok()?;
+    Some(SocketAddr::from((ip, u16::from_be_bytes(port))))
 }
 
 /// Why a connection was cut at the PROXY layer — the fault codes ADR 000057 requires logged.
@@ -99,8 +177,88 @@ pub(crate) async fn resolve_peer(
     trusted: &ProxyProtocolTrust,
     deadline: Duration,
 ) -> Result<SocketAddr, ProxyFault> {
-    let _ = (stream, trusted, deadline);
-    Ok(peer) // stub (RED)
+    let work = async {
+        if trusted.contains(peer.ip()) {
+            read_trusted_header(stream, peer).await
+        } else {
+            detect_untrusted_header(stream, peer).await
+        }
+    };
+    (tokio::time::timeout(deadline, work).await).unwrap_or(Err(ProxyFault::Deadline))
+}
+
+/// A trusted peer MUST open with a valid v2 header: read exactly the fixed prefix, then
+/// exactly the self-described remainder — never more, so the bytes after the header (TLS
+/// ClientHello / HTTP request) stay in the socket for the next layer.
+async fn read_trusted_header(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+) -> Result<SocketAddr, ProxyFault> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; PREFIX_LEN];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(ProxyFault::Truncated)?;
+    loop {
+        match parse_proxy_v2(&buf)? {
+            Parsed::Complete { decision, .. } => {
+                return Ok(match decision {
+                    ProxyV2::Local => peer,
+                    ProxyV2::Proxy { src } => src,
+                });
+            }
+            Parsed::Incomplete { needed } => {
+                // The parser only reports `Incomplete` with `needed` beyond what it saw, so
+                // the loop strictly grows the buffer and ends on the second pass; the guard
+                // keeps a (hypothetical) parser bug from spinning instead of failing closed.
+                let have = buf.len();
+                if needed <= have {
+                    return Err(ProxyFault::Truncated(
+                        std::io::ErrorKind::UnexpectedEof.into(),
+                    ));
+                }
+                buf.resize(needed, 0);
+                if let Some(tail) = buf.get_mut(have..) {
+                    stream
+                        .read_exact(tail)
+                        .await
+                        .map_err(ProxyFault::Truncated)?;
+                }
+            }
+        }
+    }
+}
+
+/// An untrusted peer must NOT speak PROXY v2 — but its bytes belong to the TLS/HTTP stack, so
+/// only peek (non-consuming): a signature mismatch at any position clears the connection to
+/// proceed with its real peer; a full signature is a fault (ADR 000057 receipt rules).
+async fn detect_untrusted_header(
+    stream: &TcpStream,
+    peer: SocketAddr,
+) -> Result<SocketAddr, ProxyFault> {
+    let mut probe = [0u8; SIGNATURE.len()];
+    loop {
+        let n = stream
+            .peek(&mut probe)
+            .await
+            .map_err(ProxyFault::Truncated)?;
+        if n == 0 {
+            return Err(ProxyFault::Truncated(
+                std::io::ErrorKind::UnexpectedEof.into(),
+            ));
+        }
+        if probe.get(..n) != SIGNATURE.get(..n) {
+            return Ok(peer);
+        }
+        if n >= SIGNATURE.len() {
+            return Err(ProxyFault::UntrustedHeader);
+        }
+        // A strict signature prefix: only more bytes can decide. `peek` keeps returning the
+        // same data immediately while nothing new arrives, so pace the loop rather than spin;
+        // the caller's deadline bounds the wait.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(test)]

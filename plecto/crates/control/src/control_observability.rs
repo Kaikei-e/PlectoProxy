@@ -54,4 +54,12 @@ impl Control {
     pub fn advertised_port(&self) -> Option<u16> {
         self.listen.advertised_port
     }
+
+    /// The parsed `[listen.proxy_protocol]` trusted networks (ADR 000057), or `None` when PROXY
+    /// v2 reception is off (the default). Captured at construction like `listen_addr` — the TCP
+    /// listener consults it once at startup; a reload does not change it. The h3/UDP listener is
+    /// out of scope (ADR 000057 decision 5).
+    pub fn proxy_protocol_trust(&self) -> Option<crate::manifest::ProxyProtocolTrust> {
+        self.proxy_protocol.clone()
+    }
 }

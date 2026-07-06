@@ -16,11 +16,9 @@ use plecto_control::{
     RequestTrace,
 };
 
-use crate::body::{
-    INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body, req_full,
-};
+use crate::body::{INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body};
 use crate::error::ServerError;
-use crate::forward::{ForwardOutcome, ForwardRequest, forward_with_retry};
+use crate::forward::{ForwardBody, ForwardOutcome, ForwardRequest, forward_with_retry};
 use crate::headers::{
     copy_headers, copy_headers_direct, headers_to_vec, set_forwarded, to_http_request,
 };
@@ -136,9 +134,9 @@ async fn proxy_core_inner(
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let mut http_req = to_http_request(&parts, scheme);
-    // Only a bodyless request can be retried without buffering — and only a bodyless request can
-    // be an Upgrade handshake (ADR 000048). `exact() == Some(0)` is hyper's framing-accurate
-    // "no body"; computed up front, before the body moves.
+    // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
+    // body moves: only a bodyless request can be an Upgrade handshake (ADR 000048), and bodyless
+    // maps to the trivially replayable `ForwardBody::Bodyless` retry contract (ADR 000058) below.
     let bodyless = body.size_hint().exact() == Some(0);
 
     // Normalize the request path once at ingress (CWE-22 Path Traversal / CWE-436
@@ -255,9 +253,13 @@ async fn proxy_core_inner(
     // (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries consume it.
     let overall = group.overall_timeout();
     let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
-    // Only a bodyless request can be retried without buffering: the opaque streamed body
-    // (ADR 000013) can't be replayed (`bodyless` was computed up front).
-    let mut real_body = Some(body);
+    // The retry loop's view of the body (ADR 000058): bodyless and buffered bodies are
+    // replayable, an opaque streamed body (ADR 000013) moves into its single attempt.
+    let mut real_body = if bodyless {
+        ForwardBody::Bodyless
+    } else {
+        ForwardBody::OneShot(body)
+    };
 
     // --- request-side body hook (ADR 000025): buffer the body (bounded) ONLY when a filter on the
     // route actually reads it — i.e. exports `on-request-body` (`reads_body`, ADR 000038). A route
@@ -265,8 +267,7 @@ async fn proxy_core_inner(
     // the zero-copy streaming path — the real fix for the body-tax (docs/servey). The chain runs on
     // the blocking pool (sync wasmtime, !Send Store), like the header chain.
     if route.reads_body
-        && !bodyless
-        && let Some(b) = real_body.take()
+        && let Some(b) = real_body.take_oneshot()
     {
         // Bound concurrent buffered-body memory and the time spent reading one body
         // (slow-body slowloris): hold a buffer permit and read under a deadline. Over the
@@ -310,7 +311,11 @@ async fn proxy_core_inner(
             .await?
         {
             RequestBodyOutcome::Respond(resp) => return Ok(http_response(resp)),
-            RequestBodyOutcome::Forward(edited) => real_body = Some(req_full(edited)),
+            // The buffered, filter-edited bytes are replayable by definition (ADR 000058):
+            // `Vec<u8>` → `Bytes` is a move, and each retry attempt shares it by reference count.
+            RequestBodyOutcome::Forward(edited) => {
+                real_body = ForwardBody::Replayable(bytes::Bytes::from(edited));
+            }
         }
     }
 
@@ -361,7 +366,6 @@ async fn proxy_core_inner(
         pick,
         hash_key,
         forward_req,
-        bodyless,
         real_body,
         timeout,
         overall_deadline,

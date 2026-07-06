@@ -64,8 +64,46 @@ async fn spawn_proxy(control: Arc<Control>) -> SocketAddr {
     addr
 }
 
+/// An upstream that answers `/healthz` with 200 (so it stays in rotation) and every other path
+/// with 503 — healthy to the prober, failing real requests, which is what exercises retry-on-5xx
+/// for a buffered body (ADR 000058) without demotion.
+async fn spawn_503_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    let status = if req.uri().path().starts_with("/healthz") {
+                        200u16
+                    } else {
+                        503u16
+                    };
+                    Ok::<Response<Full<Bytes>>, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .body(Full::new(Bytes::from_static(b"bad instance")))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
 /// filter-hello signed + loaded trusted, on a route `/api` (strip `/api`) → the body-echo upstream.
 fn control_for(upstream_addr: SocketAddr) -> Arc<Control> {
+    control_for_addrs(&[upstream_addr])
+}
+
+/// Same as [`control_for`] but with every given address in one upstream group, so round-robin —
+/// and retry onto another instance — can be exercised through the filter-body route.
+fn control_for_addrs(addrs: &[SocketAddr]) -> Arc<Control> {
     let component = filter_hello_component();
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&component).unwrap();
@@ -81,6 +119,11 @@ fn control_for(upstream_addr: SocketAddr) -> Arc<Control> {
             sbom_signature,
         },
     );
+    let addr_list = addrs
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let toml = format!(
         r#"
 [[filter]]
@@ -91,7 +134,7 @@ isolation = "trusted"
 
 [[upstream]]
 name = "echo"
-addresses = ["{upstream_addr}"]
+addresses = [{addr_list}]
 [upstream.health]
 path = "/healthz"
 interval_ms = 50
@@ -119,8 +162,18 @@ async fn post(
     path: &str,
     body: &'static [u8],
 ) -> (StatusCode, hyper::HeaderMap, String) {
+    send(client, proxy, "POST", path, body).await
+}
+
+async fn send(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    proxy: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &'static [u8],
+) -> (StatusCode, hyper::HeaderMap, String) {
     let req = Request::builder()
-        .method("POST")
+        .method(method)
         .uri(format!("http://{proxy}{path}"))
         .body(Full::new(Bytes::from_static(body)))
         .unwrap();
@@ -208,4 +261,67 @@ async fn bodyless_request_skips_the_hook() {
         Some("upstream"),
         "a bodyless request forwards normally"
     );
+}
+
+/// Wait until BOTH instances have passed a health probe, so round-robin reaches the 503 one:
+/// poll past the first success, then give a couple more probe intervals (`interval_ms = 50`).
+async fn wait_both_ready(client: &Client<HttpConnector, Full<Bytes>>, proxy: SocketAddr) {
+    wait_ready(client, proxy).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn buffered_put_body_is_rescued_by_retry_on_5xx() {
+    // ADR 000058: a body buffered for the `on-request-body` hook is replayable, so an idempotent
+    // PUT that round-robins onto the 503 instance is retried onto the healthy one instead of
+    // surfacing the 503 — and the retried attempt still carries the filter-edited body.
+    let bad = spawn_503_upstream().await;
+    let good = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_addrs(&[bad, good])).await;
+    let client = client();
+    wait_both_ready(&client, proxy).await;
+
+    for i in 0..12 {
+        let (status, _, body) = send(&client, proxy, "PUT", "/api/hello", b"hello world").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PUT #{i} was rescued by retry-on-5xx (got {status})"
+        );
+        assert_eq!(
+            body, "HELLO WORLD",
+            "the rescued attempt re-sent the filter-edited body intact"
+        );
+    }
+}
+
+#[tokio::test]
+async fn buffered_post_body_is_not_retried_on_5xx() {
+    // The retry decision table is unchanged (ADR 000058): a 5xx means the upstream RECEIVED the
+    // request, so a non-idempotent POST is never replayed onto another instance — some POSTs
+    // surface the 503 even though the buffered body is replayable.
+    let bad = spawn_503_upstream().await;
+    let good = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_addrs(&[bad, good])).await;
+    let client = client();
+    wait_both_ready(&client, proxy).await;
+
+    let mut saw_503 = false;
+    let mut saw_ok = false;
+    for _ in 0..12 {
+        let (status, _, body) = post(&client, proxy, "/api/hello", b"hello world").await;
+        match status {
+            StatusCode::OK => {
+                assert_eq!(body, "HELLO WORLD");
+                saw_ok = true;
+            }
+            StatusCode::SERVICE_UNAVAILABLE => saw_503 = true,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(
+        saw_503,
+        "a non-idempotent POST must NOT be retried around the 503 instance"
+    );
+    assert!(saw_ok, "the healthy instance keeps serving POSTs");
 }

@@ -201,10 +201,13 @@ pub(crate) mod fake {
 
     /// A `FilterRuntime`-style test double for `UpstreamClient`: no socket at all. Each call to
     /// `request` pops the next scripted outcome (repeating the last one once the script runs out),
-    /// so a test can assert exactly how many attempts a retry sequence made.
+    /// so a test can assert exactly how many attempts a retry sequence made — and, via `bodies`,
+    /// exactly which body bytes each attempt carried (a replayable retry must re-send them intact,
+    /// ADR 000058).
     pub(crate) struct FakeUpstreamClient {
         script: Mutex<Vec<Scripted>>,
         calls: Mutex<u32>,
+        bodies: Mutex<Vec<Bytes>>,
     }
 
     impl FakeUpstreamClient {
@@ -212,20 +215,33 @@ pub(crate) mod fake {
             Self {
                 script: Mutex::new(script),
                 calls: Mutex::new(0),
+                bodies: Mutex::new(Vec::new()),
             }
         }
 
         pub(crate) fn calls(&self) -> u32 {
             *self.calls.lock().unwrap()
         }
+
+        /// The request body each attempt sent, in attempt order.
+        pub(crate) fn bodies(&self) -> Vec<Bytes> {
+            self.bodies.lock().unwrap().clone()
+        }
     }
 
     impl UpstreamClient for FakeUpstreamClient {
         async fn request(
             &self,
-            _req: Request<ReqBody>,
+            req: Request<ReqBody>,
         ) -> Result<hyper::Response<ResponseBody>, UpstreamSendError> {
             *self.calls.lock().unwrap() += 1;
+            let body = req
+                .into_body()
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            self.bodies.lock().unwrap().push(body);
             let next = {
                 let mut script = self.script.lock().unwrap();
                 if script.len() > 1 {

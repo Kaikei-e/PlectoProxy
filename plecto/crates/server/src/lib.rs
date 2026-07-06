@@ -48,6 +48,9 @@ mod listener;
 mod metrics;
 mod otlp;
 mod proxy;
+// `pub`: the out-of-workspace fuzz harness (`fuzz/`) drives the pure parser (ADR 000057). Not a
+// semver surface — the crate is `publish = false`.
+pub mod proxy_protocol;
 mod respond;
 mod retry;
 mod tunnel;

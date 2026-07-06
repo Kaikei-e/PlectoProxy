@@ -65,8 +65,8 @@ pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability,
-    OutlierDetection, RateLimitKeyKind, Route, RouteRateLimit, State, StateBackendKind, TlsCert,
-    Trust, Upstream,
+    OutlierDetection, ProxyProtocolTrust, RateLimitKeyKind, Route, RouteRateLimit, State,
+    StateBackendKind, TlsCert, Trust, Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]

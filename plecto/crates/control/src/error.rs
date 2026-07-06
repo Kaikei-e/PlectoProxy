@@ -49,6 +49,12 @@ pub enum ControlError {
     #[error("state backend init failed: {0}")]
     StateBackendInit(String),
 
+    /// The `[listen]` section is inconsistent (ADR 000057): a `[listen.proxy_protocol]` with an
+    /// empty or unparseable `trusted` CIDR list. Rejected fail-closed — enabling PROXY v2
+    /// without declaring who may speak it would mean trusting every peer (deny-by-default, P4).
+    #[error("invalid [listen] config: {0}")]
+    InvalidListenConfig(String),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 

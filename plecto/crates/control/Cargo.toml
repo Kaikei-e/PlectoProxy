@@ -25,14 +25,15 @@ bench = false
 # Forwards to the host's outbound HTTP capability (ADR 000036). OFF by default: without it a
 # manifest that declares `[filter.outbound]` is rejected at validate (fail-closed), since the host
 # cannot provide the capability. When on, the section is parsed, validated, and lowered into the
-# host `LoadOptions`. Pulls `ipnet` for CIDR validation of the `allow_private` opt-in.
-outbound-http = ["plecto-host/outbound-http", "dep:ipnet"]
+# host `LoadOptions`.
+outbound-http = ["plecto-host/outbound-http"]
 
 [dependencies]
 plecto-host = { path = "../host" }
 anyhow = { workspace = true }
-# outbound-http only: CIDR parse/containment for the `[filter.outbound] allow_private` ranges.
-ipnet = { workspace = true, optional = true }
+# CIDR parse/containment: `[listen.proxy_protocol] trusted` (ADR 000057) always, plus the
+# outbound-http `[filter.outbound] allow_private` ranges (ADR 000036).
+ipnet = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

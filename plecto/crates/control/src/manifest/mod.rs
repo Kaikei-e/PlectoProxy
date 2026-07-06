@@ -36,7 +36,11 @@ pub use filter_entry::{FilterEntry, IsolationKind, OutboundConfig};
 // anyway so `crate::manifest::X` keeps resolving for every schema type (module doc above).
 #[allow(unused_imports)]
 pub use filter_entry::{AllowDest, RateLimitConfig, SchemeKind};
-pub use listen::Listen;
+pub use listen::{Listen, ProxyProtocolTrust};
+// `ProxyProtocol` is a schema field reached through `Listen` rather than by name elsewhere in
+// this crate; re-exported for the same schema-type completeness reason as `AllowDest` below.
+#[allow(unused_imports)]
+pub use listen::ProxyProtocol;
 pub use observability::Observability;
 pub(crate) use route::MAX_BACKEND_WEIGHT;
 pub use route::{RateLimitKeyKind, Route, RouteRateLimit};

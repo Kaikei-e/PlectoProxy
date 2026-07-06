@@ -50,6 +50,16 @@ pub(crate) enum ForwardBody {
 }
 
 impl ForwardBody {
+    /// Whether a failed attempt's body could be re-sent (ADR 000058): everything except the
+    /// streamed one-shot. The retry DECISION still layers failure kind / idempotency / budget on
+    /// top of this (`retry::should_attempt_retry`).
+    fn replayable(&self) -> bool {
+        match self {
+            ForwardBody::Bodyless | ForwardBody::Replayable(_) => true,
+            ForwardBody::OneShot(_) => false,
+        }
+    }
+
     /// Move a `OneShot` stream out for buffering (the `on-request-body` hook, ADR 000025),
     /// leaving `Bodyless` behind — the caller replaces that with `Replayable` once the hook
     /// forwards the edited bytes. `None` for the other variants (nothing to buffer).
@@ -102,10 +112,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
     overall_deadline: Option<Instant>,
     max_retries: u64,
 ) -> ForwardOutcome {
-    // STUB (ADR 000058 RED): still the pre-000058 predicate — only a bodyless request counts as
-    // replayable, so a buffered (`Replayable`) body is never retried. GREEN generalizes this to
-    // `body.replayable()`.
-    let replayable = matches!(body, ForwardBody::Bodyless);
+    let replayable = body.replayable();
     let mut tries_left = max_retries;
     let mut attempt: u32 = 0;
 

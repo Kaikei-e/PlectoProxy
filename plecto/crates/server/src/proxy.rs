@@ -134,9 +134,9 @@ async fn proxy_core_inner(
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let mut http_req = to_http_request(&parts, scheme);
-    // Only a bodyless request can be retried without buffering — and only a bodyless request can
-    // be an Upgrade handshake (ADR 000048). `exact() == Some(0)` is hyper's framing-accurate
-    // "no body"; computed up front, before the body moves.
+    // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
+    // body moves: only a bodyless request can be an Upgrade handshake (ADR 000048), and bodyless
+    // maps to the trivially replayable `ForwardBody::Bodyless` retry contract (ADR 000058) below.
     let bodyless = body.size_hint().exact() == Some(0);
 
     // Normalize the request path once at ingress (CWE-22 Path Traversal / CWE-436

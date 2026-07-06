@@ -25,10 +25,11 @@ pub(crate) fn is_idempotent(method: &str) -> bool {
 
 /// Whether a failed forward MAY be retried on another instance (ADR 000023) — independent of whether
 /// a different instance is actually available (the caller checks that). A retry needs remaining
-/// budget and a replayable (bodyless) body; a timeout additionally needs an idempotent method, while
-/// a connect failure is safe for any method (the upstream never received the request).
-pub(crate) fn may_retry(failure: Failure, method: &str, bodyless: bool, tries_left: u64) -> bool {
-    bodyless
+/// budget and a replayable body — bodyless, or buffered for the `on-request-body` hook (ADR
+/// 000058); a timeout additionally needs an idempotent method, while a connect failure is safe for
+/// any method (the upstream never received the request).
+pub(crate) fn may_retry(failure: Failure, method: &str, replayable: bool, tries_left: u64) -> bool {
+    replayable
         && tries_left > 0
         && match failure {
             Failure::Timeout => is_idempotent(method),
@@ -133,7 +134,7 @@ pub(crate) enum AttemptOutcome {
 pub(crate) fn should_attempt_retry(
     outcome: AttemptOutcome,
     method: &str,
-    bodyless: bool,
+    replayable: bool,
     tries_left: u64,
     overall_elapsed: bool,
 ) -> bool {
@@ -145,7 +146,7 @@ pub(crate) fn should_attempt_retry(
         AttemptOutcome::TimedOut => (true, Failure::Timeout),
         AttemptOutcome::Failed { connect } => (connect, Failure::Connect),
     };
-    retryable && may_retry(failure, method, bodyless, tries_left)
+    retryable && may_retry(failure, method, replayable, tries_left)
 }
 
 #[cfg(test)]
@@ -195,14 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn may_retry_gates_on_failure_method_body_and_budget() {
+    fn may_retry_gates_on_failure_method_replayability_and_budget() {
         // A timeout retries only for an idempotent method (the upstream may have acted).
         assert!(may_retry(Failure::Timeout, "GET", true, 1));
         assert!(!may_retry(Failure::Timeout, "POST", true, 1));
         // A connect failure never reached the upstream → safe for ANY method.
         assert!(may_retry(Failure::Connect, "POST", true, 1));
         assert!(may_retry(Failure::Connect, "GET", true, 1));
-        // A bodied request can't be replayed (no buffering) → never retried, either failure.
+        // A one-shot streamed body can't be replayed → never retried, either failure (ADR 000058:
+        // replayable covers bodyless AND buffered bodies; only the streamed one-shot is excluded).
         assert!(!may_retry(Failure::Timeout, "GET", false, 1));
         assert!(!may_retry(Failure::Connect, "POST", false, 1));
         // Exhausted budget → no retry.
@@ -242,12 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn should_attempt_retry_gates_on_outcome_method_body_budget_and_overall_deadline() {
+    fn should_attempt_retry_gates_on_outcome_method_replayability_budget_and_overall_deadline() {
         struct Case {
             name: &'static str,
             outcome: AttemptOutcome,
             method: &'static str,
-            bodyless: bool,
+            replayable: bool,
             tries_left: u64,
             overall_elapsed: bool,
             want: bool,
@@ -259,7 +261,7 @@ mod tests {
                     retriable_5xx: true,
                 },
                 method: "GET",
-                bodyless: true,
+                replayable: true,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: true,
@@ -270,7 +272,7 @@ mod tests {
                     retriable_5xx: false,
                 },
                 method: "GET",
-                bodyless: true,
+                replayable: true,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: false,
@@ -279,7 +281,7 @@ mod tests {
                 name: "timeout, idempotent -> attempt retry",
                 outcome: AttemptOutcome::TimedOut,
                 method: "HEAD",
-                bodyless: true,
+                replayable: true,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: true,
@@ -288,7 +290,7 @@ mod tests {
                 name: "timeout, non-idempotent -> stop",
                 outcome: AttemptOutcome::TimedOut,
                 method: "POST",
-                bodyless: true,
+                replayable: true,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: false,
@@ -297,7 +299,7 @@ mod tests {
                 name: "overall deadline elapsed -> stop unconditionally",
                 outcome: AttemptOutcome::TimedOut,
                 method: "GET",
-                bodyless: true,
+                replayable: true,
                 tries_left: 5,
                 overall_elapsed: true,
                 want: false,
@@ -306,7 +308,7 @@ mod tests {
                 name: "connect failure, non-idempotent method -> still attempts (any method safe)",
                 outcome: AttemptOutcome::Failed { connect: true },
                 method: "POST",
-                bodyless: true,
+                replayable: true,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: true,
@@ -315,18 +317,18 @@ mod tests {
                 name: "non-connect transport fault -> never retried",
                 outcome: AttemptOutcome::Failed { connect: false },
                 method: "GET",
-                bodyless: true,
+                replayable: true,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: false,
             },
             Case {
-                name: "bodied request -> never retried regardless of everything else",
+                name: "one-shot streamed body -> never retried regardless of everything else",
                 outcome: AttemptOutcome::Response {
                     retriable_5xx: true,
                 },
                 method: "GET",
-                bodyless: false,
+                replayable: false,
                 tries_left: 1,
                 overall_elapsed: false,
                 want: false,
@@ -335,7 +337,7 @@ mod tests {
                 name: "exhausted retry budget -> stop",
                 outcome: AttemptOutcome::TimedOut,
                 method: "GET",
-                bodyless: true,
+                replayable: true,
                 tries_left: 0,
                 overall_elapsed: false,
                 want: false,
@@ -345,7 +347,7 @@ mod tests {
             let got = should_attempt_retry(
                 case.outcome,
                 case.method,
-                case.bodyless,
+                case.replayable,
                 case.tries_left,
                 case.overall_elapsed,
             );

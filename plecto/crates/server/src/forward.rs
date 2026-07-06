@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use hyper::header::HeaderValue;
 use hyper::{HeaderMap, Request};
 use plecto_control::{HashInput, UpstreamGroup};
@@ -34,6 +35,45 @@ pub(crate) enum ForwardOutcome {
     BuildFailed(hyper::http::Error),
 }
 
+/// The request body as the retry loop sees it (ADR 000058): whether an attempt's body can be
+/// rebuilt for a re-send decides — together with the failure kind and method idempotency — whether
+/// a retry is even considered. Bodyless and buffered bodies are replayable; an opaque streamed
+/// body is not (it moves into its single attempt and is gone).
+pub(crate) enum ForwardBody {
+    /// No body at all (`size_hint().exact() == Some(0)`): each attempt sends a fresh empty body.
+    Bodyless,
+    /// An opaque streamed body (ADR 000013) — sent exactly once, never replayed.
+    OneShot(ReqBody),
+    /// A body already buffered for the `on-request-body` hook (ADR 000025 / 000038): each attempt
+    /// rebuilds a `Full` from a `Bytes` clone — a reference-count bump, never a memory copy.
+    Replayable(Bytes),
+}
+
+impl ForwardBody {
+    /// Move a `OneShot` stream out for buffering (the `on-request-body` hook, ADR 000025),
+    /// leaving `Bodyless` behind — the caller replaces that with `Replayable` once the hook
+    /// forwards the edited bytes. `None` for the other variants (nothing to buffer).
+    pub(crate) fn take_oneshot(&mut self) -> Option<ReqBody> {
+        match self {
+            ForwardBody::OneShot(_) => match std::mem::replace(self, ForwardBody::Bodyless) {
+                ForwardBody::OneShot(body) => Some(body),
+                ForwardBody::Bodyless | ForwardBody::Replayable(_) => None,
+            },
+            ForwardBody::Bodyless | ForwardBody::Replayable(_) => None,
+        }
+    }
+
+    /// The body for the NEXT attempt. A `OneShot` moves out on the first call (subsequent calls
+    /// yield an empty body, but a one-shot attempt is never retried, so none happen).
+    fn attempt_body(&mut self) -> ReqBody {
+        match self {
+            ForwardBody::Bodyless => crate::body::empty_req(),
+            ForwardBody::OneShot(body) => std::mem::replace(body, crate::body::empty_req()),
+            ForwardBody::Replayable(bytes) => crate::body::req_full(bytes.clone()),
+        }
+    }
+}
+
 /// One forward attempt's static inputs (the parts of the request that don't change across
 /// retries) — grouped so `forward_with_retry` isn't a wall of positional parameters.
 pub(crate) struct ForwardRequest<'a> {
@@ -57,12 +97,15 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
     mut pick: plecto_control::Pick,
     hash_key: Option<HashInput<'_>>,
     forward: ForwardRequest<'_>,
-    bodyless: bool,
-    mut body: Option<ReqBody>,
+    mut body: ForwardBody,
     per_try_bound: Duration,
     overall_deadline: Option<Instant>,
     max_retries: u64,
 ) -> ForwardOutcome {
+    // STUB (ADR 000058 RED): still the pre-000058 predicate — only a bodyless request counts as
+    // replayable, so a buffered (`Replayable`) body is never retried. GREEN generalizes this to
+    // `body.replayable()`.
+    let replayable = matches!(body, ForwardBody::Bodyless);
     let mut tries_left = max_retries;
     let mut attempt: u32 = 0;
 
@@ -73,13 +116,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
             retry::PerTryTimeout::Bounded(d) => d,
         };
 
-        // A bodyless request re-sends an empty body to each instance; a bodied one moves its
-        // single streamed body and (since a bodied request is never retryable) is sent once.
-        let attempt_body = if bodyless {
-            crate::body::empty_req()
-        } else {
-            body.take().unwrap_or_else(crate::body::empty_req)
-        };
+        let attempt_body = body.attempt_body();
         // The scheme is the GROUP's (ADR 000042): `https` re-encrypts via the TLS client the
         // caller selected for this group, `http` keeps the plain pre-000042 leg.
         let uri = format!(
@@ -155,7 +192,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
                 let should_retry = retry::should_attempt_retry(
                     AttemptOutcome::Response { retriable_5xx },
                     forward.method,
-                    bodyless,
+                    replayable,
                     tries_left,
                     overall_elapsed,
                 );
@@ -178,7 +215,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
                 let should_retry = retry::should_attempt_retry(
                     AttemptOutcome::TimedOut,
                     forward.method,
-                    bodyless,
+                    replayable,
                     tries_left,
                     overall_elapsed,
                 );
@@ -205,7 +242,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
                 let should_retry = retry::should_attempt_retry(
                     AttemptOutcome::Failed { connect },
                     forward.method,
-                    bodyless,
+                    replayable,
                     tries_left,
                     overall_elapsed,
                 );
@@ -298,8 +335,7 @@ mod tests {
             pick,
             None,
             req("GET", &headers),
-            true,
-            None,
+            ForwardBody::Bodyless,
             Duration::from_secs(5),
             None,
             2,
@@ -332,8 +368,7 @@ mod tests {
             pick,
             None,
             req("POST", &headers),
-            true,
-            None,
+            ForwardBody::Bodyless,
             Duration::from_millis(20),
             None,
             2,
@@ -367,8 +402,7 @@ mod tests {
             pick,
             None,
             req("GET", &headers),
-            true,
-            None,
+            ForwardBody::Bodyless,
             Duration::from_secs(5),
             elapsed_deadline,
             2,
@@ -401,8 +435,7 @@ mod tests {
             pick,
             None,
             req("POST", &headers),
-            true,
-            None,
+            ForwardBody::Bodyless,
             Duration::from_secs(5),
             None,
             1,
@@ -418,5 +451,181 @@ mod tests {
             2,
             "a connect failure (upstream never received the request) is safe to retry for any method"
         );
+    }
+
+    #[tokio::test]
+    async fn replayable_body_is_resent_intact_on_a_connect_failure() {
+        // ADR 000058: a buffered body is replayable, so a connect failure — which never reached
+        // the upstream — retries onto another instance for ANY method, and the retried attempt
+        // must carry the exact same bytes.
+        let group = test_group(&["127.0.0.1:1", "127.0.0.1:2"], 1);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![
+            Scripted::SendError(SendErrorKind::Connect),
+            Scripted::Status(200),
+        ]);
+        let metrics = ServerMetrics::new();
+        let headers = HeaderMap::new();
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            req("POST", &headers),
+            ForwardBody::Replayable(Bytes::from_static(b"buffered payload")),
+            Duration::from_secs(5),
+            None,
+            1,
+        )
+        .await;
+
+        match outcome {
+            ForwardOutcome::Response(resp, _) => assert_eq!(resp.status(), 200),
+            _ => panic!("expected the connect failure to be retried onto the other instance"),
+        }
+        assert_eq!(client.calls(), 2);
+        assert_eq!(
+            client.bodies(),
+            vec![Bytes::from_static(b"buffered payload"); 2],
+            "every attempt must re-send the buffered body intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayable_idempotent_request_is_retried_on_a_retriable_5xx() {
+        // The decision table is unchanged (ADR 000058): a retriable 5xx retries only an
+        // idempotent method — but a buffered PUT body no longer disqualifies the request.
+        let group = test_group(&["127.0.0.1:1", "127.0.0.1:2"], 1);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![Scripted::Status(503), Scripted::Status(200)]);
+        let metrics = ServerMetrics::new();
+        let headers = HeaderMap::new();
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            req("PUT", &headers),
+            ForwardBody::Replayable(Bytes::from_static(b"idempotent payload")),
+            Duration::from_secs(5),
+            None,
+            1,
+        )
+        .await;
+
+        match outcome {
+            ForwardOutcome::Response(resp, _) => assert_eq!(resp.status(), 200),
+            _ => panic!("expected the 503 to be retried onto the healthy instance"),
+        }
+        assert_eq!(client.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn replayable_non_idempotent_request_is_not_retried_on_a_timeout() {
+        // Replayability and idempotency are separate questions (ADR 000058): a timeout may
+        // already have been acted on by the upstream, so a buffered POST still never retries.
+        let group = test_group(&["127.0.0.1:1", "127.0.0.1:2"], 2);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![Scripted::Hang(Duration::from_millis(200))]);
+        let metrics = ServerMetrics::new();
+        let headers = HeaderMap::new();
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            req("POST", &headers),
+            ForwardBody::Replayable(Bytes::from_static(b"post payload")),
+            Duration::from_millis(20),
+            None,
+            2,
+        )
+        .await;
+
+        assert!(matches!(outcome, ForwardOutcome::PerTryTimeout));
+        assert_eq!(
+            client.calls(),
+            1,
+            "a non-idempotent method must not be retried after a timeout, replayable or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayable_retry_shares_the_bounded_budget() {
+        // A replayable re-send stays inside the existing bounded-retry frame (ADR 000058
+        // consequences): max_retries attempts of backoff-and-retry, then the failure surfaces.
+        let group = test_group(&["127.0.0.1:1", "127.0.0.1:2"], 2);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![Scripted::Status(503)]);
+        let metrics = ServerMetrics::new();
+        let headers = HeaderMap::new();
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            req("PUT", &headers),
+            ForwardBody::Replayable(Bytes::from_static(b"exhausted payload")),
+            Duration::from_secs(5),
+            None,
+            2,
+        )
+        .await;
+
+        match outcome {
+            ForwardOutcome::Response(resp, _) => assert_eq!(
+                resp.status(),
+                503,
+                "once the budget is spent the last 503 surfaces"
+            ),
+            _ => panic!("expected the final 503 response"),
+        }
+        assert_eq!(
+            client.calls(),
+            3,
+            "max_retries = 2 bounds a replayable request to 3 attempts total"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_streamed_body_is_never_retried() {
+        // ADR 000058 changes nothing for the streamed path: a one-shot body moves into its single
+        // attempt, so even a connect failure surfaces instead of retrying.
+        let group = test_group(&["127.0.0.1:1", "127.0.0.1:2"], 2);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![
+            Scripted::SendError(SendErrorKind::Connect),
+            Scripted::Status(200),
+        ]);
+        let metrics = ServerMetrics::new();
+        let headers = HeaderMap::new();
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            req("POST", &headers),
+            ForwardBody::OneShot(crate::body::req_full(Bytes::from_static(b"streamed"))),
+            Duration::from_secs(5),
+            None,
+            2,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ForwardOutcome::SendFailed(_)),
+            "a streamed body must surface the connect failure unretried"
+        );
+        assert_eq!(client.calls(), 1);
     }
 }

@@ -68,10 +68,11 @@ pub(crate) async fn buffer_request_body(mut body: ReqBody, max: usize) -> Option
     Some(buf)
 }
 
-/// A buffered request body (post `on-request-body` hook, ADR 000025) boxed into `ReqBody` — the
-/// transformed body the fast path forwards in place of the original stream.
-pub(crate) fn req_full(bytes: Vec<u8>) -> ReqBody {
-    Full::new(Bytes::from(bytes))
+/// A buffered request body (post `on-request-body` hook, ADR 000025) boxed into `ReqBody` — one
+/// attempt's view of a replayable body (ADR 000058). Takes `Bytes` so each retry attempt shares
+/// the same buffer by reference count instead of copying it.
+pub(crate) fn req_full(bytes: Bytes) -> ReqBody {
+    Full::new(bytes)
         .map_err(|e: Infallible| -> BoxError { match e {} })
         .boxed()
 }

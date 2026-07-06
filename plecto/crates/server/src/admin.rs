@@ -99,11 +99,25 @@ async fn admin_handle(
             "text/plain; charset=utf-8",
             "ok\n".to_string(),
         ),
-        "/readyz" => (
-            StatusCode::OK,
-            "text/plain; charset=utf-8",
-            "ready\n".to_string(),
-        ),
+        // Readiness (ADR 000059): not-ready from the shutdown signal onward — through the
+        // readiness grace and the drain — so a front LB removes this replica BEFORE accepts
+        // stop. Liveness (`/healthz` above) stays 200 the whole time: a draining process is
+        // exiting on purpose, and a restart-looping supervisor would defeat the drain.
+        "/readyz" => {
+            if *state.ready.borrow() && !*state.drain.borrow() {
+                (
+                    StatusCode::OK,
+                    "text/plain; charset=utf-8",
+                    "ready\n".to_string(),
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "text/plain; charset=utf-8",
+                    "draining\n".to_string(),
+                )
+            }
+        }
         _ => (
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",

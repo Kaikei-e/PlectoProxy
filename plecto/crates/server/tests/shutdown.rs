@@ -1,6 +1,9 @@
-//! E2E (tdd-workflow Phase 0) for graceful shutdown (ADR 000039): `serve_with_shutdown` must stop
-//! accepting when the shutdown future resolves, drain in-flight requests up to the drain deadline,
-//! cut connections that outlive it, and not let idle keep-alive connections hold the drain open.
+//! E2E (tdd-workflow Phase 0) for graceful shutdown (ADR 000039 / 000059): `serve_with_shutdown`
+//! must stop accepting when the shutdown future resolves, drain in-flight requests up to the
+//! drain window (`[listen.drain] window_ms`), cut connections that outlive it, not let idle
+//! keep-alive connections hold the drain open, flip `/readyz` to 503 at the signal (while
+//! `/healthz` stays 200), and keep accepting through the readiness grace
+//! (`[listen.drain] readiness_grace_ms`) so a front LB can take the replica out first.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,7 +61,9 @@ async fn spawn_upstream(delay: Duration) -> SocketAddr {
 
 /// Build a control plane: filter-hello signed + loaded as a trusted filter, a route `/api`
 /// (strip `/api`) → that chain → the given upstream address (same shape as `tests/e2e.rs`).
-fn control_for(upstream_addr: SocketAddr) -> Arc<Control> {
+/// `extra` is appended to the manifest TOML — the drain settings under test
+/// (`[listen.drain]`, ADR 000059) and/or an admin listener (`[observability]`).
+fn control_for(upstream_addr: SocketAddr, extra: &str) -> Arc<Control> {
     let component = filter_hello_component();
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&component).unwrap();
@@ -95,6 +100,8 @@ upstream = "echo"
 strip_prefix = "/api"
 [route.match]
 path_prefix = "/api"
+
+{extra}
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();
@@ -102,11 +109,11 @@ path_prefix = "/api"
     Arc::new(Control::load(host, &manifest, Box::new(store)).unwrap())
 }
 
-/// Spawn the proxy under test on an ephemeral port with a oneshot-triggered shutdown and the
-/// given drain deadline. Returns the bound addr, the trigger, and the serve task's handle.
+/// Spawn the proxy under test on an ephemeral port with a oneshot-triggered shutdown; the drain
+/// window / readiness grace come from the manifest's `[listen.drain]` (ADR 000059). Returns the
+/// bound addr, the trigger, and the serve task's handle.
 async fn spawn_proxy(
     control: Arc<Control>,
-    drain_deadline: Duration,
 ) -> (
     SocketAddr,
     oneshot::Sender<()>,
@@ -115,15 +122,20 @@ async fn spawn_proxy(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(serve_with_shutdown(
-        control,
-        listener,
-        async move {
-            let _ = rx.await;
-        },
-        drain_deadline,
-    ));
+    let handle = tokio::spawn(serve_with_shutdown(control, listener, async move {
+        let _ = rx.await;
+    }));
     (addr, tx, handle)
+}
+
+/// Reserve a distinct loopback port for the admin listener (bound-then-dropped, like
+/// `tests/observability.rs`).
+async fn free_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
 }
 
 fn client() -> Client<HttpConnector, Empty<Bytes>> {
@@ -163,8 +175,8 @@ async fn wait_ready(client: &Client<HttpConnector, Empty<Bytes>>, proxy: SocketA
 #[tokio::test]
 async fn graceful_shutdown_drains_inflight_and_stops_accepting() {
     let upstream = spawn_upstream(Duration::from_millis(400)).await;
-    let (proxy, shutdown, server) =
-        spawn_proxy(control_for(upstream), Duration::from_secs(5)).await;
+    let control = control_for(upstream, "[listen.drain]\nwindow_ms = 5000\n");
+    let (proxy, shutdown, server) = spawn_proxy(control).await;
     let client = client();
     wait_ready(&client, proxy).await;
 
@@ -198,10 +210,11 @@ async fn graceful_shutdown_drains_inflight_and_stops_accepting() {
 
 #[tokio::test]
 async fn drain_deadline_cuts_off_connections_that_outlive_it() {
-    // The upstream would hold /slow for 10 s, far beyond the 200 ms drain deadline.
+    // The upstream would hold /slow for 10 s, far beyond the 200 ms drain window declared in
+    // the manifest (`[listen.drain] window_ms`, ADR 000059).
     let upstream = spawn_upstream(Duration::from_secs(10)).await;
-    let (proxy, shutdown, server) =
-        spawn_proxy(control_for(upstream), Duration::from_millis(200)).await;
+    let control = control_for(upstream, "[listen.drain]\nwindow_ms = 200\n");
+    let (proxy, shutdown, server) = spawn_proxy(control).await;
     let client = client();
     wait_ready(&client, proxy).await;
 
@@ -228,10 +241,10 @@ async fn drain_deadline_cuts_off_connections_that_outlive_it() {
 #[tokio::test]
 async fn idle_keepalive_connections_do_not_hold_the_drain_open() {
     let upstream = spawn_upstream(Duration::ZERO).await;
-    // Generous deadline: if idle connections were WAITED on instead of closed, serve would sit
+    // Generous window: if idle connections were WAITED on instead of closed, serve would sit
     // here for 10 s and the timeout below would trip.
-    let (proxy, shutdown, server) =
-        spawn_proxy(control_for(upstream), Duration::from_secs(10)).await;
+    let control = control_for(upstream, "[listen.drain]\nwindow_ms = 10000\n");
+    let (proxy, shutdown, server) = spawn_proxy(control).await;
     let client = client();
     wait_ready(&client, proxy).await;
 
@@ -246,4 +259,101 @@ async fn idle_keepalive_connections_do_not_hold_the_drain_open() {
         .expect("idle keep-alive connections must be closed, not drained until the deadline")
         .unwrap();
     served.expect("shutdown with only idle connections is a clean (Ok) exit");
+}
+
+#[tokio::test]
+async fn readyz_flips_to_503_at_the_signal_while_healthz_stays_200() {
+    // The readiness contract (ADR 000059): the shutdown signal makes `/readyz` not-ready so the
+    // front LB removes the replica; `/healthz` (liveness) stays 200 through the drain so a
+    // supervisor does not restart-loop a process that is exiting on purpose.
+    let upstream = spawn_upstream(Duration::from_millis(800)).await;
+    let admin = free_addr().await;
+    let control = control_for(
+        upstream,
+        &format!("[observability]\nadmin_addr = \"{admin}\"\n\n[listen.drain]\nwindow_ms = 5000\n"),
+    );
+    let (proxy, shutdown, server) = spawn_proxy(control).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, body) = try_get(&client, admin, "/readyz").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "serving → ready");
+    assert_eq!(body, "ready\n");
+
+    // Hold a request in flight so the server sits inside its drain window when we probe.
+    let inflight = {
+        let client = client.clone();
+        tokio::spawn(async move { try_get(&client, proxy, "/api/slow").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shutdown.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (status, body) = try_get(&client, admin, "/readyz").await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "draining → not ready"
+    );
+    assert_eq!(body, "draining\n");
+    let (status, body) = try_get(&client, admin, "/healthz").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "liveness holds through the drain");
+    assert_eq!(body, "ok\n");
+
+    let (status, _) = inflight
+        .await
+        .unwrap()
+        .expect("the in-flight request still completes during the drain window");
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("serve returns once drained")
+        .unwrap()
+        .expect("clean exit");
+}
+
+#[tokio::test]
+async fn readiness_grace_keeps_accepting_before_the_drain_starts() {
+    // With `readiness_grace_ms` declared (ADR 000059), the order is: signal → /readyz 503 →
+    // grace (accepts continue — the LB may still route here) → drain. A request sent DURING the
+    // grace must be served normally, and serve must not return before the grace has elapsed.
+    let upstream = spawn_upstream(Duration::ZERO).await;
+    let admin = free_addr().await;
+    let control = control_for(
+        upstream,
+        &format!(
+            "[observability]\nadmin_addr = \"{admin}\"\n\n\
+             [listen.drain]\nreadiness_grace_ms = 600\nwindow_ms = 5000\n"
+        ),
+    );
+    let (proxy, shutdown, server) = spawn_proxy(control).await;
+    // A second client whose pool is empty until used: its first request below must open a FRESH
+    // connection during the grace (the main client would reuse its pre-signal keep-alive one).
+    let fresh = client();
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let signalled = std::time::Instant::now();
+    shutdown.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Not-ready is immediate…
+    let (status, _) = try_get(&client, admin, "/readyz").await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // …but the data plane still serves new work through the grace, on a fresh connection.
+    let (status, body) = try_get(&fresh, proxy, "/api/during-grace")
+        .await
+        .expect("a request during the readiness grace is accepted and served");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "upstream-ok");
+
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("serve returns after grace + drain")
+        .unwrap()
+        .expect("clean exit");
+    assert!(
+        signalled.elapsed() >= Duration::from_millis(600),
+        "serve must not return before the readiness grace has elapsed"
+    );
 }

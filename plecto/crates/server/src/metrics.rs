@@ -6,6 +6,7 @@
 //! data plane and the extension plane. Recording is lock-free and cheap enough to run on every
 //! request unconditionally; rendering is a cold path (an admin scrape).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -68,7 +69,35 @@ pub(crate) struct ServerMetrics {
     rate_limited: AtomicU64,
     /// Instances ejected from rotation by outlier detection (ADR 000032).
     outlier_ejections: AtomicU64,
+    /// Upgrade tunnels currently open (ADR 000059). A separate gauge from `in_flight`: a tunnel
+    /// leaves the request accounting at its 101 (correctly — the handshake WAS one request) but
+    /// keeps holding a breaker permit and an LB pick for its whole life, and this is what makes
+    /// that occupancy visible (why is the breaker open? how many tunnels would a drain cut?).
+    tunnels_active: AtomicI64,
+    /// Bytes relayed downstream (upstream → client) by upgrade tunnels, added as each closes.
+    tunnel_bytes_down: AtomicU64,
+    /// Bytes relayed upstream (client → upstream) by upgrade tunnels, added as each closes.
+    tunnel_bytes_up: AtomicU64,
     duration: Histogram,
+}
+
+/// RAII guard for the `tunnels_active` gauge: increments on creation, decrements on `Drop` —
+/// the same cancel-safety pattern as `proxy_core`'s `InFlight` (a dropped tunnel future, e.g.
+/// h2 RST_STREAM, must still decrement or the gauge drifts). Owns its `Arc` because it is moved
+/// into the spawned tunnel task alongside the breaker permit and the LB pick (ADR 000059).
+pub(crate) struct TunnelActive(Arc<ServerMetrics>);
+
+impl TunnelActive {
+    pub(crate) fn new(metrics: Arc<ServerMetrics>) -> Self {
+        metrics.tunnels_active.fetch_add(1, Ordering::Relaxed);
+        Self(metrics)
+    }
+}
+
+impl Drop for TunnelActive {
+    fn drop(&mut self) {
+        self.0.tunnels_active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ServerMetrics {
@@ -80,8 +109,18 @@ impl ServerMetrics {
             circuit_open: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             outlier_ejections: AtomicU64::new(0),
+            tunnels_active: AtomicI64::new(0),
+            tunnel_bytes_down: AtomicU64::new(0),
+            tunnel_bytes_up: AtomicU64::new(0),
             duration: Histogram::new(),
         }
+    }
+
+    /// Add a closed tunnel's per-direction byte totals (ADR 000059) — recorded once, when the
+    /// tunnel ends, by whichever path ended it (peer close, idle timeout, drain).
+    pub(crate) fn add_tunnel_bytes(&self, down: u64, up: u64) {
+        self.tunnel_bytes_down.fetch_add(down, Ordering::Relaxed);
+        self.tunnel_bytes_up.fetch_add(up, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_in_flight(&self) {
@@ -202,6 +241,36 @@ impl ServerMetrics {
         out.push(format!(
             "plecto_outlier_ejections_total {}",
             self.outlier_ejections.load(Ordering::Relaxed)
+        ));
+
+        out.push(
+            "# HELP plecto_tunnels_active Upgrade tunnels currently open (ADR 000048/000059); each holds a breaker permit and an LB pick."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_tunnels_active gauge".to_string());
+        out.push(format!(
+            "plecto_tunnels_active {}",
+            self.tunnels_active.load(Ordering::Relaxed).max(0)
+        ));
+
+        out.push(
+            "# HELP plecto_tunnel_bytes_down_total Bytes relayed downstream (upstream to client) by upgrade tunnels, recorded at tunnel close."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_tunnel_bytes_down_total counter".to_string());
+        out.push(format!(
+            "plecto_tunnel_bytes_down_total {}",
+            self.tunnel_bytes_down.load(Ordering::Relaxed)
+        ));
+
+        out.push(
+            "# HELP plecto_tunnel_bytes_up_total Bytes relayed upstream (client to upstream) by upgrade tunnels, recorded at tunnel close."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_tunnel_bytes_up_total counter".to_string());
+        out.push(format!(
+            "plecto_tunnel_bytes_up_total {}",
+            self.tunnel_bytes_up.load(Ordering::Relaxed)
         ));
 
         // --- extension plane: host-aggregated filter-execution metrics (ADR 000009) ---
@@ -338,6 +407,29 @@ mod tests {
         assert!(
             m.render(&snap(0, 0, 0), None)
                 .contains("plecto_requests_in_flight 1")
+        );
+    }
+
+    #[test]
+    fn tunnel_gauge_follows_the_guard_and_byte_counters_accumulate() {
+        let m = Arc::new(ServerMetrics::new());
+        let g1 = TunnelActive::new(m.clone());
+        let g2 = TunnelActive::new(m.clone());
+        assert!(
+            m.render(&snap(0, 0, 0), None)
+                .contains("plecto_tunnels_active 2")
+        );
+        drop(g1);
+        m.add_tunnel_bytes(19, 7);
+        m.add_tunnel_bytes(1, 2);
+        let text = m.render(&snap(0, 0, 0), None);
+        assert!(text.contains("plecto_tunnels_active 1"));
+        assert!(text.contains("plecto_tunnel_bytes_down_total 20"));
+        assert!(text.contains("plecto_tunnel_bytes_up_total 9"));
+        drop(g2);
+        assert!(
+            m.render(&snap(0, 0, 0), None)
+                .contains("plecto_tunnels_active 0")
         );
     }
 

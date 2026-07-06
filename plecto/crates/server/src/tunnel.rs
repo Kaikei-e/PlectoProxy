@@ -18,13 +18,14 @@ use tokio::sync::watch;
 
 /// Await both halves of the switch and splice them. Failing to obtain either upgraded connection
 /// (the client vanished before the 101 landed, or the upstream reneged) just drops both ends —
-/// there is no client to answer anymore.
+/// there is no client to answer anymore. Returns the `(down, up)` byte totals the tunnel relayed
+/// (ADR 000059) — `(0, 0)` when it never established.
 pub(crate) async fn run(
     downstream: hyper::upgrade::OnUpgrade,
     upstream: hyper::upgrade::OnUpgrade,
     idle_timeout: Option<Duration>,
     drain: watch::Receiver<bool>,
-) {
+) -> (u64, u64) {
     let (down, up) = match tokio::join!(downstream, upstream) {
         (Ok(d), Ok(u)) => (d, u),
         (d, u) => {
@@ -33,27 +34,35 @@ pub(crate) async fn run(
                 upstream_ok = u.is_ok(),
                 "upgrade tunnel never established"
             );
-            return;
+            return (0, 0);
         }
     };
-    splice(TokioIo::new(down), TokioIo::new(up), idle_timeout, drain).await;
+    splice(TokioIo::new(down), TokioIo::new(up), idle_timeout, drain).await
 }
 
 /// Copy bytes both ways until one side closes, the idle timer fires, or the server drains.
 /// Generic over the two streams so the relay itself is unit-testable with in-memory pipes.
+/// Returns how many bytes moved in each direction as `(down, up)` — `down` = written towards
+/// `a` (the client side), `up` = written towards `b` (the upstream side).
 pub(crate) async fn splice<A, B>(
     a: A,
     b: B,
     idle_timeout: Option<Duration>,
     mut drain: watch::Receiver<bool>,
-) where
+) -> (u64, u64)
+where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let start = Instant::now();
     let last_activity = Arc::new(AtomicU64::new(0));
-    let mut a = ActivityIo::new(a, start, last_activity.clone());
-    let mut b = ActivityIo::new(b, start, last_activity.clone());
+    // The byte tallies live OUTSIDE the copy future (ADR 000059): the idle-timeout and drain
+    // arms drop `copy_bidirectional` before it can return its totals, so the same wrapper that
+    // stamps activity counts the bytes, and the counts survive the cancellation.
+    let up_bytes = Arc::new(AtomicU64::new(0)); // read off the client side, upstream-bound
+    let down_bytes = Arc::new(AtomicU64::new(0)); // read off the upstream side, client-bound
+    let mut a = ActivityIo::new(a, start, last_activity.clone(), up_bytes.clone());
+    let mut b = ActivityIo::new(b, start, last_activity.clone(), down_bytes.clone());
     let copy = tokio::io::copy_bidirectional(&mut a, &mut b);
     tokio::pin!(copy);
     tokio::select! {
@@ -65,6 +74,10 @@ pub(crate) async fn splice<A, B>(
             tracing::debug!("upgrade tunnel closed by drain");
         }
     }
+    (
+        down_bytes.load(Ordering::Relaxed),
+        up_bytes.load(Ordering::Relaxed),
+    )
 }
 
 /// Resolve when no byte has moved in either direction for `idle_timeout`; pend forever when the
@@ -84,19 +97,28 @@ async fn idle_elapsed(start: Instant, last_activity: &AtomicU64, idle_timeout: O
 }
 
 /// An `AsyncRead + AsyncWrite` wrapper that stamps a shared millisecond clock on every byte
-/// moved, so the idle watchdog observes activity without instrumenting the copy loop itself.
+/// moved — so the idle watchdog observes activity without instrumenting the copy loop itself —
+/// and tallies the bytes it reads into `read_bytes` (counting reads, not writes, so a byte is
+/// never counted on both sides of the relay).
 struct ActivityIo<T> {
     inner: T,
     start: Instant,
     last_activity: Arc<AtomicU64>,
+    read_bytes: Arc<AtomicU64>,
 }
 
 impl<T> ActivityIo<T> {
-    fn new(inner: T, start: Instant, last_activity: Arc<AtomicU64>) -> Self {
+    fn new(
+        inner: T,
+        start: Instant,
+        last_activity: Arc<AtomicU64>,
+        read_bytes: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             inner,
             start,
             last_activity,
+            read_bytes,
         }
     }
 
@@ -114,8 +136,10 @@ impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
     ) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+        let read = buf.filled().len() - before;
+        if matches!(poll, Poll::Ready(Ok(()))) && read > 0 {
             self.mark();
+            self.read_bytes.fetch_add(read as u64, Ordering::Relaxed);
         }
         poll
     }
@@ -167,10 +191,15 @@ mod tests {
         // Half-close passes through (copy_bidirectional): the relay ends once BOTH sides closed.
         drop(client);
         drop(server);
-        tokio::time::timeout(Duration::from_secs(1), tunnel)
+        let (down, up) = tokio::time::timeout(Duration::from_secs(1), tunnel)
             .await
             .expect("the relay ends when both sides close")
             .unwrap();
+        assert_eq!(
+            (down, up),
+            (3, 3),
+            "the relay reports per-direction byte totals (ADR 000059)"
+        );
     }
 
     #[tokio::test]
@@ -202,5 +231,29 @@ mod tests {
             .await
             .expect("a drain flip must close the tunnel")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn byte_totals_survive_a_drain_cancellation() {
+        // The drain arm drops the copy future before it returns its totals; the counts must
+        // come from the wrapper, not the copy's return value (ADR 000059).
+        let (mut client, client_far) = tokio::io::duplex(64);
+        let (mut server, server_far) = tokio::io::duplex(64);
+        let (tx, drain) = watch::channel(false);
+        let tunnel = tokio::spawn(splice(client_far, server_far, None, drain));
+
+        client.write_all(b"c2s").await.unwrap();
+        let mut buf = [0u8; 3];
+        server.read_exact(&mut buf).await.unwrap();
+        server.write_all(b"s2c-x").await.unwrap();
+        let mut buf5 = [0u8; 5];
+        client.read_exact(&mut buf5).await.unwrap();
+
+        tx.send(true).unwrap();
+        let (down, up) = tokio::time::timeout(Duration::from_secs(1), tunnel)
+            .await
+            .expect("a drain flip must close the tunnel")
+            .unwrap();
+        assert_eq!((down, up), (5, 3), "totals survive the cancelled copy");
     }
 }

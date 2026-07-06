@@ -62,4 +62,29 @@ impl Control {
     pub fn proxy_protocol_trust(&self) -> Option<crate::manifest::ProxyProtocolTrust> {
         self.proxy_protocol.clone()
     }
+
+    /// The readiness grace (`[listen.drain] readiness_grace_ms`, ADR 000059): how long `/readyz`
+    /// reports not-ready — while connections are still accepted — before the drain starts, so a
+    /// front load balancer can take the replica out of rotation first. Zero (the default) starts
+    /// the drain immediately. Captured at construction like the rest of `[listen]`.
+    pub fn readiness_grace(&self) -> std::time::Duration {
+        let ms = self
+            .listen
+            .drain
+            .as_ref()
+            .and_then(|d| d.readiness_grace_ms)
+            .unwrap_or(0);
+        std::time::Duration::from_millis(ms)
+    }
+
+    /// The drain window (`[listen.drain] window_ms`, ADR 000059): how long in-flight work may
+    /// finish at shutdown before remaining connections are cut. `None` = the server's default
+    /// (30 s). One setting shared by every drain path (TCP requests, h3 GOAWAY, tunnels).
+    pub fn drain_window(&self) -> Option<std::time::Duration> {
+        self.listen
+            .drain
+            .as_ref()
+            .and_then(|d| d.window_ms)
+            .map(std::time::Duration::from_millis)
+    }
 }

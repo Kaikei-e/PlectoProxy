@@ -157,9 +157,18 @@ _Avoid_: XFF（family の一員に過ぎず全体を指さない）, proxy heade
 **Client-IP 伝播（edge モデル）**:
 fast path が受信した **forwarding header family を信頼せず剥がし**、自分が観測した接続 peer と接続 scheme から
 付け直す既定の姿勢。チェーン実行の**前**に行うので、IP ベースの判断をするフィルタも upstream も Plecto が
-確定した値だけを見る。前段に信頼できる LB を置き受信値を信頼ホップ分**尊重して追記**する **trusted-proxy
-モデル**は対の姿勢で、後続の設定 knob（ADR 000018 / 000022）。
+確定した値だけを見る。前段に信頼できる LB を置く構成でも、ヘッダ層の trusted-hops 復元は採らない
+（ADR 000056 で却下）——復元は接続層の PROXY protocol v2 受信が担い、edge モデル自体は無変更（ADR 000057）。
 _Avoid_: XFF passthrough（受信値を信頼する別姿勢）, spoof guard（機構名であって姿勢を表さない）
+
+**PROXY protocol v2 reception（接続層の peer 復元）**:
+前段 L4 LB が接続冒頭に前置する PROXY v2 バイナリヘッダを、accept 直後・TLS handshake **前**に受理して
+実クライアントの src address を接続 peer として差し替える処理。`[listen.proxy_protocol]`（trusted CIDR
+**必須**）のオプトインで、復元後は rate limit キー・forwarding header 再発行・Maglev `SourceIp`・access log
+が一括で real client に揃う。受理規則の違反（trusted 外からのヘッダ / trusted 内のヘッダ欠落・不正）は
+fail-closed に切断。`LOCAL` コマンドは実 peer のまま（LB health check 互換）。h3（UDP）listener は対象外
+（ADR 000057）。
+_Avoid_: v1 テキスト形式（不採用）, proxy protocol passthrough（素通しはしない）, real IP header（ヘッダ層の別機構）
 
 ## TLS
 

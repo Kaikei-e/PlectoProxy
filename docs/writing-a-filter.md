@@ -188,6 +188,28 @@ With no `[[tls]]`, the fast path serves plain HTTP/1.1; one or more certs enable
 (rustls, ADR 000014). `[chain]` exists for the single-chain convenience API, but the fast-path server
 uses `[[route]]`.
 
+### `[listen]`
+
+```toml
+[listen]
+addr = "0.0.0.0:8443"    # optional: data-plane bind (default 127.0.0.1:8080; the CLI arg overrides)
+advertised_port = 443    # optional: the port Alt-Svc advertises for h3 when the published port differs
+
+[listen.proxy_protocol]  # optional: PROXY protocol v2 reception (ADR 000057); absent = off
+trusted = ["10.0.0.0/8"] # required when present: CIDRs of the L4 LBs allowed to speak PROXY v2
+```
+
+`[listen]` is captured at startup — a reload does not re-bind or change it; restart to apply.
+With `[listen.proxy_protocol]`, a peer inside `trusted` MUST open every TCP connection with a
+PROXY v2 header (its `LOCAL` command — LB health checks — keeps the real endpoints), and the
+restored client address feeds the per-client-IP rate limit, `X-Forwarded-For`/`X-Real-IP`
+re-issuing, Maglev `source_ip` hashing, and the access log. Everything else is fail-closed cut:
+a missing/malformed header from a trusted peer, a PROXY v2 signature from an untrusted peer, or
+any non-TCP/IPv4/IPv6 `PROXY` command. `trusted` takes CIDR notation only (a single host is
+`"192.0.2.1/32"`), and the h3 (QUIC/UDP) listener is out of scope — front it with a QUIC-aware
+LB only if that LB can pass the client address another way (e.g. Kubernetes
+`externalTrafficPolicy: Local`).
+
 ## 5. Package, sign, and run
 
 Plecto loads filters from a local, digest-pinned OCI image-layout and **verifies a cosign signature**

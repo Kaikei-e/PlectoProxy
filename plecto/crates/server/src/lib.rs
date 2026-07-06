@@ -159,6 +159,10 @@ pub(crate) struct ServerState {
     /// The graceful-shutdown drain flag (ADR 000039), cloned into every spawned upgrade tunnel
     /// (ADR 000048) so an indefinite tunnel closes at drain instead of outliving the server.
     drain: tokio::sync::watch::Receiver<bool>,
+    /// The readiness flag (ADR 000059): `true` for the serving lifetime, flipped to `false` at
+    /// the shutdown signal — BEFORE the drain starts — so `/readyz` tells the front load
+    /// balancer to remove this replica while it still accepts connections (the readiness grace).
+    ready: tokio::sync::watch::Receiver<bool>,
 }
 
 /// An upstream TCP connector with `TCP_NODELAY` set. A proxy must disable Nagle on its upstream

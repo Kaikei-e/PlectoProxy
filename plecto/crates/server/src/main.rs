@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use plecto_control::Control;
-use plecto_server::{DEFAULT_DRAIN_DEADLINE, serve_with_shutdown};
+use plecto_server::serve_with_shutdown;
 use tokio::net::TcpListener;
 
 fn main() -> anyhow::Result<()> {
@@ -98,14 +98,15 @@ async fn run() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, version = %control.config_version(), "plecto fast path listening");
-    serve_with_shutdown(control, listener, shutdown_signal(), DEFAULT_DRAIN_DEADLINE).await?;
+    serve_with_shutdown(control, listener, shutdown_signal()).await?;
     tracing::info!("plecto fast path stopped");
     Ok(())
 }
 
 /// Resolves on the operator's "stop serving" signal — SIGTERM (process supervisors) or SIGINT
-/// (ctrl-c) — triggering graceful shutdown (ADR 000039): accept stops, in-flight connections
-/// drain up to `DEFAULT_DRAIN_DEADLINE`, then the process exits 0.
+/// (ctrl-c) — triggering graceful shutdown (ADR 000039 / 000059): `/readyz` flips not-ready,
+/// the readiness grace elapses, accept stops, in-flight connections drain up to the drain
+/// window (`[listen.drain]`, default 30 s), then the process exits 0.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

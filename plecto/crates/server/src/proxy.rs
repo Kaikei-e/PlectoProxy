@@ -457,13 +457,18 @@ async fn proxy_core_inner(
             .body(crate::body::full(Vec::new()))
             .map_err(ServerError::from)?;
         let drain = state.drain.clone();
+        let metrics = state.metrics.clone();
+        let tunnel_active = crate::metrics::TunnelActive::new(metrics.clone());
         tokio::spawn(async move {
             // Long-lived tunnels stay inside the existing resource accounting (ADR 000048): the
-            // breaker permit (ADR 000028) and the LB pick guard (least-request in-flight) live
-            // exactly as long as the tunnel, and the drain flag closes it at shutdown.
+            // breaker permit (ADR 000028), the LB pick guard (least-request in-flight) and the
+            // `tunnels_active` gauge guard (ADR 000059) live exactly as long as the tunnel, and
+            // the drain flag closes it at shutdown. The byte totals are recorded once, at close.
             let _permit = permit;
             let _pick = upstream_pick;
-            crate::tunnel::run(downstream_on, upstream_on, idle, drain).await;
+            let _active = tunnel_active;
+            let (down, up) = crate::tunnel::run(downstream_on, upstream_on, idle, drain).await;
+            metrics.add_tunnel_bytes(down, up);
         });
         return Ok(resp101);
     }

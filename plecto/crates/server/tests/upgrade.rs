@@ -109,6 +109,27 @@ async fn spawn_proxy(toml: &str) -> SocketAddr {
     proxy
 }
 
+/// Reserve a distinct loopback port for the admin listener (bound-then-dropped, like
+/// `tests/observability.rs`).
+async fn free_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// One `GET /metrics` scrape off the admin endpoint (`connection: close`, so read-to-EOF works).
+async fn scrape_metrics(admin: SocketAddr) -> String {
+    let mut s = TcpStream::connect(admin).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nhost: admin\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[tokio::test]
 async fn upgrade_route_tunnels_bytes_bidirectionally_after_the_101() {
     let upstream = spawn_echo_upgrade_upstream().await;
@@ -173,6 +194,91 @@ protocols = ["websocket"]
     })
     .await
     .expect("the upgrade handshake never tunnelled through the proxy");
+}
+
+#[tokio::test]
+async fn tunnel_occupancy_and_bytes_show_on_the_admin_metrics() {
+    // Tunnel observability (ADR 000059): a live tunnel is visible as `plecto_tunnels_active`
+    // (it left the RED tally at its 101 but still holds a breaker permit + LB pick), and its
+    // per-direction byte totals land on the counters when it closes.
+    let upstream = spawn_echo_upgrade_upstream().await;
+    let admin = free_addr().await;
+    let toml = format!(
+        r#"
+[observability]
+admin_addr = "{admin}"
+
+[[upstream]]
+name = "ws"
+addresses = ["127.0.0.1:{port}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+healthy_threshold = 1
+
+[[route]]
+upstream = "ws"
+[route.match]
+path_prefix = "/ws"
+[route.upgrade]
+protocols = ["websocket"]
+"#,
+        port = upstream.port()
+    );
+    let proxy = spawn_proxy(&toml).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // Establish a tunnel (retrying past the pessimistic-start window) and echo bytes.
+        let mut s = loop {
+            let mut s = TcpStream::connect(proxy).await.unwrap();
+            s.write_all(
+                b"GET /ws HTTP/1.1\r\n\
+                  host: e2e\r\n\
+                  connection: upgrade\r\n\
+                  upgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let head = read_head(&mut s).await;
+            if String::from_utf8_lossy(&head)
+                .to_lowercase()
+                .starts_with("http/1.1 101")
+            {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        s.write_all(b"ping-through-tunnel").await.unwrap();
+        let mut echo = [0u8; 19];
+        s.read_exact(&mut echo).await.unwrap();
+
+        assert!(
+            scrape_metrics(admin)
+                .await
+                .contains("plecto_tunnels_active 1"),
+            "a live tunnel must be visible on the gauge"
+        );
+
+        // Close the client end: the tunnel unwinds and records its byte totals exactly once.
+        drop(s);
+        loop {
+            let text = scrape_metrics(admin).await;
+            if text.contains("plecto_tunnels_active 0") {
+                assert!(
+                    text.contains("plecto_tunnel_bytes_up_total 19"),
+                    "client→upstream bytes recorded at close: {text}"
+                );
+                assert!(
+                    text.contains("plecto_tunnel_bytes_down_total 19"),
+                    "upstream→client bytes recorded at close: {text}"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tunnel metrics never reached the expected values");
 }
 
 #[tokio::test]

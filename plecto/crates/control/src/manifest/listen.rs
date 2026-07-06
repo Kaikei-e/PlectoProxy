@@ -28,6 +28,29 @@ pub struct Listen {
     /// listener, restoring the real client address behind an L4 load balancer. Absent = off.
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocol>,
+    /// `[listen.drain]` (ADR 000059): graceful-shutdown tuning. Absent = drain starts the
+    /// moment the signal lands, with the 30 s default window.
+    #[serde(default)]
+    pub drain: Option<Drain>,
+}
+
+/// `[listen.drain]` (ADR 000059): the two knobs of the documented shutdown order —
+/// signal → `/readyz` not-ready → (readiness grace) → GOAWAY / drain → window expiry → exit.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drain {
+    /// How long `/readyz` reports not-ready BEFORE the drain starts, while new connections are
+    /// still accepted — the time the front load balancer needs to take this replica out of
+    /// rotation. Set it to at least the LB's health-check interval × unhealthy threshold
+    /// (Kubernetes: the readiness probe's `periodSeconds × failureThreshold`). Absent/`0` =
+    /// the drain starts immediately (right when nothing health-checks `/readyz`).
+    #[serde(default)]
+    pub readiness_grace_ms: Option<u64>,
+    /// The drain window: how long in-flight work (TCP requests, h3 requests behind their
+    /// GOAWAY, upgrade tunnels) may finish before the remaining connections are cut. One
+    /// setting shared by every drain path. Absent = 30 000.
+    #[serde(default)]
+    pub window_ms: Option<u64>,
 }
 
 /// `[listen.proxy_protocol]` (ADR 000057): PROXY v2 reception is enabled by the section's
@@ -106,6 +129,7 @@ mod tests {
             proxy_protocol: Some(ProxyProtocol {
                 trusted: trusted.iter().map(|s| (*s).to_string()).collect(),
             }),
+            drain: None,
         }
     }
 
@@ -154,6 +178,30 @@ mod tests {
         // a dual-stack accept reports an IPv4 LB as ::ffff:10.1.2.3 — the v4 CIDR must match it
         assert!(trust.contains("::ffff:10.1.2.3".parse().unwrap()));
         assert!(!trust.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn drain_section_defaults_off_and_parses_when_present() {
+        // absent section: immediate not-ready + the server-side default window (ADR 000059)
+        let absent = crate::Manifest::from_toml("").unwrap();
+        assert!(absent.listen.drain.is_none(), "no section → defaults");
+
+        let manifest = crate::Manifest::from_toml(
+            "[listen.drain]\nreadiness_grace_ms = 5000\nwindow_ms = 200\n",
+        )
+        .unwrap();
+        let drain = manifest.listen.drain.as_ref().expect("section parsed");
+        assert_eq!(drain.readiness_grace_ms, Some(5000));
+        assert_eq!(drain.window_ms, Some(200));
+
+        // either field may be declared alone
+        let partial = crate::Manifest::from_toml("[listen.drain]\nwindow_ms = 200\n").unwrap();
+        let drain = partial.listen.drain.as_ref().expect("section parsed");
+        assert_eq!(drain.readiness_grace_ms, None);
+        assert_eq!(drain.window_ms, Some(200));
+
+        // unknown fields stay rejected (deny_unknown_fields, like every section)
+        assert!(crate::Manifest::from_toml("[listen.drain]\ngrace = 1\n").is_err());
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! The fast-path listener: bind, spawn the health supervisor + the HTTP/3 endpoint, and run the
 //! TCP accept loop. Each connection is HTTP/1.1, or HTTP/2 when TLS-ALPN negotiates `h2` (ADR
 //! 000015); the per-request handling (route → chain → forward) is shared with all transports via
-//! `proxy_core`. Graceful shutdown (ADR 000039): when the caller's shutdown future resolves, the
-//! accept loops stop, every connection is told to finish its in-flight work and close (HTTP/1.1
-//! stops keep-alive, HTTP/2 sends GOAWAY, HTTP/3 connections close), and connections still open
-//! at the drain deadline are cut.
+//! `proxy_core`. Graceful shutdown (ADR 000039 / 000059): when the caller's shutdown future
+//! resolves, `/readyz` flips not-ready and the readiness grace elapses (accepts continue, so a
+//! front LB can take the replica out of rotation first); then the accept loops stop and every
+//! connection is told to finish its in-flight work and close (HTTP/1.1 stops keep-alive, HTTP/2
+//! and HTTP/3 send GOAWAY), and connections still open at the drain window are cut.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -37,9 +38,10 @@ const MAX_HEADERS: usize = 100;
 /// server sets both the timer and this value rather than relying on the (timer-less, inert) default.
 const INBOUND_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Default drain window for graceful shutdown (ADR 000039), used by the shipped binary: generous
-/// enough for normal in-flight requests (the default per-try upstream timeout is 30 s too) and
-/// aligned with the common 30 s termination grace of process supervisors.
+/// Default drain window for graceful shutdown (ADR 000039), used when `[listen.drain] window_ms`
+/// is not declared (ADR 000059): generous enough for normal in-flight requests (the default
+/// per-try upstream timeout is 30 s too) and aligned with the common 30 s termination grace of
+/// process supervisors.
 pub const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Serve the fast path on an already-bound `listener` until it errors unrecoverably. Each accepted
@@ -52,26 +54,22 @@ pub const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 /// convention, not a public-API commitment) — the internal `ServerError` is `pub(crate)`, so a
 /// caller in another crate could not even name it. `serve_inner` does the typed work.
 pub async fn serve(control: Arc<Control>, listener: TcpListener) -> anyhow::Result<()> {
-    serve_inner(
-        control,
-        listener,
-        std::future::pending::<()>(),
-        DEFAULT_DRAIN_DEADLINE,
-    )
-    .await
-    .map_err(Into::into)
+    serve_inner(control, listener, std::future::pending::<()>())
+        .await
+        .map_err(Into::into)
 }
 
-/// Serve like [`serve`], but stop accepting when `shutdown` resolves, drain in-flight
-/// connections up to `drain_deadline`, then return `Ok` (ADR 000039). Connections still open at
-/// the deadline are cut.
+/// Serve like [`serve`], but run the graceful-shutdown sequence when `shutdown` resolves
+/// (ADR 000039 / 000059): `/readyz` flips not-ready, accepts continue for the readiness grace
+/// (`[listen.drain] readiness_grace_ms`, default zero), then the drain starts and in-flight
+/// connections get the drain window (`[listen.drain] window_ms`, default 30 s) before the
+/// stragglers are cut.
 pub async fn serve_with_shutdown(
     control: Arc<Control>,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
-    drain_deadline: Duration,
 ) -> anyhow::Result<()> {
-    serve_inner(control, listener, shutdown, drain_deadline)
+    serve_inner(control, listener, shutdown)
         .await
         .map_err(Into::into)
 }
@@ -80,7 +78,6 @@ async fn serve_inner(
     control: Arc<Control>,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
-    drain_deadline: Duration,
 ) -> Result<(), ServerError> {
     let tcp_addr = listener.local_addr().map_err(ServerError::Bind)?;
 
@@ -103,9 +100,14 @@ async fn serve_inner(
         .zip(control.otlp_buffer());
 
     // The drain flag (ADR 000039): flipped to `true` exactly once, at shutdown. Every connection
-    // task holds a receiver and gracefully closes its connection when it flips; the h3 loops stop
-    // accepting; spawned upgrade tunnels (ADR 000048) close. `false` for the serving lifetime.
+    // task holds a receiver and gracefully closes its connection when it flips; the h3 loops send
+    // GOAWAY and stop accepting; spawned upgrade tunnels (ADR 000048) close. `false` for the
+    // serving lifetime.
     let (drain_tx, drain_rx) = watch::channel(false);
+    // The readiness flag (ADR 000059): flipped to `false` at the shutdown signal, BEFORE the
+    // drain — `/readyz` goes 503 while accepts continue, so a front LB can take the replica out
+    // of rotation during the readiness grace.
+    let (ready_tx, ready_rx) = watch::channel(true);
 
     let state = Arc::new(ServerState {
         control,
@@ -116,7 +118,16 @@ async fn serve_inner(
         metrics: Arc::new(ServerMetrics::new()),
         otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
         drain: drain_rx.clone(),
+        ready: ready_rx,
     });
+
+    // Drain settings (ADR 000059), captured once like the rest of `[listen]` (a reload does not
+    // change them): one window shared by every drain path — TCP in-flight, h3 GOAWAY, tunnels.
+    let drain_window = state
+        .control
+        .drain_window()
+        .unwrap_or(DEFAULT_DRAIN_DEADLINE);
+    let readiness_grace = state.control.readiness_grace();
 
     // Admin endpoint (Stage A observability, ADR 000009): a SEPARATE listener for `/metrics` +
     // liveness/readiness, bound only when `[observability] admin_addr` is set. A bad address disables
@@ -156,7 +167,12 @@ async fn serve_inner(
         match build_h3_endpoint(cfg, tcp_addr) {
             Ok(endpoint) => {
                 tracing::info!(port = tcp_addr.port(), "HTTP/3 (QUIC) listener bound");
-                tokio::spawn(serve_h3(state.clone(), endpoint, drain_rx.clone()));
+                tokio::spawn(serve_h3(
+                    state.clone(),
+                    endpoint,
+                    drain_rx.clone(),
+                    drain_window,
+                ));
             }
             // a QUIC bind failure must not take down the TCP fast path; log and serve TCP only.
             Err(e) => {
@@ -174,6 +190,22 @@ async fn serve_inner(
             "PROXY protocol v2 enabled on the TCP listener (the h3/UDP listener is not covered — ADR 000057)"
         );
     }
+
+    // The readiness contract (ADR 000059): the caller's shutdown signal first flips `/readyz`
+    // to not-ready, then — while the accept loops keep serving — waits the readiness grace so
+    // the front LB stops routing here, and only then lets the drain begin. Zero grace (the
+    // default) collapses to "not-ready and drain in the same instant".
+    let shutdown = async move {
+        shutdown.await;
+        let _ = ready_tx.send(false);
+        if !readiness_grace.is_zero() {
+            tracing::info!(
+                grace_ms = readiness_grace.as_millis() as u64,
+                "shutdown signal: /readyz is not-ready; accepting through the readiness grace"
+            );
+            tokio::time::sleep(readiness_grace).await;
+        }
+    };
 
     // Connection tasks live in a JoinSet so the drain deadline can cut the stragglers
     // (`abort_all`). Finished tasks are reaped opportunistically in the accept loop below.
@@ -264,15 +296,15 @@ async fn serve_inner(
     drop(listener);
     let _ = drain_tx.send(true);
     let all_drained = state.conn_limit.acquire_many(MAX_CONNECTIONS as u32);
-    if tokio::time::timeout(drain_deadline, all_drained)
+    if tokio::time::timeout(drain_window, all_drained)
         .await
         .is_ok()
     {
         tracing::info!("graceful shutdown: all connections drained");
     } else {
         tracing::warn!(
-            deadline_ms = drain_deadline.as_millis() as u64,
-            "graceful shutdown: drain deadline expired; cutting remaining connections"
+            deadline_ms = drain_window.as_millis() as u64,
+            "graceful shutdown: drain window expired; cutting remaining connections"
         );
         conns.abort_all();
     }

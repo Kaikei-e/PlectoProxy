@@ -459,14 +459,9 @@ async fn graceful_shutdown_flushes_pending_spans() {
     let proxy = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        serve_with_shutdown(
-            control,
-            listener,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-            Duration::from_secs(5),
-        )
+        serve_with_shutdown(control, listener, async move {
+            let _ = shutdown_rx.await;
+        })
         .await
     });
 

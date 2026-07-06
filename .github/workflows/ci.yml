@@ -68,8 +68,11 @@ jobs:
       # debug target/ (cargo test --all) and the release target/ (cargo build --release) at
       # once. Free the runner's preinstalled bloat (~25GB: Android SDK / .NET / GHC / hosted
       # tool cache / Boost) so both fit — inline rm, no third-party action (supply-chain
-      # stance). Best-effort (|| true).
+      # stance). Best-effort (|| true). Guarded to GitHub-hosted runners: their VM is ephemeral
+      # and passwordless-sudo by design, whereas on a self-hosted runner this rm would gut a
+      # persistent machine.
       - name: Free disk space for the wasmtime/cranelift build
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/share/boost || true
           df -h /

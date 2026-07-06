@@ -46,8 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       # plecto-host pulls wasmtime 46 / cranelift (a large build); free the runner's preinstalled
-      # bloat so it fits. Best-effort, no third-party action (supply-chain stance).
+      # bloat so it fits. Best-effort, no third-party action (supply-chain stance). Guarded to
+      # GitHub-hosted runners (ephemeral VM); on a self-hosted runner this rm would gut a
+      # persistent machine.
       - name: Free disk space for the wasmtime/cranelift build
+        if: runner.environment == 'github-hosted'
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:

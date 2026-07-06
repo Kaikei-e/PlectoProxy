@@ -1,0 +1,25 @@
+# The cargo-fuzz harness (ADR 000054 residual / ADR 000057 first target). Its own workspace,
+# excluded from the host-target one: libfuzzer targets build with nightly + sanitizer flags.
+# Run from `plecto/`: `cargo +nightly fuzz run proxy_v2`.
+[package]
+name = "plecto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+plecto-server = { path = "../crates/server" }
+
+[[bin]]
+name = "proxy_v2"
+path = "fuzz_targets/proxy_v2.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

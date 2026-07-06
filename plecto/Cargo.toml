@@ -5,6 +5,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/host", "crates/control", "crates/server"]
+# The cargo-fuzz harness (ADR 000057) is its own workspace, like the example filter guests:
+# libfuzzer targets need nightly + sanitizer flags that must never leak into `cargo test --all`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.1"

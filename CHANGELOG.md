@@ -18,6 +18,40 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-08
+
+### Added
+
+- Two-tier rate limiting (ADR 000061): the native per-route / per-client-IP token bucket is now
+  documented as the **local floor** (an immediate, external-call-free flood shed per replica),
+  completed by `filter-ratelimit-redis` — a reference filter that holds the actual fleet-wide cap
+  over a general fixed-window counter (`INCRBY` plus an unconditional `EXPIRE ... NX`, Redis ≥ 7.0
+  / Valkey, no Lua dependency) consulted over the outbound-TCP capability. Running both together
+  is now the recommended shape for multi-replica deployments (see the hardening guide).
+- `host-config` capability (ADR 000066): a filter's own business settings (backend address,
+  window, limit, `on_backend_error`, ...) can now come from the manifest's `[filter.config]`
+  instead of being hardcoded in the guest. A missing or invalid required value fails the filter's
+  *load* (with `isolation = "trusted"`) rather than every request.
+- Outbound TCP capability for filters (ADR 000060, feature-gated `outbound-tcp`): filters can open
+  outbound TCP connections (Redis, Valkey, memcached, ...) over `wasi:sockets`, behind the same
+  deny-by-default allowlist, SSRF guard, and IP-pin shape as outbound HTTP. `filter-tcp-gate` is
+  the minimal example.
+- HTTP/3 GOAWAY graceful drain, a `/readyz` drain contract, and tunnel observability (ADR 000059):
+  a drain now sends GOAWAY on every h3 connection and lets in-flight requests finish within the
+  same drain window TCP already uses, instead of closing connections immediately; `/readyz` flips
+  to not-ready ahead of the drain so a front load balancer stops sending new traffic first; a
+  live gauge and byte counters make long-lived WebSocket tunnels visible.
+
+### Changed
+
+- **Breaking (manifest)**: `[filter.outbound]` is renamed to `[filter.outbound_http]`, making room
+  for the new `[filter.outbound_tcp]` section — update any manifest that declares outbound HTTP
+  for a filter.
+- The hardening guide now recommends running the local floor and the `filter-ratelimit-redis`
+  global filter together as the default multi-replica rate-limiting shape, and corrects an
+  earlier reference to the (then-unshipped) reference filter using `outbound-http` — it uses
+  `outbound-tcp`.
+
 ## [0.1.4] - 2026-07-06
 
 ### Added

@@ -337,6 +337,7 @@ mod tests {
             ratelimit: None,
             outbound_http: None,
             outbound_tcp: None,
+            config: None,
         };
         assert!(base.validate().is_ok(), "defaults are valid");
 

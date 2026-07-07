@@ -165,6 +165,11 @@ pub struct LoadOptions {
     #[cfg(all(feature = "outbound-tcp", feature = "test-support"))]
     pub outbound_tcp_static_resolver:
         Option<std::collections::HashMap<String, Vec<std::net::IpAddr>>>,
+    /// This filter's business config (manifest `[filter.config]`, ADR 000066): an arbitrary
+    /// string→string map read back via `host-config::get`. The host never interprets keys or
+    /// values. Empty (the default) when the manifest declares no `[filter.config]` section — every
+    /// `get` then reads `None`, same as an undeclared key in a non-empty map.
+    pub config: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for LoadOptions {
@@ -185,6 +190,7 @@ impl Default for LoadOptions {
             outbound_tcp: None,
             #[cfg(all(feature = "outbound-tcp", feature = "test-support"))]
             outbound_tcp_static_resolver: None,
+            config: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -244,6 +250,13 @@ impl LoadOptions {
             refill_tokens,
             refill_interval_ms,
         });
+        self
+    }
+
+    /// Lend this filter's manifest-declared business config (`[filter.config]`, ADR 000066) —
+    /// a read-only string map the filter reads back via `host-config::get`.
+    pub fn with_config(mut self, config: std::collections::BTreeMap<String, String>) -> Self {
+        self.config = config;
         self
     }
 

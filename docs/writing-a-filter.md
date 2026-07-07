@@ -32,6 +32,8 @@ capabilities the host explicitly lends it — **deny-by-default**:
 - `host-kv` — per-filter key/value bytes (session, cache).
 - `host-counter` — atomic named counters.
 - `host-ratelimit` — a host-native token bucket; the filter passes only `(key, cost)`, never the spec.
+- `host-config` — read-only manifest-declared business config (`[filter.config]`, ADR 000066); the
+  host never interprets keys or values, only the filter does.
 
 Nothing else — no network, no filesystem, no sockets — is reachable. That is enforced by the
 Component Model sandbox, not by convention.
@@ -120,13 +122,21 @@ init_deadline_ms = 200         # optional: metering overrides; unset = host defa
 request_deadline_ms = 25       # optional
 max_memory_bytes = 16777216    # optional
 ratelimit = { capacity = 100, refill_tokens = 10, refill_interval_ms = 1000 }  # optional, ADR 000026
+
+[filter.config]                # optional, ADR 000066: arbitrary string→string business config
+on_backend_error = "deny"      # read back via `host-config::get("on_backend_error")`
 ```
 
 `isolation` is the biggest performance lever. `trusted` filters are built once and pooled (fast hot
 path); `untrusted` filters run fresh per request with linear memory wiped each time (stronger
 isolation, slower). The default is `untrusted` — fail-closed. `ratelimit`, when present, is the
 **host-side** bucket spec for this filter's `host-ratelimit`; the operator owns it so an untrusted
-filter cannot widen its own limit.
+filter cannot widen its own limit. `[filter.config]` is a read-only string map the filter reads back
+via `host-config::get(key)` — the host never interprets it, so **the filter itself must validate any
+key it requires** (typically in `init`, trapping on a missing/invalid value). Combined with
+`isolation = "trusted"`, that trap surfaces as a load-time failure rather than a per-request one
+(the host eager-builds one trusted instance at load, see [`filter-ratelimit-redis`](../plecto/examples/filters/filter-ratelimit-redis))
+— a filter with a *required* config key should document that it needs `trusted` isolation.
 
 ### `[[upstream]]`
 

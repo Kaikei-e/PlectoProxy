@@ -14,7 +14,7 @@ use crate::outbound_http;
 #[cfg(feature = "outbound-tcp")]
 use crate::outbound_tcp;
 use crate::quota::KvQuota;
-use crate::state::HostState;
+use crate::state::{HostState, HostStateInit};
 use crate::{Bucket, KvBackend, LogLine, RequestBodyDecision};
 
 /// The seam between pool / lifecycle-dispatch DECISION logic (`LoadedInner`, below) and the actual
@@ -52,6 +52,9 @@ pub(crate) struct WasmtimeRuntime {
     pub(crate) max_memory_bytes: u64,
     pub(crate) ratelimit_bucket: Option<Bucket>,
     pub(crate) kv_quota: Arc<KvQuota>,
+    /// This filter's manifest-declared business config (ADR 000066), shared read-only across
+    /// every instance of this filter.
+    pub(crate) config: Arc<std::collections::BTreeMap<String, String>>,
     /// This filter's outbound HTTP state (ADR 000036): allowlist + SSRF policy + shared concurrency
     /// semaphore. `Some` only when the manifest lent it an allowlist.
     #[cfg(feature = "outbound-http")]
@@ -146,11 +149,14 @@ impl FilterRuntime for WasmtimeRuntime {
         let mut store = Store::new(
             &self.engine,
             HostState::new(
-                self.kv.clone(),
-                self.kv_prefix.clone(),
-                self.max_memory_bytes,
-                self.ratelimit_bucket,
-                self.kv_quota.clone(),
+                HostStateInit {
+                    kv: self.kv.clone(),
+                    kv_prefix: self.kv_prefix.clone(),
+                    max_memory_bytes: self.max_memory_bytes,
+                    ratelimit_bucket: self.ratelimit_bucket,
+                    quota: self.kv_quota.clone(),
+                    config: self.config.clone(),
+                },
                 #[cfg(feature = "outbound-http")]
                 self.outbound_hooks(),
                 #[cfg(feature = "outbound-tcp")]

@@ -282,6 +282,7 @@ impl Host {
             max_memory_bytes: opts.max_memory_bytes,
             ratelimit_bucket: opts.ratelimit_bucket,
             kv_quota: self.kv_quota.clone(),
+            config: Arc::new(opts.config.clone()),
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
             rt: {
                 let mut needs_rt = false;

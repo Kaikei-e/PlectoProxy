@@ -87,6 +87,15 @@ pub fn filter_tcp_gate_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_TCP_GATE_COMPONENT")).expect("read filter-tcp-gate component")
 }
 
+/// The compiled `filter-ratelimit-redis` component bytes — the global-layer reference filter of
+/// the local-floor × global two-tier rate-limit model (ADR 000061), built by this crate's
+/// `build.rs` when the `outbound-tcp` feature is on (it consults its backend over outbound TCP).
+#[cfg(feature = "outbound-tcp")]
+pub fn filter_ratelimit_redis_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_RATELIMIT_REDIS_COMPONENT"))
+        .expect("read filter-ratelimit-redis component")
+}
+
 /// A minimal in-toto-style SBOM statement that binds `component`: its `subject` digest is
 /// `sha256(component)`, satisfying the load gate's SBOM↔component binding (review f000003
 /// #1). The predicate is empty (content policy is deferred). Test / dev helper — real

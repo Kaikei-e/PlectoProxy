@@ -103,6 +103,14 @@ fn main() {
             "filter_tcp_gate",
             "FILTER_TCP_GATE_COMPONENT",
         );
+        // filter-ratelimit-redis (ADR 000061): the global-layer reference filter, also outbound-TCP
+        // (wasi:sockets) and so also wasm32-wasip2.
+        build_wasip2_component(
+            &cargo,
+            &filters.join("filter-ratelimit-redis"),
+            "filter_ratelimit_redis",
+            "FILTER_RATELIMIT_REDIS_COMPONENT",
+        );
     }
 }
 

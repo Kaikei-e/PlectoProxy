@@ -68,6 +68,9 @@ impl FilterEntry {
                 ob.io_deadline_ms,
             );
         }
+        if let Some(cfg) = &self.config {
+            opts = opts.with_config(cfg.clone());
+        }
         opts
     }
 }
@@ -94,6 +97,7 @@ mod tests {
             }),
             outbound_http: None,
             outbound_tcp: None,
+            config: None,
         };
         let opts = entry.load_options();
 
@@ -113,5 +117,26 @@ mod tests {
         assert_eq!(bucket.capacity, 100);
         assert_eq!(bucket.refill_tokens, 10);
         assert_eq!(bucket.refill_interval_ms, 1000);
+    }
+
+    #[test]
+    fn config_section_lowers_to_load_options() {
+        let m = crate::manifest::Manifest::from_toml(
+            r#"
+[[filter]]
+id = "ratelimit-redis"
+source = "s"
+digest = "sha256:abc"
+
+[filter.config]
+on_backend_error = "deny"
+"#,
+        )
+        .unwrap();
+        let opts = m.filters[0].load_options();
+        assert_eq!(
+            opts.config.get("on_backend_error").map(String::as_str),
+            Some("deny")
+        );
     }
 }

@@ -18,6 +18,18 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-08
+
+### Changed
+
+- wit-bindgen bumped to 0.59.0 (from 0.58.0) across every example/bench filter guest and the
+  CI toolchain pin (sha256-verified) — the C polyglot example (ADR 000055) now builds against
+  this version too. Verified byte-identical Rust codegen for a `stream<u8>`-returning export
+  between 0.58.0 and 0.59.0: the ergonomics gap ADR 000025 deferred true `stream<u8>` streaming
+  on (a low-level `RawStreamReader` / private `StreamVtable` return type) and the
+  wit-bindgen#1554 placeholder gating `wasi:http` convergence (ADR 000020 / 000025) both remain
+  open — this release carries no contract or behavior change.
+
 ## [0.2.0] - 2026-07-08
 
 ### Added

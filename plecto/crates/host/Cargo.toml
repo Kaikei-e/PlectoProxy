@@ -53,6 +53,17 @@ outbound-http = [
     "dep:webpki-roots",
     "wasmtime/component-model-async",
 ]
+# Experimental outbound TCP capability for filters (ADR 000060): lends the `wasi:sockets` TCP-connect
+# vocabulary (network / instance-network / tcp-create-socket / tcp, plus a host-vetted ip-name-lookup)
+# through the same deny-by-default Linker, gated per-filter by an operator allowlist + the shared SSRF
+# floor (`outbound.rs::classify`) + an IP pin + resource bounds. UDP and listen are never lent. OFF by
+# default — same quarantine rule as outbound-http. Building the fixture needs `wasm32-wasip2`.
+outbound-tcp = [
+    "dep:wasmtime-wasi",
+    "dep:ipnet",
+    "dep:tokio",
+    "wasmtime/component-model-async",
+]
 # Marker feature for the `mem-probe` example: swaps in dhat's global allocator to report host-heap
 # peak (the lifted body copy). No effect on the lib or the default build; dhat is a dev-dependency,
 # so it is never linked into a production build. Run: `cargo run -p plecto-host --example mem-probe

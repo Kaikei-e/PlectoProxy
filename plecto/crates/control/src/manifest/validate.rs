@@ -4,7 +4,7 @@
 
 use super::{
     FilterEntry, HashKeyKind, LbAlgorithm, MAX_HASH_TABLE_SIZE, MAX_INSTANCE_WEIGHT,
-    OutboundConfig, State, StateBackendKind, Upstream,
+    OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
 };
 use crate::error::ControlError;
 
@@ -187,61 +187,122 @@ impl FilterEntry {
                 ));
             }
         }
-        if let Some(ob) = &self.outbound {
-            self.validate_outbound(ob)?;
+        if let Some(ob) = &self.outbound_http {
+            self.validate_outbound_http(ob)?;
+        }
+        if let Some(ob) = &self.outbound_tcp {
+            self.validate_outbound_tcp(ob)?;
         }
         Ok(())
     }
 
-    /// Validate an outbound section. Without the `outbound-http` build the host cannot provide the
-    /// capability, so any declared outbound is rejected (fail-closed). With it, the allowlist must be
-    /// non-empty, `allow_private` CIDRs must parse, and any explicit metering value must be non-zero.
+    /// Validate an outbound_http section. Without the `outbound-http` build the host cannot provide
+    /// the capability, so any declared outbound_http is rejected (fail-closed). With it, the
+    /// allowlist must be non-empty, `allow_private` CIDRs must parse, and any explicit metering
+    /// value must be non-zero.
     #[cfg(not(feature = "outbound-http"))]
-    fn validate_outbound(&self, _ob: &OutboundConfig) -> Result<(), ControlError> {
+    fn validate_outbound_http(&self, _ob: &OutboundHttpConfig) -> Result<(), ControlError> {
         Err(ControlError::InvalidFilterConfig {
             id: self.id.clone(),
-            reason: "outbound requested but this build lacks the `outbound-http` feature"
+            reason: "outbound_http requested but this build lacks the `outbound-http` feature"
                 .to_string(),
         })
     }
 
     #[cfg(feature = "outbound-http")]
-    fn validate_outbound(&self, ob: &OutboundConfig) -> Result<(), ControlError> {
+    fn validate_outbound_http(&self, ob: &OutboundHttpConfig) -> Result<(), ControlError> {
         let bad = |reason: String| ControlError::InvalidFilterConfig {
             id: self.id.clone(),
             reason,
         };
         if ob.allow.is_empty() {
             return Err(bad(
-                "outbound.allow must list at least one destination".into()
+                "outbound_http.allow must list at least one destination".into(),
             ));
         }
         for dest in &ob.allow {
             if dest.host.trim().is_empty() {
-                return Err(bad("outbound.allow entry has an empty host".into()));
+                return Err(bad("outbound_http.allow entry has an empty host".into()));
             }
             if dest.port == Some(0) {
-                return Err(bad(format!("outbound.allow host {} has port 0", dest.host)));
+                return Err(bad(format!(
+                    "outbound_http.allow host {} has port 0",
+                    dest.host
+                )));
             }
         }
         for cidr in &ob.allow_private {
             cidr.parse::<ipnet::IpNet>().map_err(|e| {
                 bad(format!(
-                    "outbound.allow_private has invalid CIDR {cidr:?}: {e}"
+                    "outbound_http.allow_private has invalid CIDR {cidr:?}: {e}"
                 ))
             })?;
         }
         if ob.connect_timeout_ms == Some(0) {
-            return Err(bad("outbound.connect_timeout_ms must be non-zero".into()));
+            return Err(bad(
+                "outbound_http.connect_timeout_ms must be non-zero".into()
+            ));
         }
         if ob.total_timeout_ms == Some(0) {
-            return Err(bad("outbound.total_timeout_ms must be non-zero".into()));
+            return Err(bad("outbound_http.total_timeout_ms must be non-zero".into()));
         }
         if ob.max_response_bytes == Some(0) {
-            return Err(bad("outbound.max_response_bytes must be non-zero".into()));
+            return Err(bad(
+                "outbound_http.max_response_bytes must be non-zero".into()
+            ));
         }
         if ob.max_concurrent == Some(0) {
-            return Err(bad("outbound.max_concurrent must be non-zero".into()));
+            return Err(bad("outbound_http.max_concurrent must be non-zero".into()));
+        }
+        Ok(())
+    }
+
+    /// Validate an outbound_tcp section (ADR 000060) — the same fail-closed rule as outbound_http:
+    /// a build without the `outbound-tcp` feature cannot lend `wasi:sockets`, so a declared section
+    /// is rejected outright rather than silently ignored.
+    #[cfg(not(feature = "outbound-tcp"))]
+    fn validate_outbound_tcp(&self, _ob: &OutboundTcpConfig) -> Result<(), ControlError> {
+        Err(ControlError::InvalidFilterConfig {
+            id: self.id.clone(),
+            reason: "outbound_tcp requested but this build lacks the `outbound-tcp` feature"
+                .to_string(),
+        })
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    fn validate_outbound_tcp(&self, ob: &OutboundTcpConfig) -> Result<(), ControlError> {
+        let bad = |reason: String| ControlError::InvalidFilterConfig {
+            id: self.id.clone(),
+            reason,
+        };
+        if ob.allow.is_empty() {
+            return Err(bad(
+                "outbound_tcp.allow must list at least one destination".into()
+            ));
+        }
+        for dest in &ob.allow {
+            if dest.host.trim().is_empty() {
+                return Err(bad("outbound_tcp.allow entry has an empty host".into()));
+            }
+            if dest.port == 0 {
+                return Err(bad(format!(
+                    "outbound_tcp.allow host {} has port 0",
+                    dest.host
+                )));
+            }
+        }
+        for cidr in &ob.allow_private {
+            cidr.parse::<ipnet::IpNet>().map_err(|e| {
+                bad(format!(
+                    "outbound_tcp.allow_private has invalid CIDR {cidr:?}: {e}"
+                ))
+            })?;
+        }
+        if ob.max_connections == Some(0) {
+            return Err(bad("outbound_tcp.max_connections must be non-zero".into()));
+        }
+        if ob.io_deadline_ms == Some(0) {
+            return Err(bad("outbound_tcp.io_deadline_ms must be non-zero".into()));
         }
         Ok(())
     }
@@ -274,7 +335,8 @@ mod tests {
             request_deadline_ms: None,
             max_memory_bytes: None,
             ratelimit: None,
-            outbound: None,
+            outbound_http: None,
+            outbound_tcp: None,
         };
         assert!(base.validate().is_ok(), "defaults are valid");
 

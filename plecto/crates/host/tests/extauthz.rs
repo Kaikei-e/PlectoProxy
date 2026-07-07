@@ -70,7 +70,7 @@ fn request(authz_url: &str) -> HttpRequest {
 }
 
 fn outbound_opts(allow: Vec<AllowEntry>) -> LoadOptions {
-    LoadOptions::untrusted().with_outbound(
+    LoadOptions::untrusted().with_outbound_http(
         allow,
         vec![],
         Some(2_000),

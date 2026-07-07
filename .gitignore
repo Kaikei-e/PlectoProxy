@@ -5,6 +5,7 @@ plecto/examples/filters/filter-apikey/target
 plecto/examples/filters/filter-streaming/target
 plecto/examples/filters/filter-extauthz/target
 plecto/examples/filters/filter-quickstart/target
+plecto/examples/filters/filter-tcp-gate/target
 bench/filters/filter-noop/target
 plecto/spike/streaming-async/guest/target
 plecto/spike/streaming-async/host/target

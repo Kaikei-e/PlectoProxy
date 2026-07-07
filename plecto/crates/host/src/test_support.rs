@@ -80,6 +80,13 @@ pub fn filter_extauthz_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_EXTAUTHZ_COMPONENT")).expect("read filter-extauthz component")
 }
 
+/// The compiled `filter-tcp-gate` component bytes — the outbound-TCP example (a raw-TCP consult
+/// gate), built by this crate's `build.rs` when the `outbound-tcp` feature is on (ADR 000060).
+#[cfg(feature = "outbound-tcp")]
+pub fn filter_tcp_gate_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_TCP_GATE_COMPONENT")).expect("read filter-tcp-gate component")
+}
+
 /// A minimal in-toto-style SBOM statement that binds `component`: its `subject` digest is
 /// `sha256(component)`, satisfying the load gate's SBOM↔component binding (review f000003
 /// #1). The predicate is empty (content policy is deferred). Test / dev helper — real

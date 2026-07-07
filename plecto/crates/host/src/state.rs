@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "outbound-http")]
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 use wasmtime::component::Linker;
 use wasmtime::{StoreLimits, StoreLimitsBuilder};
 
@@ -14,6 +14,8 @@ use crate::bindings::plecto::filter::{
 };
 #[cfg(feature = "outbound-http")]
 use crate::outbound_http;
+#[cfg(feature = "outbound-tcp")]
+use crate::outbound_tcp;
 use crate::quota::KvQuota;
 use crate::util::wall_now_ms;
 use crate::{Bucket, KvBackend};
@@ -100,18 +102,23 @@ pub struct HostState {
     /// Shared per-namespace accounting + caps for host-held state. Charged on every
     /// `set` / `increment` / `try_acquire` that grows the store; over-quota writes fail closed.
     quota: Arc<KvQuota>,
-    /// Outbound HTTP (ADR 000036): the minimal WASI base ctx, resource table, `wasi:http` ctx, and
-    /// the SSRF-guarded hooks. `wasi:http` is added to the Linker only for filters with an outbound
-    /// policy; for every other filter `hooks` denies every call (belt-and-suspenders, so a stray
-    /// call still fails closed).
-    #[cfg(feature = "outbound-http")]
+    /// Outbound capabilities (ADR 000036 HTTP / ADR 000060 TCP): the minimal WASI base ctx and
+    /// resource table shared by both wirings. The relevant interfaces are added to the Linker only
+    /// for filters with an outbound policy; for every other filter the guards below deny every
+    /// call (belt-and-suspenders, so a stray call still fails closed).
+    #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
     wasi: wasmtime_wasi::WasiCtx,
+    #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+    table: wasmtime::component::ResourceTable,
+    /// Outbound HTTP (ADR 000036): the `wasi:http` ctx and the SSRF-guarded send hooks.
     #[cfg(feature = "outbound-http")]
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
     #[cfg(feature = "outbound-http")]
-    table: wasmtime::component::ResourceTable,
-    #[cfg(feature = "outbound-http")]
     hooks: outbound_http::PlectoHttpHooks,
+    /// Outbound TCP (ADR 000060): the per-Store guard (pinned set + connect budget) shared by the
+    /// `socket_addr_check` closure inside `wasi` above and the host's ip-name-lookup impl.
+    #[cfg(feature = "outbound-tcp")]
+    tcp: outbound_tcp::TcpGuard,
 }
 
 impl HostState {
@@ -122,7 +129,14 @@ impl HostState {
         ratelimit_bucket: Option<Bucket>,
         quota: Arc<KvQuota>,
         #[cfg(feature = "outbound-http")] hooks: outbound_http::PlectoHttpHooks,
+        #[cfg(feature = "outbound-tcp")] tcp: outbound_tcp::TcpGuard,
     ) -> Self {
+        // The base WasiCtx: empty (no fs, no env, no preopens). With outbound TCP the guard
+        // installs its socket_addr_check; otherwise the builder's deny-all socket default stands.
+        #[cfg(feature = "outbound-tcp")]
+        let wasi = tcp.wasi_ctx();
+        #[cfg(all(feature = "outbound-http", not(feature = "outbound-tcp")))]
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
         Self {
             kv,
             kv_prefix,
@@ -134,14 +148,16 @@ impl HostState {
                 .build(),
             ratelimit_bucket,
             quota,
-            #[cfg(feature = "outbound-http")]
-            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+            #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+            wasi,
+            #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+            table: wasmtime::component::ResourceTable::new(),
             #[cfg(feature = "outbound-http")]
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             #[cfg(feature = "outbound-http")]
-            table: wasmtime::component::ResourceTable::new(),
-            #[cfg(feature = "outbound-http")]
             hooks,
+            #[cfg(feature = "outbound-tcp")]
+            tcp,
         }
     }
 
@@ -150,6 +166,19 @@ impl HostState {
     pub(crate) fn begin_request(&mut self) {
         self.logs.clear();
         self.now_ms = wall_now_ms();
+        // A reused instance's connect budget belongs to the request, not the instance.
+        #[cfg(feature = "outbound-tcp")]
+        self.tcp.begin_request();
+    }
+
+    /// The host's vetted `wasi:sockets/ip-name-lookup` view (ADR 000060): the Store's resource
+    /// table plus this filter's guard.
+    #[cfg(feature = "outbound-tcp")]
+    pub(crate) fn tcp_lookup(&mut self) -> outbound_tcp::TcpLookupView<'_> {
+        outbound_tcp::TcpLookupView {
+            table: &mut self.table,
+            guard: &self.tcp,
+        }
     }
 
     /// Namespace a filter-supplied key into `{filter_id}\u{1f}{tag}\u{1f}{key}` bytes.
@@ -165,9 +194,9 @@ impl HostState {
 
 // --- host-API capability implementations (deny-by-default: only these are lent) ---
 
-// Outbound HTTP (ADR 000036): the WASI base + wasi:http projections, added to the Linker only for
-// filters with an outbound policy. They share one resource table.
-#[cfg(feature = "outbound-http")]
+// Outbound capabilities (ADR 000036 / 000060): the WASI base + per-capability projections, added
+// to the Linker only for filters with an outbound policy. They share one resource table.
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 impl wasmtime_wasi::WasiView for HostState {
     fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
         wasmtime_wasi::WasiCtxView {
@@ -190,8 +219,9 @@ impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
 
 /// Add the wasi:cli interfaces the std guest's runtime imports beyond the proxy slice (environment /
 /// exit / terminal-*), each inert under the empty `WasiCtx`. Adds NO filesystem and NO sockets, so
-/// those capabilities stay denied (security audit F-002; mirrors the streaming path).
-#[cfg(feature = "outbound-http")]
+/// those capabilities stay denied (security audit F-002; mirrors the streaming path). Outbound TCP
+/// filters (ADR 000060) get their `wasi:sockets` slice added separately, behind their own guard.
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 pub(crate) fn add_cli_runtime(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     use wasmtime_wasi::cli::{WasiCli, WasiCliView};
     use wasmtime_wasi::p2::bindings::cli;
@@ -399,6 +429,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         )
     }
 
@@ -425,6 +457,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
         let mut b = HostState::new(
             shared.clone(),
@@ -434,6 +468,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
 
         KvHost::set(&mut a, "count".into(), b"1".to_vec());
@@ -463,6 +499,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
         let mut b = HostState::new(
             shared.clone(),
@@ -472,6 +510,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
 
         assert_eq!(CounterHost::increment(&mut a, "hits".into(), 5), 5);
@@ -516,6 +556,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
         let mut b = HostState::new(
             shared.clone(),
@@ -525,6 +567,8 @@ mod tests {
             Arc::new(KvQuota::new()),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
 
         // a drains its single-token bucket on key "k".
@@ -619,6 +663,8 @@ mod tests {
             quota.clone(),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
         );
         // Two distinct keys in the same namespace: "k1" (raced on below) and "k2" (untouched —
         // its surviving budget is the tell-tale that a double-release didn't over-free the ns).
@@ -647,6 +693,8 @@ mod tests {
                         q,
                         #[cfg(feature = "outbound-http")]
                         outbound_http::PlectoHttpHooks::deny_all(),
+                        #[cfg(feature = "outbound-tcp")]
+                        crate::outbound_tcp::TcpGuard::deny_all(),
                     );
                     b.wait();
                     KvHost::delete(&mut s, "k1".into());

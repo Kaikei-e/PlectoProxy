@@ -1,11 +1,11 @@
 //! Load-time options: [`Isolation`] (the instance-lifecycle choice) and [`LoadOptions`] (the
 //! full knob set for `Host::load`), plus their defaults.
 
-#[cfg(feature = "outbound-http")]
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 use std::time::Duration;
 
 use crate::Bucket;
-#[cfg(feature = "outbound-http")]
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 use crate::outbound;
 
 /// How a filter is instantiated and isolated (ADR 000004 / 000011). Not a "trust score":
@@ -102,6 +102,24 @@ const DEFAULT_OUTBOUND_MAX_CONCURRENT: u32 = 8;
 #[cfg(feature = "outbound-http")]
 const MAX_OUTBOUND_MAX_CONCURRENT: u32 = 64;
 
+// --- outbound TCP (ADR 000060) clamps. ---
+/// Default per-request budget of TCP connects. Small: the reference use (a Redis consult) needs
+/// one connection, kept across requests on a pooled instance; per-request fan-out is the thing
+/// being bounded.
+#[cfg(feature = "outbound-tcp")]
+const DEFAULT_OUTBOUND_TCP_MAX_CONNECTIONS: u32 = 4;
+/// Host ceiling on the per-request connect budget.
+#[cfg(feature = "outbound-tcp")]
+const MAX_OUTBOUND_TCP_MAX_CONNECTIONS: u32 = 64;
+/// Default wall-clock ceiling on each guest hook call of an outbound-TCP filter. With raw TCP the
+/// host cannot see request boundaries inside the stream, so the deadline bounds the whole call —
+/// the role `total_timeout` plays for outbound HTTP (connect hangs AND read hangs, ADR 000060).
+#[cfg(feature = "outbound-tcp")]
+const DEFAULT_OUTBOUND_TCP_IO_DEADLINE_MS: u64 = 5_000;
+/// Host ceiling on the outbound-TCP hook-call deadline.
+#[cfg(feature = "outbound-tcp")]
+const MAX_OUTBOUND_TCP_IO_DEADLINE_MS: u64 = 30_000;
+
 /// Options for `Host::load`. A struct (not a bare arg) because deny-by-default grows more
 /// load-time knobs onto it. Defaults to the safe side: `Untrusted` (fail-closed) with
 /// metering on (ADR 000006). A future declarative manifest (ADR 000007) injects these.
@@ -129,11 +147,24 @@ pub struct LoadOptions {
     /// `[filter.ratelimit]`, ADR 000026). `None` = the filter has no limiter (its `try-acquire`
     /// fails closed). Host-configured so an untrusted filter cannot override its own limit.
     pub ratelimit_bucket: Option<Bucket>,
-    /// This filter's outbound HTTP policy (manifest `[filter.outbound]`, ADR 000036): the
+    /// This filter's outbound HTTP policy (manifest `[filter.outbound_http]`, ADR 000036): the
     /// deny-by-default allowlist + SSRF opt-in + resource bounds enforced at the `wasi:http`
-    /// send seam. `None` = the filter is lent no outbound capability (the default).
+    /// send seam. `None` = the filter is lent no outbound HTTP capability (the default).
     #[cfg(feature = "outbound-http")]
-    pub outbound: Option<outbound::OutboundPolicy>,
+    pub outbound_http: Option<outbound::OutboundPolicy>,
+    /// This filter's outbound TCP policy (manifest `[filter.outbound_tcp]`, ADR 000060): the
+    /// deny-by-default allowlist + SSRF opt-in + resource bounds enforced at the host's
+    /// ip-name-lookup and connect seams. `None` = the filter is lent no outbound TCP capability
+    /// (the default).
+    #[cfg(feature = "outbound-tcp")]
+    pub outbound_tcp: Option<outbound::OutboundTcpPolicy>,
+    /// Test-only DNS override for the outbound TCP capability: `Some(map)` replaces the system
+    /// resolver so the feature-gated E2E suite can point an allowlisted NAME at a controlled
+    /// address deterministically. NOT production provenance — gated behind `test-support`.
+    #[doc(hidden)]
+    #[cfg(all(feature = "outbound-tcp", feature = "test-support"))]
+    pub outbound_tcp_static_resolver:
+        Option<std::collections::HashMap<String, Vec<std::net::IpAddr>>>,
 }
 
 impl Default for LoadOptions {
@@ -149,7 +180,11 @@ impl Default for LoadOptions {
             max_requests_per_instance: DEFAULT_MAX_REQUESTS_PER_INSTANCE,
             ratelimit_bucket: None,
             #[cfg(feature = "outbound-http")]
-            outbound: None,
+            outbound_http: None,
+            #[cfg(feature = "outbound-tcp")]
+            outbound_tcp: None,
+            #[cfg(all(feature = "outbound-tcp", feature = "test-support"))]
+            outbound_tcp_static_resolver: None,
         }
     }
 }
@@ -218,7 +253,7 @@ impl LoadOptions {
     /// options are clamped again at the send seam. The filter cannot supply or widen any of this.
     #[cfg(feature = "outbound-http")]
     #[allow(clippy::too_many_arguments)]
-    pub fn with_outbound(
+    pub fn with_outbound_http(
         mut self,
         allow: Vec<outbound::AllowEntry>,
         allow_private: Vec<String>,
@@ -234,7 +269,7 @@ impl LoadOptions {
             .iter()
             .filter_map(|c| c.parse::<ipnet::IpNet>().ok())
             .collect();
-        self.outbound = Some(outbound::OutboundPolicy {
+        self.outbound_http = Some(outbound::OutboundPolicy {
             allow,
             allow_private,
             connect_timeout: Duration::from_millis(clamp_ms(
@@ -254,6 +289,50 @@ impl LoadOptions {
                 .unwrap_or(DEFAULT_OUTBOUND_MAX_CONCURRENT)
                 .clamp(1, MAX_OUTBOUND_MAX_CONCURRENT),
         });
+        self
+    }
+
+    /// Lend this filter the outbound TCP capability (ADR 000060) with an already-parsed allowlist
+    /// and private-range opt-in. The budget and deadline are clamped to host maxima here — the
+    /// filter cannot supply or widen any of this (same rule as `with_outbound_http`).
+    #[cfg(feature = "outbound-tcp")]
+    pub fn with_outbound_tcp(
+        mut self,
+        allow: Vec<outbound::TcpAllowEntry>,
+        allow_private: Vec<String>,
+        max_connections: Option<u32>,
+        io_deadline_ms: Option<u64>,
+    ) -> Self {
+        // Parse the operator's CIDR strings; a malformed one is dropped, leaving that range blocked
+        // (fail-closed). The manifest validates them up front, so this is belt-and-suspenders.
+        let allow_private = allow_private
+            .iter()
+            .filter_map(|c| c.parse::<ipnet::IpNet>().ok())
+            .collect();
+        self.outbound_tcp = Some(outbound::OutboundTcpPolicy {
+            allow,
+            allow_private,
+            max_connections: max_connections
+                .unwrap_or(DEFAULT_OUTBOUND_TCP_MAX_CONNECTIONS)
+                .clamp(1, MAX_OUTBOUND_TCP_MAX_CONNECTIONS),
+            io_deadline: Duration::from_millis(
+                io_deadline_ms
+                    .unwrap_or(DEFAULT_OUTBOUND_TCP_IO_DEADLINE_MS)
+                    .clamp(1, MAX_OUTBOUND_TCP_IO_DEADLINE_MS),
+            ),
+        });
+        self
+    }
+
+    /// Test-only: resolve outbound-TCP names from a static map instead of real DNS (see
+    /// `LoadOptions::outbound_tcp_static_resolver`).
+    #[doc(hidden)]
+    #[cfg(all(feature = "outbound-tcp", feature = "test-support"))]
+    pub fn with_outbound_tcp_static_resolver(
+        mut self,
+        entries: Vec<(String, Vec<std::net::IpAddr>)>,
+    ) -> Self {
+        self.outbound_tcp_static_resolver = Some(entries.into_iter().collect());
         self
     }
 }

@@ -1,7 +1,8 @@
-//! Outbound HTTP capability policy (ADR 000036).
+//! Outbound capability policy (ADR 000036 HTTP / ADR 000060 TCP).
 //!
-//! When a filter is lent `wasi:http/outgoing-handler`, every call it makes is gated by two
-//! independent checks that this module owns:
+//! When a filter is lent an outbound capability (`wasi:http/outgoing-handler` or the
+//! `wasi:sockets` TCP-connect vocabulary), every call it makes is gated by two independent
+//! checks that this module owns:
 //!
 //! 1. **Outbound allowlist** — an operator-declared set of exact `(scheme, host, port)` triples.
 //!    Deny-by-default: a destination not on the list is rejected. The filter cannot supply or widen
@@ -13,7 +14,9 @@
 //!    the allowlist but resolves to a blocked IP is still rejected (defeats DNS rebinding).
 //!
 //! This module is the pure policy — no wasmtime, no I/O. The wiring that resolves DNS, pins the
-//! vetted IP, connects, and bounds the call lives in [`super::outbound_http`] (feature-gated). The
+//! vetted IP, connects, and bounds the call lives in `outbound_http` / `outbound_tcp`
+//! (feature-gated); both capabilities share the single [`classify`] below, so the SSRF floor
+//! cannot drift between them (ADR 000060). The
 //! deny ranges below are hand-written octet predicates (transparent + auditable, and not dependent
 //! on unstable `IpAddr` methods like `is_global`); only the operator `allow_private` opt-in uses
 //! `ipnet` for CIDR containment. The range set follows the OWASP SSRF Prevention algorithm.
@@ -24,12 +27,14 @@ use ipnet::IpNet;
 
 /// URL scheme a filter may target. `https` is the default; `http` is only reachable when an
 /// allowlist entry names it explicitly.
+#[cfg(feature = "outbound-http")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
     Http,
     Https,
 }
 
+#[cfg(feature = "outbound-http")]
 impl Scheme {
     /// The default port for this scheme, used when an allowlist entry (or a request authority)
     /// omits the port.
@@ -44,6 +49,7 @@ impl Scheme {
 /// One operator-declared allowed destination: an EXACT `(scheme, host, port)` triple. No wildcards
 /// or suffix matching — the target use cases (JWKS / introspection / ext_authz) are fixed endpoints,
 /// and exact matching is the most auditable deny-by-default form (ADR 000036).
+#[cfg(feature = "outbound-http")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowEntry {
     pub scheme: Scheme,
@@ -65,8 +71,9 @@ pub enum AddrVerdict {
     BlockedPrivate,
 }
 
-/// The per-filter outbound policy the host enforces at the `send_request` seam. Built from the
-/// manifest `[filter.outbound]` section via `LoadOptions` (values already clamped to host maxima).
+/// The per-filter outbound HTTP policy the host enforces at the `send_request` seam. Built from the
+/// manifest `[filter.outbound_http]` section via `LoadOptions` (values already clamped to host maxima).
+#[cfg(feature = "outbound-http")]
 #[derive(Debug, Clone)]
 pub struct OutboundPolicy {
     /// Exact allowed destinations. Empty means the filter can reach nothing (deny-by-default).
@@ -85,6 +92,7 @@ pub struct OutboundPolicy {
     pub max_concurrent: u32,
 }
 
+#[cfg(feature = "outbound-http")]
 impl OutboundPolicy {
     /// Whether `(scheme, host, port)` is on the allowlist. Host comparison is ASCII-case-insensitive
     /// (DNS is case-insensitive); scheme and port must match exactly.
@@ -92,6 +100,51 @@ impl OutboundPolicy {
         self.allow
             .iter()
             .any(|e| e.scheme == scheme && e.port == port && e.host.eq_ignore_ascii_case(host))
+    }
+
+    /// Classify a resolved IP against the SSRF guard, honoring this filter's `allow_private` opt-in.
+    pub fn classify(&self, ip: IpAddr) -> AddrVerdict {
+        classify(ip, &self.allow_private)
+    }
+}
+
+/// One operator-declared allowed TCP destination: an EXACT `(host, port)` pair (ADR 000060). No
+/// scheme and no default port — a raw TCP endpoint (Redis, memcached) has neither.
+#[cfg(feature = "outbound-tcp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpAllowEntry {
+    /// Exact host: a DNS name (matched case-insensitively) or an IP literal.
+    pub host: String,
+    pub port: u16,
+}
+
+/// The per-filter outbound TCP policy (ADR 000060), enforced at two seams the host owns: the
+/// `wasi:sockets/ip-name-lookup` implementation (only allowlisted names resolve; every resolved
+/// address is classified and pinned) and the `socket_addr_check` connect gate (floor + allowlist +
+/// IP pin + per-request connect budget). Built from the manifest `[filter.outbound_tcp]` section
+/// via `LoadOptions` (values already clamped to host maxima).
+#[cfg(feature = "outbound-tcp")]
+#[derive(Debug, Clone)]
+pub struct OutboundTcpPolicy {
+    /// Exact allowed destinations. Empty means the filter can reach nothing (deny-by-default).
+    pub allow: Vec<TcpAllowEntry>,
+    /// Private/ULA ranges the operator opted this filter into. Never opens the reserved floor.
+    pub allow_private: Vec<IpNet>,
+    /// Per-request budget of TCP connects (a pooled instance's held connection costs only its
+    /// opening request). Bounds per-request fan-out; accumulated sockets are bounded by the
+    /// pool's `max_requests_per_instance` recycle.
+    pub max_connections: u32,
+    /// Wall-clock ceiling on each guest hook call — the host-side I/O deadline epoch interruption
+    /// cannot provide while the guest blocks in socket I/O (connect *and* read hangs).
+    pub io_deadline: std::time::Duration,
+}
+
+#[cfg(feature = "outbound-tcp")]
+impl OutboundTcpPolicy {
+    /// Whether `host` names an allowlisted destination (any port). Host comparison is
+    /// ASCII-case-insensitive (DNS is case-insensitive). The name-resolution gate.
+    pub fn allows_name(&self, host: &str) -> bool {
+        self.allow.iter().any(|e| e.host.eq_ignore_ascii_case(host))
     }
 
     /// Classify a resolved IP against the SSRF guard, honoring this filter's `allow_private` opt-in.
@@ -340,6 +393,7 @@ mod tests {
 
     // --- allowlist matching ---
 
+    #[cfg(feature = "outbound-http")]
     fn policy(entries: Vec<AllowEntry>) -> OutboundPolicy {
         OutboundPolicy {
             allow: entries,
@@ -351,6 +405,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "outbound-http")]
     #[test]
     fn allowlist_exact_match_case_insensitive_host() {
         let p = policy(vec![AllowEntry {
@@ -366,9 +421,28 @@ mod tests {
         assert!(!p.allows(Scheme::Https, "sub.authz.example.com", 443)); // no suffix match
     }
 
+    #[cfg(feature = "outbound-http")]
     #[test]
     fn empty_allowlist_denies_everything() {
         let p = policy(vec![]);
         assert!(!p.allows(Scheme::Https, "authz.example.com", 443));
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    #[test]
+    fn tcp_allows_name_is_case_insensitive_and_exact() {
+        let p = OutboundTcpPolicy {
+            allow: vec![TcpAllowEntry {
+                host: "redis.internal".into(),
+                port: 6379,
+            }],
+            allow_private: vec![],
+            max_connections: 4,
+            io_deadline: std::time::Duration::from_secs(5),
+        };
+        assert!(p.allows_name("redis.internal"));
+        assert!(p.allows_name("REDIS.Internal")); // DNS case-insensitive
+        assert!(!p.allows_name("evil.internal")); // exact host only
+        assert!(!p.allows_name("sub.redis.internal")); // no suffix match
     }
 }

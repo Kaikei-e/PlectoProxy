@@ -43,14 +43,24 @@ pub mod otlp;
 mod streaming;
 #[cfg(feature = "streaming-body")]
 pub use streaming::{StreamingDecision, StreamingLimits, run_streaming_body};
-// Outbound HTTP capability for filters (ADR 000036), OFF by default. The pure allowlist + SSRF
-// policy; the wasmtime-wasi-http wiring that enforces it is added in `outbound_http` (same gate).
-#[cfg(feature = "outbound-http")]
+// Outbound capabilities for filters (ADR 000036 HTTP / ADR 000060 TCP), each OFF by default.
+// `outbound` is the pure allowlist + SSRF policy both share (one `classify` = one floor); the
+// wasmtime wirings that enforce it are `outbound_http` / `outbound_tcp` (per-feature gates), and
+// `resolver` is the host-side DNS seam they share.
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 mod outbound;
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+pub use outbound::AddrVerdict;
 #[cfg(feature = "outbound-http")]
-pub use outbound::{AddrVerdict, AllowEntry, OutboundPolicy, Scheme};
+pub use outbound::{AllowEntry, OutboundPolicy, Scheme};
+#[cfg(feature = "outbound-tcp")]
+pub use outbound::{OutboundTcpPolicy, TcpAllowEntry};
 #[cfg(feature = "outbound-http")]
 mod outbound_http;
+#[cfg(feature = "outbound-tcp")]
+mod outbound_tcp;
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+mod resolver;
 
 mod engine;
 mod errors;

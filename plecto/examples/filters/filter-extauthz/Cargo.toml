@@ -13,7 +13,7 @@ license = "Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.58"
+wit-bindgen = "0.59"
 # Pre-generated wasi 0.2 bindings for the outbound HTTP call (wasi:http/outgoing-handler + wasi:io).
 wasi = "0.14"
 

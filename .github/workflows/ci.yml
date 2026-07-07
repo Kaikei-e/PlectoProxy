@@ -151,13 +151,13 @@ jobs:
           set -euo pipefail
           curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
           echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
-          curl -sSL -o wit-bindgen.tar.gz https://github.com/bytecodealliance/wit-bindgen/releases/download/v0.58.0/wit-bindgen-0.58.0-x86_64-linux.tar.gz
-          echo "16831a7b18fed12f1b1ece26e458adb0c6c9ce0c7f3308e3f2fb7770f990a618  wit-bindgen.tar.gz" | sha256sum -c -
+          curl -sSL -o wit-bindgen.tar.gz https://github.com/bytecodealliance/wit-bindgen/releases/download/v0.59.0/wit-bindgen-0.59.0-x86_64-linux.tar.gz
+          echo "06b173e5aa3f3a0f5b5597c3502e2885fc9c63300f59a21151971249dda82bf4  wit-bindgen.tar.gz" | sha256sum -c -
           curl -sSL -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz
           echo "0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce  wasi-sdk.tar.gz" | sha256sum -c -
           tar xzf wasm-tools.tar.gz && tar xzf wit-bindgen.tar.gz && tar xzf wasi-sdk.tar.gz
           echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
-          echo "${{ runner.temp }}/wit-bindgen-0.58.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wit-bindgen-0.59.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "WASI_SDK_PATH=${{ runner.temp }}/wasi-sdk-33.0-x86_64-linux" >> "$GITHUB_ENV"
       - name: Install MoonBit
         run: |

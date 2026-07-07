@@ -1,0 +1,20 @@
+# filter-ratelimit-redis — reference `plecto:filter` for the global layer of the local-floor ×
+# global two-tier rate-limit model (ADR 000061). Consults a RESP-compatible store (Redis, Valkey,
+# ...) over the lent outbound TCP capability (ADR 000060). Like filter-tcp-gate it imports
+# `wasi:sockets` (via the `wasi` crate) and builds for wasm32-wasip2 — NOT part of the default
+# build. Declares its own [workspace] so the native plecto/ workspace never absorbs it.
+[package]
+name = "filter-ratelimit-redis"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+# Pre-generated wasi 0.2 bindings for the outbound TCP dialogue (wasi:sockets + wasi:io).
+wasi = "0.14"
+
+[workspace]

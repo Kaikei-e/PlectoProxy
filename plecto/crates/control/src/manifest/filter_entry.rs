@@ -1,6 +1,8 @@
 //! One filter to load (`[[filter]]`), pinned by OCI digest, plus its host-side rate-limit and
 //! outbound-HTTP sub-config (ADR 000006 / 000026 / 000036).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Host-side token-bucket spec for a filter's `host-ratelimit` (ADR 000026), set in the manifest
@@ -151,6 +153,13 @@ pub struct FilterEntry {
     /// is rejected at validate (fail-closed).
     #[serde(default)]
     pub outbound_tcp: Option<OutboundTcpConfig>,
+    /// This filter's business config (ADR 000066), `[filter.config]`: an arbitrary string→string
+    /// map the filter reads back via `host-config::get`. The host does not interpret keys or
+    /// values — only the filter does (e.g. Redis host/port, window seconds, `on_backend_error`).
+    /// Absent = an empty map (every `get` reads `None`). Unlike `ratelimit` / `outbound_*`, this is
+    /// a base capability with no feature gate.
+    #[serde(default)]
+    pub config: Option<BTreeMap<String, String>>,
 }
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
@@ -443,5 +452,52 @@ io_deadline_ms = 999999999
             m.filters[0].validate().is_err(),
             "outbound_http requires the outbound-http build"
         );
+    }
+
+    #[test]
+    fn config_section_parses_as_string_map() {
+        // `[filter.config]` (ADR 000066) is an arbitrary string→string map — no feature gate,
+        // no `deny_unknown_fields`, the host never interprets it.
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "ratelimit-redis"
+source = "oci/ratelimit-redis"
+digest = "sha256:abc"
+
+[filter.config]
+on_backend_error = "deny"
+redis_host = "redis.internal"
+redis_port = "6379"
+window_seconds = "60"
+limit = "1000"
+route_tag = "api-v1"
+"#,
+        )
+        .unwrap();
+        let cfg = m.filters[0].config.as_ref().expect("config present");
+        assert_eq!(
+            cfg.get("on_backend_error").map(String::as_str),
+            Some("deny")
+        );
+        assert_eq!(
+            cfg.get("redis_host").map(String::as_str),
+            Some("redis.internal")
+        );
+        assert_eq!(cfg.len(), 6);
+    }
+
+    #[test]
+    fn config_section_absent_by_default() {
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "x"
+source = "s"
+digest = "sha256:abc"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.filters[0].config, None);
     }
 }

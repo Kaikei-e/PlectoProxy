@@ -92,6 +92,17 @@ _Avoid_: syscall, runtime API（曖昧）
 （超ホット経路は WASM 境界を跨がない）、フィルタは「consult するか・どのキーで」を判断するだけ。
 _Avoid_: throttle, quota（別概念）
 
+**host-config（capability）**:
+manifest `[filter.config]` 由来の読み取り専用 string→string map を貸す能力（ADR 000066）。
+`get(key) -> option<string>` のみ——host はキーの意味を一切解釈しない、純粋なパススルー。
+`host-kv`（フィルタ自身が書く*可変業務状態*）とは責務が逆——host-config はフィルタが**書けない**、
+operator 所有の設定値。他の基本 capability（host-log/host-clock/host-kv/host-counter/host-ratelimit）
+と同格で、manifest 宣言の有無に関わらず全フィルタに無条件で貸す（outbound-http/outbound-tcp の
+ような feature-gate 付き per-filter オプトインとは異なる）。特定キーが必須かどうかは host は
+知らない——検証は各フィルタの `init()` の責務（`isolation = "trusted"` と組み合わせると、trap が
+manifest 適用時の load 失敗として表面化する。「Persistent connection」も参照）。
+_Avoid_: host-kv（可変状態との混同）, secrets（秘密管理の含意——host-config は秘密管理機構ではない）
+
 **Outbound capability（outbound HTTP）**:
 フィルタが外部へ HTTP を 1 本発行する能力（ext_authz / JWKS 取得 / token introspection / OPA 問い合わせ）。
 標準形 `wasi:http/outgoing-handler` で貸し、他の host-API と同じ deny-by-default ゲート（`Linker`）を通す。

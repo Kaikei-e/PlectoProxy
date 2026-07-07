@@ -1,6 +1,7 @@
 //! Per-request host state ([`HostState`]) and the host-API capability implementations
 //! (deny-by-default: only these are lent to a filter, ADR 000006 / 000011).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
@@ -10,7 +11,7 @@ use wasmtime::{StoreLimits, StoreLimitsBuilder};
 use crate::LogLevel;
 use crate::bindings;
 use crate::bindings::plecto::filter::{
-    host_clock, host_counter, host_kv, host_log, host_ratelimit,
+    host_clock, host_config, host_counter, host_kv, host_log, host_ratelimit,
 };
 #[cfg(feature = "outbound-http")]
 use crate::outbound_http;
@@ -119,18 +120,37 @@ pub struct HostState {
     /// `socket_addr_check` closure inside `wasi` above and the host's ip-name-lookup impl.
     #[cfg(feature = "outbound-tcp")]
     tcp: outbound_tcp::TcpGuard,
+    /// This filter's manifest-declared business config (`[filter.config]`, ADR 000066) — a
+    /// read-only string map the filter reads back via `host-config`. The host never interprets it.
+    config: Arc<BTreeMap<String, String>>,
+}
+
+/// The always-present [`HostState::new`] fields, grouped so the constructor's argument count
+/// stays under clippy's threshold without an `#[allow]` — the outbound capabilities stay
+/// separate, cfg-gated trailing params, since they don't exist in every build.
+pub(crate) struct HostStateInit {
+    pub(crate) kv: Arc<dyn KvBackend>,
+    pub(crate) kv_prefix: String,
+    pub(crate) max_memory_bytes: u64,
+    pub(crate) ratelimit_bucket: Option<Bucket>,
+    pub(crate) quota: Arc<KvQuota>,
+    pub(crate) config: Arc<BTreeMap<String, String>>,
 }
 
 impl HostState {
     pub(crate) fn new(
-        kv: Arc<dyn KvBackend>,
-        kv_prefix: String,
-        max_memory_bytes: u64,
-        ratelimit_bucket: Option<Bucket>,
-        quota: Arc<KvQuota>,
+        init: HostStateInit,
         #[cfg(feature = "outbound-http")] hooks: outbound_http::PlectoHttpHooks,
         #[cfg(feature = "outbound-tcp")] tcp: outbound_tcp::TcpGuard,
     ) -> Self {
+        let HostStateInit {
+            kv,
+            kv_prefix,
+            max_memory_bytes,
+            ratelimit_bucket,
+            quota,
+            config,
+        } = init;
         // The base WasiCtx: empty (no fs, no env, no preopens). With outbound TCP the guard
         // installs its socket_addr_check; otherwise the builder's deny-all socket default stands.
         #[cfg(feature = "outbound-tcp")]
@@ -148,6 +168,7 @@ impl HostState {
                 .build(),
             ratelimit_bucket,
             quota,
+            config,
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
             wasi,
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
@@ -409,6 +430,12 @@ impl host_ratelimit::Host for HostState {
     }
 }
 
+impl host_config::Host for HostState {
+    fn get(&mut self, key: String) -> Option<String> {
+        self.config.get(&key).cloned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for the deny-by-default host-API implementations (ADR 000006 / 000011).
@@ -420,13 +447,22 @@ mod tests {
     use host_kv::Host as KvHost;
     use host_log::Host as LogHost;
 
+    /// A [`HostStateInit`] with test-friendly defaults: a fresh in-memory backend, no rate-limit
+    /// bucket, a fresh quota, and no business config. Callers override individual fields.
+    fn init_for(prefix: &str) -> HostStateInit {
+        HostStateInit {
+            kv: Arc::new(MemoryBackend::default()),
+            kv_prefix: prefix.to_string(),
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            ratelimit_bucket: None,
+            quota: Arc::new(KvQuota::new()),
+            config: Arc::new(BTreeMap::new()),
+        }
+    }
+
     fn state(prefix: &str) -> HostState {
         HostState::new(
-            Arc::new(MemoryBackend::default()),
-            prefix.to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            None,
-            Arc::new(KvQuota::new()),
+            init_for(prefix),
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
@@ -450,22 +486,20 @@ mod tests {
         // (capability isolation across a chain, ADR 000006 / 000011).
         let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
         let mut a = HostState::new(
-            shared.clone(),
-            "filter-a\u{1f}".to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            None,
-            Arc::new(KvQuota::new()),
+            HostStateInit {
+                kv: shared.clone(),
+                ..init_for("filter-a\u{1f}")
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
             crate::outbound_tcp::TcpGuard::deny_all(),
         );
         let mut b = HostState::new(
-            shared.clone(),
-            "filter-b\u{1f}".to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            None,
-            Arc::new(KvQuota::new()),
+            HostStateInit {
+                kv: shared.clone(),
+                ..init_for("filter-b\u{1f}")
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
@@ -492,22 +526,20 @@ mod tests {
         // (cross-tenant leakage, CWE-200). Only the `_KV_` test covered this before.
         let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
         let mut a = HostState::new(
-            shared.clone(),
-            "filter-a\u{1f}".to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            None,
-            Arc::new(KvQuota::new()),
+            HostStateInit {
+                kv: shared.clone(),
+                ..init_for("filter-a\u{1f}")
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
             crate::outbound_tcp::TcpGuard::deny_all(),
         );
         let mut b = HostState::new(
-            shared.clone(),
-            "filter-b\u{1f}".to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            None,
-            Arc::new(KvQuota::new()),
+            HostStateInit {
+                kv: shared.clone(),
+                ..init_for("filter-b\u{1f}")
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
@@ -549,22 +581,22 @@ mod tests {
         // The bucket spec is host-configured (ADR 000026), so each filter's HostState carries it.
         let shared: Arc<dyn KvBackend> = Arc::new(MemoryBackend::default());
         let mut a = HostState::new(
-            shared.clone(),
-            "filter-a\u{1f}".to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            Some(one_token_no_refill()),
-            Arc::new(KvQuota::new()),
+            HostStateInit {
+                kv: shared.clone(),
+                ratelimit_bucket: Some(one_token_no_refill()),
+                ..init_for("filter-a\u{1f}")
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
             crate::outbound_tcp::TcpGuard::deny_all(),
         );
         let mut b = HostState::new(
-            shared.clone(),
-            "filter-b\u{1f}".to_string(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            Some(one_token_no_refill()),
-            Arc::new(KvQuota::new()),
+            HostStateInit {
+                kv: shared.clone(),
+                ratelimit_bucket: Some(one_token_no_refill()),
+                ..init_for("filter-b\u{1f}")
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
@@ -656,11 +688,11 @@ mod tests {
         let prefix = "f\u{1f}".to_string();
 
         let mut seed = HostState::new(
-            shared.clone(),
-            prefix.clone(),
-            DEFAULT_MAX_MEMORY_BYTES,
-            None,
-            quota.clone(),
+            HostStateInit {
+                kv: shared.clone(),
+                quota: quota.clone(),
+                ..init_for(&prefix)
+            },
             #[cfg(feature = "outbound-http")]
             outbound_http::PlectoHttpHooks::deny_all(),
             #[cfg(feature = "outbound-tcp")]
@@ -686,11 +718,11 @@ mod tests {
                 let b = barrier.clone();
                 thread::spawn(move || {
                     let mut s = HostState::new(
-                        kv,
-                        p,
-                        DEFAULT_MAX_MEMORY_BYTES,
-                        None,
-                        q,
+                        HostStateInit {
+                            kv,
+                            quota: q,
+                            ..init_for(&p)
+                        },
                         #[cfg(feature = "outbound-http")]
                         outbound_http::PlectoHttpHooks::deny_all(),
                         #[cfg(feature = "outbound-tcp")]

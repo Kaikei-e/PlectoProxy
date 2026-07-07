@@ -136,6 +136,17 @@ interface host-ratelimit {
     try-acquire: func(key: string, cost: u64) -> acquire;
 }
 
+// --- host-config: read-only, manifest-declared business config (ADR 000066). A generic
+// --- string passthrough — the host does not interpret keys or values, only the filter does.
+// --- Operator-owned (the filter cannot write it), same ownership model as host-ratelimit's
+// --- bucket spec. Absence of a key just means it was not declared in `[filter.config]`; a
+// --- filter that requires a key validates it itself (typically in `init`, trapping on a
+// --- missing/invalid value — combined with `isolation = "trusted"` this surfaces as a load
+// --- failure rather than a per-request one, ADR 000066 §Decision 4).
+interface host-config {
+    get: func(key: string) -> option<string>;
+}
+
 // The base contract: header-only filters (auth, rate-limit, header rewrite) implement exactly this.
 // It deliberately does NOT export `on-request-body`, so the host can tell — by the ABSENCE of that
 // export (ADR 000005 mechanism 2 / ADR 000038) — that this filter never reads the request body, and
@@ -151,6 +162,7 @@ world filter {
     import host-kv;
     import host-counter;
     import host-ratelimit;
+    import host-config;
 
     // heavy, once-per-instance initialisation (Tenet 4)
     export init: func();
@@ -175,6 +187,7 @@ world filter-body {
     import host-kv;
     import host-counter;
     import host-ratelimit;
+    import host-config;
 
     export init: func();
     export on-request: func(req: http-request) -> request-decision;

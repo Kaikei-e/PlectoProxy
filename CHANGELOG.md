@@ -18,6 +18,38 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-09
+
+### Added
+
+- Fat-guest minimal WASI grant (ADR 000063, feature-gated `fat-guest`, off by default): a fixed,
+  minimal WASI slice (`wasi:io` / `wasi:clocks` / `wasi:random` / `wasi:cli`, plus an empty
+  `wasi:filesystem` — never filesystem access, never sockets) opt-in per filter via manifest
+  `wasi = "minimal"`, for guest language runtimes that assume some baseline WASI is present.
+  Unlocks Go/TinyGo as the first **Tier B** polyglot filter language (`filter-hello-go`),
+  alongside the existing zero-WASI **Tier A** trio (Rust / MoonBit / JS / C, ADR 000055). A fat
+  guest's stdout/stderr is bridged into its `host-log` (stdout → debug, stderr → warn; 4 KiB/line,
+  64 KiB/request combined, truncate-and-warn-once past the budget) — including an unterminated
+  final line — so a trap's own diagnostic output (a TinyGo panic message, say) still reaches the
+  request's span instead of being lost with the discarded instance. Deny-by-default holds either
+  way: a fat guest fails to instantiate unless BOTH the host's `fat-guest` build and the filter's
+  `wasi = "minimal"` declaration are present, and the grant alone does not satisfy a
+  `wasi:sockets` / `wasi:http` import — those stay separate, allowlisted capabilities
+  (`outbound_http` / `outbound_tcp`, ADR 000036 / 000060).
+
+## [0.2.2] - 2026-07-08
+
+### Added
+
+- Opt-in shared TLS session-ticket keys (ADR 000062, manifest `[resumption] stek_file`): replicas
+  behind a round-robin load balancer recover TLS 1.3 resumption hit rate by deriving session
+  ticket keys deterministically from (key-file contents, cert set) via HKDF, so every replica
+  agrees without coordination, while a shared file cannot cross deployments serving different
+  certs (the class of issue behind CVE-2025-23419 / CVE-2025-23048). Ticket construction is
+  AES-256-CBC + HMAC-SHA-256 (encrypt-then-MAC), matching rustls' own move away from GCM for
+  session tickets. Default per-node behavior (ADR 000052) is unchanged when `[resumption]` is
+  absent.
+
 ## [0.2.1] - 2026-07-08
 
 ### Changed

@@ -65,6 +65,11 @@ rustls = { workspace = true }
 # webpki-roots: the Mozilla root store the upstream TLS client (ADR 000042) verifies against when
 # no `[upstream.tls] ca_path` names an internal CA. Compiled-in (no OS cert-store I/O at runtime).
 webpki-roots = { workspace = true }
+# aws-lc-rs (direct, beyond the rustls provider): the shared-STEK ticketer (ADR 000062) derives
+# per-cert-set ticket keys with HKDF and seals tickets with AES-256-CBC + HMAC-SHA-256 — only
+# aws-lc-rs primitives, per the ADR (one crypto backend, ADR 000051). Version-unified with the
+# rustls `aws_lc_rs` feature's own dependency by cargo.
+aws-lc-rs = "1"
 
 [dev-dependencies]
 # this crate's own integration tests load real fixture components via plecto-host's test_support
@@ -75,6 +80,10 @@ plecto-host = { path = "../host", features = ["test-support"] }
 tempfile = "3"
 # rcgen: a fresh self-signed cert to unit-test the TCP/QUIC ServerConfig builder (ADR 000014/000016).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# proptest: pins the shared-STEK key schedule and ticket seal/open (ADR 000062) — determinism of
+# the HKDF derivation, roundtrip over arbitrary plaintexts, and decrypt-never-panics over
+# arbitrary attacker bytes.
+proptest = "1"
 # criterion: in-process micro-benchmarks for the fast-path hot functions (LB pick, route match,
 # path normalization). `default-features = false` drops plotters/rayon — we only need the bench
 # harness + baseline comparison (the CI regression gate uses --save-baseline / --baseline).

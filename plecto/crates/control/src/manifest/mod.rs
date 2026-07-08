@@ -5,8 +5,8 @@
 //!
 //! Split by concern: this module holds only `Manifest` itself + `Manifest::from_toml`. Each
 //! `[section]`'s schema (every `struct`/`enum` + its serde defaults) lives in its own sibling
-//! module — `listen`, `observability`, `tls`, `upstream`, `route`, `state`, `trust`,
-//! `filter_entry`, `chain` — and is re-exported here so `crate::manifest::X` keeps resolving for
+//! module — `listen`, `observability`, `tls`, `resumption`, `upstream`, `route`, `state`,
+//! `trust`, `filter_entry`, `chain` — and is re-exported here so `crate::manifest::X` keeps resolving for
 //! every type. `validate` holds the build-time validation (`Upstream::validate_lb`,
 //! `FilterEntry::validate`, `State::validate`), `content_hash` holds the semantic content-hash,
 //! and `lowering` holds `FilterEntry::load_options` (manifest → host `LoadOptions`).
@@ -17,6 +17,7 @@ mod filter_entry;
 mod listen;
 mod lowering;
 mod observability;
+mod resumption;
 mod route;
 mod state;
 mod tls;
@@ -44,6 +45,7 @@ pub use listen::{Listen, ProxyProtocolTrust};
 #[allow(unused_imports)]
 pub use listen::{Drain, ProxyProtocol};
 pub use observability::Observability;
+pub use resumption::Resumption;
 pub(crate) use route::MAX_BACKEND_WEIGHT;
 pub use route::{RateLimitKeyKind, Route, RouteRateLimit};
 // `Backend` / `RouteMatch` / `RouteUpgrade` are only named via `crate::manifest::X` from
@@ -97,6 +99,12 @@ pub struct Manifest {
     /// HTTP/1.1 (the fast path serves TLS only when at least one cert is declared).
     #[serde(default, rename = "tls")]
     pub tls: Vec<TlsCert>,
+    /// `[resumption]`: opt-in shared session-ticket keys across replicas (ADR 000062). `None`
+    /// (the default) keeps the per-node, process-lifetime ticket key (ADR 000052). Rides the
+    /// content hash like `[[tls]]` and is rebuilt on reload — the keys derive deterministically
+    /// from (file, cert set), so a rebuild with unchanged inputs keeps outstanding tickets valid.
+    #[serde(default)]
+    pub resumption: Option<Resumption>,
     /// `[observability]`: operational metrics / access-log / admin-endpoint config (ADR 000009),
     /// captured at construction. `skip_serializing` keeps it OUT of the semantic `content_hash`, so
     /// toggling observability never counts as a config-version change (it is not part of the

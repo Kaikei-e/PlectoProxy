@@ -49,6 +49,7 @@ mod reload;
 mod rng;
 mod route;
 mod snapshot;
+mod stek;
 mod tls;
 mod upstream;
 mod weighted;
@@ -346,7 +347,7 @@ pub fn validate_manifest(manifest: &Manifest, base_dir: &Path) -> Result<String,
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
     route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
-    tls::build_server_configs(&manifest.tls, base_dir)?;
+    tls::build_server_configs(&manifest.tls, manifest.resumption.as_ref(), base_dir)?;
     // A throwaway registry runs the full upstream validation (names, LB, `[upstream.tls]` CA
     // loads) without touching any live state.
     UpstreamRegistry::new().reconcile(&manifest.upstreams, base_dir)?;
@@ -499,10 +500,11 @@ fn build_active(
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
     // from `[[tls]]`, sharing one SNI cert resolver. A bad cert is fail-closed here, so a failed
     // reload never swaps in a TLS config that cannot serve. Built before the registry is touched.
-    let (tls, quic_tls) = match tls::build_server_configs(&manifest.tls, base_dir)? {
-        Some(configs) => (Some(configs.tcp), Some(configs.quic)),
-        None => (None, None),
-    };
+    let (tls, quic_tls) =
+        match tls::build_server_configs(&manifest.tls, manifest.resumption.as_ref(), base_dir)? {
+            Some(configs) => (Some(configs.tcp), Some(configs.quic)),
+            None => (None, None),
+        };
 
     // Compute the content hash BEFORE the registry reconcile (review f000005 P3#8). `reconcile`
     // is the step that MUTATES persistent state (the health registry, which survives reloads), so

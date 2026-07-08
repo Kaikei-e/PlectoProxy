@@ -149,6 +149,14 @@ pub enum ControlError {
         reason: String,
     },
 
+    /// The `[resumption]` shared-STEK config (ADR 000062) is invalid or its key file failed the
+    /// fail-closed startup discipline: out-of-range `max_age_hours`, no `[[tls]]` cert to bind
+    /// tickets to, a key file that is unreadable / not exactly 64 raw bytes / readable by group
+    /// or other, or a cert whose SPKI the provider cannot expose (nothing to bind to). All abort
+    /// the build like a bad cert — a proxy never comes up sharing ticket keys it cannot protect.
+    #[error("[resumption] stek_file {path:?}: {reason}")]
+    Stek { path: String, reason: String },
+
     /// An `[upstream.tls]` CA bundle could not be read or parsed, or yielded no usable root
     /// (ADR 000042). Fail-closed at build, like `TlsCert`: a bad CA path aborts the build /
     /// reload before the upstream registry mutates, so the forward leg never silently falls

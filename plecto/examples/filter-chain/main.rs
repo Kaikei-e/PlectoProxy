@@ -60,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
 
     let control = Arc::new(Control::from_manifest_path(&manifest_path)?);
 
-    let listener = TcpListener::bind(PROXY_ADDR).await?;
+    // Overridable (PLECTO_PROXY_ADDR) so a host whose default port is taken can move it.
+    let proxy_addr = std::env::var("PLECTO_PROXY_ADDR").unwrap_or_else(|_| PROXY_ADDR.to_string());
+    let listener = TcpListener::bind(&proxy_addr).await?;
     let proxy = listener.local_addr()?;
     tokio::spawn(async move {
         if let Err(e) = serve(control, listener).await {

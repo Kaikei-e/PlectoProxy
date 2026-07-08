@@ -83,10 +83,19 @@ async fn main() -> anyhow::Result<()> {
     // new tree). This dir is that ops step.
     std::fs::create_dir_all(deploy.join("state"))?;
 
-    let manifest_path = deploy.join("manifest.toml");
-    std::fs::write(&manifest_path, manifest_toml(&digest, i1, i2, i3))?;
+    // Overridable (PLECTO_PROXY_ADDR / PLECTO_ADMIN_ADDR) so a host whose default ports are
+    // taken can move them. PROXY_ADDR is only ever printed (STEP 2 starts a separate binary
+    // with it as a CLI arg); ADMIN_ADDR is also baked into the manifest's [observability].
+    let proxy_addr = std::env::var("PLECTO_PROXY_ADDR").unwrap_or_else(|_| PROXY_ADDR.to_string());
+    let admin_addr = std::env::var("PLECTO_ADMIN_ADDR").unwrap_or_else(|_| ADMIN_ADDR.to_string());
 
-    print_banner(&deploy, &manifest_path);
+    let manifest_path = deploy.join("manifest.toml");
+    std::fs::write(
+        &manifest_path,
+        manifest_toml(&digest, i1, i2, i3, &proxy_addr, &admin_addr),
+    )?;
+
+    print_banner(&deploy, &manifest_path, &proxy_addr, &admin_addr);
     tokio::signal::ctrl_c().await?;
     println!(
         "\nbackend fleet stopped. The deploy dir stays for inspection: {}",
@@ -136,10 +145,17 @@ async fn spawn_instance(label: &'static str) -> anyhow::Result<SocketAddr> {
     Ok(addr)
 }
 
-fn manifest_toml(digest: &str, i1: SocketAddr, i2: SocketAddr, i3: SocketAddr) -> String {
+fn manifest_toml(
+    digest: &str,
+    i1: SocketAddr,
+    i2: SocketAddr,
+    i3: SocketAddr,
+    proxy_addr: &str,
+    admin_addr: &str,
+) -> String {
     format!(
         r#"# Plecto production-shaped manifest — served by the real `plecto` binary:
-#   cargo run -q -p plecto-server -- target/production-demo/manifest.toml {PROXY_ADDR}
+#   cargo run -q -p plecto-server -- target/production-demo/manifest.toml {proxy_addr}
 # Edit anything below and `kill -HUP <plecto pid>` to reload with zero downtime (ADR 000039).
 
 [trust]
@@ -157,7 +173,7 @@ digest = "{digest}"
 isolation = "trusted"
 
 [observability]
-admin_addr = "{ADMIN_ADDR}"     # /metrics /healthz /readyz — never on the data-plane port
+admin_addr = "{admin_addr}"     # /metrics /healthz /readyz — never on the data-plane port
 access_log = true                 # one structured JSON event per request
 
 [[upstream]]
@@ -186,7 +202,7 @@ key = "client-ip"
     )
 }
 
-fn print_banner(deploy: &Path, manifest: &Path) {
+fn print_banner(deploy: &Path, manifest: &Path, proxy_addr: &str, admin_addr: &str) {
     let deploy = deploy.display();
     println!("\n  Plecto demo — a production-shaped deployment (real binary + manifest.toml)\n");
     println!("  deploy dir : {deploy}");
@@ -196,27 +212,27 @@ fn print_banner(deploy: &Path, manifest: &Path) {
         "\n  STEP 1 — done: the deploy dir is prepared (signed filter, trust root, manifest)."
     );
     println!("\n  STEP 2 — in a SECOND terminal, start the real gateway binary on it:\n");
-    println!("    cargo run -q -p plecto-server -- {deploy}/manifest.toml {PROXY_ADDR}");
+    println!("    cargo run -q -p plecto-server -- {deploy}/manifest.toml {proxy_addr}");
     println!("\n  STEP 3 — exercise it like an operator (this terminal):\n");
     println!("    # auth: no key → the signed WASM filter short-circuits 401");
-    println!("    curl -s -o /dev/null -w 'HTTP %{{http_code}}\\n' http://{PROXY_ADDR}/api/data");
+    println!("    curl -s -o /dev/null -w 'HTTP %{{http_code}}\\n' http://{proxy_addr}/api/data");
     println!("    # …a valid key → 200, identity stamped, least-request spread across api-1/2/3");
     println!(
-        "    for i in $(seq 6); do curl -s -H 'x-api-key: alice-secret' http://{PROXY_ADDR}/api/data; done"
+        "    for i in $(seq 6); do curl -s -H 'x-api-key: alice-secret' http://{proxy_addr}/api/data; done"
     );
     println!();
     println!("    # native rate-limit floor (5 rps, burst 10, per client IP): burst through it");
     println!(
-        "    for i in $(seq 14); do curl -s -o /dev/null -w '%{{http_code}} ' -H 'x-api-key: alice-secret' http://{PROXY_ADDR}/api/data; done; echo"
+        "    for i in $(seq 14); do curl -s -o /dev/null -w '%{{http_code}} ' -H 'x-api-key: alice-secret' http://{proxy_addr}/api/data; done; echo"
     );
     println!("    #   → what's left of the burst passes (200), then 429s with");
     println!("    #     x-plecto-fault: rate-limited + retry-after (the floor counted the");
     println!("    #     auth curls above too — it runs before the chain, even on a 401)");
     println!();
     println!("    # the admin endpoint — RED metrics, filter spans, readiness (its own port):");
-    println!("    curl -s http://{ADMIN_ADDR}/metrics | grep -E '^plecto_' | head");
+    println!("    curl -s http://{admin_addr}/metrics | grep -E '^plecto_' | head");
     println!(
-        "    curl -s -o /dev/null -w 'readyz: HTTP %{{http_code}}\\n' http://{ADMIN_ADDR}/readyz"
+        "    curl -s -o /dev/null -w 'readyz: HTTP %{{http_code}}\\n' http://{admin_addr}/readyz"
     );
     println!();
     println!("    # ops: edit {deploy}/manifest.toml (e.g. rate = 50), then reload / drain:");

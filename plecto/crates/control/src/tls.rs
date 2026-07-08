@@ -5,9 +5,11 @@
 //! failed reload never swaps in a TLS config that cannot serve, and the config rides `ActiveConfig`
 //! behind the same `ArcSwap` as the filter set. Sync rustls + the `aws_lc_rs` provider (ADR
 //! 000051 — one crypto backend shared with the QUIC config and the host's `sigstore` dependency);
-//! the async acceptor lives in `plecto-server`. Session resumption is stateless (ADR 000052): one
-//! process-lifetime ticket key (6h rotation / 12h window, node-local per ADR 000053), no stateful
-//! session cache, 0-RTT refused as an invariant.
+//! the async acceptor lives in `plecto-server`. Session resumption is stateless (ADR 000052): by
+//! default one process-lifetime ticket key (6h rotation / 12h window, node-local per ADR 000053),
+//! or — opt-in via `[resumption]` (ADR 000062) — cert-bound keys derived from a shared file
+//! (`stek.rs`) so tickets resume across replicas. Either way: no stateful session cache, 0-RTT
+//! refused as an invariant.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,7 +23,8 @@ use rustls::server::{ClientHello, NoServerSessionStorage, ProducesTickets, Resol
 use rustls::sign::CertifiedKey;
 
 use crate::error::ControlError;
-use crate::manifest::TlsCert;
+use crate::manifest::{Resumption, TlsCert};
+use crate::stek::SharedStekTicketer;
 
 /// SNI cert selection (ADR 000014): a per-host cert map plus an optional default. `resolve` is
 /// called by rustls during the handshake with the client's SNI; no match and no default → `None`,
@@ -82,16 +85,29 @@ pub(crate) struct TlsConfigs {
 /// advertises `[h3]` and is TLS-1.3 only (QUIC mandates 1.3, RFC 9001). Both share one `SniResolver`.
 pub(crate) fn build_server_configs(
     entries: &[TlsCert],
+    resumption: Option<&Resumption>,
     base_dir: &Path,
 ) -> Result<Option<TlsConfigs>, ControlError> {
     if entries.is_empty() {
+        // `[resumption]` without any `[[tls]]` is a config mistake, not a no-op: the operator
+        // asked for cross-replica resumption on a proxy that terminates no TLS. Fail closed.
+        if let Some(resumption) = resumption {
+            return Err(ControlError::Stek {
+                path: resumption.stek_file.clone(),
+                reason: "[resumption] requires at least one [[tls]] cert (ticket keys bind to \
+                         the cert set, ADR 000062)"
+                    .to_string(),
+            });
+        }
         return Ok(None);
     }
 
     let mut by_host: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
     let mut default: Option<Arc<CertifiedKey>> = None;
+    let mut all_certified: Vec<Arc<CertifiedKey>> = Vec::with_capacity(entries.len());
     for entry in entries {
         let certified = Arc::new(load_certified_key(entry, base_dir)?);
+        all_certified.push(certified.clone());
         match &entry.host {
             Some(host) => {
                 if by_host
@@ -111,8 +127,18 @@ pub(crate) fn build_server_configs(
 
     // One resolver, shared by both configs (Arc clone): SNI selects the same cert over TCP and QUIC.
     let resolver = Arc::new(SniResolver { by_host, default });
-    // One ticket producer, ditto (ADR 000052): stateless TLS 1.3 resumption over both paths.
-    let ticketer = shared_ticketer()?;
+    // One ticket producer, ditto: stateless TLS 1.3 resumption over both paths. Default is the
+    // per-node process-lifetime key (ADR 000052); `[resumption]` swaps in the shared cert-bound
+    // ticketer (ADR 000062) — rebuilt each build, which is safe because its keys are a pure
+    // function of (key file, cert set): unchanged inputs re-derive the same keys across reloads.
+    let ticketer: Arc<dyn ProducesTickets> = match resumption {
+        Some(resumption) => SharedStekTicketer::from_manifest(
+            resumption,
+            base_dir,
+            cert_set_binding(&all_certified, resumption)?,
+        )?,
+        None => shared_ticketer()?,
+    };
 
     // TCP: HTTP/1.1 + HTTP/2 via ALPN (h2 preferred, ADR 000015), TLS 1.2 + 1.3.
     let mut tcp = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
@@ -215,6 +241,47 @@ pub(crate) fn parse_upstream_sni(
     })
 }
 
+/// The cert-set binding identity fed to the shared-STEK key schedule (ADR 000062 (a)): SHA-256
+/// over the sorted, deduplicated SPKI SHA-256 fingerprints of every `[[tls]]` cert. SPKI (the
+/// RFC 7469 pin basis), not the whole cert: the key pair is the cryptographic identity, so a
+/// routine renewal under the same key keeps outstanding tickets resumable, while any cert-set
+/// difference between deployments derives disjoint ticket keys. `ProducesTickets` is per-config
+/// (rustls cannot tell the ticketer which SNI cert a handshake selected), so the binding is the
+/// SET — cross-SNI acceptance inside one config is separately refused by rustls' own SNI match
+/// on resumption (`resumedata.sni == sni`, pinned by an E2E test).
+///
+/// The SPKI comes from the loaded private key (`SigningKey::public_key`), not from parsing the
+/// cert: `load_certified_key` already verified they match (`keys_match`), and this avoids an
+/// X.509 parser dependency. A provider that cannot expose it fails the build closed — shared
+/// STEK without a binding identity is exactly the unbound sharing the ADR rejects.
+fn cert_set_binding(
+    certified: &[Arc<CertifiedKey>],
+    resumption: &Resumption,
+) -> Result<[u8; 32], ControlError> {
+    use sha2::{Digest, Sha256};
+    let mut fingerprints: Vec<[u8; 32]> = Vec::with_capacity(certified.len());
+    for certified_key in certified {
+        let spki = certified_key
+            .key
+            .public_key()
+            .ok_or_else(|| ControlError::Stek {
+                path: resumption.stek_file.clone(),
+                reason:
+                    "a [[tls]] key's SPKI is unavailable from the provider; shared STEK cannot \
+                     bind tickets to the cert set (ADR 000062 (a))"
+                        .to_string(),
+            })?;
+        fingerprints.push(Sha256::digest(spki.as_ref()).into());
+    }
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    let mut hasher = Sha256::new();
+    for fingerprint in &fingerprints {
+        hasher.update(fingerprint);
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// A rustls provider/version init failure (not a per-cert fault) mapped to a fail-closed error.
 fn provider_init_err(e: rustls::Error) -> ControlError {
     ControlError::TlsCert {
@@ -301,6 +368,21 @@ impl crate::Control {
 mod tests {
     use super::*;
 
+    /// A 64-byte owner-only key file + `[resumption]` entry in `dir` (shared STEK, ADR 000062).
+    fn resumption_entry(dir: &Path, fill: u8) -> Resumption {
+        let path = dir.join("stek.key");
+        std::fs::write(&path, [fill; crate::stek::STEK_FILE_LEN]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        Resumption {
+            stek_file: path.to_str().unwrap().to_string(),
+            max_age_hours: 24,
+        }
+    }
+
     /// A fresh self-signed cert written to a temp dir, plus a host-less (default) `[[tls]]` entry.
     fn default_cert_entry() -> (tempfile::TempDir, TlsCert) {
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -320,7 +402,7 @@ mod tests {
     #[test]
     fn builds_tcp_and_quic_configs_with_distinct_alpn() {
         let (dir, entry) = default_cert_entry();
-        let configs = build_server_configs(&[entry], dir.path())
+        let configs = build_server_configs(&[entry], None, dir.path())
             .unwrap()
             .expect("a cert entry yields TCP + QUIC configs");
         // TCP advertises h2 then http/1.1 (ADR 000015); QUIC advertises only h3 (ADR 000016).
@@ -341,7 +423,7 @@ mod tests {
         // ADR 000052's invariants, pinned per path so a rustls default change (or a refactor that
         // touches only one config) cannot silently reintroduce the stateful cache or 0-RTT.
         let (dir, entry) = default_cert_entry();
-        let configs = build_server_configs(&[entry], dir.path())
+        let configs = build_server_configs(&[entry], None, dir.path())
             .unwrap()
             .expect("a cert entry yields TCP + QUIC configs");
         for (label, config) in [("tcp", &configs.tcp), ("quic", &configs.quic)] {
@@ -372,10 +454,12 @@ mod tests {
         // the SAME producer across rebuilds — a manifest reload must not invalidate outstanding
         // tickets (ADR 000052: process-lifetime, node-local key).
         let (dir, entry) = default_cert_entry();
-        let a = build_server_configs(std::slice::from_ref(&entry), dir.path())
+        let a = build_server_configs(std::slice::from_ref(&entry), None, dir.path())
             .unwrap()
             .unwrap();
-        let b = build_server_configs(&[entry], dir.path()).unwrap().unwrap();
+        let b = build_server_configs(&[entry], None, dir.path())
+            .unwrap()
+            .unwrap();
         assert!(
             Arc::ptr_eq(&a.tcp.ticketer, &a.quic.ticketer),
             "TCP and QUIC share one ticket producer"
@@ -389,7 +473,7 @@ mod tests {
     #[test]
     fn no_tls_entries_yields_none() {
         assert!(
-            build_server_configs(&[], std::path::Path::new("."))
+            build_server_configs(&[], None, std::path::Path::new("."))
                 .unwrap()
                 .is_none(),
             "no [[tls]] means no TLS/QUIC configs (plain HTTP/1.1, no h3)"
@@ -412,10 +496,122 @@ mod tests {
             cert_path: cert_path.to_str().unwrap().to_string(),
             key_path: key_path.to_str().unwrap().to_string(),
         };
-        let err = match build_server_configs(&[entry], dir.path()) {
+        let err = match build_server_configs(&[entry], None, dir.path()) {
             Err(e) => e,
             Ok(_) => panic!("a mismatched cert/key pair must be rejected at build"),
         };
         assert!(matches!(err, ControlError::TlsCert { .. }));
+    }
+
+    // ----- ADR 000062: [resumption] shared STEK -----
+
+    #[test]
+    fn shared_stek_keeps_the_resumption_invariants() {
+        // ADR 000062 (c): opting into the shared ticketer changes the KEY, not the posture —
+        // stateless tickets on, no session cache, 0-RTT refused, on both paths. The lifetime
+        // hint becomes max_age_hours (the acceptance window the key file discipline enforces).
+        let (dir, entry) = default_cert_entry();
+        let resumption = resumption_entry(dir.path(), 7);
+        let configs = build_server_configs(&[entry], Some(&resumption), dir.path())
+            .unwrap()
+            .unwrap();
+        for (label, config) in [("tcp", &configs.tcp), ("quic", &configs.quic)] {
+            assert!(config.ticketer.enabled(), "{label}: tickets are issued");
+            assert_eq!(
+                config.ticketer.lifetime(),
+                24 * 60 * 60,
+                "{label}: the hint is max_age_hours, not the per-node 12h"
+            );
+            assert!(!config.session_storage.can_cache(), "{label}: no cache");
+            assert_eq!(
+                config.max_early_data_size, 0,
+                "{label}: 0-RTT stays refused"
+            );
+        }
+        assert!(
+            Arc::ptr_eq(&configs.tcp.ticketer, &configs.quic.ticketer),
+            "TCP and QUIC share the one shared-STEK producer (same cert set → same keys)"
+        );
+    }
+
+    #[test]
+    fn shared_stek_rebuilds_derive_interchangeable_keys() {
+        // The reload story (ADR 000062): unlike the per-node OnceLock, each build constructs a
+        // FRESH ticketer — outstanding tickets survive anyway because the keys are a pure
+        // function of (file, cert set). Pin that: a ticket sealed by build A opens in build B.
+        let (dir, entry) = default_cert_entry();
+        let resumption = resumption_entry(dir.path(), 7);
+        let a = build_server_configs(std::slice::from_ref(&entry), Some(&resumption), dir.path())
+            .unwrap()
+            .unwrap();
+        let b = build_server_configs(&[entry], Some(&resumption), dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&a.tcp.ticketer, &b.tcp.ticketer),
+            "sanity: rebuilds construct distinct ticketer objects"
+        );
+        let ticket = a.tcp.ticketer.encrypt(b"session-state").unwrap();
+        assert_eq!(
+            b.tcp.ticketer.decrypt(&ticket).as_deref(),
+            Some(&b"session-state"[..]),
+            "a reload (or another replica) re-derives the same keys"
+        );
+    }
+
+    #[test]
+    fn shared_stek_binds_tickets_to_the_cert_set() {
+        // ADR 000062 (a) at the build level: same key file, different cert → the ticket does not
+        // cross (the USENIX'25 cross-listener class, killed in the key schedule).
+        let (dir_a, entry_a) = default_cert_entry();
+        let (dir_b, entry_b) = default_cert_entry(); // a different self-signed key pair
+        let resumption = resumption_entry(dir_a.path(), 7);
+        let a = build_server_configs(&[entry_a], Some(&resumption), dir_a.path())
+            .unwrap()
+            .unwrap();
+        let b = build_server_configs(&[entry_b], Some(&resumption), dir_b.path())
+            .unwrap()
+            .unwrap();
+        let ticket = a.tcp.ticketer.encrypt(b"session-state").unwrap();
+        assert_eq!(
+            b.tcp.ticketer.decrypt(&ticket),
+            None,
+            "a deployment with a different cert set must not accept the ticket"
+        );
+    }
+
+    #[test]
+    fn resumption_without_tls_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let resumption = resumption_entry(dir.path(), 7);
+        let err = match build_server_configs(&[], Some(&resumption), dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("[resumption] with no [[tls]] must fail the build"),
+        };
+        assert!(matches!(err, ControlError::Stek { .. }));
+    }
+
+    #[test]
+    fn shared_stek_bad_file_fails_the_build_closed() {
+        // Wrong length and (on unix) loose permissions abort the build like a bad cert.
+        let (dir, entry) = default_cert_entry();
+        let mut resumption = resumption_entry(dir.path(), 7);
+        std::fs::write(&resumption.stek_file, [7u8; 48]).unwrap();
+        let err =
+            match build_server_configs(std::slice::from_ref(&entry), Some(&resumption), dir.path())
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a 48-byte file must be rejected"),
+            };
+        assert!(matches!(err, ControlError::Stek { .. }));
+
+        // Out-of-range max_age_hours is rejected before the file is touched.
+        resumption = resumption_entry(dir.path(), 7);
+        resumption.max_age_hours = 169;
+        let err = match build_server_configs(&[entry], Some(&resumption), dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("max_age_hours over the RFC 8446 cap must be rejected"),
+        };
+        assert!(matches!(err, ControlError::Stek { .. }));
     }
 }

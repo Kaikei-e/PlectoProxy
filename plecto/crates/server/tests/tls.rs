@@ -32,7 +32,11 @@ struct TestCert {
 }
 
 fn make_cert() -> TestCert {
-    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    make_cert_for("localhost")
+}
+
+fn make_cert_for(host: &str) -> TestCert {
+    let generated = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
@@ -180,8 +184,18 @@ async fn https_get(
 /// built once so callers can SHARE it across connections — a second connection then offers the
 /// first's session ticket, which is what the resumption tests below exercise.
 fn resuming_client_config(root: CertificateDer<'static>) -> Arc<ClientConfig> {
+    resuming_client_config_with_roots(vec![root])
+}
+
+/// [`resuming_client_config`] trusting several roots — for the cross-cert-set tests, where one
+/// client talks to proxies presenting different self-signed certs.
+fn resuming_client_config_with_roots(
+    root_certs: Vec<CertificateDer<'static>>,
+) -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
-    roots.add(root).unwrap();
+    for root in root_certs {
+        roots.add(root).unwrap();
+    }
     Arc::new(
         ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
             .with_safe_default_protocol_versions()
@@ -189,6 +203,20 @@ fn resuming_client_config(root: CertificateDer<'static>) -> Arc<ClientConfig> {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     )
+}
+
+/// A fresh shared STEK file (ADR 000062): 64 raw random-ish bytes, owner-only. Returns the dir
+/// (kept alive) and the absolute path for the manifest's `[resumption] stek_file`.
+fn make_stek(fill: u8) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stek.key");
+    std::fs::write(&path, [fill; 64]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    (dir, path.to_str().unwrap().to_string())
 }
 
 /// One HTTPS GET on a FRESH connection using the shared `config`, returning the handshake kind
@@ -200,9 +228,19 @@ async fn https_get_kind(
     config: Arc<ClientConfig>,
     path: &str,
 ) -> (StatusCode, HandshakeKind) {
+    https_get_kind_sni(proxy, config, "localhost", path).await
+}
+
+/// [`https_get_kind`] with an explicit SNI — for the cross-SNI resumption tests.
+async fn https_get_kind_sni(
+    proxy: SocketAddr,
+    config: Arc<ClientConfig>,
+    sni: &str,
+    path: &str,
+) -> (StatusCode, HandshakeKind) {
     let connector = TlsConnector::from(config);
     let tcp = TcpStream::connect(proxy).await.unwrap();
-    let server_name = ServerName::try_from("localhost").unwrap();
+    let server_name = ServerName::try_from(sni.to_string()).unwrap();
     let tls = connector.connect(server_name, tcp).await.unwrap();
     let kind = tls.get_ref().1.handshake_kind().unwrap();
 
@@ -322,6 +360,174 @@ async fn ticket_resumes_across_config_rebuilds() {
         cross,
         HandshakeKind::Resumed,
         "a ticket from before the rebuild resumes after it (process-lifetime key, ADR 000052)"
+    );
+}
+
+#[tokio::test]
+async fn shared_stek_ticket_resumes_across_replicas() {
+    // ADR 000062: two INDEPENDENT proxies (two replicas behind a round-robin LB in miniature)
+    // pointed at one [resumption] stek_file and serving the same cert. A ticket issued by one
+    // must resume on the other — that recovered hit rate is the entire point of the opt-in.
+    // Unlike `ticket_resumes_across_config_rebuilds` (process-lifetime OnceLock key), each
+    // Control here builds its own shared-STEK ticketer; only the deterministic derivation from
+    // (file, cert set) makes their tickets interchangeable.
+    let cert = make_cert();
+    let (_stek_dir, stek_path) = make_stek(7);
+    let upstream = spawn_upstream().await;
+    let block = format!(
+        "\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n[resumption]\nstek_file = \"{}\"\n",
+        cert.cert_path, cert.key_path, stek_path
+    );
+    let toml = manifest_toml(upstream, "{digest}", &block);
+    let proxy_a = spawn_proxy(Arc::new(loaded_control(&toml).unwrap())).await;
+    let proxy_b = spawn_proxy(Arc::new(loaded_control(&toml).unwrap())).await;
+    let config = resuming_client_config(cert.cert_der.clone());
+
+    let (_, first) = https_get_kind(proxy_a, config.clone(), "/api/hello").await;
+    assert_eq!(first, HandshakeKind::Full);
+    let (_, cross) = https_get_kind(proxy_b, config, "/api/hello").await;
+    assert_eq!(
+        cross,
+        HandshakeKind::Resumed,
+        "replica B accepts replica A's ticket (shared STEK, same cert set — ADR 000062)"
+    );
+}
+
+#[tokio::test]
+async fn shared_stek_ticket_does_not_cross_cert_sets() {
+    // ADR 000062 (a), the E2E the ADR's Cons section demands: two deployments SHARING the key
+    // file but serving DIFFERENT certs (the USENIX'25 "STEK Sharing is Not Caring" shape behind
+    // nginx CVE-2025-23419 / Apache CVE-2025-23048). The HKDF cert binding must make replica B
+    // reject replica A's ticket — a full handshake, not a cross-deployment resumption.
+    let cert_a = make_cert();
+    let cert_b = make_cert(); // same SNI "localhost", different key pair = different cert set
+    let (_stek_dir, stek_path) = make_stek(7);
+    let upstream = spawn_upstream().await;
+    let block = |cert: &TestCert| {
+        format!(
+            "\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n[resumption]\nstek_file = \"{}\"\n",
+            cert.cert_path, cert.key_path, stek_path
+        )
+    };
+    let proxy_a = spawn_proxy(Arc::new(
+        loaded_control(&manifest_toml(upstream, "{digest}", &block(&cert_a))).unwrap(),
+    ))
+    .await;
+    let proxy_b = spawn_proxy(Arc::new(
+        loaded_control(&manifest_toml(upstream, "{digest}", &block(&cert_b))).unwrap(),
+    ))
+    .await;
+    // One client trusting both certs, one shared session cache: it WILL offer A's ticket to B.
+    let config =
+        resuming_client_config_with_roots(vec![cert_a.cert_der.clone(), cert_b.cert_der.clone()]);
+
+    let (_, first) = https_get_kind(proxy_a, config.clone(), "/api/hello").await;
+    assert_eq!(first, HandshakeKind::Full);
+    let (_, cross) = https_get_kind(proxy_b, config, "/api/hello").await;
+    assert_eq!(
+        cross,
+        HandshakeKind::Full,
+        "a different cert set must NOT accept the ticket despite the shared key file \
+         (cert binding, ADR 000062 (a))"
+    );
+}
+
+/// A deliberately SNI-confused client session store: every ticket is cached — and offered —
+/// under one pinned key, so a ticket obtained from `a.localhost` is offered when connecting to
+/// `b.localhost`. This is the client half of the CVE-2025-23419 crossing shape; a correct stack
+/// must answer it with a full handshake (rustls' server refuses resumption when the ticket's SNI
+/// differs — `can_resume`, verified at rustls 0.23.41 `server/hs.rs:57`).
+#[derive(Debug)]
+struct SniConfusedStore(tokio_rustls::rustls::client::ClientSessionMemoryCache);
+
+fn pinned() -> ServerName<'static> {
+    ServerName::try_from("pinned.invalid").unwrap()
+}
+
+impl tokio_rustls::rustls::client::ClientSessionStore for SniConfusedStore {
+    fn set_kx_hint(&self, _: ServerName<'static>, group: tokio_rustls::rustls::NamedGroup) {
+        self.0.set_kx_hint(pinned(), group);
+    }
+    fn kx_hint(&self, _: &ServerName<'_>) -> Option<tokio_rustls::rustls::NamedGroup> {
+        self.0.kx_hint(&pinned())
+    }
+    fn set_tls12_session(
+        &self,
+        _: ServerName<'static>,
+        value: tokio_rustls::rustls::client::Tls12ClientSessionValue,
+    ) {
+        self.0.set_tls12_session(pinned(), value);
+    }
+    fn tls12_session(
+        &self,
+        _: &ServerName<'_>,
+    ) -> Option<tokio_rustls::rustls::client::Tls12ClientSessionValue> {
+        self.0.tls12_session(&pinned())
+    }
+    fn remove_tls12_session(&self, _: &ServerName<'static>) {
+        self.0.remove_tls12_session(&pinned());
+    }
+    fn insert_tls13_ticket(
+        &self,
+        _: ServerName<'static>,
+        value: tokio_rustls::rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.0.insert_tls13_ticket(pinned(), value);
+    }
+    fn take_tls13_ticket(
+        &self,
+        _: &ServerName<'static>,
+    ) -> Option<tokio_rustls::rustls::client::Tls13ClientSessionValue> {
+        self.0.take_tls13_ticket(&pinned())
+    }
+}
+
+#[tokio::test]
+async fn ticket_does_not_resume_across_sni_hosts_within_one_proxy() {
+    // The within-one-listener half of the CVE-2025-23419 shape: one proxy, two SNI vhosts,
+    // shared STEK on. A client that (maliciously or buggily) replays vhost A's ticket at vhost B
+    // must get a full handshake. Our ticketer cannot see the SNI (it is per-config), so this
+    // rests on rustls' own resumption SNI match — which is exactly why the test pins the
+    // OUTCOME end-to-end: if a rustls upgrade ever relaxed it, this fails and the shared-STEK
+    // threat model needs revisiting.
+    let cert_a = make_cert_for("a.localhost");
+    let cert_b = make_cert_for("b.localhost");
+    let (_stek_dir, stek_path) = make_stek(7);
+    let upstream = spawn_upstream().await;
+    let block = format!(
+        "\n[[tls]]\nhost = \"a.localhost\"\ncert_path = \"{}\"\nkey_path = \"{}\"\n\
+         \n[[tls]]\nhost = \"b.localhost\"\ncert_path = \"{}\"\nkey_path = \"{}\"\n\
+         \n[resumption]\nstek_file = \"{}\"\n",
+        cert_a.cert_path, cert_a.key_path, cert_b.cert_path, cert_b.key_path, stek_path
+    );
+    let control = loaded_control(&manifest_toml(upstream, "{digest}", &block)).unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert_a.cert_der.clone()).unwrap();
+    roots.add(cert_b.cert_der.clone()).unwrap();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.resumption =
+        tokio_rustls::rustls::client::Resumption::store(Arc::new(SniConfusedStore(
+            tokio_rustls::rustls::client::ClientSessionMemoryCache::new(256),
+        )));
+    let config = Arc::new(config);
+
+    let (_, first) = https_get_kind_sni(proxy, config.clone(), "a.localhost", "/api/hello").await;
+    assert_eq!(first, HandshakeKind::Full);
+    // Positive control: the confused store still resumes on the SAME SNI, so the Full below is
+    // a refusal, not a broken client cache.
+    let (_, same) = https_get_kind_sni(proxy, config.clone(), "a.localhost", "/api/hello").await;
+    assert_eq!(same, HandshakeKind::Resumed, "same-SNI resumption works");
+    let (_, cross) = https_get_kind_sni(proxy, config, "b.localhost", "/api/hello").await;
+    assert_eq!(
+        cross,
+        HandshakeKind::Full,
+        "a ticket from a.localhost must not resume a b.localhost handshake"
     );
 }
 

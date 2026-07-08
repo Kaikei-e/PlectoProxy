@@ -214,3 +214,48 @@ fn no_target_fails_closed() {
     let (status, _body) = short_circuit_body(&filter, &req);
     assert_eq!(status, 503);
 }
+
+/// ADR 000063 Decision 4's other half: the fat-guest grant (`wasi = "minimal"`) lends ONLY the
+/// Tier B allowlist (`io`/`clocks`/`random`/`cli`/`filesystem`) — never `sockets` or `http`, those
+/// stay their own separate, allowlisted capabilities (ADR 000036 / 000060). `filter-tcp-gate`
+/// imports `wasi:sockets`, so loading it with the fat-guest grant alone (no `outbound_tcp`
+/// policy, so the host never links `wasi:sockets`) must still fail to instantiate — structural
+/// deny, not merely a denied call. Requires `fat-guest` in addition to this file's `outbound-tcp`
+/// gate, since it needs both `filter_tcp_gate_component()` (outbound-tcp) and
+/// `LoadOptions::with_wasi_minimal` (fat-guest).
+#[cfg(feature = "fat-guest")]
+#[test]
+fn the_wasi_minimal_grant_alone_does_not_satisfy_a_sockets_import() {
+    use plecto_host::test_support::{TestSigner, bound_sbom, filter_tcp_gate_component};
+    use plecto_host::{Host, SignedArtifact};
+
+    let bytes = filter_tcp_gate_component();
+    let signer = TestSigner::new().unwrap();
+    let component_signature = signer.sign(&bytes).unwrap();
+    let sbom = bound_sbom(&bytes);
+    let sbom_signature = signer.sign(&sbom).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let artifact = SignedArtifact {
+        component_bytes: &bytes,
+        component_signature: &component_signature,
+        sbom: &sbom,
+        sbom_signature: &sbom_signature,
+    };
+
+    let err = host
+        .load(
+            "filter-tcp-gate",
+            &artifact,
+            LoadOptions::untrusted().with_wasi_minimal(),
+        )
+        .err()
+        .expect(
+            "filter-tcp-gate imports wasi:sockets, which the fat-guest grant does not lend — \
+             load must fail closed",
+        );
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("import") || msg.contains("wasi") || msg.contains("unknown"),
+        "expected an unresolved-import style failure, got: {msg}"
+    );
+}

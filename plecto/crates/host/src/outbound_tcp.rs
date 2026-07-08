@@ -119,11 +119,12 @@ impl TcpGuard {
         }
     }
 
-    /// The `WasiCtx` for a Store guarded by this handle: every socket-address use funnels into
-    /// [`TcpGuard::permits`], UDP is disabled outright, and the upstream ip-name-lookup permission
-    /// stays at its deny default (the host's own lookup implementation replaces it).
-    pub(crate) fn wasi_ctx(&self) -> wasmtime_wasi::WasiCtx {
-        let mut builder = wasmtime_wasi::WasiCtxBuilder::new();
+    /// Configure a shared `WasiCtxBuilder` for a Store guarded by this handle: every
+    /// socket-address use funnels into [`TcpGuard::permits`], UDP is disabled outright, and the
+    /// upstream ip-name-lookup permission stays at its deny default (the host's own lookup
+    /// implementation replaces it). A builder (not a built `WasiCtx`) so `HostState::new` can
+    /// compose this with the fat-guest stdio wiring (ADR 000063) on the same builder.
+    pub(crate) fn configure_wasi_ctx(&self, builder: &mut wasmtime_wasi::WasiCtxBuilder) {
         if self.inner.is_some() {
             let guard = self.clone();
             builder.socket_addr_check(move |addr, addr_use| {
@@ -133,7 +134,6 @@ impl TcpGuard {
             builder.allow_udp(false);
         }
         // No policy: the builder's defaults already deny every socket address.
-        builder.build()
     }
 
     /// The connect gate. Pure decision logic (no I/O), so the deny paths are directly

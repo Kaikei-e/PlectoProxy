@@ -34,6 +34,11 @@ pub(crate) trait FilterRuntime: Send + Sync {
     fn set_request_deadline(&self, instance: &mut Self::Instance);
     /// Drain this instance's per-request host-log lines after a call.
     fn take_logs(&self, instance: &mut Self::Instance) -> Vec<LogLine>;
+    /// Like [`take_logs`](Self::take_logs), but for the trap path: the instance is about to be
+    /// discarded, so this must also recover anything that a normal drain would otherwise leave
+    /// buffered for a later call that will now never come (ADR 000063: an unterminated stdio
+    /// partial line, e.g. a panic message with no trailing newline).
+    fn take_logs_after_trap(&self, instance: &mut Self::Instance) -> Vec<LogLine>;
 }
 
 /// The production `FilterRuntime`: everything needed to instantiate and drive a real wasmtime
@@ -67,6 +72,10 @@ pub(crate) struct WasmtimeRuntime {
     /// their guest calls block on real I/O the pollster executor cannot drive.
     #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
     pub(crate) rt: Option<Arc<tokio::runtime::Runtime>>,
+    /// This filter's manifest `wasi = "minimal"` declaration (ADR 000063), copied from
+    /// `LoadOptions::wasi_minimal` at `Host::load`.
+    #[cfg(feature = "fat-guest")]
+    pub(crate) wasi_minimal: bool,
 }
 
 impl WasmtimeRuntime {
@@ -156,6 +165,8 @@ impl FilterRuntime for WasmtimeRuntime {
                     ratelimit_bucket: self.ratelimit_bucket,
                     quota: self.kv_quota.clone(),
                     config: self.config.clone(),
+                    #[cfg(feature = "fat-guest")]
+                    wasi_minimal: self.wasi_minimal,
                 },
                 #[cfg(feature = "outbound-http")]
                 self.outbound_hooks(),
@@ -189,7 +200,11 @@ impl FilterRuntime for WasmtimeRuntime {
     }
 
     fn take_logs(&self, instance: &mut WasmtimeInstance) -> Vec<LogLine> {
-        std::mem::take(&mut instance.store.data_mut().logs)
+        instance.store.data_mut().take_logs()
+    }
+
+    fn take_logs_after_trap(&self, instance: &mut WasmtimeInstance) -> Vec<LogLine> {
+        instance.store.data_mut().take_logs_after_trap()
     }
 }
 

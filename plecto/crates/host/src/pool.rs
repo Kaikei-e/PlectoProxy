@@ -15,6 +15,11 @@ use crate::{Isolation, LogLine, RunError, TelemetrySink};
 #[cfg(test)]
 use anyhow::Result;
 
+/// The result of one guest hook call: on `Err`, the `RunError` is paired with whatever host-log
+/// lines (including fat-guest stdio, ADR 000063) were recovered from the failed instance before
+/// it was discarded — a trap's own diagnostic output would otherwise be lost along with it.
+pub(crate) type HookResult<T> = std::result::Result<(T, Vec<LogLine>), (RunError, Vec<LogLine>)>;
+
 /// Shared, isolation-independent load result. Generic over the `FilterRuntime` seam so the pool /
 /// lifecycle-dispatch logic here is unit-testable against a fake runtime — production always
 /// resolves `R = WasmtimeRuntime` (`LoadedFilter` is a concrete, non-generic struct built that way).
@@ -174,15 +179,16 @@ impl<R: FilterRuntime> LoadedInner<R> {
     fn run_fresh<T>(
         &self,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
-    ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
+    ) -> HookResult<T> {
         if wall_now_ms() < self.untrusted_breaker.lock().cooldown_until_ms {
-            return Err(RunError::Unavailable);
+            return Err((RunError::Unavailable, Vec::new()));
         }
         let mut inst = match self.runtime.instantiate_initialized() {
             Ok(inst) => inst,
             Err(e) => {
                 self.untrusted_breaker.lock().record_trap();
-                return Err(RunError::Instantiate(e));
+                // Nothing instantiated → no Store, no logs to recover.
+                return Err((RunError::Instantiate(e), Vec::new()));
             }
         };
         self.runtime.set_request_deadline(&mut inst);
@@ -193,8 +199,13 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 Ok((value, logs))
             }
             Err(e) => {
+                // The instance is discarded either way (its linear memory is undefined after a
+                // trap), so recover whatever host-log/stdio output it produced before failing —
+                // ADR 000063's whole point is that a trapping guest's own diagnostic output
+                // (e.g. a TinyGo panic on stderr) still reaches the span this request emits.
+                let logs = self.runtime.take_logs_after_trap(&mut inst);
                 self.untrusted_breaker.lock().record_trap();
-                Err(RunError::from_call(e))
+                Err((RunError::from_call(e), logs))
             }
         }
     }
@@ -210,8 +221,9 @@ impl<R: FilterRuntime> LoadedInner<R> {
         &self,
         pool: &TrustedPool<R::Instance>,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
-    ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
-        let mut pooled = self.checkout(pool)?;
+    ) -> HookResult<T> {
+        // Nothing instantiated yet on a checkout failure → no Store, no logs to recover.
+        let mut pooled = self.checkout(pool).map_err(|e| (e, Vec::new()))?;
         // Armed across the guest call: a panic unwinding out of `call` must still release the
         // `live` slot and wake a waiter. Both normal arms below disarm and do their own
         // bookkeeping (return-to-idle / recycle / discard).
@@ -243,9 +255,11 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 Ok((value, logs))
             }
             Err(e) => {
-                // Trap → this instance's linear memory is undefined → discard it (release the
-                // slot first), then bump the pool-wide breaker; past the threshold open a short
+                // Trap → this instance's linear memory is undefined → discard it. Recover its
+                // logs (including any unterminated stdio partial line, ADR 000063) BEFORE the
+                // discard, then bump the pool-wide breaker; past the threshold open a short
                 // cooldown so a deterministically-trapping filter fails closed cheaply.
+                let logs = self.runtime.take_logs_after_trap(&mut pooled.instance);
                 slot.armed = false;
                 drop(pooled);
                 let mut g = pool.inner.lock();
@@ -256,7 +270,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 }
                 drop(g);
                 pool.available.notify_one();
-                Err(RunError::from_call(e))
+                Err((RunError::from_call(e), logs))
             }
         }
     }
@@ -266,11 +280,16 @@ impl<R: FilterRuntime> LoadedInner<R> {
     /// lifecycle decision already (an `Option`, exhaustively matched below) — no separate
     /// `Lifecycle` enum is introduced, since that would just restate the `Option` with no new
     /// information.
+    /// The Err side carries the logs recovered from the failed instance alongside the
+    /// `RunError` (ADR 000063): a trap's own diagnostic output (e.g. a guest panic) is otherwise
+    /// lost the moment the instance is discarded. `filter.rs` feeds these into the span it emits
+    /// for the failing call, then drops them from the public `Result` it returns (unchanged
+    /// contract: a `RunError` alone).
     pub(crate) fn run_hook<T>(
         &self,
         trusted: Option<&TrustedPool<R::Instance>>,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
-    ) -> std::result::Result<(T, Vec<LogLine>), RunError> {
+    ) -> HookResult<T> {
         match trusted {
             Some(pool) => self.run_pooled(pool, call),
             None => self.run_fresh(call),
@@ -403,6 +422,9 @@ mod pool_tests {
         fn take_logs(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
             Vec::new()
         }
+        fn take_logs_after_trap(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
+            Vec::new()
+        }
     }
 
     fn fake_inner(runtime: FakeRuntime) -> LoadedInner<FakeRuntime> {
@@ -500,7 +522,7 @@ mod pool_tests {
                 wasmtime::Result::<()>::Err(wasmtime::Error::msg("simulated trap"))
             });
             assert!(
-                matches!(result, Err(RunError::Trap(_))),
+                matches!(result, Err((RunError::Trap(_), _))),
                 "expected a Trap before the breaker opens, got {result:?}"
             );
         }
@@ -513,7 +535,7 @@ mod pool_tests {
             },
         );
         assert!(
-            matches!(result, Err(RunError::Unavailable)),
+            matches!(result, Err((RunError::Unavailable, _))),
             "the pool-wide breaker should be open"
         );
 
@@ -563,7 +585,7 @@ mod pool_tests {
                 wasmtime::Result::<()>::Err(wasmtime::Error::msg("simulated trap"))
             });
             assert!(
-                matches!(result, Err(RunError::Trap(_))),
+                matches!(result, Err((RunError::Trap(_), _))),
                 "expected a Trap before the breaker opens, got {result:?}"
             );
         }
@@ -573,7 +595,7 @@ mod pool_tests {
             panic!("must not be called while the untrusted breaker is open")
         });
         assert!(
-            matches!(result, Err(RunError::Unavailable)),
+            matches!(result, Err((RunError::Unavailable, _))),
             "the per-filter untrusted breaker should be open"
         );
         assert_eq!(

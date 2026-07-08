@@ -40,7 +40,7 @@ fast path と extension plane は上下関係でも主従関係でもなく、**
 
 ### P4 — deny-by-default、そして fail-closed
 
-フィルタが import できる能力は、ホストが明示的に貸した interface のみ: **host-log / host-clock / host-kv / host-counter / host-ratelimit の5つ**であり、それ以外の import は Linker に存在しない（ADR 000006）。WASI import はゼロが既定（zero-WASI guest）で、deny-by-default の Linker がそのまま instantiate できる唯一の形である（ADR 000055）。
+フィルタが import できる能力は、ホストが明示的に貸した interface のみ: **host-log / host-clock / host-kv / host-counter / host-ratelimit の5つ**であり、それ以外の import は Linker に存在しない（ADR 000006）。WASI import はゼロが既定（zero-WASI guest、Tier A）で、追加の宣言なしに deny-by-default の Linker が instantiate できる形である（ADR 000055）。ランタイムが最小限の WASI 存在を前提とする fat guest（TinyGo/Go、Tier B）には、固定・最小・off-by-default のスライス——`wasi:io` / `clocks` / `random` / `cli`、および一部ランタイムの起動処理が無条件に import する空の `wasi:filesystem`——を貸せる。fs アクセスも sockets も一切なく、host のビルドとフィルタの manifest 宣言の両方が opt-in したときのみ有効（ADR 000063）。どちらか片方でも欠ければ instantiate に失敗する deny-by-default のままである。
 
 失敗は常に閉じる側に倒す: フィルタの trap / epoch deadline 超過は素通り（fail-open）させない。unhealthy な upstream しか無ければ 503。quota 超過は拒否。バケット状態の破損は「全許可」ではなく「空＝deny + self-heal」。署名の欠落・不一致はロード前に Err。path 正規化で解釈できない迂回表現は拒否。バッファ permit のエラーも fail-closed（直近の `dfab595` に至るまで一貫）。**「安全側に倒すか迷ったら、既に答えは出ている」**が本原則の運用形である。
 
@@ -154,7 +154,7 @@ ADR 000029 の役割駆動基準と Fork 6 から、配置は次の順で問う:
 
 ### 3.2 能力（capability）を増やすときの規律
 
-新しい host-API は「1 interface = 1 capability」で切り、deny-by-default を維持する。危険な能力は **off-by-default の feature gate に隔離してから**入れる——現行の実例は `outbound-http`（wasi:http 収斂ゲートまで既定ビルド外）、`streaming-body`（wasip3 Tier-2 まで）、`polyglot-conformance`（既定 `cargo test` に影響しない）。フィルタが自分に課された制約を自己申告で緩められる形（バケット容量の guest 指定等）は設計段階で禁じる。fat guest への最小 `WasiCtx` 貸与（Go/TinyGo 解禁の鍵）は独立のセキュリティ判断として繰り延べられており（ADR 000055 / 000010）、なし崩しに広げない。
+新しい host-API は「1 interface = 1 capability」で切り、deny-by-default を維持する。危険な能力は **off-by-default の feature gate に隔離してから**入れる——現行の実例は `outbound-http`（wasi:http 収斂ゲートまで既定ビルド外）、`streaming-body`（wasip3 Tier-2 まで）、`polyglot-conformance`（既定 `cargo test` に影響しない）、`fat-guest`（Tier B guest 向け最小 WASI 貸与、ADR 000063——既定 off、on でもフィルタの manifest が `wasi = "minimal"` を宣言しない限り不活性）。フィルタが自分に課された制約を自己申告で緩められる形（バケット容量の guest 指定等）は設計段階で禁じる。
 
 ### 3.3 依存を増やすときの規律
 
@@ -198,7 +198,7 @@ ADR は `docs/ADR/NNNNNN.md`、frontmatter + wikilink、テンプレは `templat
 |---|---|
 | `wasm32-wasip3` が Rust Tier-2 到達・wit-bindgen async 成熟 | `streaming-body` feature の既定化に向けた昇格判断（`stream<u8>` 本実装、M3 の真のストリーミング増分） |
 | `wasi:http`（proxy / middleware）収斂ゲートの成立 | 型語彙の `wasi:http` 収斂実施（ADR 000020）と、`outbound-http` の既定ビルド入り判断 |
-| fat guest への最小 `WasiCtx` 貸与の個別 ADR | Go（TinyGo）フィルタの解禁（ADR 000055 が名指しで繰り延べた判断）——**2026-07-06 に ADR 000063 で判断済み**（Tier B として解禁、実装待ち） |
+| Go（`gc`）本体が wasip2/p3 で Tier 相当の Component Model 対応に到達 | Tier B（ADR 000063、2026-07-06 判断・2026-07-08 実装）が前提とする TinyGo 限定の再訪 |
 | mTLS スライス着手 | downstream / upstream の client cert 検証設計（deferred 序列の先頭、ADR 000054。現状は両向き `with_no_client_auth`） |
 | リモート filter-registry 取得（wkg 境界）の需要成立 | M4 の残余——現行はオフライン image-layout が意図された既定 |
 | crypto provider の代替（例: 第三者監査済み pure-Rust 実装）の成熟 | ADR 000051 の再訪。判断基準は同 ADR が確立した「実リンク検証 + ビルド DX + 保守状況」 |

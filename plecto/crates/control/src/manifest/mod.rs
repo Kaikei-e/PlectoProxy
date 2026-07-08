@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ControlError;
 
 pub use chain::Chain;
-pub use filter_entry::{FilterEntry, IsolationKind, OutboundHttpConfig, OutboundTcpConfig};
+pub use filter_entry::{
+    FilterEntry, IsolationKind, OutboundHttpConfig, OutboundTcpConfig, WasiKind,
+};
 // `AllowDest` / `TcpAllowDest` / `RateLimitConfig` are schema fields reached through
 // `OutboundHttpConfig` / `OutboundTcpConfig` / `FilterEntry` rather than by name elsewhere in this
 // crate today; `SchemeKind` is only named via `crate::manifest::X` from the `outbound-http`-gated

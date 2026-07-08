@@ -153,6 +153,11 @@ pub struct FilterEntry {
     /// is rejected at validate (fail-closed).
     #[serde(default)]
     pub outbound_tcp: Option<OutboundTcpConfig>,
+    /// This filter's WASI grant (ADR 000063), `wasi = "none" | "minimal"`. Absent/`"none"` (the
+    /// default) keeps the filter zero-WASI (Tier A). Requires the `fat-guest` build; otherwise
+    /// `"minimal"` is rejected at validate (fail-closed).
+    #[serde(default)]
+    pub wasi: WasiKind,
     /// This filter's business config (ADR 000066), `[filter.config]`: an arbitrary string→string
     /// map the filter reads back via `host-config::get`. The host does not interpret keys or
     /// values — only the filter does (e.g. Redis host/port, window seconds, `on_backend_error`).
@@ -171,6 +176,22 @@ pub enum IsolationKind {
     #[default]
     Untrusted,
     Trusted,
+}
+
+/// A filter's WASI grant (ADR 000063). `minimal` lends the fixed, non-configurable slice —
+/// `wasi:io` / `wasi:clocks` / `wasi:random` / `wasi:cli` (no filesystem, no sockets), stdout/
+/// stderr bridged into this filter's `host-log` — for guests whose runtime assumes WASI is
+/// present (TinyGo/Go and similar "fat" guests). Unlike `outbound_http`/`outbound_tcp` there is
+/// no allowlist to declare: the grant is fixed, so this is a bare enum, not a sub-table. Requires
+/// the `fat-guest` build; otherwise `minimal` is rejected at validate (fail-closed).
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum WasiKind {
+    #[default]
+    None,
+    Minimal,
 }
 
 #[cfg(test)]
@@ -451,6 +472,55 @@ io_deadline_ms = 999999999
         assert!(
             m.filters[0].validate().is_err(),
             "outbound_http requires the outbound-http build"
+        );
+    }
+
+    const WASI_MINIMAL_TOML: &str = r#"
+[[filter]]
+id = "hello-go"
+source = "oci/hello-go"
+digest = "sha256:abc"
+wasi = "minimal"
+"#;
+
+    #[test]
+    fn wasi_defaults_to_none() {
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "x"
+source = "s"
+digest = "sha256:abc"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.filters[0].wasi, WasiKind::None);
+    }
+
+    #[test]
+    fn wasi_minimal_parses() {
+        let m = Manifest::from_toml(WASI_MINIMAL_TOML).unwrap();
+        assert_eq!(m.filters[0].wasi, WasiKind::Minimal);
+    }
+
+    #[cfg(feature = "fat-guest")]
+    #[test]
+    fn wasi_minimal_validates_and_lowers_to_load_options() {
+        let m = Manifest::from_toml(WASI_MINIMAL_TOML).unwrap();
+        let entry = &m.filters[0];
+        entry.validate().expect("valid wasi = \"minimal\" section");
+        assert!(entry.load_options().wasi_minimal);
+    }
+
+    #[cfg(not(feature = "fat-guest"))]
+    #[test]
+    fn wasi_minimal_rejected_without_feature() {
+        // A manifest that asks for the fat-guest grant must fail closed on a build that cannot
+        // provide it (same rule as outbound_http/outbound_tcp).
+        let m = Manifest::from_toml(WASI_MINIMAL_TOML).unwrap();
+        assert!(
+            m.filters[0].validate().is_err(),
+            "wasi = \"minimal\" requires the fat-guest build"
         );
     }
 

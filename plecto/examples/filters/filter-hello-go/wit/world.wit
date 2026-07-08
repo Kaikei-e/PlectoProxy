@@ -1,0 +1,92 @@
+package plecto:filter@0.1.0;
+
+interface types {
+    record header {
+        name: string,
+        value: string,
+    }
+    record http-request {
+        method: string,
+        path: string,
+        authority: string,
+        scheme: string,
+        headers: list<header>,
+    }
+    record http-response {
+        status: u16,
+        headers: list<header>,
+        body: list<u8>,
+    }
+    record request-edit {
+        set-headers: list<header>,
+        remove-headers: list<string>,
+    }
+    record response-edit {
+        set-status: option<u16>,
+        set-headers: list<header>,
+        remove-headers: list<string>,
+    }
+    variant request-decision {
+        %continue,
+        modified(request-edit),
+        short-circuit(http-response),
+    }
+    variant response-decision {
+        %continue,
+        modified(response-edit),
+    }
+    variant request-body-decision {
+        %continue(list<u8>),
+        short-circuit(http-response),
+    }
+}
+
+interface host-log {
+    enum level { trace, debug, info, warn, error }
+    log: func(level: level, message: string);
+}
+
+interface host-clock {
+    now-ms: func() -> u64;
+}
+
+interface host-kv {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>);
+    delete: func(key: string);
+}
+
+interface host-counter {
+    increment: func(key: string, delta: s64) -> s64;
+    get: func(key: string) -> s64;
+}
+
+interface host-ratelimit {
+    record acquire {
+        allowed: bool,
+        remaining: u64,
+        retry-after-ms: u64,
+    }
+    try-acquire: func(key: string, cost: u64) -> acquire;
+}
+
+interface host-config {
+    get: func(key: string) -> option<string>;
+}
+
+world filter-body-go {
+    use types.{http-request, http-response, request-decision, response-decision, request-body-decision};
+
+    import host-log;
+    import host-clock;
+    import host-kv;
+    import host-counter;
+    import host-ratelimit;
+    import host-config;
+    include wasi:cli/imports@0.2.0;
+
+    export init: func();
+    export on-request: func(req: http-request) -> request-decision;
+    export on-request-body: func(body: list<u8>) -> request-body-decision;
+    export on-response: func(resp: http-response) -> response-decision;
+}

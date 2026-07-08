@@ -170,6 +170,14 @@ pub struct LoadOptions {
     /// values. Empty (the default) when the manifest declares no `[filter.config]` section — every
     /// `get` then reads `None`, same as an undeclared key in a non-empty map.
     pub config: std::collections::BTreeMap<String, String>,
+    /// This filter's WASI grant (manifest `wasi = "minimal"`, ADR 000063): a minimal, FIXED
+    /// slice — `wasi:io` / `wasi:clocks` / `wasi:random` / `wasi:cli` (empty env/args, no
+    /// filesystem, no sockets) — for guests whose runtime assumes WASI is present (TinyGo/Go and
+    /// similar "fat" guests). `false` (the default) keeps the filter zero-WASI (Tier A, ADR
+    /// 000055): the default Linker lends it none of this. Unlike `outbound_http`/`outbound_tcp`
+    /// there is no allowlist to configure — the grant is fixed, so this is a bare toggle.
+    #[cfg(feature = "fat-guest")]
+    pub wasi_minimal: bool,
 }
 
 impl Default for LoadOptions {
@@ -191,6 +199,8 @@ impl Default for LoadOptions {
             #[cfg(all(feature = "outbound-tcp", feature = "test-support"))]
             outbound_tcp_static_resolver: None,
             config: std::collections::BTreeMap::new(),
+            #[cfg(feature = "fat-guest")]
+            wasi_minimal: false,
         }
     }
 }
@@ -337,6 +347,16 @@ impl LoadOptions {
         self
     }
 
+    /// Lend this filter the minimal WASI grant (ADR 000063): `wasi:io` / `wasi:clocks` /
+    /// `wasi:random` / `wasi:cli` (empty env/args, no filesystem, no sockets), plus its
+    /// stdout/stderr bridged into this filter's host-log. No allowlist to configure — the grant
+    /// is fixed, so this is a bare toggle (unlike `with_outbound_http`/`with_outbound_tcp`).
+    #[cfg(feature = "fat-guest")]
+    pub fn with_wasi_minimal(mut self) -> Self {
+        self.wasi_minimal = true;
+        self
+    }
+
     /// Test-only: resolve outbound-TCP names from a static map instead of real DNS (see
     /// `LoadOptions::outbound_tcp_static_resolver`).
     #[doc(hidden)]
@@ -370,5 +390,13 @@ mod tests {
         assert!(
             LoadOptions::untrusted().init_deadline_ms < LoadOptions::trusted().init_deadline_ms
         );
+    }
+
+    #[cfg(feature = "fat-guest")]
+    #[test]
+    fn wasi_minimal_is_off_by_default_and_toggled_explicitly() {
+        assert!(!LoadOptions::untrusted().wasi_minimal);
+        assert!(!LoadOptions::trusted().wasi_minimal);
+        assert!(LoadOptions::untrusted().with_wasi_minimal().wasi_minimal);
     }
 }

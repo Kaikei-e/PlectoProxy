@@ -4,6 +4,8 @@ use plecto_host::LoadOptions;
 
 #[cfg(feature = "outbound-http")]
 use super::SchemeKind;
+#[cfg(feature = "fat-guest")]
+use super::WasiKind;
 use super::{FilterEntry, IsolationKind};
 
 impl FilterEntry {
@@ -68,6 +70,10 @@ impl FilterEntry {
                 ob.io_deadline_ms,
             );
         }
+        #[cfg(feature = "fat-guest")]
+        if self.wasi == WasiKind::Minimal {
+            opts = opts.with_wasi_minimal();
+        }
         if let Some(cfg) = &self.config {
             opts = opts.with_config(cfg.clone());
         }
@@ -97,6 +103,7 @@ mod tests {
             }),
             outbound_http: None,
             outbound_tcp: None,
+            wasi: crate::manifest::WasiKind::None,
             config: None,
         };
         let opts = entry.load_options();

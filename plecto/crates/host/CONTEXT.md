@@ -45,17 +45,21 @@ _Avoid_: body mode（曖昧）, body flag（点ではなく分類）
 **Body-transform filter**:
 ボディを `stream<u8>` で流しながら読む/変換するフィルタ。WASM 税（コピー）を負う側。
 
-**Zero-WASI guest**:
+**Zero-WASI guest（Tier A）**:
 `plecto:filter` の interface だけを import する（WASI import ゼロの）フィルタコンポーネント。
-デフォルトの deny-by-default Linker がそのまま instantiate できる唯一の形。Rust
+デフォルトの deny-by-default Linker が追加の宣言なしに instantiate できる形。Rust
 （wasm32-unknown-unknown）・MoonBit・C のほか、WASI 機能を無効化した JS（ComponentizeJS の
 disableFeatures）や Python（componentize-py --stub-wasi）もこの形にできる。
 _Avoid_: pure component（ComponentizeJS 固有の呼称）, header-only filter（body disposition の別軸）
 
-**Fat guest**:
+**Fat guest（Tier B）**:
 言語ランタイムが wasi 0.2 interface（`wasi:cli` / `wasi:io` / `wasi:clocks` …）の提供を前提とする
-ゲストコンポーネント。TinyGo が代表。host が最小 `WasiCtx` を能動的に貸さない限り instantiate に失敗し、
-現状の host は貸さない（貸すか否かは ADR 000010 が名指しした将来の判断）。
+ゲストコンポーネント。TinyGo（Go）が代表——ファイルを一切使わないプログラムでも `wasi:filesystem/types`
+/ `preopens` を無条件 import する（wasip2 ランタイムの起動処理由来、TinyGo 0.41.1 で実機確認）。host の
+`fat-guest` feature（off-by-default）＋フィルタの manifest `wasi = "minimal"` 宣言の両方が揃ったときのみ、
+固定・最小の WASI スライス（`wasi:io` / `clocks` / `random` / `cli` ＋ preopens 空の `filesystem`。
+fs アクセスも sockets も一切なし）を host が貸す（ADR 000063）。どちらか片方でも欠けば instantiate に
+失敗する（deny-by-default）。参照実装: `examples/filters/filter-hello-go/`。
 _Avoid_: WASI guest（どの WASI をどこまで要るのかが出ない）
 
 **Trusted filter / Untrusted filter**:

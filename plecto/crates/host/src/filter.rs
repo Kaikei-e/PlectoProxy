@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::observe;
-use crate::pool::{LoadedInner, TrustedPool};
+use crate::pool::{HookResult, LoadedInner, TrustedPool};
 use crate::runtime::{WasmtimeInstance, WasmtimeRuntime};
 use crate::{
     Hook, HttpRequest, HttpResponse, Isolation, LogLine, RequestBodyDecision, RequestDecision,
@@ -48,14 +48,14 @@ impl LoadedFilter {
         trace: &RequestTrace,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
         if !self.inner.sink.enabled() {
-            return self.run_on_request(req);
+            return self.run_on_request(req).map_err(|(err, _)| err);
         }
         let start = SystemTime::now();
         let elapsed = Instant::now();
         let result = self.run_on_request(req);
         let outcome = match &result {
             Ok((decision, _)) => SpanOutcome::from(decision),
-            Err(err) => SpanOutcome::from(err),
+            Err((err, _)) => SpanOutcome::from(err),
         };
         self.emit_span(
             trace,
@@ -65,13 +65,10 @@ impl LoadedFilter {
             elapsed.elapsed(),
             &result,
         );
-        result
+        result.map_err(|(err, _)| err)
     }
 
-    fn run_on_request(
-        &self,
-        req: &HttpRequest,
-    ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
+    fn run_on_request(&self, req: &HttpRequest) -> HookResult<RequestDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner
                 .runtime
@@ -89,7 +86,7 @@ impl LoadedFilter {
         trace: &RequestTrace,
     ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
         if !self.inner.sink.enabled() {
-            return self.run_on_request_body(body);
+            return self.run_on_request_body(body).map_err(|(err, _)| err);
         }
         let start = SystemTime::now();
         let elapsed = Instant::now();
@@ -97,7 +94,7 @@ impl LoadedFilter {
         let outcome = match &result {
             Ok((RequestBodyDecision::Continue(_), _)) => SpanOutcome::Continue,
             Ok((RequestBodyDecision::ShortCircuit(_), _)) => SpanOutcome::ShortCircuit,
-            Err(err) => SpanOutcome::from(err),
+            Err((err, _)) => SpanOutcome::from(err),
         };
         self.emit_span(
             trace,
@@ -107,13 +104,10 @@ impl LoadedFilter {
             elapsed.elapsed(),
             &result,
         );
-        result
+        result.map_err(|(err, _)| err)
     }
 
-    fn run_on_request_body(
-        &self,
-        body: &[u8],
-    ) -> std::result::Result<(RequestBodyDecision, Vec<LogLine>), RunError> {
+    fn run_on_request_body(&self, body: &[u8]) -> HookResult<RequestBodyDecision> {
         // Header-only filter: no `on-request-body` export, so the body never enters guest memory.
         // The fast path already skips buffering (`reads_body()` is false); this is the defensive
         // floor — pass the body through unchanged without instantiating anything.
@@ -126,8 +120,10 @@ impl LoadedFilter {
     }
 
     /// Build and emit the span for one filter execution (ADR 000009). The filter's host-log
-    /// lines (`Ok`) become span events; a `RunError` carries no logs but its outcome
-    /// (trap / deadline / …) is still recorded. Errors never abort emission — telemetry is
+    /// lines become span events whether the call succeeded (`Ok`) or trapped (`Err`) — a `RunError`
+    /// still carries whatever logs (including fat-guest stdio, ADR 000063) were recovered from the
+    /// failed instance before it was discarded, so a trapping guest's own diagnostic output (e.g.
+    /// a panic message) still shows up in this span. Errors never abort emission — telemetry is
     /// best-effort and out of the fail-closed path.
     fn emit_span<T>(
         &self,
@@ -136,11 +132,11 @@ impl LoadedFilter {
         outcome: SpanOutcome,
         start: SystemTime,
         duration: Duration,
-        result: &std::result::Result<(T, Vec<LogLine>), RunError>,
+        result: &HookResult<T>,
     ) {
         let logs: &[LogLine] = match result {
             Ok((_, logs)) => logs,
-            Err(_) => &[],
+            Err((_, logs)) => logs,
         };
         let span = observe::build_filter_span(
             trace,
@@ -162,14 +158,14 @@ impl LoadedFilter {
         trace: &RequestTrace,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         if !self.inner.sink.enabled() {
-            return self.run_on_response(resp);
+            return self.run_on_response(resp).map_err(|(err, _)| err);
         }
         let start = SystemTime::now();
         let elapsed = Instant::now();
         let result = self.run_on_response(resp);
         let outcome = match &result {
             Ok((decision, _)) => SpanOutcome::from(decision),
-            Err(err) => SpanOutcome::from(err),
+            Err((err, _)) => SpanOutcome::from(err),
         };
         self.emit_span(
             trace,
@@ -179,13 +175,10 @@ impl LoadedFilter {
             elapsed.elapsed(),
             &result,
         );
-        result
+        result.map_err(|(err, _)| err)
     }
 
-    fn run_on_response(
-        &self,
-        resp: &HttpResponse,
-    ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
+    fn run_on_response(&self, resp: &HttpResponse) -> HookResult<ResponseDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner
                 .runtime

@@ -30,6 +30,10 @@ outbound-http = ["plecto-host/outbound-http"]
 # Forwards to the host's outbound TCP capability (ADR 000060) — same fail-closed rule for
 # `[filter.outbound_tcp]` as outbound-http above.
 outbound-tcp = ["plecto-host/outbound-tcp"]
+# Forwards to the host's fat-guest minimal WASI grant (ADR 000063) — same fail-closed rule for
+# `wasi = "minimal"` as outbound-http above (unlike those, no sub-config to lower: the grant is
+# fixed).
+fat-guest = ["plecto-host/fat-guest"]
 
 [dependencies]
 plecto-host = { path = "../host" }

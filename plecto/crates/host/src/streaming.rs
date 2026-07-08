@@ -14,7 +14,6 @@
 use anyhow::Result;
 use wasmtime::component::{Component, Linker, ResourceTable, StreamReader};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
-use wasmtime_wasi::cli::{WasiCli, WasiCliView};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::engine::EpochTicker;
@@ -75,22 +74,6 @@ fn build_engine() -> Result<Engine> {
     Ok(Engine::new(&config)?)
 }
 
-/// Add the wasi:cli interfaces the std guest's runtime imports beyond the proxy slice (environment /
-/// exit / terminal-*). Each is inert under an empty `WasiCtx`; crucially this adds NO filesystem and
-/// NO sockets, so those capabilities stay denied (security audit F-002).
-fn add_cli_runtime(linker: &mut Linker<Ctx>) -> Result<()> {
-    use wasmtime_wasi::p2::bindings::cli;
-    let getter = <Ctx as WasiCliView>::cli;
-    cli::environment::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    cli::exit::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    cli::terminal_input::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    cli::terminal_output::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    cli::terminal_stdin::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    cli::terminal_stdout::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    cli::terminal_stderr::add_to_linker::<Ctx, WasiCli>(linker, getter)?;
-    Ok(())
-}
-
 /// Run a streaming body filter `component` over `body`: feed the bytes as a `stream<u8>`, drive
 /// `process-body` on component-model-async with a minimal WASI slice and the sandbox bounds in
 /// `limits`, and return the decision. A trap / deadline / link failure is an `Err` the caller maps
@@ -114,7 +97,7 @@ pub fn run_streaming_body(
     // `wasi:http/middleware` convergence (ADR 000020).
     let mut linker: Linker<Ctx> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
-    add_cli_runtime(&mut linker)?;
+    crate::state::add_cli_runtime::<Ctx>(&mut linker)?;
 
     let store_limits = StoreLimitsBuilder::new()
         .memory_size(limits.memory_cap)

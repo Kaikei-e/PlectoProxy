@@ -20,7 +20,11 @@ use crate::outbound_tcp;
 use crate::pool::{LoadedInner, TrustedPool};
 use crate::quota::KvQuota;
 use crate::runtime::{FilterRuntime, WasmtimeRuntime};
-#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+#[cfg(any(
+    feature = "outbound-http",
+    feature = "outbound-tcp",
+    feature = "fat-guest"
+))]
 use crate::state::add_cli_runtime;
 use crate::state::{HostState, KV_NS_DELIM};
 use crate::{Isolation, KvBackend, LoadOptions, MemoryBackend, NoopSink, SignedArtifact};
@@ -211,7 +215,11 @@ impl Host {
             };
             outbound_tcp::OutboundTcpState::new(policy, resolver)
         });
-        #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+        #[cfg(any(
+            feature = "outbound-http",
+            feature = "outbound-tcp",
+            feature = "fat-guest"
+        ))]
         {
             let mut needs_wasi_base = false;
             #[cfg(feature = "outbound-http")]
@@ -222,6 +230,10 @@ impl Host {
             {
                 needs_wasi_base |= outbound_tcp.is_some();
             }
+            #[cfg(feature = "fat-guest")]
+            {
+                needs_wasi_base |= opts.wasi_minimal;
+            }
             if needs_wasi_base {
                 wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
                 // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
@@ -229,6 +241,15 @@ impl Host {
                 // capability boundary that matters (mirrors the streaming path, audit F-002).
                 add_cli_runtime(&mut linker)?;
             }
+        }
+        // Fat guest (ADR 000063): TinyGo's wasip2 runtime unconditionally imports
+        // `wasi:filesystem/types` + `wasi:filesystem/preopens` even for a program that never
+        // touches a file (confirmed against TinyGo 0.41.1) — link an EMPTY filesystem (no
+        // preopened directory, ever) so such a guest instantiates while filesystem access stays
+        // structurally unreachable.
+        #[cfg(feature = "fat-guest")]
+        if opts.wasi_minimal {
+            crate::state::add_inert_filesystem(&mut linker)?;
         }
         #[cfg(feature = "outbound-http")]
         if outbound.is_some() {
@@ -300,6 +321,8 @@ impl Host {
             outbound,
             #[cfg(feature = "outbound-tcp")]
             outbound_tcp,
+            #[cfg(feature = "fat-guest")]
+            wasi_minimal: opts.wasi_minimal,
         };
 
         let trusted = match opts.isolation {

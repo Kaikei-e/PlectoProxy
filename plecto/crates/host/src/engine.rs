@@ -24,9 +24,14 @@ pub(crate) enum Allocation {
 pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    // Outbound HTTP (ADR 000036) / outbound TCP (ADR 000060) lend async WASI interfaces; enable
-    // the Component Model async ABI so they link. Off by default; a non-async guest is unaffected.
-    #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+    // Outbound HTTP (ADR 000036) / outbound TCP (ADR 000060) / fat guest (ADR 000063) lend async
+    // WASI interfaces; enable the Component Model async ABI so they link. Off by default; a
+    // non-async guest is unaffected.
+    #[cfg(any(
+        feature = "outbound-http",
+        feature = "outbound-tcp",
+        feature = "fat-guest"
+    ))]
     config.wasm_component_model_async(true);
     // epoch interruption: the low-overhead deadline mechanism for the data plane (ADR 000006;
     // epoch over fuel — lighter, no determinism requirement here). A background ticker

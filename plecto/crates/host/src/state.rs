@@ -4,7 +4,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+#[cfg(any(
+    feature = "outbound-http",
+    feature = "outbound-tcp",
+    feature = "fat-guest",
+    feature = "streaming-body"
+))]
 use wasmtime::component::Linker;
 use wasmtime::{StoreLimits, StoreLimitsBuilder};
 
@@ -56,13 +61,14 @@ const MAX_LOG_MSG_BYTES: usize = 8 * 1024;
 /// for any reasonable filter and bounds the pathological case — cheap defense-in-depth.
 const MAX_TABLE_ELEMENTS: usize = 100_000;
 
-/// Neutralize a guest-supplied log message (CWE-117): truncate to a byte cap on a char
+/// Neutralize a guest-supplied log message (CWE-117): truncate to `max_bytes` on a char
 /// boundary and replace control characters (CR/LF for log-line injection, C0/C1/ESC for terminal
 /// ANSI) with the replacement char. The filter is untrusted and may embed `Authorization` header
 /// bytes or escape sequences, so the host — the trust boundary — neutralizes before storing.
-fn sanitize_log_message(mut message: String) -> String {
-    if message.len() > MAX_LOG_MSG_BYTES {
-        let mut end = MAX_LOG_MSG_BYTES;
+/// Shared by every `LogBudget` impl (each brings its own `max_bytes`).
+pub(crate) fn sanitize_log_message(mut message: String, max_bytes: usize) -> String {
+    if message.len() > max_bytes {
+        let mut end = max_bytes;
         while !message.is_char_boundary(end) {
             end -= 1;
         }
@@ -77,6 +83,61 @@ fn sanitize_log_message(mut message: String) -> String {
     message
 }
 
+/// A per-request budget gate for guest-emitted log volume (CWE-770): decides whether/how to
+/// record one candidate line, sanitizing and truncating it in the process. Two independent
+/// policies implement this — `host-log`'s existing per-request LINE-COUNT cap
+/// ([`LineCountBudget`]) and the WASI stdio bridge's per-request BYTE budget (`ByteBudget`, ADR
+/// 000063) — sharing one interface so a chatty guest's stdout/stderr cannot starve its own
+/// explicit `host-log` calls of their budget, or vice versa, even though both funnel into the
+/// same [`HostState::logs`](HostState) → OTLP span-event path.
+pub(crate) trait LogBudget {
+    /// `level` is the line's natural level (the caller's level for a `host-log` call; a fixed
+    /// per-stream level for the stdio bridge). A truncation event always downgrades the stored
+    /// level to `LogLevel::Warn` regardless of `level`. Returns the exact `(level, message)` to
+    /// store, already sanitized/truncated, or `None` to drop this line silently (budget already
+    /// exhausted by an earlier call).
+    fn admit(&mut self, level: LogLevel, message: String) -> Option<(LogLevel, String)>;
+}
+
+/// [`LogBudget`] for `host-log`: caps the per-request LINE COUNT (not bytes) at `max_lines`,
+/// reserving the last slot for one truncation marker so overflow stays observable.
+pub(crate) struct LineCountBudget {
+    max_lines: usize,
+    count: usize,
+}
+
+impl LineCountBudget {
+    pub(crate) fn new(max_lines: usize) -> Self {
+        Self {
+            max_lines,
+            count: 0,
+        }
+    }
+
+    /// Reset for the next request (pooled/trusted instances reuse the same budget).
+    pub(crate) fn reset(&mut self) {
+        self.count = 0;
+    }
+}
+
+impl LogBudget for LineCountBudget {
+    fn admit(&mut self, level: LogLevel, message: String) -> Option<(LogLevel, String)> {
+        let last_slot = self.max_lines.saturating_sub(1);
+        if self.count < last_slot {
+            self.count += 1;
+            Some((level, sanitize_log_message(message, MAX_LOG_MSG_BYTES)))
+        } else if self.count == last_slot {
+            self.count += 1;
+            Some((
+                LogLevel::Warn,
+                "… host-log truncated (per-request line cap reached)".to_string(),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 /// Per-request host state: the capability handles lent to a filter plus request-scoped
 /// buffers. For untrusted filters a fresh one is built per request; for trusted filters
 /// the same one is reused with `begin_request` resetting the per-request fields, while the
@@ -89,6 +150,10 @@ pub struct HostState {
     /// Per-request host-log buffer. `pub(crate)`: `runtime.rs`'s `WasmtimeRuntime::take_logs`
     /// drains it directly after a guest call (structural cross-module access, no behavior change).
     pub(crate) logs: Vec<LogLine>,
+    /// `host-log`'s per-request [`LogBudget`] (line-count policy). Independent of the stdio
+    /// bridge's own [`ByteBudget`](crate::stdio::ByteBudget) (ADR 000063) so a chatty guest's
+    /// stdout/stderr cannot starve this filter's own explicit `host-log` calls, or vice versa.
+    host_log_budget: LineCountBudget,
     /// Wall-clock ms captured once at request start: a stable per-request snapshot.
     now_ms: u64,
     /// Linear-memory / table / instance caps for this Store (ADR 000006). Wired via
@@ -103,13 +168,22 @@ pub struct HostState {
     /// Shared per-namespace accounting + caps for host-held state. Charged on every
     /// `set` / `increment` / `try_acquire` that grows the store; over-quota writes fail closed.
     quota: Arc<KvQuota>,
-    /// Outbound capabilities (ADR 000036 HTTP / ADR 000060 TCP): the minimal WASI base ctx and
-    /// resource table shared by both wirings. The relevant interfaces are added to the Linker only
-    /// for filters with an outbound policy; for every other filter the guards below deny every
-    /// call (belt-and-suspenders, so a stray call still fails closed).
-    #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+    /// Outbound capabilities (ADR 000036 HTTP / ADR 000060 TCP) and the fat-guest minimal WASI
+    /// grant (ADR 000063) share this minimal WASI base ctx and resource table. The relevant
+    /// interfaces are added to the Linker only for filters with an outbound policy or a `wasi =
+    /// "minimal"` declaration; for every other filter the guards below deny every call
+    /// (belt-and-suspenders, so a stray call still fails closed).
+    #[cfg(any(
+        feature = "outbound-http",
+        feature = "outbound-tcp",
+        feature = "fat-guest"
+    ))]
     wasi: wasmtime_wasi::WasiCtx,
-    #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+    #[cfg(any(
+        feature = "outbound-http",
+        feature = "outbound-tcp",
+        feature = "fat-guest"
+    ))]
     table: wasmtime::component::ResourceTable,
     /// Outbound HTTP (ADR 000036): the `wasi:http` ctx and the SSRF-guarded send hooks.
     #[cfg(feature = "outbound-http")]
@@ -120,6 +194,12 @@ pub struct HostState {
     /// `socket_addr_check` closure inside `wasi` above and the host's ip-name-lookup impl.
     #[cfg(feature = "outbound-tcp")]
     tcp: outbound_tcp::TcpGuard,
+    /// Fat guest (ADR 000063): `Some` only for a filter this build lent the minimal WASI grant
+    /// AND that declared `wasi = "minimal"` — its stdout/stderr is bridged here, drained into
+    /// `logs` (above) by [`HostState::take_logs`]. `None` for every other filter, including a
+    /// fat-guest-capable build where this filter declared no such grant.
+    #[cfg(feature = "fat-guest")]
+    stdio_bridge: Option<crate::stdio::StdioBridge>,
     /// This filter's manifest-declared business config (`[filter.config]`, ADR 000066) — a
     /// read-only string map the filter reads back via `host-config`. The host never interprets it.
     config: Arc<BTreeMap<String, String>>,
@@ -135,6 +215,11 @@ pub(crate) struct HostStateInit {
     pub(crate) ratelimit_bucket: Option<Bucket>,
     pub(crate) quota: Arc<KvQuota>,
     pub(crate) config: Arc<BTreeMap<String, String>>,
+    /// This filter's manifest `wasi = "minimal"` declaration (ADR 000063). Meaningless (but
+    /// harmless) when the `fat-guest` feature is off — the manifest validator rejects the
+    /// declaration on such a build before `HostState` is ever constructed.
+    #[cfg(feature = "fat-guest")]
+    pub(crate) wasi_minimal: bool,
 }
 
 impl HostState {
@@ -150,17 +235,35 @@ impl HostState {
             ratelimit_bucket,
             quota,
             config,
+            #[cfg(feature = "fat-guest")]
+            wasi_minimal,
         } = init;
-        // The base WasiCtx: empty (no fs, no env, no preopens). With outbound TCP the guard
-        // installs its socket_addr_check; otherwise the builder's deny-all socket default stands.
+        // The base WasiCtx builder: empty (no fs, no env, no preopens) until a lent capability
+        // configures its own slice. Outbound TCP installs its `socket_addr_check`; fat guest
+        // wires stdout/stderr into this filter's host-log (ADR 000063). Neither present leaves
+        // the builder's deny-all-sockets / discard-stdio defaults standing.
+        #[cfg(any(
+            feature = "outbound-http",
+            feature = "outbound-tcp",
+            feature = "fat-guest"
+        ))]
+        let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
         #[cfg(feature = "outbound-tcp")]
-        let wasi = tcp.wasi_ctx();
-        #[cfg(all(feature = "outbound-http", not(feature = "outbound-tcp")))]
-        let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
+        tcp.configure_wasi_ctx(&mut wasi_builder);
+        #[cfg(feature = "fat-guest")]
+        let stdio_bridge = if wasi_minimal {
+            let bridge = crate::stdio::StdioBridge::new();
+            wasi_builder.stdout(bridge.stream(crate::stdio::StdioKind::Stdout));
+            wasi_builder.stderr(bridge.stream(crate::stdio::StdioKind::Stderr));
+            Some(bridge)
+        } else {
+            None
+        };
         Self {
             kv,
             kv_prefix,
             logs: Vec::new(),
+            host_log_budget: LineCountBudget::new(MAX_LOG_LINES_PER_REQUEST),
             now_ms: wall_now_ms(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(max_memory_bytes as usize)
@@ -169,9 +272,17 @@ impl HostState {
             ratelimit_bucket,
             quota,
             config,
-            #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
-            wasi,
-            #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+            #[cfg(any(
+                feature = "outbound-http",
+                feature = "outbound-tcp",
+                feature = "fat-guest"
+            ))]
+            wasi: wasi_builder.build(),
+            #[cfg(any(
+                feature = "outbound-http",
+                feature = "outbound-tcp",
+                feature = "fat-guest"
+            ))]
             table: wasmtime::component::ResourceTable::new(),
             #[cfg(feature = "outbound-http")]
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
@@ -179,13 +290,46 @@ impl HostState {
             hooks,
             #[cfg(feature = "outbound-tcp")]
             tcp,
+            #[cfg(feature = "fat-guest")]
+            stdio_bridge,
         }
+    }
+
+    /// Drain this request's host-log lines, merging in any lines the fat-guest stdio bridge
+    /// queued (ADR 000063) — both feed the same OTLP span-event path
+    /// (`observe::build_filter_span`), so a trapped guest's stdout/stderr shows up in the same
+    /// trace as the failing request. Called once per guest call, from `runtime.rs`.
+    pub(crate) fn take_logs(&mut self) -> Vec<LogLine> {
+        #[cfg(feature = "fat-guest")]
+        if let Some(bridge) = &self.stdio_bridge {
+            self.logs.extend(bridge.drain());
+        }
+        std::mem::take(&mut self.logs)
+    }
+
+    /// Like [`HostState::take_logs`], but for the trap path: the instance is about to be
+    /// discarded, so this also flushes any still-unterminated stdio partial line (ADR 000063) —
+    /// e.g. a TinyGo panic message written to stderr with no trailing newline right before the
+    /// trap — instead of losing it along with the instance. `runtime.rs`/`pool.rs` call this
+    /// instead of `take_logs` from a call's `Err` arm so a trapped request's own diagnostic
+    /// output still reaches `emit_span`, which is the whole point of the stdio bridge.
+    pub(crate) fn take_logs_after_trap(&mut self) -> Vec<LogLine> {
+        #[cfg(feature = "fat-guest")]
+        if let Some(bridge) = &self.stdio_bridge {
+            self.logs.extend(bridge.drain_final());
+        }
+        std::mem::take(&mut self.logs)
     }
 
     /// Reset per-request state for a reused (trusted) instance. Clears the log buffer and
     /// re-snapshots the clock; the WASM instance's linear memory (init-derived) is untouched.
     pub(crate) fn begin_request(&mut self) {
         self.logs.clear();
+        self.host_log_budget.reset();
+        #[cfg(feature = "fat-guest")]
+        if let Some(bridge) = &self.stdio_bridge {
+            bridge.begin_request();
+        }
         self.now_ms = wall_now_ms();
         // A reused instance's connect budget belongs to the request, not the instance.
         #[cfg(feature = "outbound-tcp")]
@@ -215,9 +359,14 @@ impl HostState {
 
 // --- host-API capability implementations (deny-by-default: only these are lent) ---
 
-// Outbound capabilities (ADR 000036 / 000060): the WASI base + per-capability projections, added
-// to the Linker only for filters with an outbound policy. They share one resource table.
-#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+// Outbound capabilities (ADR 000036 / 000060) and the fat-guest grant (ADR 000063): the WASI
+// base + per-capability projections, added to the Linker only for filters with an outbound
+// policy or a `wasi = "minimal"` declaration. They share one resource table.
+#[cfg(any(
+    feature = "outbound-http",
+    feature = "outbound-tcp",
+    feature = "fat-guest"
+))]
 impl wasmtime_wasi::WasiView for HostState {
     fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
         wasmtime_wasi::WasiCtxView {
@@ -238,22 +387,55 @@ impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
     }
 }
 
-/// Add the wasi:cli interfaces the std guest's runtime imports beyond the proxy slice (environment /
-/// exit / terminal-*), each inert under the empty `WasiCtx`. Adds NO filesystem and NO sockets, so
-/// those capabilities stay denied (security audit F-002; mirrors the streaming path). Outbound TCP
-/// filters (ADR 000060) get their `wasi:sockets` slice added separately, behind their own guard.
-#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
-pub(crate) fn add_cli_runtime(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
+/// Add the wasi:cli interfaces a std guest's runtime imports beyond the proxy slice (environment /
+/// exit / terminal-*), each inert under an empty `WasiCtx` (environment returns `[]`, exit traps,
+/// the terminals are not TTYs). Adds NO filesystem and NO sockets, so those capabilities stay
+/// denied (security audit F-002). Generic over the embedder state `T` so the sync host
+/// (`HostState`, here) and the experimental async streaming host (`streaming::Ctx`) share one
+/// definition instead of two copies of the same wiring; outbound-TCP filters (ADR 000060) get
+/// their `wasi:sockets` slice added separately, behind their own guard.
+#[cfg(any(
+    feature = "outbound-http",
+    feature = "outbound-tcp",
+    feature = "fat-guest",
+    feature = "streaming-body"
+))]
+pub(crate) fn add_cli_runtime<T: wasmtime_wasi::cli::WasiCliView>(
+    linker: &mut Linker<T>,
+) -> wasmtime::Result<()> {
     use wasmtime_wasi::cli::{WasiCli, WasiCliView};
     use wasmtime_wasi::p2::bindings::cli;
-    let getter = <HostState as WasiCliView>::cli;
-    cli::environment::add_to_linker::<HostState, WasiCli>(linker, getter)?;
-    cli::exit::add_to_linker::<HostState, WasiCli>(linker, getter)?;
-    cli::terminal_input::add_to_linker::<HostState, WasiCli>(linker, getter)?;
-    cli::terminal_output::add_to_linker::<HostState, WasiCli>(linker, getter)?;
-    cli::terminal_stdin::add_to_linker::<HostState, WasiCli>(linker, getter)?;
-    cli::terminal_stdout::add_to_linker::<HostState, WasiCli>(linker, getter)?;
-    cli::terminal_stderr::add_to_linker::<HostState, WasiCli>(linker, getter)?;
+    let getter = <T as WasiCliView>::cli;
+    cli::environment::add_to_linker::<T, WasiCli>(linker, getter)?;
+    cli::exit::add_to_linker::<T, WasiCli>(linker, getter)?;
+    cli::terminal_input::add_to_linker::<T, WasiCli>(linker, getter)?;
+    cli::terminal_output::add_to_linker::<T, WasiCli>(linker, getter)?;
+    cli::terminal_stdin::add_to_linker::<T, WasiCli>(linker, getter)?;
+    cli::terminal_stdout::add_to_linker::<T, WasiCli>(linker, getter)?;
+    cli::terminal_stderr::add_to_linker::<T, WasiCli>(linker, getter)?;
+    Ok(())
+}
+
+/// Link an EMPTY `wasi:filesystem` (`types` + `preopens`) for a fat guest declaring `wasi =
+/// "minimal"` (ADR 000063). Confirmed empirically (TinyGo 0.41.1): a wasip2 TinyGo guest
+/// unconditionally imports `wasi:filesystem/types` + `wasi:filesystem/preopens` as part of its
+/// runtime bootstrap, even for a program that never touches a file — so Tier B must LINK the
+/// interface for such a guest to instantiate at all. This lends ZERO real capability: the
+/// `WasiCtx`'s preopens list is never populated (no `WasiCtxBuilder::preopened_dir` call
+/// anywhere in the fat-guest path), so `preopens.get-directories()` returns `[]` and the guest
+/// can never obtain a `descriptor` resource to operate on — filesystem access stays structurally
+/// unreachable, exactly like `add_cli_runtime`'s inert `wasi:cli/environment`. Not part of
+/// `add_cli_runtime` itself: outbound-http/outbound-tcp/streaming-body guests are Rust-authored
+/// (no forced runtime import), so only the fat-guest path needs this.
+#[cfg(feature = "fat-guest")]
+pub(crate) fn add_inert_filesystem<T: wasmtime_wasi::filesystem::WasiFilesystemView>(
+    linker: &mut Linker<T>,
+) -> wasmtime::Result<()> {
+    use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView};
+    use wasmtime_wasi::p2::bindings::filesystem;
+    let getter = <T as WasiFilesystemView>::filesystem;
+    filesystem::types::add_to_linker::<T, WasiFilesystem>(linker, getter)?;
+    filesystem::preopens::add_to_linker::<T, WasiFilesystem>(linker, getter)?;
     Ok(())
 }
 
@@ -262,19 +444,10 @@ impl bindings::plecto::filter::types::Host for HostState {}
 
 impl host_log::Host for HostState {
     fn log(&mut self, level: LogLevel, message: String) {
-        // Bound per-request log volume and neutralize control bytes: a guest can
-        // loop `log` until its deadline, so cap the line count (reserving the last slot for one
-        // truncation marker) and sanitize each message before it is stored.
-        match self.logs.len() {
-            n if n < MAX_LOG_LINES_PER_REQUEST - 1 => self.logs.push(LogLine {
-                level,
-                message: sanitize_log_message(message),
-            }),
-            n if n == MAX_LOG_LINES_PER_REQUEST - 1 => self.logs.push(LogLine {
-                level: LogLevel::Warn,
-                message: "… host-log truncated (per-request line cap reached)".to_string(),
-            }),
-            _ => {}
+        // `LineCountBudget` bounds per-request log volume (CWE-770: a guest can loop `log` until
+        // its deadline) and `sanitize_log_message` (inside `admit`) neutralizes control bytes.
+        if let Some((level, message)) = self.host_log_budget.admit(level, message) {
+            self.logs.push(LogLine { level, message });
         }
     }
 }
@@ -457,6 +630,8 @@ mod tests {
             ratelimit_bucket: None,
             quota: Arc::new(KvQuota::new()),
             config: Arc::new(BTreeMap::new()),
+            #[cfg(feature = "fat-guest")]
+            wasi_minimal: false,
         }
     }
 

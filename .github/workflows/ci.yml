@@ -102,6 +102,14 @@ jobs:
       # (SSRF floor unopenable / IP pin / connect budget) — run it, don't just compile it.
       - run: cargo test -p plecto-host --features outbound-tcp
       - run: cargo test -p plecto-control --features outbound-tcp
+      # Fat guest (ADR 000063, OFF by default): the stdio bridge / manifest-toggle unit tests run
+      # here (no TinyGo toolchain needed — that's `polyglot-guest-go` below, which builds and
+      # exercises the real Go component against this same feature).
+      - run: cargo test -p plecto-host --features fat-guest
+      - run: cargo test -p plecto-control --features fat-guest
+      # Combined with outbound-tcp: proves the fat-guest grant alone does NOT satisfy a
+      # `wasi:sockets` import (ADR 000063 Decision 4's structural-deny half, tcp_gate.rs).
+      - run: cargo test -p plecto-host --features outbound-tcp,fat-guest --test tcp_gate
       - run: cargo build --release
 
   # Lint the excluded WASM guest against its real target.
@@ -171,6 +179,51 @@ jobs:
           ./examples/filters/filter-hello-js/build.sh
       - name: Same contract, same assertions, three languages
         run: cargo test -p plecto-host --features polyglot-conformance --test polyglot
+
+  # Tier B polyglot guest: filter-hello-go, the first "fat guest" (ADR 000063) — TinyGo's wasip2
+  # runtime assumes WASI is present, so this is NOT zero-WASI like the Tier A trio above. Its own
+  # job (separate toolchain: TinyGo + wkg + wit-bindgen-go, none of which Tier A needs) builds it
+  # and runs the Tier B conformance suite (crates/host/tests/polyglot_tier_b.rs) against the
+  # `fat-guest` feature — the falsifiable proof that the minimal-WASI grant links a real TinyGo
+  # guest while still denying it outside that grant.
+  polyglot-guest-go:
+    name: polyglot guest (Go / TinyGo, Tier B)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          toolchain: "1.96.0" # SHA-pinned (A08): re-state the toolchain the ref no longer encodes.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: plecto-polyglot-go
+          cache-on-failure: true
+          workspaces: plecto
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+      - name: Install TinyGo / wasm-tools / wkg (sha256-pinned)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o tinygo.tar.gz https://github.com/tinygo-org/tinygo/releases/download/v0.41.1/tinygo0.41.1.linux-amd64.tar.gz
+          echo "e156d1d93a376eef639a4143d13be07e8c463fb6cf2d7d447698ed4474d23e91  tinygo.tar.gz" | sha256sum -c -
+          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
+          echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
+          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
+          echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
+          chmod +x wkg
+          mkdir -p wkg-bin && mv wkg wkg-bin/
+          tar xzf tinygo.tar.gz && tar xzf wasm-tools.tar.gz
+          echo "${{ runner.temp }}/tinygo/bin" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wkg-bin" >> "$GITHUB_PATH"
+          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build filter-hello-go (asserts the Tier B WASI allowlist)
+        run: ./examples/filters/filter-hello-go/build.sh
+      - name: Tier B conformance (fat-guest grant, deny-by-default, stdio bridge)
+        run: cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyglot_tier_b
 
   # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).
   # A security vulnerability, unmaintained crate, or yanked version fails CI — supply-chain

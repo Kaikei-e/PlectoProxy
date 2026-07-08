@@ -64,6 +64,22 @@ outbound-tcp = [
     "dep:tokio",
     "wasmtime/component-model-async",
 ]
+# Fat guest (ADR 000063): lends a minimal WASI slice — wasi:io / wasi:clocks (real monotonic +
+# wall) / wasi:random (real CSPRNG) / wasi:cli (env = [], args = [], exit; stdout/stderr bridged
+# into this filter's host-log, ADR 000063 Decision 2) — to filters that declare `wasi = "minimal"`
+# in the manifest. No filesystem, no sockets: those stay separate, deny-by-default capabilities
+# (outbound-http / outbound-tcp). OFF by default — the shipped zero-WASI guests (Tier A, ADR
+# 000055) are untouched; this unlocks "fat" guests (TinyGo/Go and other WASI-runtime-assuming
+# toolchains, Tier B) without widening what a zero-WASI filter can link. Shares the exact same
+# minimal-WASI base wiring (`add_to_linker_proxy_interfaces_async` + `add_cli_runtime`) that
+# outbound-http/outbound-tcp already pull in ad hoc — this feature is that wiring's formalization,
+# independently gated. Building the fixture needs `wasm32-wasip2` (Rust) or TinyGo (Go).
+fat-guest = [
+    "dep:wasmtime-wasi",
+    "dep:bytes",
+    "dep:tokio",
+    "wasmtime/component-model-async",
+]
 # Marker feature for the `mem-probe` example: swaps in dhat's global allocator to report host-heap
 # peak (the lifted body copy). No effect on the lib or the default build; dhat is a dev-dependency,
 # so it is never linked into a production build. Run: `cargo run -p plecto-host --example mem-probe

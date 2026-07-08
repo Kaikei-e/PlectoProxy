@@ -193,6 +193,27 @@ impl FilterEntry {
         if let Some(ob) = &self.outbound_tcp {
             self.validate_outbound_tcp(ob)?;
         }
+        if self.wasi == super::WasiKind::Minimal {
+            self.validate_wasi_minimal()?;
+        }
+        Ok(())
+    }
+
+    /// Validate a `wasi = "minimal"` declaration (ADR 000063): without the `fat-guest` build the
+    /// host cannot provide the grant, so it is rejected (fail-closed) — same rule as
+    /// `outbound_http`/`outbound_tcp`. Unlike those, there is no sub-config to check once the
+    /// build has the capability: the grant is fixed, so presence alone is valid.
+    #[cfg(not(feature = "fat-guest"))]
+    fn validate_wasi_minimal(&self) -> Result<(), ControlError> {
+        Err(ControlError::InvalidFilterConfig {
+            id: self.id.clone(),
+            reason: "wasi = \"minimal\" requested but this build lacks the `fat-guest` feature"
+                .to_string(),
+        })
+    }
+
+    #[cfg(feature = "fat-guest")]
+    fn validate_wasi_minimal(&self) -> Result<(), ControlError> {
         Ok(())
     }
 
@@ -311,7 +332,7 @@ impl FilterEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{IsolationKind, RateLimitConfig};
+    use crate::manifest::{IsolationKind, RateLimitConfig, WasiKind};
 
     #[test]
     fn is_prime_is_correct() {
@@ -337,6 +358,7 @@ mod tests {
             ratelimit: None,
             outbound_http: None,
             outbound_tcp: None,
+            wasi: WasiKind::None,
             config: None,
         };
         assert!(base.validate().is_ok(), "defaults are valid");

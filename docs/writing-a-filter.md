@@ -122,6 +122,7 @@ init_deadline_ms = 200         # optional: metering overrides; unset = host defa
 request_deadline_ms = 25       # optional
 max_memory_bytes = 16777216    # optional
 ratelimit = { capacity = 100, refill_tokens = 10, refill_interval_ms = 1000 }  # optional, ADR 000026
+wasi = "minimal"                # optional (default "none"), ADR 000063: Tier B fat-guest WASI grant
 
 [filter.config]                # optional, ADR 000066: arbitrary string→string business config
 on_backend_error = "deny"      # read back via `host-config::get("on_backend_error")`
@@ -131,7 +132,10 @@ on_backend_error = "deny"      # read back via `host-config::get("on_backend_err
 path); `untrusted` filters run fresh per request with linear memory wiped each time (stronger
 isolation, slower). The default is `untrusted` — fail-closed. `ratelimit`, when present, is the
 **host-side** bucket spec for this filter's `host-ratelimit`; the operator owns it so an untrusted
-filter cannot widen its own limit. `[filter.config]` is a read-only string map the filter reads back
+filter cannot widen its own limit. `wasi = "minimal"` lends the fixed Tier B WASI slice a fat guest
+(TinyGo/Go) needs to instantiate at all (§7) — requires the host's `fat-guest` build, otherwise
+rejected at validate; the default `"none"` keeps a filter zero-WASI (Tier A). `[filter.config]` is
+a read-only string map the filter reads back
 via `host-config::get(key)` — the host never interprets it, so **the filter itself must validate any
 key it requires** (typically in `init`, trapping on a missing/invalid value). Combined with
 `isolation = "trusted"`, that trap surfaces as a load-time failure rather than a per-request one
@@ -257,46 +261,82 @@ returns.
 
 Because the contract is WIT, a filter can be written in any language that targets a WASM component.
 The contract and the manifest are the same regardless of language; only the binding toolchain
-differs. The catch is not the language — it is **WASI**: the host's default Linker lends only the
-plecto host-API and deliberately links no `wasi:*` interfaces, so a filter component must arrive
-with **zero WASI imports** or instantiation fails on the unresolved imports. Three bundled examples
-(the filter-hello conformance subset, ported) show which toolchains can do that today, and CI runs
-the **same assertion suite** against all of them (`plecto/crates/host/tests/polyglot.rs`, job
-`polyglot-guests`):
+differs. The catch is not the language — it is **WASI**. Plecto Proxy recognizes two tiers:
 
-| Language | Example | Toolchain | Component size | Zero-WASI how |
-|---|---|---|---|---|
-| MoonBit | [`filter-hello-moonbit`](../plecto/examples/filters/filter-hello-moonbit) | `moon` + `wasm-tools` (`component embed --encoding utf16` + `component new`) | ~22 KB | pure core module, no adapter needed |
-| JavaScript/TypeScript | [`filter-hello-js`](../plecto/examples/filters/filter-hello-js) | ComponentizeJS (`npm run build`) | ~12 MB (StarlingMonkey engine constant) | `disableFeatures: ['random','stdio','clocks','http','fetch-event']` |
-| C | [`filter-hello-c`](../plecto/examples/filters/filter-hello-c) | `wit-bindgen c` + wasi-sdk (`--target=wasm32-wasip2 -mexec-model=reactor`) | ~66 KB | call no WASI API and no adapter is linked |
+- **Tier A (zero-WASI, the default)**: the host's default Linker lends only the plecto host-API
+  and deliberately links no `wasi:*` interfaces, so a filter component must arrive with **zero
+  WASI imports** or instantiation fails on the unresolved imports. Most languages can do this.
+- **Tier B (minimal WASI, opt-in, ADR 000063)**: a "fat guest" — a language runtime that assumes
+  some baseline WASI is present, TinyGo/Go being the reference case — is lent a fixed, minimal
+  slice (`wasi:io` / `wasi:clocks` / `wasi:random` / `wasi:cli`, plus an empty `wasi:filesystem`
+  some runtimes' bootstrap unconditionally imports even though it touches no file — zero preopens,
+  so zero reachable paths). Never filesystem *access*, never sockets. Requires the host's
+  off-by-default `fat-guest` cargo feature AND the filter's manifest entry to declare
+  `wasi = "minimal"`; absent either, a fat guest fails to instantiate (deny-by-default, ADR 000063
+  Decision 4) exactly like an unlisted `wasi:*` import does for Tier A.
 
-Each example has a `build.sh` that builds the component and **fails the build if any `wasi:*`
-import appears** — run it, then verify against the host with:
+Four bundled examples (the filter-hello conformance subset, ported) show which toolchains can do
+this today:
+
+| Tier | Language | Example | Toolchain | Component size | WASI surface |
+|---|---|---|---|---|---|
+| A | MoonBit | [`filter-hello-moonbit`](../plecto/examples/filters/filter-hello-moonbit) | `moon` + `wasm-tools` (`component embed --encoding utf16` + `component new`) | ~22 KB | none |
+| A | JavaScript/TypeScript | [`filter-hello-js`](../plecto/examples/filters/filter-hello-js) | ComponentizeJS (`npm run build`) | ~12 MB (StarlingMonkey engine constant) | none (`disableFeatures: ['random','stdio','clocks','http','fetch-event']`) |
+| A | C | [`filter-hello-c`](../plecto/examples/filters/filter-hello-c) | `wit-bindgen c` + wasi-sdk (`--target=wasm32-wasip2 -mexec-model=reactor`) | ~66 KB | none |
+| B | Go | [`filter-hello-go`](../plecto/examples/filters/filter-hello-go) | TinyGo (`-target=wasip2`) + `wit-bindgen-go` (`go.bytecodealliance.org/cmd/wit-bindgen-go`) + `wkg` (WIT deps) | ~850 KB | `wasi:io`/`clocks`/`random`/`cli`/`filesystem` (preopens empty) |
+
+Each Tier A example has a `build.sh` that builds the component and **fails the build if any
+`wasi:*` import appears**; `filter-hello-go`'s `build.sh` instead asserts every `wasi:*` import is
+within the Tier B allowlist (`io`/`clocks`/`random`/`cli`/`filesystem` — never `sockets`/`http`).
+Run the relevant one, then verify against the host:
 
 ```bash
+# Tier A — same assertion suite against all three languages:
 cargo test -p plecto-host --features polyglot-conformance --test polyglot
+
+# Tier B — the fat-guest grant, deny-by-default without it, and the conformance subset:
+cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyglot_tier_b
 ```
 
-One deliberate exception to the zero-WASI rule: a filter the manifest lends an **outbound
-capability** to (`[filter.outbound_http]`, ADR 000036, or `[filter.outbound_tcp]`, ADR 000060) is
-no longer zero-WASI. Such a filter builds for `wasm32-wasip2` and imports `wasi:*` interfaces
-(`wasi:http/outgoing-handler`, or the `wasi:sockets` TCP-connect vocabulary, plus the `wasi:io`
-base they pull in), and the host links exactly those slices — only for that filter, only behind
-the declared allowlist + SSRF guard, and only on a build with the matching off-by-default cargo
-feature (`outbound-http` / `outbound-tcp`). Everything else here still applies: a filter with no
-outbound section in the manifest gets the default Linker and must arrive with zero WASI imports.
+To opt a Go/TinyGo (or other Tier B) filter in, build the host with the `fat-guest` cargo feature
+and declare the grant in its manifest entry:
+
+```toml
+[[filter]]
+id = "my-go-filter"
+source = "artifacts/my-go-filter"
+digest = "sha256:..."
+wasi = "minimal"    # ADR 000063; requires the host's `fat-guest` build, else rejected at validate
+```
+
+stdout/stderr from a Tier B guest is bridged into that filter's `host-log` (stdout → `debug`,
+stderr → `warn`; 4 KiB/line, 64 KiB/request combined, truncate-and-warn-once past the budget) — a
+TinyGo panic message shows up in the same trace as the request that triggered it, without the
+guest importing `host-log` itself.
+
+The `wasi:clocks` lent to a Tier B guest are the runtime's OWN real monotonic/wall clocks (needed
+for the TinyGo runtime to boot at all) — reading them directly from guest code (e.g. Go's
+`time.Now()`) is **non-deterministic** across a retry or a re-run. A filter's *decision* logic must
+stay on the `host-clock` host-API (§1 above): the same per-request millisecond snapshot every
+language gets, so policy stays reproducible regardless of tier. Treat `wasi:clocks` as a
+Go-runtime implementation detail, not a contract-level time source.
+
+One more deliberate exception to the zero-WASI rule, orthogonal to Tier B: a filter the manifest
+lends an **outbound capability** to (`[filter.outbound_http]`, ADR 000036, or
+`[filter.outbound_tcp]`, ADR 000060) also imports `wasi:*` interfaces (`wasi:http/outgoing-handler`,
+or the `wasi:sockets` TCP-connect vocabulary, plus the `wasi:io` base they pull in), and the host
+links exactly those slices — only for that filter, only behind the declared allowlist + SSRF guard,
+and only on a build with the matching off-by-default cargo feature (`outbound-http` /
+`outbound-tcp`). A filter can combine `wasi = "minimal"` with an outbound capability (e.g. a Go
+filter that also calls out over HTTP) — the host composes both grants on the same `WasiCtx`. A
+filter with none of these declared gets the default Linker and must arrive with zero WASI imports.
 See `filter-extauthz` (HTTP) and `filter-tcp-gate` (TCP) under `plecto/examples/filters/` for the
-two shapes.
+outbound shapes.
 
-Two more languages, for completeness:
+One more language, for completeness:
 
-- **Python** works the same way (`componentize-py --stub-wasi` bundles CPython, ~17 MB). It passes
-  the same gate but is heavy for a per-request filter; no bundled example.
-- **Go is the one that cannot** (yet): TinyGo's `wasip2` target is built around the
-  `wasi:cli/command` world, so its components always import `wasi:cli`/`wasi:io`/`wasi:clocks` —
-  which the default Linker will not provide. Lending a minimal `WasiCtx` to such "fat" guests is a
-  deliberate, separate host decision (a new security surface flagged in ADR 000010); until it is
-  taken, Go filters cannot load. Big Go (the `gc` toolchain) has no Component Model support at all.
+- **Python** works the Tier A way (`componentize-py --stub-wasi` bundles CPython, ~17 MB). It
+  passes the zero-WASI gate but is heavy for a per-request filter; no bundled example.
 
 First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain on the
 [roadmap](../README.md#roadmap) (M6).

@@ -40,7 +40,7 @@ The principle covers **absence** as well as presence. The contract is split into
 
 ### P4 — Deny-by-default, and fail-closed
 
-The only capabilities a filter can import are the interfaces the host explicitly lends: **host-log / host-clock / host-kv / host-counter / host-ratelimit — five and no more**; no other import exists in the Linker (ADR 000006). Zero WASI imports is the default (zero-WASI guests) — the only shape the deny-by-default Linker can instantiate as-is (ADR 000055).
+The only capabilities a filter can import are the interfaces the host explicitly lends: **host-log / host-clock / host-kv / host-counter / host-ratelimit — five and no more**; no other import exists in the Linker (ADR 000006). Zero WASI imports is the default (zero-WASI guests, Tier A) — the shape the deny-by-default Linker instantiates with no further declaration (ADR 000055). A fat guest whose runtime assumes some baseline WASI (TinyGo/Go, Tier B) may be lent a fixed, minimal, off-by-default slice — `wasi:io` / `clocks` / `random` / `cli`, plus an empty `wasi:filesystem` some runtimes' bootstrap unconditionally imports — never filesystem access, never sockets, and only when both the host build and the filter's manifest entry opt in (ADR 000063); absent either, it still fails to instantiate, deny-by-default.
 
 Failure always falls to the closed side: a filter trap or epoch-deadline overrun is never allowed to fail open. If only unhealthy upstreams remain, respond 503. Quota exceeded: reject. Corrupted bucket state means "empty = deny + self-heal", never "allow all". A missing or mismatched signature is an Err before load. Path normalisation rejects any bypass encoding it cannot interpret. Buffer-permit errors are fail-closed too (consistent through the most recent commits). The operational form of this principle: **"If you are wondering whether to fail safe, the answer has already been given."**
 
@@ -154,7 +154,7 @@ From the role-driven criteria of ADR 000029 and Fork 6, placement is asked in th
 
 ### 3.2 Discipline for adding capabilities
 
-A new host-API is cut as "1 interface = 1 capability", preserving deny-by-default. Dangerous capabilities are **quarantined behind off-by-default feature gates before** they land — current instances: `outbound-http` (outside the default build until the wasi:http convergence gate), `streaming-body` (until wasip3 Tier 2), `polyglot-conformance` (no effect on default `cargo test`). Shapes that let a filter relax its own constraints by self-declaration (guest-specified bucket capacity, etc.) are forbidden at design time. Lending fat guests a minimal `WasiCtx` (the key to unlocking Go/TinyGo) is deferred as an independent security decision (ADR 000055 / 000010) and is not to be widened by drift.
+A new host-API is cut as "1 interface = 1 capability", preserving deny-by-default. Dangerous capabilities are **quarantined behind off-by-default feature gates before** they land — current instances: `outbound-http` (outside the default build until the wasi:http convergence gate), `streaming-body` (until wasip3 Tier 2), `polyglot-conformance` (no effect on default `cargo test`), `fat-guest` (the minimal-WASI grant for Tier B guests, ADR 000063 — off by default, and even on, inert unless a filter's manifest entry declares `wasi = "minimal"`). Shapes that let a filter relax its own constraints by self-declaration (guest-specified bucket capacity, etc.) are forbidden at design time.
 
 ### 3.3 Discipline for adding dependencies
 
@@ -198,7 +198,7 @@ The principles do not change, but the policies carry explicit external triggers 
 |---|---|
 | `wasm32-wasip3` reaches Rust Tier 2, wit-bindgen async matures | Promotion of the `streaming-body` feature toward default (real `stream<u8>` implementation, M3's true-streaming increment) |
 | The `wasi:http` (proxy / middleware) convergence gate is met | Executing the `wasi:http` type convergence (ADR 000020) and the default-build decision for `outbound-http` |
-| A dedicated ADR for lending fat guests a minimal `WasiCtx` | Unlocking Go (TinyGo) filters (the decision ADR 000055 deferred by name) — **decided 2026-07-06 as ADR 000063** (Tier B unlock; implementation pending) |
+| Go (`gc`) reaches Tier-equivalent wasip2/p3 Component Model support | Revisit the TinyGo-only assumption behind Tier B (ADR 000063, decided 2026-07-06 and implemented 2026-07-08) |
 | The mTLS slice starts | Design of downstream/upstream client-cert verification (head of the deferred ordering, ADR 000054; both directions are currently `with_no_client_auth`) |
 | Demand materialises for remote filter-registry fetch (the wkg boundary) | The M4 remainder — offline image-layout is the intended default today |
 | A credible alternative crypto provider matures (e.g. an audited pure-Rust implementation) | Revisiting ADR 000051, using the criteria that ADR established: actual-link verification + build DX + maintenance status |

@@ -61,6 +61,9 @@ mod outbound_http;
 mod outbound_tcp;
 #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
 mod resolver;
+// Fat guest (ADR 000063): the minimal-WASI stdio bridge, OFF by default.
+#[cfg(feature = "fat-guest")]
+mod stdio;
 
 mod engine;
 mod errors;

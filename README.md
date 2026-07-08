@@ -1,10 +1,10 @@
 <div align="center">
 
-# Plecto
+# Plecto Proxy
 
 **A self-hostable, programmable L7 reverse proxy & API gateway — in Rust, extended with WebAssembly.**
 
-[![CI](https://github.com/Kaikei-e/Plecto/actions/workflows/ci.yml/badge.svg)](https://github.com/Kaikei-e/Plecto/actions/workflows/ci.yml)
+[![CI](https://github.com/Kaikei-e/PlectoProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Kaikei-e/PlectoProxy/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/)
 [![Status: early development](https://img.shields.io/badge/status-early%20development-yellow.svg)](#roadmap)
@@ -15,7 +15,7 @@ English · [日本語](README.ja.md)
 
 ---
 
-Plecto pairs **two complementary halves** through a typed [WIT](https://component-model.bytecodealliance.org/) contract:
+Plecto Proxy pairs **two complementary halves** through a typed [WIT](https://component-model.bytecodealliance.org/) contract:
 
 - a **fast path** in native Rust — connection handling, TLS termination, HTTP/1.1·2·3, routing, load balancing, and upstream management;
 - an **extension plane** of **WebAssembly Component Model filters** — the per-request *decisions* (auth, header/body rewriting, rate limiting, WAF, policy) that you write in **any language**, plug in over the `plecto:filter` contract, and **hot-swap with zero downtime**.
@@ -25,7 +25,7 @@ The speed-critical path stays native Rust. Your request logic runs as a sandboxe
 > [!WARNING]
 > **Status: early development.** The design is settled (66 ADRs, 61 accepted) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `--version`); `v0.1.1` is tagged with a signed-artifact release pipeline (cosign + SBOM) of its own. The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
-## Why Plecto?
+## Why Plecto Proxy?
 
 Every gateway eventually faces the same question: **where does custom logic go?** The classic answers each involve trade-offs:
 
@@ -34,9 +34,9 @@ Every gateway eventually faces the same question: **where does custom logic go?*
 | Config / DSL | ✅ | ✅ | ❌ | ✅ |
 | Recompile into the binary | ✅ | ❌ | ❌ | ❌ |
 | Out-of-process (`ext_proc`, sidecar) | ❌ | ✅ | ✅ | ✅ |
-| **WASM filters — Plecto** | ✅ | ✅ | ✅ | ✅ |
+| **WASM filters — Plecto Proxy** | ✅ | ✅ | ✅ | ✅ |
 
-WASM data-plane filters are an idea **Envoy and proxy-wasm pioneered** — proxy-wasm targets the earlier WASM ABI (v0.2.1); the **Component Model and WIT** have since matured into a typed, polyglot, composable foundation, and Plecto builds on them natively. High-performance Rust proxies like **Cloudflare's Pingora** show how fast a native data path can be; Plecto's focus is **pairing that speed with a Component-Model extension plane**, for teams who want to self-host and keep traffic and secrets on their own infrastructure — **data sovereignty** as a first principle.
+WASM data-plane filters are an idea **Envoy and proxy-wasm pioneered** — proxy-wasm targets the earlier WASM ABI (v0.2.1); the **Component Model and WIT** have since matured into a typed, polyglot, composable foundation, and Plecto Proxy builds on them natively. High-performance Rust proxies like **Cloudflare's Pingora** show how fast a native data path can be; Plecto Proxy's focus is **pairing that speed with a Component-Model extension plane**, for teams who want to self-host and keep traffic and secrets on their own infrastructure — **data sovereignty** as a first principle.
 
 See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alternatives.
 
@@ -54,7 +54,7 @@ See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alterna
 
 ## Architecture
 
-Plecto is a fast **native highway** plus a **checkpoint where your own code runs**: native Rust
+Plecto Proxy is a fast **native highway** plus a **checkpoint where your own code runs**: native Rust
 accepts connections, terminates TLS, speaks HTTP, routes, and load-balances; the **extension plane**
 hands each request to your *filter* — a small sandboxed WASM program — which inspects it and returns
 one of three decisions. That decision is where the policy lives.
@@ -128,11 +128,11 @@ The native fast path has matured well past "a proxy that works." A snapshot of w
 | **Rate limiting** | **two-tier model** ([ADR 61](docs/ADR/000061.md)): a native L7 token-bucket **local floor** per **route** / **client-IP** (node-local, sheds bursts before they cost a round trip) plus [`filter-ratelimit-redis`](plecto/examples/filters/filter-ratelimit-redis), a reference **global** filter that consults a RESP-compatible store (Redis/Valkey) over the outbound-TCP capability — recommended together, see the [hardening guide](docs/hardening.md) — [33](docs/ADR/000033.md) · [53](docs/ADR/000053.md) · [60](docs/ADR/000060.md) · [66](docs/ADR/000066.md) |
 | **Extension plane** | `plecto:filter` chain over headers and, for opted-in filters, the body (header-only filters skip buffering — zero-copy); typed `decision`; trusted **pooled** / untrusted **fresh** instances; deny-by-default host-API with per-filter + host-wide quotas; feature-gated **outbound HTTP** and **outbound TCP** (both SSRF-guarded); a `host-config` capability lends filter business settings declared in the manifest — [1](docs/ADR/000001.md) · [25](docs/ADR/000025.md) · [38](docs/ADR/000038.md) · [60](docs/ADR/000060.md) · [66](docs/ADR/000066.md) |
 | **Client IP** | edge-model propagation — re-issues `X-Forwarded-For` / `X-Real-IP` from the real peer before the chain runs — [18](docs/ADR/000018.md) |
-| **Supply chain & ops** | cosign + SBOM-verified filter loading; zero-downtime SIGHUP reload + graceful shutdown wired into the shipped binary; W3C trace propagation, RED metrics, OTLP export; `plecto validate` / `schema` / `--version`; Plecto's own binary and container image carry the same signed-artifact discipline — [6](docs/ADR/000006.md) · [39](docs/ADR/000039.md) · [46](docs/ADR/000046.md) · [47](docs/ADR/000047.md) |
+| **Supply chain & ops** | cosign + SBOM-verified filter loading; zero-downtime SIGHUP reload + graceful shutdown wired into the shipped binary; W3C trace propagation, RED metrics, OTLP export; `plecto validate` / `schema` / `--version`; Plecto Proxy's own binary and container image carry the same signed-artifact discipline — [6](docs/ADR/000006.md) · [39](docs/ADR/000039.md) · [46](docs/ADR/000046.md) · [47](docs/ADR/000047.md) |
 
 ## The filter contract
 
-The heart of Plecto is the `plecto:filter` WIT world — a custom world that defines Plecto's own vocabulary (the typed `decision`, init/per-request hooks, the deny-by-default host-API) while reusing standard types for polyglot compatibility.
+The heart of Plecto Proxy is the `plecto:filter` WIT world — a custom world that defines Plecto Proxy's own vocabulary (the typed `decision`, init/per-request hooks, the deny-by-default host-API) while reusing standard types for polyglot compatibility.
 
 ```wit
 package plecto:filter@0.1.0;
@@ -258,7 +258,7 @@ The benchmark harnesses (`bench-server`, `swap-bench`) are not demos — they li
 
 ## Roadmap
 
-Plecto is built ADR-first, milestone by milestone. The full detail — landed items, what's next, and the deciding ADR for each — lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); here's the snapshot:
+Plecto Proxy is built ADR-first, milestone by milestone. The full detail — landed items, what's next, and the deciding ADR for each — lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); here's the snapshot:
 
 | Milestone | Status | Covers |
 | --- | --- | --- |
@@ -266,7 +266,7 @@ Plecto is built ADR-first, milestone by milestone. The full detail — landed it
 | **M1** — Filter runtime hardening | ✅ landed | trusted pool / untrusted fresh-per-request, redb KV, host-native rate limiting, quotas |
 | **M2** — The data path (fast path) | 🚧 maturing | HTTP/1–3 + TLS, routing / LB / resilience, upstream TLS + periodic DNS re-resolve, WebSocket tunnelling |
 | **M3** — Async & bodies | 🚧 Stages 1–2 landed | wasmtime-46 async, header/body-world split, buffer-then-decide body hook; `stream<u8>` is experimental |
-| **M4** — Provenance & zero-downtime reload | ✅ landed | OCI + cosign + SBOM filter loading, SIGHUP reload + graceful shutdown, signed releases of Plecto itself |
+| **M4** — Provenance & zero-downtime reload | ✅ landed | OCI + cosign + SBOM filter loading, SIGHUP reload + graceful shutdown, signed releases of Plecto Proxy itself |
 | **M5** — Observability & opt-in distribution | 🚧 mostly landed | W3C trace propagation, RED metrics, OTLP export landed; opt-in config consensus deferred |
 | **M6** — Polyglot SDKs & reference filters | 🚧 examples landed | MoonBit/JS/C example filters + one shared conformance suite (CI-gated); SSRF-guarded outbound HTTP and outbound TCP (both feature-gated), with `filter-ratelimit-redis` as a real-world reference filter; SDKs and Go (needs minimal-WASI linker) pending |
 
@@ -304,11 +304,11 @@ Plecto is built ADR-first, milestone by milestone. The full detail — landed it
 
 ## Design decisions
 
-Plecto records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 66 (61 accepted, 5 proposed) live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 66 (61 accepted, 5 proposed) live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
 
 ## Contributing
 
-Contributions are deliberate: please **agree an approach in an issue or [Discussion](https://github.com/Kaikei-e/Plecto/discussions) before opening a PR** (unsolicited PRs may be closed). Plecto follows outside-in TDD (E2E → WIT-conformance → unit) and records load-bearing decisions as ADRs. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide — including the areas that need extra care and DCO sign-off — and [CLAUDE.md](CLAUDE.md) for conventions. Local CI parity before a PR:
+Contributions are deliberate: please **agree an approach in an issue or [Discussion](https://github.com/Kaikei-e/PlectoProxy/discussions) before opening a PR** (unsolicited PRs may be closed). Plecto Proxy follows outside-in TDD (E2E → WIT-conformance → unit) and records load-bearing decisions as ADRs. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide — including the areas that need extra care and DCO sign-off — and [CLAUDE.md](CLAUDE.md) for conventions. Local CI parity before a PR:
 
 ```bash
 cd plecto
@@ -325,4 +325,4 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE). T
 
 ## Prior art & acknowledgements
 
-Plecto stands on the shoulders of [Envoy](https://www.envoyproxy.io/) / [proxy-wasm](https://github.com/proxy-wasm), [Cloudflare Pingora](https://github.com/cloudflare/pingora), and the [Bytecode Alliance](https://bytecodealliance.org/) — [wasmtime](https://wasmtime.dev/), [WIT, and the Component Model](https://component-model.bytecodealliance.org/).
+Plecto Proxy stands on the shoulders of [Envoy](https://www.envoyproxy.io/) / [proxy-wasm](https://github.com/proxy-wasm), [Cloudflare Pingora](https://github.com/cloudflare/pingora), and the [Bytecode Alliance](https://bytecodealliance.org/) — [wasmtime](https://wasmtime.dev/), [WIT, and the Component Model](https://component-model.bytecodealliance.org/).

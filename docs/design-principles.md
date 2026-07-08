@@ -1,32 +1,32 @@
-# Plecto Canon — Design Principles, Architectural Policy, and Working Guidelines
+# Plecto Proxy Canon — Design Principles, Architectural Policy, and Working Guidelines
 
 English · [日本語](design-principles.ja.md)
 
 > **Established**: 2026-07-06 (adopted into `docs/` alongside [ADR 000056](ADR/000056.md))
-> **Basis**: Derived directly from the primary sources of `github.com/Kaikei-e/Plecto` at HEAD `c5274db61a9dc10775200dd296e2dd3d4e0725e2` (latest tag `v0.1.3`), fresh-cloned the same day with no cache — the WIT contract text (`plecto/wit/world.wit`), all 55 ADRs, `CLAUDE.md`, `CONTEXT-MAP.md`, each crate's `CONTEXT.md`, `docs/ROADMAP.md`, `docs/hardening.md`, `performance/README.md`, and the README.
-> **Nature**: This document crystallises Plecto's design philosophy in three layers — **principles** (what does not change), **policy** (how structure is chosen), and **guidelines** (how day-to-day judgment is applied). The primary record of individual decisions lives in `docs/ADR/`; the contract's authoritative text lives in `wit/`. Where this document disagrees with an ADR or the WIT, the ADR/WIT wins and this document is revised (Chapter 7).
+> **Basis**: Derived directly from the primary sources of `github.com/Kaikei-e/PlectoProxy` at HEAD `c5274db61a9dc10775200dd296e2dd3d4e0725e2` (latest tag `v0.1.3`), fresh-cloned the same day with no cache — the WIT contract text (`plecto/wit/world.wit`), all 55 ADRs, `CLAUDE.md`, `CONTEXT-MAP.md`, each crate's `CONTEXT.md`, `docs/ROADMAP.md`, `docs/hardening.md`, `performance/README.md`, and the README.
+> **Nature**: This document crystallises Plecto Proxy's design philosophy in three layers — **principles** (what does not change), **policy** (how structure is chosen), and **guidelines** (how day-to-day judgment is applied). The primary record of individual decisions lives in `docs/ADR/`; the contract's authoritative text lives in `wit/`. Where this document disagrees with an ADR or the WIT, the ADR/WIT wins and this document is revised (Chapter 7).
 
 ---
 
 ## Chapter 0 — Mission and the order of values
 
-**Plecto is a self-hostable, programmable L7 reverse proxy / API gateway.** It joins two complementary halves with a typed WIT contract: the **fast path** (native Rust) — connection acceptance, TLS termination, HTTP/1.1/2/3, routing, load balancing, upstream management — and the **extension plane** (WASM Component Model filters) — the per-request *decisions*: authentication, rewriting, rate limiting, WAF, policy. The paths where speed is decisive stay native Rust; request logic runs as sandboxed WASM components that **can touch nothing beyond the capabilities the host has explicitly lent them — enforced by the sandbox, not by convention.**
+**Plecto Proxy is a self-hostable, programmable L7 reverse proxy / API gateway.** It joins two complementary halves with a typed WIT contract: the **fast path** (native Rust) — connection acceptance, TLS termination, HTTP/1.1/2/3, routing, load balancing, upstream management — and the **extension plane** (WASM Component Model filters) — the per-request *decisions*: authentication, rewriting, rate limiting, WAF, policy. The paths where speed is decisive stay native Rust; request logic runs as sandboxed WASM components that **can touch nothing beyond the capabilities the host has explicitly lent them — enforced by the sandbox, not by convention.**
 
 Every design decision is subordinate to the order of values set by `CLAUDE.md`:
 
 **Safety × portability × self-hostability × operational simplicity ＞ feature coverage × strong privileges × distributed-by-default.**
 
-When the left side conflicts with the right, Plecto always chooses the left. This one line is the parent of every principle, policy, and non-goal below. The mission serves "teams that want to run their own infrastructure and keep both traffic and secrets on it" — **data sovereignty is the first principle.** The quality yardstick is "fit for production adoption by a SaaS company": able to answer a security questionnaire without blanks, with multi-replica semantics documented and a verifiable supply chain. Formal certification for finance/government procurement (FIPS 140-3 and the like) is a non-goal (ADR 000054).
+When the left side conflicts with the right, Plecto Proxy always chooses the left. This one line is the parent of every principle, policy, and non-goal below. The mission serves "teams that want to run their own infrastructure and keep both traffic and secrets on it" — **data sovereignty is the first principle.** The quality yardstick is "fit for production adoption by a SaaS company": able to answer a security questionnaire without blanks, with multi-replica semantics documented and a verifiable supply chain. Formal certification for finance/government procurement (FIPS 140-3 and the like) is a non-goal (ADR 000054).
 
 ---
 
 ## Chapter 1 — Design principles: what does not change
 
-These principles constitute Plecto's identity. A proposal that changes them is not "an improvement to Plecto" but "a proposal for a different project"; revising a principle always requires an ADR.
+These principles constitute Plecto Proxy's identity. A proposal that changes them is not "an improvement to Plecto Proxy" but "a proposal for a different project"; revising a principle always requires an ADR.
 
 ### P1 — The simultaneous satisfaction of four conditions is the reason to exist
 
-The traditional three options for placing custom gateway logic — config/DSL (a ceiling on expressiveness), recompiled-in native extensions (no untrusted code, one language, whole-process blast radius), and out-of-process callouts (a network round trip on every request) — **cannot simultaneously deliver "in-process speed", "sandboxed safety", "freedom of language", and "zero-downtime replacement".** WASM is effectively the only technology that satisfies all four at once, and Plecto stands on that single point (ADR 000001). The insight that "data-plane filters belong in WASM" is a conclusion Envoy/proxy-wasm spent roughly a decade proving; Plecto explicitly acknowledges that debt while building **natively** on the typed, polyglot, composable foundation of the Component Model / WIT that proxy-wasm never reached. Any design that permanently sacrifices one of the four conditions violates this principle.
+The traditional three options for placing custom gateway logic — config/DSL (a ceiling on expressiveness), recompiled-in native extensions (no untrusted code, one language, whole-process blast radius), and out-of-process callouts (a network round trip on every request) — **cannot simultaneously deliver "in-process speed", "sandboxed safety", "freedom of language", and "zero-downtime replacement".** WASM is effectively the only technology that satisfies all four at once, and Plecto Proxy stands on that single point (ADR 000001). The insight that "data-plane filters belong in WASM" is a conclusion Envoy/proxy-wasm spent roughly a decade proving; Plecto Proxy explicitly acknowledges that debt while building **natively** on the typed, polyglot, composable foundation of the Component Model / WIT that proxy-wasm never reached. Any design that permanently sacrifices one of the four conditions violates this principle.
 
 ### P2 — Two complementary halves, joined by a typed contract
 
@@ -36,7 +36,7 @@ The fast path and the extension plane are not in a hierarchy or a master–serva
 
 A filter's return value is never a bare flag or boolean but always a WIT `variant`: on the request side the three-valued `continue` / `modified(request-edit)` / `short-circuit(http-response)`; on the response side `continue` / `modified(response-edit)`. As the WIT source comments put it: **"Never a bare flag."** (Tenet 3.)
 
-The principle covers **absence** as well as presence. The contract is split into a header-only `filter` world and a body-reading `filter-body` world, so the very **absence** of an `on-request-body` export is a machine-verifiable fact — "this filter does not read the body" — from which the host derives skipping body buffering entirely (zero-copy passthrough; ADR 000005 / 000025 / 000038). Deriving performance optimisation **from the shape of the contract** rather than from operator vigilance is the heart of Plecto's type design.
+The principle covers **absence** as well as presence. The contract is split into a header-only `filter` world and a body-reading `filter-body` world, so the very **absence** of an `on-request-body` export is a machine-verifiable fact — "this filter does not read the body" — from which the host derives skipping body buffering entirely (zero-copy passthrough; ADR 000005 / 000025 / 000038). Deriving performance optimisation **from the shape of the contract** rather than from operator vigilance is the heart of Plecto Proxy's type design.
 
 ### P4 — Deny-by-default, and fail-closed
 
@@ -48,7 +48,7 @@ Failure always falls to the closed side: a filter trap or epoch-deadline overrun
 
 Filters are pinned as OCI artifacts by content digest (sha256), with cosign signature + SBOM verified at load time. The SBOM is bound to the target component via in-toto subject digests, rejecting "a valid signature but an unrelated SBOM". `load` accepts only signed artifacts; no raw-bytes bypass path exists structurally. An empty trust policy means "load nothing"; there is no "allow unsigned" escape hatch in the production API.
 
-And **the supply-chain discipline imposed on filters applies to Plecto's own distribution** (ADR 000047): `cargo-auditable` builds, syft SBOMs, and cosign keyless signatures ship with every tagged release; CI toolchains are sha256-pinned; dependencies are governed by `deny.toml` (cargo-deny) as a CI-blocking gate. The promise "your code, trusted, runs on the gateway" holds only if our own supply chain survives the same verification.
+And **the supply-chain discipline imposed on filters applies to Plecto Proxy's own distribution** (ADR 000047): `cargo-auditable` builds, syft SBOMs, and cosign keyless signatures ship with every tagged release; CI toolchains are sha256-pinned; dependencies are governed by `deny.toml` (cargo-deny) as a CI-blocking gate. The promise "your code, trusted, runs on the gateway" holds only if our own supply chain survives the same verification.
 
 ### P6 — Filters are stateless; the host lends state, and state is node-local
 
@@ -88,7 +88,7 @@ Untrusted input is never allowed to take a worker down. Filter traps are isolate
 
 ### 2.1 Three bounded contexts
 
-Plecto's Rust workspace consists of three crates = three contexts, each with its own `CONTEXT.md`.
+Plecto Proxy's Rust workspace consists of three crates = three contexts, each with its own `CONTEXT.md`.
 
 | Context | crate | Responsibility |
 |---|---|---|

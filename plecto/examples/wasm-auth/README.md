@@ -1,6 +1,6 @@
 # wasm-auth — a real WASM filter: API-key authentication
 
-Plecto's thesis in one runnable file: the per-request *decision* — here, authentication —
+Plecto Proxy's thesis in one runnable file: the per-request *decision* — here, authentication —
 is a **sandboxed `plecto:filter` component**, not native proxy code. The filter can touch
 only the host-API it was lent (`host-kv`, `host-counter`, `host-log` — no network, no FS),
 and returns a **typed decision**: `continue` / `modified` / `short-circuit`.

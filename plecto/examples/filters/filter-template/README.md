@@ -1,8 +1,8 @@
-# Plecto filter template
+# Plecto Proxy filter template
 
 A minimal, self-contained starting point for a `plecto:filter`. The WIT contract is **vendored**
 under [`wit/`](wit/), so this crate builds wherever you copy it — no relative path back into the
-Plecto repo.
+Plecto Proxy repo.
 
 ## Start a new filter
 
@@ -15,7 +15,7 @@ cp -r plecto/examples/filters/filter-template my-filter
 …or generate it with [`cargo generate`](https://github.com/cargo-generate/cargo-generate):
 
 ```bash
-cargo generate --git https://github.com/Kaikei-e/Plecto.git \
+cargo generate --git https://github.com/Kaikei-e/PlectoProxy.git \
   examples/filters/filter-template --name my-filter
 ```
 
@@ -28,7 +28,7 @@ response hooks) in `src/lib.rs`.
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-That produces a core WASM module; Plecto wraps it into a Component before loading it. The full
+That produces a core WASM module; Plecto Proxy wraps it into a Component before loading it. The full
 build, sign, package, and run walkthrough — plus the manifest field reference — is in
 [`docs/writing-a-filter.md`](../../../../docs/writing-a-filter.md). A ready-to-edit
 [`manifest.toml`](manifest.toml) is included here.

@@ -1,6 +1,6 @@
-# Plecto — Context Map
+# Plecto Proxy — Context Map
 
-Plecto は、**相補関係にある二つの構成要素**（native-Rust の fast path / WASM の extension plane）を
+Plecto Proxy は、**相補関係にある二つの構成要素**（native-Rust の fast path / WASM の extension plane）を
 WIT 型契約で結ぶ、セルフホスト可能な L7 リバースプロキシ / API ゲートウェイ。用語集はコンテキストごとに分割し、
 本ファイルはその地図——どのコンテキストがどこにあり、どう関係するか——と、全体に跨る語彙だけを持つ。実装詳細・
 仕様・決定は置かない（設計判断は `CLAUDE.md` と `docs/ADR/`、契約は `wit/` を参照）。

@@ -1,6 +1,6 @@
 <!--
-Thanks for contributing to Plecto! Please read CONTRIBUTING.md first.
-Plecto is invitation-only for code: a PR that is neither from a maintainer nor references an
+Thanks for contributing to Plecto Proxy! Please read CONTRIBUTING.md first.
+Plecto Proxy is invitation-only for code: a PR that is neither from a maintainer nor references an
 `accepting-pr`-labelled issue is closed automatically. Open an issue and agree the approach first.
 For a vulnerability, do NOT open a PR — see SECURITY.md.
 -->

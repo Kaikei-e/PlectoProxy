@@ -1,4 +1,4 @@
-# Plecto examples
+# Plecto Proxy examples
 
 Runnable, use-case-focused demos — a guided path from a 5-minute hello up through the real things a
 gateway does. Each is one self-contained file that spins up the proxy **plus** its in-process
@@ -24,7 +24,7 @@ around it), 9 puts it all in one real deployment.
 | # | Example | What you learn |
 |---|---------|----------------|
 | 1 | **`quickstart`** | The 5-minute hello: a sandboxed WASM filter stamps a header on your response. |
-| 2 | **`wasm-auth`** | A *real* filter doing real work — API-key authentication, host-held state (KV), and the typed `decision` (`continue` / `modified` / `short-circuit` 401). Plecto's thesis in one file. |
+| 2 | **`wasm-auth`** | A *real* filter doing real work — API-key authentication, host-held state (KV), and the typed `decision` (`continue` / `modified` / `short-circuit` 401). Plecto Proxy's thesis in one file. |
 | 3 | **`filter-chain`** | Compose filters: how a request flows through the chain, each hook's typed decision, and host-native rate limiting. |
 | 4 | **`load-balancing`** | The native fast path: one upstream over three instances, round-robin + active health checks, and **fail-closed** ejection/recovery (a total outage → 503, no client errors). |
 | 5 | **`tls-http`** | TLS termination (rustls): HTTP/1.1, HTTP/2 (ALPN), and **HTTP/3 over QUIC** on one port, with `/api/*` routing. |

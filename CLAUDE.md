@@ -1,11 +1,11 @@
-# CLAUDE.md — Plecto
+# CLAUDE.md — Plecto Proxy
 
 このファイルは Claude Code 用のプロジェクト規約であり、設計の要約と source of truth。設計思想の原典は
 [docs/design-principles.md](docs/design-principles.md)（英語・正）/ [docs/design-principles.ja.md](docs/design-principles.ja.md)
 （日本語・同期）——原則（P1–P12）・アーキテクチャ方針・配置決定木・非目標・進化の条件を三層で定礎する。
 個別判断の一次記録は `docs/ADR/`、契約の正文は `wit/`（序列は原典第7章）。本ファイルは単体で完結するよう要点を内包する。
 
-## Plecto とは
+## Plecto Proxy とは
 
 セルフホスト可能・プログラマブルな **L7 リバースプロキシ / API ゲートウェイ（Rust）**。
 **相補関係にある二つの構成要素**を WIT 型契約で結ぶ:
@@ -23,7 +23,7 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 ## リポジトリ構成
 
 ```
-/ (git root = GitHub: Kaikei-e/Plecto)
+/ (git root = GitHub: Kaikei-e/PlectoProxy)
 ├── CLAUDE.md                  ← このファイル
 ├── CONTEXT-MAP.md             ← ドメイン用語集の地図（コンテキスト分割・全体横断語彙）
 ├── docs/design-principles.md  ← 設計思想の原典（EN 正 / .ja.md 同期。原則・方針・指針の三層）

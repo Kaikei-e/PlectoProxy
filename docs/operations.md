@@ -1,6 +1,6 @@
 # Operations guide
 
-How to run Plecto behind a fleet: the shutdown/readiness contract a front load balancer can
+How to run Plecto Proxy behind a fleet: the shutdown/readiness contract a front load balancer can
 rely on, and the knobs that tune it. Companion to the [hardening guide](hardening.md) (which
 covers multi-instance state semantics); this page covers process lifecycle.
 

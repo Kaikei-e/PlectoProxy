@@ -1,9 +1,9 @@
 # Security Policy
 
-Plecto is a reverse proxy and API gateway that sits in the request path and terminates TLS. We take
+Plecto Proxy is a reverse proxy and API gateway that sits in the request path and terminates TLS. We take
 vulnerability reports seriously and appreciate your help in disclosing them responsibly.
 
-> **Status: early development.** Plecto has no released, production-supported version yet, so there
+> **Status: early development.** Plecto Proxy has no released, production-supported version yet, so there
 > is no formal patch SLA or bug-bounty program. We will still investigate every credible report and
 > credit reporters who ask to be credited.
 
@@ -12,7 +12,7 @@ vulnerability reports seriously and appreciate your help in disclosing them resp
 **Please do not open a public issue, pull request, or Discussion for a security problem.**
 
 Report privately through GitHub's **[Private Vulnerability
-Reporting](https://github.com/Kaikei-e/Plecto/security/advisories/new)** (the *Security* tab →
+Reporting](https://github.com/Kaikei-e/PlectoProxy/security/advisories/new)** (the *Security* tab →
 *Report a vulnerability*). This keeps the report confidential while we triage it and gives us a
 private channel to coordinate a fix and disclosure with you.
 
@@ -28,7 +28,7 @@ coordinated disclosure timeline with you before any public write-up.
 
 ## Scope
 
-Plecto's threat model centers on running **untrusted, possibly multi-tenant WASM filters** behind a
+Plecto Proxy's threat model centers on running **untrusted, possibly multi-tenant WASM filters** behind a
 deny-by-default capability boundary, and on the L7 data path. Reports are especially valuable when
 they concern:
 
@@ -46,5 +46,5 @@ authority — that is the design, not a vulnerability.
 
 ## Supported versions
 
-While Plecto is pre-release, only the `main` branch is supported. Please reproduce against the
+While Plecto Proxy is pre-release, only the `main` branch is supported. Please reproduce against the
 latest `main` before reporting.

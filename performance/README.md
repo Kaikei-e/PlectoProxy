@@ -1,21 +1,21 @@
-# Plecto Performance
+# Plecto Proxy Performance
 
-An honest performance snapshot of Plecto's two halves: the **native load-balancing fast
+An honest performance snapshot of Plecto Proxy's two halves: the **native load-balancing fast
 path** and the **WASM extension plane** (per-request filters, host-enforced rate limiting, the
 request-body hook). The goal is **transparency about method**, not a leaderboard. Every number
 here is an internal **regression baseline** — not a capacity guide, and not a comparison against
 other proxies.
 
-All components — load generator, Plecto, the upstream instances, and any tooling — run
+All components — load generator, Plecto Proxy, the upstream instances, and any tooling — run
 **co-resident on a single commodity developer host over loopback**, so absolute figures are
-bounded by that host and by the generator, not by Plecto in isolation. Read them as **relative**
+bounded by that host and by the generator, not by Plecto Proxy in isolation. Read them as **relative**
 signals — ratios, curve shapes and time-constants, not headline throughput.
 
 ## Measurement setup
 
-- **Core isolation by pinning.** Plecto (and its in-process backends) is pinned to one dedicated
+- **Core isolation by pinning.** Plecto Proxy (and its in-process backends) is pinned to one dedicated
   set of CPU cores; **every** load generator is pinned to a separate, disjoint set. The generator
-  therefore never steals a core from the proxy — the run measures Plecto, not the generator
+  therefore never steals a core from the proxy — the run measures Plecto Proxy, not the generator
   fighting it. (Done with `taskset`; no privileged host tuning.)
 - **No host tuning.** CPU governor / turbo are left at their defaults — no fixed-frequency lock.
   Absolute throughput shifts run-to-run with clock; the **ratios, shapes and time-constants** are
@@ -190,7 +190,7 @@ between them is a real bug.
 
 # 1. Load-balancing fast path
 
-Subject: one Plecto route forwarding to an upstream pool of **3 instances**, round-robin pick
+Subject: one Plecto Proxy route forwarding to an upstream pool of **3 instances**, round-robin pick
 over the healthy set, active health probe every **500 ms** with eject after **2** consecutive
 failures (≈ ~1 s to detect). The three upstream nodes are three loopback backends, so the run
 needs no external network.
@@ -285,7 +285,7 @@ every second:
   survivors (a + c) absorb the full load **with zero failed requests**. The survivors' split is
   *not* even — the ejected instance's round-robin slot is taken by its neighbour — so traffic
   shifts but isn't re-balanced across the survivors (the all-healthy split *is* exactly even).
-- **Fail-closed, not fail-open.** With **every** instance unhealthy, Plecto returns **HTTP 503**
+- **Fail-closed, not fail-open.** With **every** instance unhealthy, Plecto Proxy returns **HTTP 503**
   promptly (no hang, no blind forward); the 503/s line jumps to the full offered rate.
 - **Fast recovery.** Restoring health returns instances to rotation within ~1 s.
 
@@ -376,7 +376,7 @@ sign/verify + cert bytes is a much smaller saving than skipping ECDHE too would 
 
 # 2. WASM extension plane
 
-Plecto runs each request's *decision* — auth, rewriting, rate limiting, policy — as a sandboxed
+Plecto Proxy runs each request's *decision* — auth, rewriting, rate limiting, policy — as a sandboxed
 **WebAssembly Component Model filter**, not native proxy code. This measures what that costs,
 changing only **how the decision runs**. The bundled `bench/harnesses/bench-server` serves a **ladder** of
 routes — all forwarding to the **same** backend — so each adjacent delta isolates one cost (the full
@@ -499,10 +499,10 @@ not this benchmark.)
 ## Outbound ext_authz (ADR 000036)
 
 A filter can call an external authorization service per request over the lent, SSRF-guarded outbound
-capability (`filter-extauthz`). Per-request cost is three parts, only the first two Plecto's: the
+capability (`filter-extauthz`). Per-request cost is three parts, only the first two Plecto Proxy's: the
 WASM tax (the same [cost ladder](#the-wasm-cost-ladder--isolating-each-cost)), the outbound gate
 (allowlist + SSRF classification — nanoseconds, negligible), and the network round-trip to the authz
-endpoint, which dominates and is the *operator's* latency, not Plecto's.
+endpoint, which dominates and is the *operator's* latency, not Plecto Proxy's.
 
 Load numbers are deferred rather than faked: the SSRF guard blocks loopback by design, so a hermetic
 mock authz needs a non-loopback endpoint (environment-specific), and the connector currently opens a
@@ -511,7 +511,7 @@ the host's `outbound-http` test suite (allowlist deny + DNS-rebinding SSRF block
 
 ## Host-enforced rate limiting
 
-Plecto's rate limiter is a **host-native token bucket** (ADR 000026): the bucket spec
+Plecto Proxy's rate limiter is a **host-native token bucket** (ADR 000026): the bucket spec
 (`capacity` / `refill_tokens` / `refill_interval_ms`) is configured **in the operator's manifest**,
 not by the filter — an untrusted filter passes only `(key, cost)` and so cannot widen its own limit.
 The refill + counting stay host-side (the WASM boundary is not crossed on the hot path); the filter
@@ -676,7 +676,7 @@ stays absent until that tooling is in place — server support is verified, not 
 
 ## WebSocket Upgrade tunnel (ADR 000048)
 
-Plecto's HTTP/1.1 Upgrade path (ADR 000048): a route declaring `[route.upgrade] protocols =
+Plecto Proxy's HTTP/1.1 Upgrade path (ADR 000048): a route declaring `[route.upgrade] protocols =
 ["websocket"]` forwards the client's handshake (controlled re-issue — hop-by-hop stripping stays
 the default for every other route), and on the upstream's 101 the proxy splices the two connections
 into an opaque bidirectional byte tunnel — the same relay technique nginx `proxy_pass`, Envoy's

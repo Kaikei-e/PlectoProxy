@@ -1,19 +1,19 @@
 name: Feature request
-description: Suggest an idea or enhancement for Plecto
+description: Suggest an idea or enhancement for Plecto Proxy
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Plecto is built ADR-first and design decisions follow the project's
-        [tenets](https://github.com/Kaikei-e/Plecto#design-tenets). For a larger change, consider
-        opening a [Discussion](https://github.com/Kaikei-e/Plecto/discussions) first so we can agree
+        Plecto Proxy is built ADR-first and design decisions follow the project's
+        [tenets](https://github.com/Kaikei-e/PlectoProxy#design-tenets). For a larger change, consider
+        opening a [Discussion](https://github.com/Kaikei-e/PlectoProxy/discussions) first so we can agree
         on the shape.
   - type: textarea
     id: problem
     attributes:
       label: Problem
-      description: What are you trying to do, and where does Plecto fall short today?
+      description: What are you trying to do, and where does Plecto Proxy fall short today?
     validations:
       required: true
   - type: textarea

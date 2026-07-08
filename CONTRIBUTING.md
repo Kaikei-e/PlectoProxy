@@ -1,13 +1,13 @@
-# Contributing to Plecto
+# Contributing to Plecto Proxy
 
-Thanks for your interest in Plecto — a self-hostable, programmable L7 reverse proxy and API
+Thanks for your interest in Plecto Proxy — a self-hostable, programmable L7 reverse proxy and API
 gateway in Rust, extended with WebAssembly filters. This guide gets you from a clean clone to a
 green test run and a well-formed pull request.
 
 > **Status: early development — invitation-only for code.** The design is settled (see
 > [`docs/ADR/`](docs/ADR/)) and the foundation runs end to end, but interfaces still move, and
-> contributions are handled **deliberately, not by volume**. **Plecto does not accept unsolicited
-> pull requests.** Open an [issue or Discussion](https://github.com/Kaikei-e/Plecto/discussions),
+> contributions are handled **deliberately, not by volume**. **Plecto Proxy does not accept unsolicited
+> pull requests.** Open an [issue or Discussion](https://github.com/Kaikei-e/PlectoProxy/discussions),
 > agree the approach, and once a maintainer labels the issue `accepting-pr`, open a PR that
 > references it. A PR that is neither from a maintainer nor references an `accepting-pr` issue is
 > **closed automatically** ([`.github/workflows/pr-policy.yml`](.github/workflows/pr-policy.yml)).
@@ -37,8 +37,8 @@ The Rust workspace lives under `plecto/`. Run commands from there (or use `just`
 you from the repository root):
 
 ```bash
-git clone https://github.com/Kaikei-e/Plecto
-cd Plecto
+git clone https://github.com/Kaikei-e/PlectoProxy
+cd PlectoProxy
 
 just check         # fmt --check + clippy -D warnings + test  (full local CI parity)
 # …or directly:
@@ -72,7 +72,7 @@ Run `just` with no arguments to list every recipe.
 
 ## How we work
 
-**Outside-in TDD.** Plecto is built test-first, from the outside in:
+**Outside-in TDD.** Plecto Proxy is built test-first, from the outside in:
 
 1. **E2E** — a request flowing through the filter chain.
 2. **WIT-conformance** — when a change crosses the filter/host boundary (the `plecto:filter`
@@ -124,7 +124,7 @@ reviewed line by line. Found a *vulnerability*? Do **not** open a PR — follow
 
 ## Pull requests
 
-Plecto is **invitation-only for code**: a PR that is neither from a maintainer nor references an
+Plecto Proxy is **invitation-only for code**: a PR that is neither from a maintainer nor references an
 `accepting-pr`-labelled issue is closed automatically (see above). Once your change has an agreed,
 `accepting-pr`-labelled issue, open the PR and reference it. PRs are then reviewed deliberately, not
 merged on green CI alone. Before you open one:
@@ -156,6 +156,6 @@ A pull request whose commits are not signed off will not be merged.
 
 ## Questions
 
-Use [GitHub Discussions](https://github.com/Kaikei-e/Plecto/discussions) for questions and ideas,
-and [Issues](https://github.com/Kaikei-e/Plecto/issues) for bugs and concrete proposals. Thanks for
-helping build Plecto.
+Use [GitHub Discussions](https://github.com/Kaikei-e/PlectoProxy/discussions) for questions and ideas,
+and [Issues](https://github.com/Kaikei-e/PlectoProxy/issues) for bugs and concrete proposals. Thanks for
+helping build Plecto Proxy.

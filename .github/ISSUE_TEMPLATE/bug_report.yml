@@ -1,18 +1,18 @@
 name: Bug report
-description: Something in Plecto behaves incorrectly
+description: Something in Plecto Proxy behaves incorrectly
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to file a bug. For **security vulnerabilities**, do not use this
-        form — follow [SECURITY.md](https://github.com/Kaikei-e/Plecto/blob/main/SECURITY.md) and
+        form — follow [SECURITY.md](https://github.com/Kaikei-e/PlectoProxy/blob/main/SECURITY.md) and
         report privately instead.
   - type: dropdown
     id: component
     attributes:
       label: Component
-      description: Which part of Plecto is affected?
+      description: Which part of Plecto Proxy is affected?
       options:
         - Fast path (plecto-server — routing, LB, TLS, HTTP)
         - Extension plane / host (plecto-host — wasmtime, capabilities, pooling)
@@ -52,7 +52,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Output of `rustc --version`, your OS, and the Plecto commit (`git rev-parse HEAD`).
+      description: Output of `rustc --version`, your OS, and the Plecto Proxy commit (`git rev-parse HEAD`).
       render: text
     validations:
       required: true

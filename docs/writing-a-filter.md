@@ -1,6 +1,6 @@
 # Writing a filter
 
-A **filter** is your request logic, running as a sandboxed WebAssembly component. Plecto's native
+A **filter** is your request logic, running as a sandboxed WebAssembly component. Plecto Proxy's native
 fast path handles connections, TLS, HTTP, routing, and load balancing; it hands each request to your
 filter, which **inspects it and returns one typed decision**. This guide takes you from an empty
 directory to a running filter.
@@ -48,7 +48,7 @@ Either copy it or generate it:
 cp -r plecto/examples/filters/filter-template my-filter
 
 # …or with cargo-generate
-cargo generate --git https://github.com/Kaikei-e/Plecto.git \
+cargo generate --git https://github.com/Kaikei-e/PlectoProxy.git \
   examples/filters/filter-template --name my-filter
 ```
 
@@ -70,7 +70,7 @@ see [section 7](#7-other-languages).
 
 ## 3. Build and componentize
 
-A filter is built for `wasm32-unknown-unknown` (no WASI: it imports only the granted Plecto
+A filter is built for `wasm32-unknown-unknown` (no WASI: it imports only the granted Plecto Proxy
 capabilities, ADR 000010), then wrapped into a **component**:
 
 ```bash
@@ -222,7 +222,7 @@ LB only if that LB can pass the client address another way (e.g. Kubernetes
 
 ## 5. Package, sign, and run
 
-Plecto loads filters from a local, digest-pinned OCI image-layout and **verifies a cosign signature**
+Plecto Proxy loads filters from a local, digest-pinned OCI image-layout and **verifies a cosign signature**
 plus an SBOM↔component binding before running them (ADR 000006 / 000007) — bad signature, refused,
 fail-closed. The public key must be listed in `[trust]`.
 

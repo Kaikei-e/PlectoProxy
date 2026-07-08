@@ -2,7 +2,7 @@
   // Minimal Rust dev container. The toolchain channel and the wasm32-unknown-unknown
   // target come from plecto/rust-toolchain.toml, so this stays thin; `rustup show`
   // pre-installs them on create.
-  "name": "Plecto",
+  "name": "Plecto Proxy",
   "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
   "postCreateCommand": "cd plecto && rustup show",
   "customizations": {

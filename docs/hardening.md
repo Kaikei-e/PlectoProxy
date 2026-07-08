@@ -1,7 +1,7 @@
 # Hardening guide
 
-Operational guidance for running Plecto beyond a single instance. The first fact to internalize:
-**all host-held state in Plecto is node-local.** There is no gossip, no shared store, no
+Operational guidance for running Plecto Proxy beyond a single instance. The first fact to internalize:
+**all host-held state in Plecto Proxy is node-local.** There is no gossip, no shared store, no
 cross-instance consensus in the native fast path — each `plecto` process only knows about the
 requests it personally handled. This is a deliberate design boundary ([ADR 000053](ADR/000053.md)),
 not a gap: it keeps the core single-binary and self-hostable ([ADR 000008](ADR/000008.md)) instead
@@ -32,7 +32,7 @@ bursts before they reach the shared limiter; global holds the real number. Confi
 per-replica floor everywhere (cheap, always on) and add the filter on any route that needs an
 exact fleet-wide quota rather than the engineering approximations below.
 
-The standard Plecto deployment shape for a SaaS-grade rollout ([ADR 000054](ADR/000054.md)) is a
+The standard Plecto Proxy deployment shape for a SaaS-grade rollout ([ADR 000054](ADR/000054.md)) is a
 **front load balancer fanning out to N replicas**. Because the rate limiter is node-local, the
 `[route.rate_limit]` you configure is a **per-replica** bucket, not a fleet-wide one. Two concrete
 consequences if you rely on the local floor alone:
@@ -58,7 +58,7 @@ different replicas — see the next pattern for when they don't.
 
 **2. Key-consistent routing (consistent hashing / Maglev) — node-local approximates global.**
 
-If the front LB (or Plecto's own weighted Maglev consistent hashing, see the [README](../README.md),
+If the front LB (or Plecto Proxy's own weighted Maglev consistent hashing, see the [README](../README.md),
 [ADR 35](ADR/000035.md)) pins a given key — typically client IP — to the same replica for the
 lifetime of a hash ring, then that key's requests are counted by one bucket on one node. The
 node-local limiter then behaves like a *de facto* global limiter for that key, with no coordination
@@ -71,10 +71,10 @@ Maglev minimizes (but does not eliminate) that disruption compared to naive modu
 Neither approximation pattern above gives you an exact, coordination-free global limit — they
 give you an engineering approximation. If your product requires a strict fleet-wide quota (e.g. a
 hard per-tenant API quota that must hold regardless of which replica or how many), that is
-**shared state**, and Plecto's placement rule keeps shared state out of the native fast path
+**shared state**, and Plecto Proxy's placement rule keeps shared state out of the native fast path
 ([ADR 000029](ADR/000029.md), [ADR 000053](ADR/000053.md)). The supported path is a **filter** that
 consults an external store over a lent outbound capability, the same shape Envoy uses for its
-external global rate limit service — and Plecto's version of that service IS the filter itself
+external global rate limit service — and Plecto Proxy's version of that service IS the filter itself
 (no separate process, ADR 000061's single-binary win).
 
 [`filter-ratelimit-redis`](../plecto/examples/filters/filter-ratelimit-redis) is the reference

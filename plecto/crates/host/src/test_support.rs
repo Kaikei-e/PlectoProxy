@@ -96,15 +96,8 @@ pub fn filter_ratelimit_redis_component() -> Vec<u8> {
         .expect("read filter-ratelimit-redis component")
 }
 
-/// A minimal in-toto-style SBOM statement that binds `component`: its `subject` digest is
-/// `sha256(component)`, satisfying the load gate's SBOM↔component binding (review f000003
-/// #1). The predicate is empty (content policy is deferred). Test / dev helper — real
-/// attestations come from `cosign attest`.
-pub fn bound_sbom(component: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let digest = hex::encode(Sha256::digest(component));
-    format!(
-        r#"{{"_type":"https://in-toto.io/Statement/v1","subject":[{{"name":"filter","digest":{{"sha256":"{digest}"}}}}],"predicateType":"https://cyclonedx.org/bom","predicate":{{}}}}"#
-    )
-    .into_bytes()
-}
+/// The SBOM-binding helper moved to `dev_signer` (ADR 000065): it is now production code,
+/// shared by `plecto conformance`'s self-signed load check and the dev-key flow, not just
+/// tests. Re-exported here so the existing test suites keep importing it from
+/// `test_support::bound_sbom` unchanged.
+pub use crate::dev_signer::bound_sbom;

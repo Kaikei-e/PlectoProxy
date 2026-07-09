@@ -39,6 +39,7 @@ mod artifact;
 mod chain;
 mod control_observability;
 mod control_reload;
+mod diagnostic;
 mod error;
 mod hash;
 mod maglev;
@@ -63,6 +64,10 @@ use plecto_host::{LoadedFilter, SignedArtifact};
 
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::{ChainOutcome, RequestBodyOutcome};
+pub use diagnostic::{
+    DEV_KEY_IN_TRUST, Diagnostic, PATH_NORMALIZATION_REJECTED, QUOTA_EXCEEDED,
+    SIGNATURE_VERIFICATION_FAILED, diagnose,
+};
 pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability,
@@ -91,6 +96,15 @@ pub use upstream::{
 pub use plecto_host::{
     FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse, InMemorySink, MetricsSink,
     MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
+};
+// Filter Dev Kit (ADR 000065): `plecto conformance` / `plecto dev` / `plecto new-filter` need
+// the generic conformance battery and the persistent dev-signing key. Re-exported the same way
+// as the rest of the host surface above — `plecto-server` never takes a direct `plecto-host`
+// production dependency; a plain (non-`test-support`) `plecto-host` build needs no wasm32
+// toolchain, so this widens no dependency edge, just this crate's existing re-export list.
+pub use plecto_host::{
+    ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevSigner, bound_sbom,
+    public_key_path_for, run_conformance,
 };
 // The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.
@@ -313,6 +327,16 @@ fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
     Manifest::from_toml(&toml)
 }
 
+/// [`validate_manifest`] / [`validate_manifest_path`]'s success value: the manifest's config
+/// version plus any non-fatal [`Diagnostic`] warnings (ADR 000065 decision 5) — currently just
+/// [`DEV_KEY_IN_TRUST`], raised when a `[trust]` key file carries `plecto_host::DEV_KEY_MARKER`.
+/// A warning never fails validation: a `plecto dev`-generated manifest is SUPPOSED to trip it.
+#[derive(Debug)]
+pub struct ValidateOutcome {
+    pub config_version: String,
+    pub warnings: Vec<Diagnostic>,
+}
+
 /// Statically validate `manifest` — the `plecto validate` core (the `nginx -t` shape): every
 /// check the server would fail closed on at startup that needs no artifact and mutates nothing.
 /// Covers the strict parse (the caller already ran it), `[trust]` key files, `[state]` coherence,
@@ -324,10 +348,18 @@ fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
 /// OCI artifact resolution and the signature/SBOM load gate (the deploy dir may not exist where
 /// validation runs — startup still enforces them, ADR 000006/000007), and the `[state]` backend
 /// open (validation must never create a redb file).
-pub fn validate_manifest(manifest: &Manifest, base_dir: &Path) -> Result<String, ControlError> {
+pub fn validate_manifest(
+    manifest: &Manifest,
+    base_dir: &Path,
+) -> Result<ValidateOutcome, ControlError> {
     let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
+    let mut warnings = Vec::new();
     for key_path in &manifest.trust.keys {
-        pems.push(std::fs::read(base_dir.join(key_path))?);
+        let pem = std::fs::read(base_dir.join(key_path))?;
+        if pem.starts_with(plecto_host::DEV_KEY_MARKER.as_bytes()) {
+            warnings.push(DEV_KEY_IN_TRUST);
+        }
+        pems.push(pem);
     }
     TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
     manifest.state.validate()?;
@@ -351,12 +383,16 @@ pub fn validate_manifest(manifest: &Manifest, base_dir: &Path) -> Result<String,
     // A throwaway registry runs the full upstream validation (names, LB, `[upstream.tls]` CA
     // loads) without touching any live state.
     UpstreamRegistry::new().reconcile(&manifest.upstreams, base_dir)?;
-    manifest.content_hash()
+    let config_version = manifest.content_hash()?;
+    Ok(ValidateOutcome {
+        config_version,
+        warnings,
+    })
 }
 
 /// [`validate_manifest`] for an on-disk manifest: reads + strictly parses `path`, resolving
 /// relative paths against the manifest's own directory (the same rule the server applies).
-pub fn validate_manifest_path(path: &Path) -> Result<String, ControlError> {
+pub fn validate_manifest_path(path: &Path) -> Result<ValidateOutcome, ControlError> {
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let manifest = read_manifest(path)?;
     validate_manifest(&manifest, base_dir)

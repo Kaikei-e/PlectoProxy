@@ -123,6 +123,9 @@ redb = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 sigstore = { workspace = true }
+# DevSigner (ADR 000065): zeroize-on-drop wrapper for the persisted dev-key private-key PEM,
+# already resolved transitively via sigstore.
+zeroize = { workspace = true }
 # SBOM↔component binding (ADR 000006 hardening): parse the SBOM in-toto statement and
 # verify its subject digest is sha256(component), so a validly-signed but UNRELATED SBOM
 # cannot be paired with a component (review f000003 #1).

@@ -65,6 +65,13 @@ mod resolver;
 #[cfg(feature = "fat-guest")]
 mod stdio;
 
+// Generic conformance battery (ADR 000065): the `plecto conformance` CLI surface. Production
+// code, distinct from `tests/polyglot.rs`'s fixture-specific internal regression suite.
+mod conformance;
+// DevSigner (ADR 000065): the persistent, project-local signing key for `plecto dev` /
+// `plecto conformance`. Production code (unlike `test_support`) — it links into a plain
+// `plecto-server` build, not just behind `test-support`.
+mod dev_signer;
 mod engine;
 mod errors;
 mod filter;
@@ -86,6 +93,8 @@ mod util;
 pub mod test_support;
 
 pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_bucket};
+pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conformance};
+pub use dev_signer::{DEV_KEY_MARKER, DevSigner, bound_sbom, public_key_path_for};
 pub use observe::{
     FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
     RequestTrace, SpanOutcome, TelemetrySink,

@@ -42,6 +42,12 @@ _Avoid_: restart, hot restart（プロセス再起動を含意）
 （operator が編集済みマニフェストの取り込みを明示 push する慣習）。
 _Avoid_: config push（設定を運ぶ含意で、xDS 的動的 push と混同）
 
+**Dev key（開発鍵）**:
+`plecto dev` のインナーループ専用、プロジェクトローカル・永続な ECDSA-P256 署名鍵（`.plecto/dev-key`）。本番の
+運用者管理鍵とも、テスト専用の使い捨て `TestSigner` とも別物——検証経路は本番と同一コードのまま、trust root の
+中身だけを差し替える二相化（ADR 000065）。dev manifest の `[trust]` にのみ公開鍵を注入し、本番 manifest には触れない。
+_Avoid_: test key（TestSigner と混同——dev key は永続する）, signing key（本番運用鍵と区別が付かない）
+
 ## TLS 終端
 
 **Stateless resumption（ステートレス再開）**:

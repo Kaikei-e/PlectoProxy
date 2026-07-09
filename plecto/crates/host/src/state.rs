@@ -307,13 +307,14 @@ impl HostState {
         std::mem::take(&mut self.logs)
     }
 
-    /// Like [`HostState::take_logs`], but for the trap path: the instance is about to be
-    /// discarded, so this also flushes any still-unterminated stdio partial line (ADR 000063) —
-    /// e.g. a TinyGo panic message written to stderr with no trailing newline right before the
-    /// trap — instead of losing it along with the instance. `runtime.rs`/`pool.rs` call this
-    /// instead of `take_logs` from a call's `Err` arm so a trapped request's own diagnostic
-    /// output still reaches `emit_span`, which is the whole point of the stdio bridge.
-    pub(crate) fn take_logs_after_trap(&mut self) -> Vec<LogLine> {
+    /// Like [`HostState::take_logs`], but for an instance about to be discarded — a trap, or a
+    /// fresh/untrusted instance's `Ok` arm (fresh instances are always single-use regardless of
+    /// outcome): this also flushes any still-unterminated stdio partial line (ADR 000063) — e.g.
+    /// a TinyGo panic message written to stderr with no trailing newline right before the trap —
+    /// instead of losing it along with the instance. `runtime.rs`/`pool.rs` call this instead of
+    /// `take_logs` whenever the instance will not be reused, so a discarded instance's own
+    /// diagnostic output still reaches `emit_span`, which is the whole point of the stdio bridge.
+    pub(crate) fn take_logs_final(&mut self) -> Vec<LogLine> {
         #[cfg(feature = "fat-guest")]
         if let Some(bridge) = &self.stdio_bridge {
             self.logs.extend(bridge.drain_final());

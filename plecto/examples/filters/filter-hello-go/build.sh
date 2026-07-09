@@ -2,7 +2,8 @@
 # Build the Go (TinyGo) guest into a Tier B ("fat guest") plecto:filter component (ADR 000063).
 #
 # Requires: TinyGo >= 0.34, wasm-tools >= 1.252, wkg (wasm-pkg-tools), wit-bindgen-go
-# (go.bytecodealliance.org/cmd/wit-bindgen-go, `go install ...@latest`) on PATH.
+# (go.bytecodealliance.org/cmd/wit-bindgen-go, `go install ...@v0.7.0` — pin to the version CI
+# pins, .github/workflows/ci.yml job `polyglot-guest-go`) on PATH.
 #
 # Unlike the Tier A guests (filter-hello-{c,moonbit,js}), this is NOT zero-WASI: TinyGo's wasip2
 # target assumes the `wasi:cli/command` world, so `wit/world.wit` composes the base

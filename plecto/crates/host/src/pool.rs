@@ -389,6 +389,9 @@ mod pool_tests {
 
     /// A `FilterRuntime` with no wasmtime engine at all: `instantiate_initialized` just hands out
     /// an incrementing id, so tests can assert exactly how many times an instance was (re)built.
+    /// `take_logs`/`take_logs_after_trap` return distinct marker lines (not just `Vec::new()`) so
+    /// a test can assert WHICH ONE `run_fresh`/`run_pooled` actually called, not merely that some
+    /// `Vec<LogLine>` came back.
     struct FakeRuntime {
         next_id: AtomicU64,
         instantiate_calls: AtomicUsize,
@@ -407,6 +410,13 @@ mod pool_tests {
         }
     }
 
+    fn marker_log(message: &str) -> Vec<LogLine> {
+        vec![LogLine {
+            level: crate::LogLevel::Debug,
+            message: message.to_string(),
+        }]
+    }
+
     impl FilterRuntime for FakeRuntime {
         type Instance = FakeInstance;
 
@@ -420,10 +430,10 @@ mod pool_tests {
         fn begin_request(&self, _instance: &mut FakeInstance) {}
         fn set_request_deadline(&self, _instance: &mut FakeInstance) {}
         fn take_logs(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
-            Vec::new()
+            marker_log("take_logs")
         }
         fn take_logs_after_trap(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
-            Vec::new()
+            marker_log("take_logs_after_trap")
         }
     }
 
@@ -611,6 +621,30 @@ mod pool_tests {
         assert!(
             result.is_ok(),
             "the untrusted lifecycle should self-heal once the cooldown elapses, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_fresh_recovers_final_logs_on_success_not_just_on_trap() {
+        // Regression (staff review of ADR 000063): a fresh/untrusted instance is discarded after
+        // ONE call regardless of whether it traps — so an unterminated stdio partial line (e.g. a
+        // guest that writes "done" with no trailing '\n' then returns normally) must be recovered
+        // on the Ok arm exactly like the Err arm already does, not silently dropped along with
+        // the discarded instance.
+        let runtime = FakeRuntime::new();
+        let inner = fake_inner(runtime);
+
+        let (_value, logs) = inner
+            .run_hook(None, |inst: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+            .expect("a non-trapping call succeeds");
+
+        assert_eq!(
+            logs,
+            marker_log("take_logs_after_trap"),
+            "run_fresh's Ok arm must use the final drain (partial-line flush), \
+             not the plain mid-lifetime drain — the instance is discarded either way"
         );
     }
 }

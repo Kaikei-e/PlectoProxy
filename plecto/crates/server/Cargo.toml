@@ -118,6 +118,8 @@ bytes = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# serde_json: `plecto conformance --json` (ADR 000065) — machine-readable output for CI.
+serde_json = { workspace = true }
 # tracing-subscriber: the binary's JSON log + access-log formatter (ADR 000009 Stage A). Used only
 # by `main.rs` (the lib never installs a subscriber); minimal features keep the footprint small.
 tracing-subscriber = { workspace = true }
@@ -140,6 +142,18 @@ parking_lot = { workspace = true }
 quinn = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
+# --- Filter Dev Kit (ADR 000065): `plecto dev` / `plecto new-filter` inner loop. ---
+# notify(-debouncer-mini): watch a filter's src/ for changes and debounce the rebuild trigger
+# (~300ms). 8.x is the current stable line; 9.0 was still pre-release as of the ADR's research.
+notify-debouncer-mini = "0.7"
+# toml_edit: format-preserving rewrite of a dev manifest's `[[filter]].digest` after every
+# rebuild — a plain parse+reserialize (via `toml`/serde) would blow away the operator's own
+# comments and layout in a file `plecto dev` shares write access to with a human.
+toml_edit = "0.22"
+# wit-component: wrap a rebuilt wasm32-unknown-unknown core module into a Component at runtime —
+# the same `ComponentEncoder` recipe `crates/host/build.rs` already uses at BUILD time (ADR
+# 000010), needed here because `plecto dev` componentizes on every file-watch trigger, not once.
+wit-component = "0.252"
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for E2E fixtures,
@@ -148,8 +162,6 @@ h3-quinn = { workspace = true }
 # plain production build of plecto-server never needs wasm32-unknown-unknown).
 plecto-host = { path = "../host", features = ["test-support"] }
 tempfile = "3"
-# decode `plecto schema`'s stdout in the CLI E2E (ADR 000049). Dev-only.
-serde_json = { workspace = true }
 # OTLP decode ORACLE for the hand-written exporter's E2E (ADR 000040): the official generated
 # proto types, kept independent of the shipped encoder. `gen-tonic-messages` pulls prost only —
 # no tonic/gRPC stack. Dev-only, never linked into a production build.

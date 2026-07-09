@@ -419,3 +419,39 @@ fn chain_referencing_unknown_filter_is_rejected() {
         Err(e) => assert!(matches!(e, ControlError::UnknownChainFilter(_)), "got {e}"),
     }
 }
+
+#[test]
+fn validate_warns_when_trust_references_a_dev_key() {
+    // ADR 000065 decision 2/5: a `[trust]` key file carrying `plecto_host::DEV_KEY_MARKER`
+    // does not fail `plecto validate` (a `plecto dev`-generated manifest is SUPPOSED to
+    // reference one) but DOES surface `DEV_KEY_IN_TRUST` so a human can tell it apart from a
+    // real production signing key.
+    let dir = tempfile::tempdir().unwrap();
+    let (signer, _private_key_pem) = plecto_host::DevSigner::generate().unwrap();
+    std::fs::write(
+        dir.path().join("dev.pub"),
+        format!(
+            "{}\n{}",
+            plecto_host::DEV_KEY_MARKER,
+            signer.public_key_pem()
+        ),
+    )
+    .unwrap();
+    let toml = "[trust]\nkeys = [\"dev.pub\"]\n";
+    let manifest = Manifest::from_toml(toml).unwrap();
+
+    let outcome = plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
+    assert_eq!(outcome.warnings, vec![plecto_control::DEV_KEY_IN_TRUST]);
+}
+
+#[test]
+fn validate_is_silent_for_a_non_dev_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (signer, _private_key_pem) = plecto_host::DevSigner::generate().unwrap();
+    std::fs::write(dir.path().join("prod.pub"), signer.public_key_pem()).unwrap();
+    let toml = "[trust]\nkeys = [\"prod.pub\"]\n";
+    let manifest = Manifest::from_toml(toml).unwrap();
+
+    let outcome = plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
+    assert!(outcome.warnings.is_empty());
+}

@@ -24,6 +24,7 @@ use crate::headers::{
 };
 use crate::respond::{
     fault, http_response, stream_response, stream_response_direct, synth, synth_retry_after,
+    with_error_code,
 };
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
 
@@ -149,10 +150,13 @@ async fn proxy_core_inner(
         Some(std::borrow::Cow::Owned(path)) => http_req.path = path,
         Some(std::borrow::Cow::Borrowed(_)) => {}
         None => {
-            return Ok(synth(
-                StatusCode::BAD_REQUEST,
-                &fault::BAD_PATH,
-                b"bad request path",
+            return Ok(with_error_code(
+                synth(
+                    StatusCode::BAD_REQUEST,
+                    &fault::BAD_PATH,
+                    b"bad request path",
+                ),
+                &plecto_control::PATH_NORMALIZATION_REJECTED,
             ));
         }
     }
@@ -182,11 +186,14 @@ async fn proxy_core_inner(
     // per-filter `host-ratelimit` capability (ADR 000026) is a separate, policy-shaped limiter.
     if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(peer.ip()) {
         state.metrics.inc_rate_limited();
-        return Ok(synth_retry_after(
-            StatusCode::TOO_MANY_REQUESTS,
-            &fault::RATE_LIMITED,
-            b"rate limit exceeded",
-            retry_after_ms.div_ceil(1000),
+        return Ok(with_error_code(
+            synth_retry_after(
+                StatusCode::TOO_MANY_REQUESTS,
+                &fault::RATE_LIMITED,
+                b"rate limit exceeded",
+                retry_after_ms.div_ceil(1000),
+            ),
+            &plecto_control::QUOTA_EXCEEDED,
         ));
     }
 

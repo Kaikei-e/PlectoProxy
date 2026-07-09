@@ -23,6 +23,13 @@ _Avoid_: result, verdict, response（ここでは別物を指す）
 fast path（host）と untrusted な WASM フィルタの間の型付き境界。`wasi:http` の request/response
 型を再利用しつつ、decision / hooks / host-API という Plecto 固有の語彙を持つ独自ワールド。
 
+**Conformant（component）**:
+`plecto conformance` が判定する性質。特定フィクスチャの挙動（`filter-hello` の `x-block` ヘッダ応答など）ではなく、
+任意の `plecto:filter` 実装に共通して要求できる汎用プロパティ（world の構造的妥当性・署名/SBOM ロードゲート通過・
+trap しない・宣言 deadline 内に応答する）を指す。`tests/polyglot.rs` の言語横断フィクスチャテストは別物
+（`filter-hello` 固有の振る舞いに依存する Rust 内部の回帰テスト、CLI には持ち出さない）。
+_Avoid_: valid filter（漠然）, passes tests（フィクスチャ依存の含意）
+
 ## 実行モデル
 
 **init hook**:

@@ -9,6 +9,13 @@
 //! - `plecto validate <manifest.toml>` — statically validate a manifest and exit (the `nginx -t`
 //!   shape: strict parse + every fail-closed startup check that needs no artifact; for CI and
 //!   pre-SIGHUP checks)
+//! - `plecto conformance <component.wasm> [--json]` — Filter Dev Kit (ADR 000065): run the
+//!   generic `plecto:filter` conformance battery against a component and exit non-zero unless
+//!   every check passes. `--json` prints a machine-readable report instead of plain text.
+//! - `plecto new-filter --lang rust <name>` — Filter Dev Kit (ADR 000065): scaffold a new
+//!   `plecto:filter` guest crate + a dev manifest trusting your project's dev key.
+//! - `plecto dev <filter-dir>` — Filter Dev Kit (ADR 000065): watch, componentize, gate on
+//!   conformance, sign with the dev key, and reload in a loop (unix only — SIGHUP-based).
 //! - `plecto schema` — print the manifest's JSON Schema (draft-07) for editor completion / CI
 //! - `plecto --version` — print the version and exit
 
@@ -18,6 +25,10 @@ use std::sync::Arc;
 use plecto_control::Control;
 use plecto_server::serve_with_shutdown;
 use tokio::net::TcpListener;
+
+mod dev_cmd;
+mod dev_key;
+mod new_filter;
 
 fn main() -> anyhow::Result<()> {
     // Cap glibc malloc arenas BEFORE the runtime spawns worker threads (M_ARENA_MAX only gates new
@@ -40,7 +51,7 @@ async fn run() -> anyhow::Result<()> {
         .with_target(true)
         .try_init();
 
-    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate <manifest.toml> | plecto schema | plecto --version";
+    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate <manifest.toml> | plecto conformance <component.wasm> [--json] | plecto new-filter --lang rust <name> | plecto dev <filter-dir> | plecto schema | plecto --version";
     let mut args = std::env::args().skip(1);
     let manifest = match args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.as_str() {
         "--version" | "-V" => {
@@ -61,12 +72,94 @@ async fn run() -> anyhow::Result<()> {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("usage: plecto validate <manifest.toml>"))?;
             match plecto_control::validate_manifest_path(Path::new(&path)) {
-                Ok(version) => {
-                    println!("manifest OK: {path} (config version {version})");
+                Ok(outcome) => {
+                    println!(
+                        "manifest OK: {path} (config version {})",
+                        outcome.config_version
+                    );
+                    for warning in &outcome.warnings {
+                        println!("warning {warning}");
+                    }
                     return Ok(());
                 }
                 Err(e) => anyhow::bail!("manifest INVALID: {path}: {e}"),
             }
+        }
+        // Filter Dev Kit conformance CLI (ADR 000065 decision 3): the CLI surface over the same
+        // generic-property battery `plecto dev` runs before every reload. Self-signs with a
+        // throwaway key (never `.plecto/dev-key`), so this needs no manifest, no trust setup —
+        // just a component.
+        "conformance" => {
+            let rest: Vec<String> = args.collect();
+            let json = rest.iter().any(|a| a == "--json");
+            let path = rest
+                .iter()
+                .find(|a| a.as_str() != "--json")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("usage: plecto conformance <component.wasm> [--json]")
+                })?
+                .clone();
+            let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
+            let report = plecto_control::run_conformance(&bytes);
+            if json {
+                let checks: Vec<serde_json::Value> = report
+                    .checks
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({"name": c.name, "passed": c.passed, "detail": c.detail})
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({"conformant": report.is_conformant(), "checks": checks})
+                );
+            } else {
+                for check in &report.checks {
+                    let mark = if check.passed { "PASS" } else { "FAIL" };
+                    println!("[{mark}] {} — {}", check.name, check.detail);
+                }
+            }
+            if report.is_conformant() {
+                return Ok(());
+            }
+            anyhow::bail!("{path} is not conformant with plecto:filter");
+        }
+        // Filter Dev Kit scaffold CLI (ADR 000065 decision 4): `plecto new-filter --lang rust
+        // <name>` — the `filter-template` directory, CLI-ified, plus the project's dev key and
+        // a ready-to-run dev manifest. `--lang`/`<name>` accepted in either order.
+        "new-filter" => {
+            let rest: Vec<String> = args.collect();
+            let usage = || anyhow::anyhow!("usage: plecto new-filter --lang <lang> <name>");
+            let lang_idx = rest.iter().position(|a| a == "--lang");
+            let lang = lang_idx.and_then(|i| rest.get(i + 1)).ok_or_else(usage)?;
+            let lang_value_idx = lang_idx.map(|i| i + 1);
+            let name = rest
+                .iter()
+                .enumerate()
+                .find(|(i, a)| a.as_str() != "--lang" && Some(*i) != lang_value_idx)
+                .map(|(_, a)| a.as_str())
+                .ok_or_else(usage)?;
+            let project_root = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("resolve the current directory: {e}"))?;
+            new_filter::run(lang, name, &project_root)?;
+            return Ok(());
+        }
+        // Filter Dev Kit inner loop (ADR 000065 decision 2): watch → componentize → conformance
+        // gate → dev-key sign → reload, in-process, reusing the exact SIGHUP reload plumbing
+        // `plecto serve` uses. unix-only, like the rest of the SIGHUP reload mechanism.
+        #[cfg(unix)]
+        "dev" => {
+            let filter_dir = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: plecto dev <filter-dir>"))?;
+            let project_root = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("resolve the current directory: {e}"))?;
+            dev_cmd::run(Path::new(&filter_dir), &project_root).await?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        "dev" => {
+            anyhow::bail!("plecto dev requires unix (it reloads via SIGHUP, like plecto serve)")
         }
         manifest => manifest.to_string(),
     };

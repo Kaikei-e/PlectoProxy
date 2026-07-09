@@ -40,8 +40,18 @@ Component Model sandbox, not by convention.
 
 ## 2. Scaffold
 
-Start from the template in [`plecto/examples/filters/filter-template/`](../plecto/examples/filters/filter-template/).
-Either copy it or generate it:
+The fastest path, and the one this guide's other examples assume, is the Filter Dev Kit CLI
+(ADR 000065) — it scaffolds the crate, fetches the WIT contract via `wkg` (ADR 000064), and
+writes a ready-to-run dev manifest in one step:
+
+```bash
+plecto new-filter --lang rust my-filter
+```
+
+Rust is the only `--lang` implemented so far; `go`/`moonbit`/`c`/`js` scaffolds are tracked
+follow-up work (see §7 for hand-written examples in those languages today). Without the CLI, or
+to see exactly what it generates, start from the template in
+[`plecto/examples/filters/filter-template/`](../plecto/examples/filters/filter-template/) instead:
 
 ```bash
 # copy
@@ -232,15 +242,44 @@ Plecto Proxy loads filters from a local, digest-pinned OCI image-layout and **ve
 plus an SBOM↔component binding before running them (ADR 000006 / 000007) — bad signature, refused,
 fail-closed. The public key must be listed in `[trust]`.
 
-The complete, worked pipeline is the [`wasm-auth` example](../plecto/examples/wasm-auth/main.rs): it
-signs the component, writes the offline OCI layout, computes the digest, and starts a real proxy — all
-in one runnable file. **Read it as your reference.** For production, sign with `cosign sign-blob`
-using a key whose public half is in `[trust].keys`.
+For **local development**, `plecto dev <filter-dir>` (ADR 000065, Rust filters today) closes this
+whole loop automatically — no manual signing, no separate reload command:
 
-Streamlined packaging/signing tooling (`plecto`-side helpers) is on the roadmap (M6); today the
-example is the canonical recipe.
+```bash
+plecto dev my-filter
+```
+
+It watches `my-filter/src/`, and on every change: rebuilds (`cargo build --target
+wasm32-unknown-unknown --release` + `wit-component`), runs the same generic conformance battery as
+`plecto conformance` (§6), and — **only if conformant** — signs with your project's persistent dev
+key (`.plecto/dev-key`, generated on first use, `.gitignore`d automatically), writes the OCI
+layout, rewrites `my-filter/manifest.toml`'s pinned digest, and reloads the running gateway via the
+same SIGHUP path `plecto serve` uses. A non-conformant rebuild is reported and discarded — the
+gateway keeps serving the last good build. The verification code path is never weakened for dev:
+only *which* key is in `[trust]` differs from production (P5, ADR 000006).
+
+The dev key is **not** a production signing key — `plecto validate` warns (`PLECTO-E0004`) if a
+manifest's `[trust]` ever references one outside a dev context. For a **production** deploy, sign
+with `cosign sign-blob` (or your CI's signer) using a key whose public half is in `[trust].keys`,
+and follow the packaging pipeline in the [`wasm-auth` example](../plecto/examples/wasm-auth/main.rs)
+— it signs the component, writes the offline OCI layout, computes the digest, and starts a real
+proxy, all in one runnable file. **Read it as your production reference.**
 
 ## 6. Test it locally
+
+The fastest contract-level check, no manifest or upstream needed, is `plecto conformance`
+(ADR 000065) against a built component:
+
+```bash
+plecto conformance my-filter/dist/my_filter.component.wasm
+```
+
+It self-signs with a throwaway key (never your persistent `.plecto/dev-key`) and checks the
+generic properties any `plecto:filter` must have: the component loads under the real signature/SBOM
+gate, and it handles a generic request without trapping or exceeding its deadline. It does **not**
+check your filter's specific policy (e.g. "does it block the right headers") — that is what §1's
+world and your own test requests are for. `plecto dev` (§5) runs this same battery automatically
+before every reload.
 
 The fastest way to see *your* filter run end to end is to adapt an example:
 
@@ -347,7 +386,9 @@ First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain o
 
 Everything above assumes you have `plecto/wit/`. If your filter lives outside this repository —
 which is the normal case for a real filter — fetch the contract with the standard WIT toolchain
-instead of copying files by hand (ADR 000064).
+instead of copying files by hand (ADR 000064). `plecto new-filter --lang rust` (§2) runs exactly
+the `wkg get` command below for you; read on if you want the manual steps, are scaffolding another
+language by hand, or just want to know what the CLI is doing under the hood.
 
 The contract is published on every tagged release as a [CNCF Wasm OCI
 Artifact](https://tag-runtime.cncf.io/wgs/wasm/deliverables/wasm-oci-artifact/) to `ghcr.io`, the

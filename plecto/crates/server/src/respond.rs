@@ -12,6 +12,7 @@ use crate::headers::{copy_headers, copy_headers_direct, copy_headers_preserving}
 
 const X_PLECTO_FAULT: HeaderName = HeaderName::from_static("x-plecto-fault");
 const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
+const X_PLECTO_ERROR_CODE: HeaderName = HeaderName::from_static("x-plecto-error-code");
 
 /// Static `x-plecto-fault` marker values for [`synth`] / [`synth_retry_after`]. `static` (not a
 /// bare literal) so every call site passes an already compile-time-validated `&'static
@@ -112,6 +113,23 @@ pub(crate) fn synth_retry_after(
     resp
 }
 
+/// Attach a stable `x-plecto-error-code` (ADR 000065 decision 5's PLECTO-E four-tuple) to an
+/// already-synthesised fail-closed response. Only the faults with a registered
+/// `plecto_control::Diagnostic` get this header — most `x-plecto-fault` values don't (the same
+/// selective code-assignment principle rustc's own diagnostics use: reserve a code for the
+/// messages that need more than the message). `diagnostic.code` is one of our own `PLECTO-E`
+/// constants, always valid header-value ASCII, so this stays infallible.
+pub(crate) fn with_error_code(
+    mut resp: Response<ResponseBody>,
+    diagnostic: &plecto_control::Diagnostic,
+) -> Response<ResponseBody> {
+    resp.headers_mut().insert(
+        X_PLECTO_ERROR_CODE,
+        HeaderValue::from_static(diagnostic.code),
+    );
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +170,27 @@ mod tests {
         assert!(
             !resp.headers().contains_key("x-evil"),
             "an invalid header value is dropped from a synthesised response"
+        );
+    }
+
+    #[test]
+    fn with_error_code_sets_the_plecto_error_code_header() {
+        let resp = with_error_code(
+            synth(
+                StatusCode::TOO_MANY_REQUESTS,
+                &fault::RATE_LIMITED,
+                b"limited",
+            ),
+            &plecto_control::QUOTA_EXCEEDED,
+        );
+        assert_eq!(
+            resp.headers().get("x-plecto-error-code").unwrap(),
+            "PLECTO-E0002"
+        );
+        // `synth`'s own header (x-plecto-fault) is untouched by attaching the code alongside it.
+        assert_eq!(
+            resp.headers().get("x-plecto-fault").unwrap(),
+            "rate-limited"
         );
     }
 }

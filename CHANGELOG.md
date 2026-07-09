@@ -21,6 +21,8 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-09
+
 ### Added
 
 - WIT contract distribution via `wkg` / OCI Artifact (ADR 000064): `plecto:filter` (and the
@@ -31,6 +33,18 @@ All notable changes to Plecto are documented here. The format follows
   establishes the contract compatibility policy (`docs/writing-a-filter.md` §8): additive changes
   are minor, breaking changes are major, and the host keeps loading every contract major version
   for at least two release series after a newer major ships.
+- Filter Dev Kit, Rust slice (ADR 000065): `plecto new-filter --lang rust <name>` scaffolds a
+  filter project (fetching the `plecto:filter` WIT via `wkg`, ADR 000064) with a generated
+  project-local dev signing key, and `plecto dev <filter-dir>` watches `src/`, rebuilds
+  (`wasm32-unknown-unknown` + `wit-component`), runs `plecto conformance` against the build
+  (world validity, self-signed load-gate, no-trap, deadline compliance), and only on a pass signs
+  it with the dev key and reloads the running gateway via the same SIGHUP path `plecto serve`
+  uses — a non-conformant build is discarded without touching the manifest, so the running
+  gateway never regresses. `plecto conformance <component.wasm> [--json]` also runs standalone
+  against any component. New PLECTO-E0001–E0004 diagnostic codes (signature failure / quota
+  exceeded / path-normalization rejection / dev-key-in-trust warning) surface as a stable
+  code + cause + suggestion + docs four-tuple. `new-filter` scaffolds for Go/MoonBit/C/JS are
+  explicitly deferred (a clear error, not a silent skip) — ADR 000065 records the full scope cut.
 
 ## [0.2.3] - 2026-07-09
 

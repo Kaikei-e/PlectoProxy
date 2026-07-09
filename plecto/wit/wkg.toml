@@ -1,0 +1,6 @@
+[metadata]
+description = "plecto:filter — the typed contract between Plecto Proxy's native fast path and WASM Component Model filters. See docs/writing-a-filter.md for the filter-authoring guide."
+license = "Apache-2.0"
+homepage = "https://github.com/Kaikei-e/PlectoProxy"
+repository = "https://github.com/Kaikei-e/PlectoProxy"
+documentation = "https://github.com/Kaikei-e/PlectoProxy/blob/main/docs/writing-a-filter.md"

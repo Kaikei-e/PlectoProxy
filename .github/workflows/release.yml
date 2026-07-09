@@ -11,10 +11,13 @@
 #   - *.spdx.json                          SBOM (syft, reads the auditable data too)
 #   - ghcr.io/<owner>/plecto               multi-arch image, provenance + SBOM attestations,
 #                                          cosign-signed by digest
+#   - ghcr.io/kaikei-e/wit/plecto/*        plecto:filter (+ experimental plecto:filter-streaming)
+#                                          WIT contract, CNCF Wasm OCI Artifact layout (ADR 000064);
+#                                          digest recorded in this tag's release notes
 #
 # Verify a binary:
 #   cosign verify-blob --bundle plecto-<tag>-<target>.tar.gz.sigstore.json \
-#     --certificate-identity-regexp 'https://github.com/Kaikei-e/Plecto/\.github/workflows/release\.yml@.*' \
+#     --certificate-identity-regexp 'https://github.com/Kaikei-e/PlectoProxy/\.github/workflows/release\.yml@.*' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 #     plecto-<tag>-<target>.tar.gz
 # Verify the image (same flags, `cosign verify ghcr.io/<owner>/plecto@<digest>`).
@@ -244,3 +247,81 @@ jobs:
         run: |
           digest=$(jq -r '.["containerimage.descriptor"].digest' /tmp/imagetools-metadata.json)
           cosign sign --yes "${{ env.IMAGE }}@${digest}"
+
+  # Publishes the plecto:filter WIT contract (and the experimental plecto:filter-streaming) to
+  # ghcr.io as CNCF Wasm OCI Artifacts (ADR 000064) — the contract-side counterpart of the
+  # binary/image supply-chain discipline above. Independent of `binaries`/`container-build`: a
+  # WIT-publish hiccup must not block shipping the binaries, and vice versa — `needs: gate` only.
+  #
+  # The WIT contract is versioned independently of the crate/binary release (CHANGELOG.md's
+  # "Versioning policy"), so most tags republish an unchanged `package plecto:filter@x.y.z`. The
+  # existence + digest check below makes that a no-op read instead of depending on wkg's own
+  # re-publish-identical-version behavior, which this workflow does not assume either way.
+  wit-publish:
+    name: WIT contract (wkg publish)
+    needs: gate
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    # Job-level permissions REPLACE the workflow-level default (deny-by-default, ADR 000006's own
+    # rule turned on this workflow): this job neither cosign-signs nor reads the gate's CI status,
+    # so it gets neither `id-token` nor `actions: read`.
+    permissions:
+      contents: write # create/edit the draft release + read its current notes
+      packages: write # push the WIT OCI artifacts to ghcr.io
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install wkg (sha256-pinned, same release ci.yml already pins for wkg wit fetch)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
+          echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
+          chmod +x wkg
+          mkdir -p wkg-bin && mv wkg wkg-bin/
+          echo "${{ runner.temp }}/wkg-bin" >> "$GITHUB_PATH"
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+          # wkg has no OCI-auth flag of its own — it falls back to this docker credential store
+          # when its own config carries none (plecto/wkg-registry.toml deliberately doesn't).
+      - name: Publish plecto:filter and plecto:filter-streaming
+        id: publish
+        run: |
+          set -euo pipefail
+          publish_one() {
+            local wit_dir="$1" pkg_name="$2" out_var="$3"
+            local version ref digest
+            version=$(sed -n "s/^package plecto:${pkg_name}@\([0-9.]*\);/\1/p" "${wit_dir}"/*.wit)
+            : "${version:?could not parse a package plecto:${pkg_name}@x.y.z; line from ${wit_dir}}"
+            ref="ghcr.io/kaikei-e/wit/plecto/${pkg_name}:${version}"
+            if docker buildx imagetools inspect "${ref}" >/dev/null 2>&1; then
+              echo "plecto:${pkg_name}@${version} already published at ${ref} — skipping push"
+            else
+              wkg wit build --wit-dir "${wit_dir}" -o "${pkg_name}.wasm" --config plecto/wkg-registry.toml
+              wkg publish "${pkg_name}.wasm" --config plecto/wkg-registry.toml
+            fi
+            digest=$(docker buildx imagetools inspect "${ref}" --format "{{json .Manifest}}" | jq -r '.digest')
+            echo "plecto:${pkg_name}@${version} -> ${ref}@${digest}"
+            echo "${out_var}=${ref}@${digest}" >>"$GITHUB_OUTPUT"
+          }
+          publish_one plecto/wit filter filter_ref
+          publish_one plecto/wit-streaming filter-streaming streaming_ref
+      - name: Record the published digests in this tag's release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # both `binaries` and this job race to create the draft once; the loser's create is a no-op.
+          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
+            --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md" || true
+          {
+            gh release view "${GITHUB_REF_NAME}" --json body -q .body
+            echo
+            echo "WIT contract (ADR 000064):"
+            echo "- ${{ steps.publish.outputs.filter_ref }}"
+            echo "- ${{ steps.publish.outputs.streaming_ref }} (experimental, off-by-default)"
+          } >/tmp/release-notes.md
+          gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/release-notes.md

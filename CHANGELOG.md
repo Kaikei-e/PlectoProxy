@@ -11,12 +11,26 @@ All notable changes to Plecto are documented here. The format follows
   **Removed** with a migration note. Patch bumps are always safe to take.
 - **WIT contract**: the filter contract is versioned independently as `plecto:filter@<version>`.
   A manifest declares which contract its filters target; the host keeps loading every contract
-  version it ships support for, so a proxy upgrade never silently breaks deployed filters.
+  version it ships support for, so a proxy upgrade never silently breaks deployed filters. The
+  contract is published as a CNCF Wasm OCI Artifact to `ghcr.io` on every tagged release (`wkg
+  publish`, ADR 000064); the published digest is recorded in that tag's release notes, the
+  contract-side counterpart of the binary/image supply-chain record below.
 - **Release artifacts**: binaries and images are cosign-signed (keyless) with SBOMs attached —
   the same supply-chain bar Plecto's own filter loading enforces. Verify commands are in the
   release notes of each release.
 
 ## [Unreleased]
+
+### Added
+
+- WIT contract distribution via `wkg` / OCI Artifact (ADR 000064): `plecto:filter` (and the
+  experimental, off-by-default `plecto:filter-streaming`) now publish to `ghcr.io` on every tagged
+  release, alongside the existing signed binaries/images — `wkg get plecto:filter@<version>` is
+  now the canonical way for a filter author to fetch the contract without cloning this repository.
+  The release workflow records the published digest in each tag's release notes. Also formally
+  establishes the contract compatibility policy (`docs/writing-a-filter.md` §8): additive changes
+  are minor, breaking changes are major, and the host keeps loading every contract major version
+  for at least two release series after a newer major ships.
 
 ## [0.2.3] - 2026-07-09
 

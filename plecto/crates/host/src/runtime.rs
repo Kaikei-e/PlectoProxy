@@ -32,13 +32,16 @@ pub(crate) trait FilterRuntime: Send + Sync {
     fn begin_request(&self, instance: &mut Self::Instance);
     /// Set the per-request epoch deadline before a hook call.
     fn set_request_deadline(&self, instance: &mut Self::Instance);
-    /// Drain this instance's per-request host-log lines after a call.
+    /// Drain this instance's per-request host-log lines after a call, for an instance that will
+    /// be reused (a pooled/trusted instance on its `Ok` arm): a still-unterminated stdio partial
+    /// line legitimately stays buffered, since a later call on the same instance may complete it.
     fn take_logs(&self, instance: &mut Self::Instance) -> Vec<LogLine>;
-    /// Like [`take_logs`](Self::take_logs), but for the trap path: the instance is about to be
-    /// discarded, so this must also recover anything that a normal drain would otherwise leave
-    /// buffered for a later call that will now never come (ADR 000063: an unterminated stdio
-    /// partial line, e.g. a panic message with no trailing newline).
-    fn take_logs_after_trap(&self, instance: &mut Self::Instance) -> Vec<LogLine>;
+    /// Like [`take_logs`](Self::take_logs), but for an instance about to be discarded — a trap
+    /// (pooled or fresh), or a fresh/untrusted instance's `Ok` arm, since fresh instances are
+    /// always single-use regardless of outcome. Also recovers anything a normal drain would
+    /// otherwise leave buffered for a later call that will now never come (ADR 000063: an
+    /// unterminated stdio partial line, e.g. a panic message with no trailing newline).
+    fn take_logs_final(&self, instance: &mut Self::Instance) -> Vec<LogLine>;
 }
 
 /// The production `FilterRuntime`: everything needed to instantiate and drive a real wasmtime
@@ -203,8 +206,8 @@ impl FilterRuntime for WasmtimeRuntime {
         instance.store.data_mut().take_logs()
     }
 
-    fn take_logs_after_trap(&self, instance: &mut WasmtimeInstance) -> Vec<LogLine> {
-        instance.store.data_mut().take_logs_after_trap()
+    fn take_logs_final(&self, instance: &mut WasmtimeInstance) -> Vec<LogLine> {
+        instance.store.data_mut().take_logs_final()
     }
 }
 

@@ -194,7 +194,12 @@ impl<R: FilterRuntime> LoadedInner<R> {
         self.runtime.set_request_deadline(&mut inst);
         match call(&mut inst) {
             Ok(value) => {
-                let logs = self.runtime.take_logs(&mut inst);
+                // A fresh/untrusted instance is used for exactly one call and then discarded
+                // regardless of outcome — the final drain (not the plain mid-lifetime one) so an
+                // unterminated stdio partial line (ADR 000063: e.g. a guest that writes without a
+                // trailing newline before returning normally) is recovered here exactly like the
+                // trap arm below, instead of being silently lost with the discarded instance.
+                let logs = self.runtime.take_logs_final(&mut inst);
                 self.untrusted_breaker.lock().clear();
                 Ok((value, logs))
             }
@@ -203,7 +208,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 // trap), so recover whatever host-log/stdio output it produced before failing —
                 // ADR 000063's whole point is that a trapping guest's own diagnostic output
                 // (e.g. a TinyGo panic on stderr) still reaches the span this request emits.
-                let logs = self.runtime.take_logs_after_trap(&mut inst);
+                let logs = self.runtime.take_logs_final(&mut inst);
                 self.untrusted_breaker.lock().record_trap();
                 Err((RunError::from_call(e), logs))
             }
@@ -259,7 +264,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 // logs (including any unterminated stdio partial line, ADR 000063) BEFORE the
                 // discard, then bump the pool-wide breaker; past the threshold open a short
                 // cooldown so a deterministically-trapping filter fails closed cheaply.
-                let logs = self.runtime.take_logs_after_trap(&mut pooled.instance);
+                let logs = self.runtime.take_logs_final(&mut pooled.instance);
                 slot.armed = false;
                 drop(pooled);
                 let mut g = pool.inner.lock();
@@ -389,8 +394,8 @@ mod pool_tests {
 
     /// A `FilterRuntime` with no wasmtime engine at all: `instantiate_initialized` just hands out
     /// an incrementing id, so tests can assert exactly how many times an instance was (re)built.
-    /// `take_logs`/`take_logs_after_trap` return distinct marker lines (not just `Vec::new()`) so
-    /// a test can assert WHICH ONE `run_fresh`/`run_pooled` actually called, not merely that some
+    /// `take_logs`/`take_logs_final` return distinct marker lines (not just `Vec::new()`) so a
+    /// test can assert WHICH ONE `run_fresh`/`run_pooled` actually called, not merely that some
     /// `Vec<LogLine>` came back.
     struct FakeRuntime {
         next_id: AtomicU64,
@@ -432,8 +437,8 @@ mod pool_tests {
         fn take_logs(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
             marker_log("take_logs")
         }
-        fn take_logs_after_trap(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
-            marker_log("take_logs_after_trap")
+        fn take_logs_final(&self, _instance: &mut FakeInstance) -> Vec<LogLine> {
+            marker_log("take_logs_final")
         }
     }
 
@@ -642,7 +647,7 @@ mod pool_tests {
 
         assert_eq!(
             logs,
-            marker_log("take_logs_after_trap"),
+            marker_log("take_logs_final"),
             "run_fresh's Ok arm must use the final drain (partial-line flush), \
              not the plain mid-lifetime drain — the instance is discarded either way"
         );

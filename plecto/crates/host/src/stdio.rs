@@ -222,8 +222,8 @@ impl StdioBridge {
     }
 
     /// Like `drain`, but also flushes any still-unterminated partial line first (ADR 000063):
-    /// called from `HostState::take_logs_after_trap` on the trap path, where the instance is
-    /// about to be discarded.
+    /// called from `HostState::take_logs_final` whenever the instance is about to be discarded
+    /// (a trap, or a fresh/untrusted instance's `Ok` arm).
     pub(crate) fn drain_final(&self) -> Vec<LogLine> {
         self.inner
             .lock()

@@ -64,6 +64,8 @@ wit_bindgen::generate!({ path: "wit", world: "filter" });
 
 That vendored copy is why a generated filter builds anywhere. Keeping it in sync with the canonical
 `plecto/wit/world.wit` is your responsibility; inside this repo, `just sync-template-wit` refreshes it.
+Outside this repo — the normal case once your filter has its own home — refresh it with `wkg get`
+instead of copying files by hand; see [§8](#8-contract-distribution-and-compatibility-policy).
 
 Because the contract is WIT, **any language that compiles to a WASM component can write a filter** —
 see [section 7](#7-other-languages).
@@ -340,3 +342,60 @@ One more language, for completeness:
 
 First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain on the
 [roadmap](../README.md#roadmap) (M6).
+
+## 8. Contract distribution and compatibility policy
+
+Everything above assumes you have `plecto/wit/`. If your filter lives outside this repository —
+which is the normal case for a real filter — fetch the contract with the standard WIT toolchain
+instead of copying files by hand (ADR 000064).
+
+The contract is published on every tagged release as a [CNCF Wasm OCI
+Artifact](https://tag-runtime.cncf.io/wgs/wasm/deliverables/wasm-oci-artifact/) to `ghcr.io`, the
+same way WASI's own WIT packages are distributed under `ghcr.io/webassembly`. There is no
+`/.well-known/wasm-pkg/registry.json` under a Plecto-controlled domain yet (that comes once a docs
+domain exists), so point [`wkg`](https://github.com/bytecodealliance/wasm-pkg-tools) at the
+registry explicitly:
+
+```bash
+cat > wkg-registry.toml <<'EOF'
+[namespace_registries.plecto]
+registry = "ghcr.io"
+metadata = { oci = { registry = "ghcr.io", namespacePrefix = "kaikei-e/wit/" } }
+EOF
+
+wkg get plecto:filter@0.1.0 --config wkg-registry.toml -o wit/ --format wit
+```
+
+That writes the plain-text WIT to `wit/`, ready for `wit_bindgen::generate!` (or any other
+language's binding generator) — no `git clone` of this repository required. Pin the version, and
+verify the pulled contract against the digest recorded in that tag's [GitHub
+Release](https://github.com/Kaikei-e/PlectoProxy/releases) notes before you build against it, the
+same fail-closed instinct §5's digest-pinned filter loading already asks of you.
+
+The experimental streaming contract publishes the same way, one package over: `plecto:filter-streaming@0.1.0`.
+It carries **no compatibility guarantee** — it is the off-by-default `streaming-body` feature's
+contract (§3's `filter`/`filter-body` split has no third `streaming` world yet) and may change or
+disappear without a major bump. Do not depend on it outside an explicit opt-in build.
+
+### Compatibility policy
+
+The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
+versioning policy already says so. `plecto:filter@0.1.0` and a `plecto` binary at `0.2.3` is the
+normal, expected state.
+
+- **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional
+  field, a new export on `filter-body` — minor. Removing or changing the signature of an existing
+  export or host-API function — major.
+- **The host keeps loading every contract version it ships support for.** A `plecto` upgrade does
+  not silently break a filter built against an older `plecto:filter` version; the host branches on
+  the component's own world version at load time. On a major bump, the previous major stays
+  accepted for **at least two release series** before its removal is declared — via ADR, the same
+  way any other deprecation in this project is declared (never silently).
+- **`filter` vs. `filter-body` compatibility is part of this policy** (ADR 000038): the base
+  `filter` world exporting nothing new stays minor-compatible forever by construction (the
+  *absence* of `on-request-body` is itself contractual, not an oversight). Adding an export to
+  `filter-body` is minor; changing an existing export's signature (on either world) is major.
+
+This is the filter-author-facing analogue of the supply-chain discipline Plecto applies to its own
+release binaries and images (ADR 000047): a digest-pinned artifact, a declared stability contract,
+and a fail-closed way to tell when either one is violated.

@@ -1,0 +1,5 @@
+[metadata]
+description = "EXPERIMENTAL — plecto:filter-streaming, the off-by-default streaming request-body contract. NOT the shipped plecto:filter contract; stays out of the default build until wasm32-wasip3 reaches Tier 2. See docs/ADR/000064.md."
+license = "Apache-2.0"
+homepage = "https://github.com/Kaikei-e/PlectoProxy"
+repository = "https://github.com/Kaikei-e/PlectoProxy"

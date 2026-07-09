@@ -1,3 +1,3 @@
-idle VmRSS: 41236 kB
-RSS with ~1000 conns: 66216 kB
-bytes/conn ≈ 25580
+idle VmRSS: 42428 kB
+RSS with ~1000 conns: 67484 kB
+bytes/conn ≈ 25657

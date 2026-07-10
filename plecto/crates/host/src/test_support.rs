@@ -80,6 +80,13 @@ pub fn filter_extauthz_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_EXTAUTHZ_COMPONENT")).expect("read filter-extauthz component")
 }
 
+/// The compiled `filter-jwt` component bytes — JWT Resource-Server reference (ADR 000070), built
+/// by this crate's `build.rs` when the `outbound-http` feature is on (JWKS path needs it).
+#[cfg(feature = "outbound-http")]
+pub fn filter_jwt_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_JWT_COMPONENT")).expect("read filter-jwt component")
+}
+
 /// The compiled `filter-tcp-gate` component bytes — the outbound-TCP example (a raw-TCP consult
 /// gate), built by this crate's `build.rs` when the `outbound-tcp` feature is on (ADR 000060).
 #[cfg(feature = "outbound-tcp")]

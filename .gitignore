@@ -8,6 +8,7 @@ plecto/examples/filters/filter-quickstart/target
 plecto/examples/filters/filter-tcp-gate/target
 plecto/examples/filters/filter-ratelimit-redis/target
 plecto/examples/filters/filter-template/target
+plecto/examples/filters/filter-jwt/target
 bench/filters/filter-noop/target
 plecto/spike/streaming-async/guest/target
 plecto/spike/streaming-async/host/target

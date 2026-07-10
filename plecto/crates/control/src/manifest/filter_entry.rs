@@ -314,8 +314,6 @@ max_concurrent = 100000
     #[test]
     fn outbound_rejects_bad_config() {
         let cases = [
-            // empty allowlist
-            ("allow = []", "empty allowlist"),
             // unparseable CIDR
             (
                 "allow = [{ host = \"a\" }]\nallow_private = [\"not-a-cidr\"]",
@@ -334,6 +332,28 @@ max_concurrent = 100000
             let m = Manifest::from_toml(&toml).unwrap();
             assert!(m.filters[0].validate().is_err(), "{why} must be rejected");
         }
+    }
+
+    /// Empty `allow` is deny-by-default (no reachable destination) but still links wasi:http —
+    /// required by wasip2 guests that import the interface even when unused (filter-jwt static path).
+    #[cfg(feature = "outbound-http")]
+    #[test]
+    fn outbound_allows_empty_allowlist_as_deny_all() {
+        let toml = r#"
+[[filter]]
+id = "x"
+source = "s"
+digest = "sha256:abc"
+[filter.outbound_http]
+allow = []
+"#;
+        let m = Manifest::from_toml(toml).unwrap();
+        m.filters[0]
+            .validate()
+            .expect("empty allow is deny-all, not invalid");
+        let opts = m.filters[0].load_options();
+        assert!(opts.outbound_http.is_some());
+        assert!(opts.outbound_http.unwrap().allow.is_empty());
     }
 
     const OUTBOUND_TCP_TOML: &str = r#"

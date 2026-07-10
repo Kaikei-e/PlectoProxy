@@ -218,9 +218,11 @@ impl FilterEntry {
     }
 
     /// Validate an outbound_http section. Without the `outbound-http` build the host cannot provide
-    /// the capability, so any declared outbound_http is rejected (fail-closed). With it, the
-    /// allowlist must be non-empty, `allow_private` CIDRs must parse, and any explicit metering
-    /// value must be non-zero.
+    /// the capability, so any declared outbound_http is rejected (fail-closed). With it,
+    /// `allow_private` CIDRs must parse and any explicit metering value must be non-zero.
+    /// An empty `allow` is permitted: it links `wasi:http` (needed by wasip2 guests that import
+    /// the interface even when unused, e.g. filter-jwt static PEM path) while remaining
+    /// deny-by-default — no destination is reachable.
     #[cfg(not(feature = "outbound-http"))]
     fn validate_outbound_http(&self, _ob: &OutboundHttpConfig) -> Result<(), ControlError> {
         Err(ControlError::InvalidFilterConfig {
@@ -236,11 +238,6 @@ impl FilterEntry {
             id: self.id.clone(),
             reason,
         };
-        if ob.allow.is_empty() {
-            return Err(bad(
-                "outbound_http.allow must list at least one destination".into(),
-            ));
-        }
         for dest in &ob.allow {
             if dest.host.trim().is_empty() {
                 return Err(bad("outbound_http.allow entry has an empty host".into()));

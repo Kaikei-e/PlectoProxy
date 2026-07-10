@@ -158,6 +158,11 @@ dhat = "0.3"
 # no tonic/gRPC stack. Dev-only, never linked into a production build.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14"
+# filter-jwt host tests (ADR 000070): mint ES256/RS256 test tokens and hand-build an alg=none
+# token (jsonwebtoken refuses to encode one) to exercise the alg-allowlist gate directly.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+serde = { workspace = true, features = ["derive"] }
+base64 = "0.22"
 
 [[bench]]
 name = "wasm"

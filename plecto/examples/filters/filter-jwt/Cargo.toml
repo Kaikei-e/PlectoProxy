@@ -1,0 +1,29 @@
+# filter-jwt — Resource-Server JWT verification reference (ADR 000070).
+# Builds for wasm32-wasip2 so the JWKS-at-init path can import
+# wasi:http/outgoing-handler; the static PEM/JWK path never calls outbound.
+#
+# Crypto is verify-only (p256 / rsa) — ECDSA/RSA verification needs no RNG, so this guest
+# never pulls in getrandom/wasi:random at all. We deliberately avoid jsonwebtoken here: its
+# getrandom backend pinned a `wasi` crate release that didn't component-link cleanly against
+# the outbound-http host's wasmtime-wasi grant. Declares its own [workspace].
+[package]
+name = "filter-jwt"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.59"
+wasi = "0.14"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+signature = { version = "2", default-features = false }
+
+[workspace]

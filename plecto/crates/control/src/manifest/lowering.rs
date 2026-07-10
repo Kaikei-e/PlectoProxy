@@ -30,7 +30,9 @@ impl FilterEntry {
         }
         #[cfg(feature = "outbound-http")]
         if let Some(ob) = &self.outbound_http {
-            // Validated already (`validate`), so the CIDR parses and the allowlist is non-empty.
+            // Validated already (`validate`): CIDRs parse, metering is non-zero. An empty `allow`
+            // is permitted (deny-all) so wasip2 guests can link `wasi:http` without naming a
+            // destination (filter-jwt static PEM path, ADR 000070).
             let allow = ob
                 .allow
                 .iter()

@@ -19,16 +19,15 @@ pub(crate) fn public_key_path(project_root: &Path) -> PathBuf {
     plecto_control::public_key_path_for(&dev_key_path(project_root))
 }
 
-/// Load or create the project's dev key, appending `.plecto/` to `<project_root>/.gitignore`
-/// the first time this project gets one (idempotent — never appends a duplicate line).
+/// Load or create the project's dev key, ensuring `.plecto/` is in `<project_root>/.gitignore`
+/// (idempotent — never appends a duplicate line). Re-asserted on EVERY run, not just the one
+/// that creates the key: the ignore entry is what keeps the private key out of the repo, so a
+/// later `.gitignore` prune must not silently disarm it.
 pub(crate) fn load_or_create_dev_signer(project_root: &Path) -> Result<DevSigner> {
     let key_path = dev_key_path(project_root);
-    let existed = key_path.exists();
     let signer = DevSigner::load_or_create(&key_path)
         .with_context(|| format!("load or create dev key at {}", key_path.display()))?;
-    if !existed {
-        ensure_gitignore_entry(project_root)?;
-    }
+    ensure_gitignore_entry(project_root)?;
     Ok(signer)
 }
 
@@ -71,6 +70,21 @@ mod tests {
         assert_eq!(
             gitignore.lines().filter(|l| l.trim() == ".plecto/").count(),
             1
+        );
+    }
+
+    #[test]
+    fn a_pruned_gitignore_entry_is_restored_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_dev_signer(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+
+        load_or_create_dev_signer(dir.path()).unwrap();
+        let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            gitignore.contains(".plecto/"),
+            "the ignore entry guarding the private key must come back even though the key \
+             already exists"
         );
     }
 

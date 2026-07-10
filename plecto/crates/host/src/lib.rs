@@ -94,7 +94,7 @@ pub mod test_support;
 
 pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_bucket};
 pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conformance};
-pub use dev_signer::{DEV_KEY_MARKER, DevSigner, bound_sbom, public_key_path_for};
+pub use dev_signer::{DEV_KEY_MARKER, DevKeyError, DevSigner, bound_sbom, public_key_path_for};
 pub use observe::{
     FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
     RequestTrace, SpanOutcome, TelemetrySink,

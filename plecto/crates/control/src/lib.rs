@@ -66,7 +66,7 @@ pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::{ChainOutcome, RequestBodyOutcome};
 pub use diagnostic::{
     DEV_KEY_IN_TRUST, Diagnostic, PATH_NORMALIZATION_REJECTED, QUOTA_EXCEEDED,
-    SIGNATURE_VERIFICATION_FAILED, diagnose,
+    SIGNATURE_VERIFICATION_FAILED, diagnose, diagnosed_message,
 };
 pub use error::ControlError;
 pub use manifest::{
@@ -103,7 +103,7 @@ pub use plecto_host::{
 // production dependency; a plain (non-`test-support`) `plecto-host` build needs no wasm32
 // toolchain, so this widens no dependency edge, just this crate's existing re-export list.
 pub use plecto_host::{
-    ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevSigner, bound_sbom,
+    ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevKeyError, DevSigner, bound_sbom,
     public_key_path_for, run_conformance,
 };
 // The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the

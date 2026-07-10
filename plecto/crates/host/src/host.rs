@@ -187,7 +187,7 @@ impl Host {
         };
         let component = Component::from_binary(engine, component_bytes)?;
         let mut linker = Linker::<HostState>::new(engine);
-        // deny-by-default: lend ONLY the plecto host-API (all five interfaces at once).
+        // deny-by-default: lend ONLY the plecto host-API (every basic capability in one call).
         // No WASI is added — unless this filter has an outbound policy (below).
         Filter::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)?;
 

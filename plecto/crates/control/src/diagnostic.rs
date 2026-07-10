@@ -89,6 +89,16 @@ pub fn diagnose(err: &ControlError) -> Option<Diagnostic> {
     }
 }
 
+/// Render `err` for a human-facing surface (startup, `plecto dev`), appending the four-part
+/// diagnostic when one is registered — the piece that actually puts PLECTO-E0001 in front of a
+/// newcomer whose filter failed the signature gate (ADR 000065 decision 5).
+pub fn diagnosed_message(err: &ControlError) -> String {
+    match diagnose(err) {
+        Some(diagnostic) => format!("{err}\n{diagnostic}"),
+        None => err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +124,20 @@ mod tests {
         assert!(rendered.contains("PLECTO-E0001"));
         assert!(rendered.contains("suggestion:"));
         assert!(rendered.contains("docs:"));
+    }
+
+    #[test]
+    fn diagnosed_message_appends_the_diagnostic_only_when_one_is_registered() {
+        let signature = ControlError::Load {
+            id: "f".to_string(),
+            err: anyhow::Error::from(LoadError::UnverifiedComponentSignature),
+        };
+        let rendered = diagnosed_message(&signature);
+        assert!(rendered.contains("failed the load gate"));
+        assert!(rendered.contains("PLECTO-E0001"));
+        assert!(rendered.contains("suggestion:"));
+
+        let plain = ControlError::DuplicateFilterId("f".to_string());
+        assert_eq!(diagnosed_message(&plain), plain.to_string());
     }
 }

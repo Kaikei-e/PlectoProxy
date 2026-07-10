@@ -48,8 +48,21 @@ pub fn serve_reloads(control: &Control, source: &mut dyn ReloadSource) {
                 tracing::info!(config_version = %hash, "reload: swapped to new manifest");
             }
             Err(err) => {
-                // Fail-closed: keep serving the old set; surface the error, do not crash.
-                tracing::error!(error = %err, "reload failed; keeping current set");
+                // Fail-closed: keep serving the old set; surface the error, do not crash. A
+                // registered PLECTO-E diagnostic (ADR 000065 decision 5) rides along as
+                // structured fields — the reload log is where a signature failure surfaces.
+                match crate::diagnose(&err) {
+                    Some(d) => tracing::error!(
+                        error = %err,
+                        code = d.code,
+                        suggestion = d.suggestion,
+                        docs = d.docs,
+                        "reload failed; keeping current set"
+                    ),
+                    None => {
+                        tracing::error!(error = %err, "reload failed; keeping current set")
+                    }
+                }
             }
         }
     }

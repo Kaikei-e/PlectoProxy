@@ -51,7 +51,7 @@ fn request(headers: &[(&str, &str)]) -> HttpRequest {
             .iter()
             .map(|(n, v)| Header {
                 name: (*n).to_string(),
-                value: (*v).to_string(),
+                value: v.as_bytes().to_vec(),
             })
             .collect(),
     }
@@ -81,6 +81,27 @@ fn local_state(logs: &[LogLine]) -> u32 {
 }
 
 #[test]
+fn non_utf8_request_header_continues_with_native_bytes() {
+    let (_host, filter) = signed_load(LoadOptions::untrusted());
+    let raw: &[u8] = &[0xC3, 0x28];
+    let req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        authority: "example.test".to_string(),
+        scheme: "https".to_string(),
+        headers: vec![Header {
+            name: "x-blob".to_string(),
+            value: raw.to_vec(),
+        }],
+    };
+    let (decision, _) = on_req(&filter, &req).unwrap();
+    assert!(
+        matches!(decision, RequestDecision::Continue),
+        "filter-hello should continue an unblocked request"
+    );
+}
+
+#[test]
 fn continues_when_request_is_not_blocked() {
     let (_host, filter) = signed_load(LoadOptions::untrusted());
 
@@ -105,7 +126,7 @@ fn short_circuits_when_block_header_present() {
             assert!(
                 resp.headers
                     .iter()
-                    .any(|h| h.name == "x-plecto" && h.value == "blocked"),
+                    .any(|h| h.name == "x-plecto" && h.value.as_slice() == b"blocked"),
                 "short-circuit response must carry the filter's header"
             );
         }

@@ -436,7 +436,7 @@ fn route_matches(
         // so deciding on the first occurrence keeps our routing aligned with Gateway-API's
         // "first match entry decides" and mirrors the query rule below.
         match headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
-            Some(h) if h.value == *value => {}
+            Some(h) if h.value.as_slice() == value.as_bytes() => {}
             _ => return false,
         }
     }
@@ -576,7 +576,7 @@ mod tests {
     fn header(name: &str, value: &str) -> Header {
         Header {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

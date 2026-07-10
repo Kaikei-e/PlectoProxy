@@ -95,7 +95,7 @@ fn generic_request() -> HttpRequest {
         scheme: "https".to_string(),
         headers: vec![Header {
             name: "user-agent".to_string(),
-            value: "plecto-conformance".to_string(),
+            value: b"plecto-conformance".to_vec(),
         }],
     }
 }

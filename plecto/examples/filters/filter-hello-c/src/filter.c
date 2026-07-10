@@ -72,12 +72,21 @@ static size_t u64_to_str(uint64_t v, char *out) {
     return n;
 }
 
+// header.value is list<u8> (ADR 000071) — dup the C string's bytes into a heap buffer the
+// generated post-return will free, same ownership rule as filter_body_string_dup.
+static void list_u8_dup(filter_body_list_u8_t *ret, const char *s) {
+    size_t len = strlen(s);
+    ret->ptr = malloc(len);
+    ret->len = len;
+    memcpy(ret->ptr, s, len);
+}
+
 static plecto_filter_types_list_header_t one_header(const char *name, const char *value) {
     plecto_filter_types_list_header_t list;
     list.ptr = malloc(sizeof(plecto_filter_types_header_t));
     list.len = 1;
     filter_body_string_dup(&list.ptr[0].name, name);
-    filter_body_string_dup(&list.ptr[0].value, value);
+    list_u8_dup(&list.ptr[0].value, value);
     return list;
 }
 

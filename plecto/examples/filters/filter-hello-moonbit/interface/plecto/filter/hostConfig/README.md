@@ -1,0 +1,7 @@
+--- host-config: read-only, manifest-declared business config (ADR 000066). A generic
+--- string passthrough — the host does not interpret keys or values, only the filter does.
+--- Operator-owned (the filter cannot write it), same ownership model as host-ratelimit's
+--- bucket spec. Absence of a key just means it was not declared in `[filter.config]`; a
+--- filter that requires a key validates it itself (typically in `init`, trapping on a
+--- missing/invalid value — combined with `isolation = "trusted"` this surfaces as a load
+--- failure rather than a per-request one, ADR 000066 §Decision 4).

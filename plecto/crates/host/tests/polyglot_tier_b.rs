@@ -84,7 +84,7 @@ fn request(headers: &[(&str, &str)]) -> HttpRequest {
             .iter()
             .map(|(n, v)| Header {
                 name: (*n).to_string(),
-                value: (*v).to_string(),
+                value: v.as_bytes().to_vec(),
             })
             .collect(),
     }
@@ -140,7 +140,7 @@ fn with_the_wasi_minimal_grant_the_fat_guest_satisfies_the_conformance_subset() 
             assert!(
                 resp.headers
                     .iter()
-                    .any(|h| h.name == "x-plecto" && h.value == "blocked"),
+                    .any(|h| h.name == "x-plecto" && h.value.as_slice() == b"blocked"),
                 "short-circuit must carry the filter's header"
             );
         }
@@ -158,7 +158,7 @@ fn with_the_wasi_minimal_grant_the_fat_guest_satisfies_the_conformance_subset() 
             assert!(
                 edit.set_headers
                     .iter()
-                    .any(|h| h.name == "x-plecto-added" && h.value == "1"),
+                    .any(|h| h.name == "x-plecto-added" && h.value.as_slice() == b"1"),
                 "the edit must add x-plecto-added: 1"
             );
         }

@@ -223,7 +223,7 @@ fn request(headers: &[(&str, &str)]) -> HttpRequest {
             .iter()
             .map(|(n, v)| HttpHeader {
                 name: (*n).to_string(),
-                value: (*v).to_string(),
+                value: v.as_bytes().to_vec(),
             })
             .collect(),
     }
@@ -233,7 +233,7 @@ fn header_value<'a>(headers: &'a [HttpHeader], name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 #[test]

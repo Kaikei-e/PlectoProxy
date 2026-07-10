@@ -210,7 +210,7 @@ fn request(client_ip: &str) -> HttpRequest {
         scheme: "https".to_string(),
         headers: vec![Header {
             name: "x-forwarded-for".to_string(),
-            value: client_ip.to_string(),
+            value: client_ip.as_bytes().to_vec(),
         }],
     }
 }

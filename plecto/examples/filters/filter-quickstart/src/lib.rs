@@ -34,7 +34,7 @@ impl Guest for FilterQuickstart {
             set_status: None,
             set_headers: vec![Header {
                 name: "x-plecto".to_string(),
-                value: "hello-from-wasm".to_string(),
+                value: b"hello-from-wasm".to_vec(),
             }],
             remove_headers: vec![],
         })

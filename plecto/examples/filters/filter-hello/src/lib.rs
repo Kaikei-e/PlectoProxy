@@ -41,7 +41,7 @@ fn header_value<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 impl Guest for FilterHello {
@@ -96,7 +96,10 @@ impl Guest for FilterHello {
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case("x-plecto-busy"))
         {
-            let iters: u64 = h.value.parse().unwrap_or(0);
+            let iters: u64 = std::str::from_utf8(&h.value)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let mut acc: u64 = 0;
             let mut i: u64 = 0;
             while i < iters {
@@ -113,7 +116,7 @@ impl Guest for FilterHello {
             return RequestDecision::Modified(RequestEdit {
                 set_headers: vec![Header {
                     name: "x-plecto-added".to_string(),
-                    value: "1".to_string(),
+                    value: b"1".to_vec(),
                 }],
                 remove_headers: vec![],
             });
@@ -131,7 +134,7 @@ impl Guest for FilterHello {
                     status: 429,
                     headers: vec![Header {
                         name: "retry-after-ms".to_string(),
-                        value: outcome.retry_after_ms.to_string(),
+                        value: outcome.retry_after_ms.to_string().into_bytes(),
                     }],
                     body: b"rate limited by filter-hello".to_vec(),
                 });
@@ -143,7 +146,7 @@ impl Guest for FilterHello {
                 status: 403,
                 headers: vec![Header {
                     name: "x-plecto".to_string(),
-                    value: "blocked".to_string(),
+                    value: b"blocked".to_vec(),
                 }],
                 body: b"blocked by filter-hello".to_vec(),
             })
@@ -165,7 +168,7 @@ impl Guest for FilterHello {
                 status: 403,
                 headers: vec![Header {
                     name: "x-plecto".to_string(),
-                    value: "blocked-body".to_string(),
+                    value: b"blocked-body".to_vec(),
                 }],
                 body: b"blocked body by filter-hello".to_vec(),
             })
@@ -186,7 +189,7 @@ impl Guest for FilterHello {
                 set_status: None,
                 set_headers: vec![Header {
                     name: "x-plecto-respadded".to_string(),
-                    value: "1".to_string(),
+                    value: b"1".to_vec(),
                 }],
                 remove_headers: vec![],
             });

@@ -138,7 +138,7 @@ mod tests {
     fn h(name: &str, value: &str) -> Header {
         Header {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -172,7 +172,7 @@ mod tests {
             .filter(|x| x.name.eq_ignore_ascii_case("x-replace"))
             .collect();
         assert_eq!(replaced.len(), 1, "set replaces, not duplicates");
-        assert_eq!(replaced[0].value, "new");
+        assert_eq!(replaced[0].value.as_slice(), b"new");
         assert!(
             request
                 .headers
@@ -235,7 +235,7 @@ mod tests {
             .headers
             .iter()
             .filter(|x| x.name.eq_ignore_ascii_case("set-cookie"))
-            .map(|x| x.value.as_str())
+            .map(|x| std::str::from_utf8(&x.value).expect("utf-8"))
             .collect();
         assert_eq!(
             cookies,
@@ -248,6 +248,6 @@ mod tests {
             .filter(|x| x.name.eq_ignore_ascii_case("x-keep"))
             .collect();
         assert_eq!(keep.len(), 1, "a non-repeatable header still replaces");
-        assert_eq!(keep[0].value, "2");
+        assert_eq!(keep[0].value.as_slice(), b"2");
     }
 }

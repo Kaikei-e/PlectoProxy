@@ -25,7 +25,7 @@ fn req(headers: &[(&str, &str)]) -> HttpRequest {
             .iter()
             .map(|(n, v)| Header {
                 name: (*n).to_string(),
-                value: (*v).to_string(),
+                value: v.as_bytes().to_vec(),
             })
             .collect(),
     }
@@ -206,7 +206,7 @@ fn response_chain_applies_edit() {
         status: 200,
         headers: vec![Header {
             name: "x-plecto-respedit".to_string(),
-            value: "1".to_string(),
+            value: b"1".to_vec(),
         }],
         body: vec![],
     };

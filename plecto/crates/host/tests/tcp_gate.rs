@@ -68,7 +68,7 @@ fn request(target: &str) -> HttpRequest {
         scheme: "https".to_string(),
         headers: vec![Header {
             name: "x-tcp-target".to_string(),
-            value: target.to_string(),
+            value: target.as_bytes().to_vec(),
         }],
     }
 }

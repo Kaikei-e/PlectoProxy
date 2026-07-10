@@ -61,7 +61,7 @@ fn request() -> HttpRequest {
         scheme: "https".to_string(),
         headers: vec![Header {
             name: "x-req".to_string(),
-            value: "1".to_string(),
+            value: b"1".to_vec(),
         }],
     }
 }

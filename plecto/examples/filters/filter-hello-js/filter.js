@@ -6,9 +6,9 @@
 // Consequence: Date.now() / Math.random() are unavailable in here by design — time
 // comes from host-clock, exactly as the contract intends.
 
-import { log } from 'plecto:filter/host-log@0.1.0';
-import { increment, get as counterGet } from 'plecto:filter/host-counter@0.1.0';
-import { tryAcquire } from 'plecto:filter/host-ratelimit@0.1.0';
+import { log } from 'plecto:filter/host-log@0.2.0';
+import { increment, get as counterGet } from 'plecto:filter/host-counter@0.2.0';
+import { tryAcquire } from 'plecto:filter/host-ratelimit@0.2.0';
 
 function findHeader(headers, name) {
   return headers.find((h) => h.name.toLowerCase() === name);
@@ -16,6 +16,12 @@ function findHeader(headers, name) {
 
 function text(s) {
   return new TextEncoder().encode(s);
+}
+
+// Header values are the contract's `list<u8>` (ADR 000071), lifted here as a Uint8Array —
+// decode as UTF-8 the same way the reference guest's `str::from_utf8` does.
+function headerText(bytes) {
+  return new TextDecoder().decode(bytes);
 }
 
 export function init() {
@@ -30,7 +36,7 @@ export function onRequest(req) {
     return {
       tag: 'modified',
       val: {
-        setHeaders: [{ name: 'x-plecto-added', value: '1' }],
+        setHeaders: [{ name: 'x-plecto-added', value: text('1') }],
         removeHeaders: [],
       },
     };
@@ -38,14 +44,15 @@ export function onRequest(req) {
 
   const rl = findHeader(req.headers, 'x-plecto-ratelimit');
   if (rl) {
-    const key = rl.value === '' ? 'default' : rl.value;
+    const decoded = headerText(rl.value);
+    const key = decoded === '' ? 'default' : decoded;
     const outcome = tryAcquire(key, 1n);
     if (!outcome.allowed) {
       return {
         tag: 'short-circuit',
         val: {
           status: 429,
-          headers: [{ name: 'retry-after-ms', value: String(outcome.retryAfterMs) }],
+          headers: [{ name: 'retry-after-ms', value: text(String(outcome.retryAfterMs)) }],
           body: text('rate limited by filter-hello-js'),
         },
       };
@@ -57,7 +64,7 @@ export function onRequest(req) {
       tag: 'short-circuit',
       val: {
         status: 403,
-        headers: [{ name: 'x-plecto', value: 'blocked' }],
+        headers: [{ name: 'x-plecto', value: text('blocked') }],
         body: text('blocked by filter-hello-js'),
       },
     };
@@ -80,7 +87,7 @@ export function onRequestBody(body) {
       tag: 'short-circuit',
       val: {
         status: 403,
-        headers: [{ name: 'x-plecto', value: 'blocked-body' }],
+        headers: [{ name: 'x-plecto', value: text('blocked-body') }],
         body: text('blocked body by filter-hello-js'),
       },
     };
@@ -100,7 +107,7 @@ export function onResponse(resp) {
       tag: 'modified',
       val: {
         setStatus: undefined,
-        setHeaders: [{ name: 'x-plecto-respadded', value: '1' }],
+        setHeaders: [{ name: 'x-plecto-respadded', value: text('1') }],
         removeHeaders: [],
       },
     };

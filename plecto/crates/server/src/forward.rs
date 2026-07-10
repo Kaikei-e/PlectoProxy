@@ -10,7 +10,7 @@ use hyper::header::HeaderValue;
 use hyper::{HeaderMap, Request};
 use plecto_control::{HashInput, UpstreamGroup};
 
-use crate::headers::copy_headers_preserving;
+use crate::headers::copy_headers;
 use crate::metrics::ServerMetrics;
 use crate::retry::{self, AttemptOutcome};
 use crate::upstream_client::{UpstreamClient, UpstreamSendError};
@@ -88,9 +88,9 @@ impl ForwardBody {
 /// retries) — grouped so `forward_with_retry` isn't a wall of positional parameters.
 pub(crate) struct ForwardRequest<'a> {
     pub(crate) method: &'a str,
-    /// The chain-edited headers (contract `string` values).
+    /// The chain-edited headers (contract byte values).
     pub(crate) chain_headers: &'a [plecto_control::Header],
-    /// The original inbound headers, so a pass-through header forwards byte-for-byte (P3#6).
+    /// The original inbound headers (TE / Upgrade pass-through decisions).
     pub(crate) original_headers: &'a HeaderMap,
     pub(crate) upstream_path: &'a str,
     pub(crate) traceparent: &'a str,
@@ -133,11 +133,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
             forward.upstream_path
         );
         let mut builder = Request::builder().method(forward.method).uri(uri);
-        copy_headers_preserving(
-            builder.headers_mut(),
-            forward.chain_headers,
-            forward.original_headers,
-        );
+        copy_headers(builder.headers_mut(), forward.chain_headers);
         if let Some(h) = builder.headers_mut()
             && let Ok(v) = HeaderValue::from_str(forward.traceparent)
         {

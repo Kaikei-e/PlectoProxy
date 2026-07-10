@@ -160,7 +160,7 @@ fn no_route_response() -> HttpResponse {
         status: 404,
         headers: vec![plecto_host::Header {
             name: "x-plecto-fault".to_string(),
-            value: "no-route".to_string(),
+            value: b"no-route".to_vec(),
         }],
         body: b"no route".to_vec(),
     }

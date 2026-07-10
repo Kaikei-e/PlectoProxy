@@ -21,6 +21,31 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-10
+
+### Added
+
+- JWT verification reference filter (ADR 000070): `filter-jwt` ships as Program F2's first
+  reference — a Resource-Server-style Bearer JWT gate with ES256 and RS256 only (RFC 8725
+  aligned), hybrid key supply (static PEM/JWK XOR `jwks_url` fetched once at `init` over outbound
+  HTTP), RFC 6750 short-circuit 401 semantics, and on success `modified` with `x-authenticated-user`
+  and `x-jwt-issuer` identity stamps. `isolation = "trusted"` is mandatory on both paths. Host
+  integration tests cover the static key path, load-time failures, alg rejection, and JWKS init
+  failure when outbound is unusable. Control now permits an empty `[filter.outbound_http] allow`
+  as deny-all so wasm32-wasip2 guests can link `wasi:http` without granting any destination.
+
+### Fixed
+
+- Filter Dev Kit / `host-config` audit follow-up (ADR 000065 / 000066): PLECTO-E diagnostic
+  codes now render on startup load failures and in SIGHUP reload logs; the PLECTO-E table lands
+  in `docs/writing-a-filter.md`; dev signing keys are created atomically at mode 0600 with a
+  `Zeroizing` reload buffer; `DevSigner` errors are typed with `thiserror`; `.plecto/` gitignore
+  is re-asserted on every dev-key use; ADR 000065's implementation record is corrected
+  (conformance-before-sign, signer types, inotify claim retracted).
+- host (test deps): host JWT test token minting switches `jsonwebtoken` to the `aws_lc_rs`
+  backend, dropping the RUSTSEC-2023-0071 `rsa` crate that `rust_crypto` pulled in and that
+  `cargo-deny` correctly blocked.
+
 ## [0.2.4] - 2026-07-09
 
 ### Added

@@ -34,6 +34,9 @@ All notable changes to Plecto are documented here. The format follows
   `ceiling.csv` adds RR/CRR KPI labels; new `industry` phase and `bench/methodology.md`. Load runs
   stay loopback-only; `REQUIRE_OFFLINE=1` refuses a default IPv4 route. Legacy k6 open-loop via
   `OPENLOOP_GEN=k6`.
+- Performance snapshot refreshed (2026-07-11 full `run-perf.sh all`): `performance/README.md`
+  numbers and `performance/img/*.webp` charts regenerated; open-loop publishes the auto
+  70 %-of-peak schedule-latency figure (0 dropped) instead of the old k6-pinned 60k/s path.
 
 ### Fixed
 

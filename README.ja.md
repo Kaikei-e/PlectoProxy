@@ -101,7 +101,7 @@ flowchart TB
     verify["署名検証してからロード<br/>署名不正 → 拒否（fail-closed）"]
     profile{"どれだけ信頼する？"}
 
-    pooled["trusted → pooled<br/>一度だけ構築・インスタンス再利用<br/>速いホット経路（~2 µs / req）"]
+    pooled["trusted → pooled<br/>一度だけ構築・インスタンス再利用<br/>速いホット経路（≈ 1 µs / req）"]
     fresh["untrusted → リクエスト毎に fresh<br/>毎回作り直し＋ゼロ化<br/>強い隔離（~12倍遅い）"]
 
     guards["全インスタンス常時:<br/>時間上限 · メモリ上限<br/>trap / timeout で fail-closed"]
@@ -113,7 +113,7 @@ flowchart TB
     fresh --> guards
 ```
 
-**判断の指針:** ユーザー固有のロジック・ポリシー・WAF・認証・書換 → WASM フィルタ。TLS・ルーティング・LB・コネクションプール・グローバルカウンタ → native Rust —— [ADR 000029](docs/ADR/000029.md) が固定した「役割駆動」の配置基準で、native は横断的な関心事にのみ育ち、per-request のポリシーには育たない。WASM 税（データコピー＋ホストコール）はリクエスト判断ロジックにのみ課し、速い経路には課さない——pooled フィルタで **~2 µs/req** と実測（[performance](performance/README.md)）。
+**判断の指針:** ユーザー固有のロジック・ポリシー・WAF・認証・書換 → WASM フィルタ。TLS・ルーティング・LB・コネクションプール・グローバルカウンタ → native Rust —— [ADR 000029](docs/ADR/000029.md) が固定した「役割駆動」の配置基準で、native は横断的な関心事にのみ育ち、per-request のポリシーには育たない。WASM 税（データコピー＋ホストコール）はリクエスト判断ロジックにのみ課し、速い経路には課さない——pooled フィルタで **≈ 1 µs/req** と実測（[performance](performance/README.md)）。
 
 ## いま gateway ができること
 

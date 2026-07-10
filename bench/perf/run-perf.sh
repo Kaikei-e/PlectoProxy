@@ -40,6 +40,11 @@ _NCPU="$(nproc)"; _HALF="$(( _NCPU / 2 ))"
 PROXY_CPUS="${PROXY_CPUS:-0-$(( _HALF - 1 ))}"
 GEN_CPUS="${GEN_CPUS:-$_HALF-$(( _NCPU - 1 ))}"
 export K6_NO_USAGE_REPORT=true
+# oha ≥1.14 maps NO_COLOR through clap and only accepts true/false — the conventional NO_COLOR=1
+# (common in CI/agent environments) makes every oha invocation fail with an empty JSON file.
+if [[ "${NO_COLOR:-}" == "1" ]]; then
+  export NO_COLOR=true
+fi
 
 assert_offline(){
   # Soft by default: generators already target 127.0.0.1 only. REQUIRE_OFFLINE=1 hard-fails if a

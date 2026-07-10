@@ -1,11 +1,13 @@
 {
-  "target_rps": 60000,
-  "achieved_rps": 59301.41111111111,
-  "reqs": 5337127,
-  "failed": 0,
-  "dropped": 86432,
-  "p50": 0.129049,
-  "p95": 10.370759300000014,
-  "p99": 23.87807416000002,
-  "p99_9": 35.5840143540004
+  "generator": "plecto-loadgen",
+  "method": "constant-arrival-rate+schedule-latency",
+  "target_rps": 90610,
+  "achieved_rps": 90610.000000,
+  "reqs": 8154900,
+  "failed": 0.00000000,
+  "dropped": 0,
+  "p50": 2.246000,
+  "p95": 17.609000,
+  "p99": 29.974000,
+  "p99_9": 47.260000
 }

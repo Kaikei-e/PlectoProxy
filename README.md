@@ -114,7 +114,7 @@ flowchart TB
     fresh --> guards
 ```
 
-**Rule of thumb:** user-specific logic / policy / WAF / auth / rewrite → a WASM filter; TLS / routing / LB / connection pools / global counters → native Rust — a role-driven placement rule fixed in [ADR 000029](docs/ADR/000029.md): native grows only for cross-cutting concerns, never per-request policy. The WASM "tax" (data copy + host-call overhead) hits only request-decision logic, never the speed path — **~2 µs/request** for a pooled filter ([performance](performance/README.md)).
+**Rule of thumb:** user-specific logic / policy / WAF / auth / rewrite → a WASM filter; TLS / routing / LB / connection pools / global counters → native Rust — a role-driven placement rule fixed in [ADR 000029](docs/ADR/000029.md): native grows only for cross-cutting concerns, never per-request policy. The WASM "tax" (data copy + host-call overhead) hits only request-decision logic, never the speed path — **≈ 1 µs/request** for a pooled filter ([performance](performance/README.md)).
 
 ## What the gateway does today
 

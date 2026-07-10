@@ -12,6 +12,8 @@
 //!       --duration 30 --out ws_echo.csv
 //!   plecto-loadgen tls --mode resumed --target https://127.0.0.1:28443/ --ca cert.pem \
 //!       --duration 20 --workers 48 --out tls_resumed.csv
+//!   plecto-loadgen openloop --target http://127.0.0.1:28080/ --rate 60000 --duration 90 \
+//!       --warmup 5 --workers 64 --out openloop.json
 //!
 //! `rr` fires N keep-alive GETs and tallies the `X-Instance` header (round-robin split to
 //! single-request precision). `ejection` holds a fixed open-loop arrival rate while a controller
@@ -30,6 +32,10 @@
 //! the certificate + key-exchange handshake), `--mode resumed` shares one session cache so
 //! post-warmup connections resume via the server's stateless tickets; oha can't split these two
 //! (it shares one ClientConfig, so its cold connections silently resume once the server tickets).
+//! `openloop` is the **authoritative** coordinated-omission-safe tail driver (wrk2 schedule
+//! latency): constant arrival rate with latency measured from the intended send time. Prefer it
+//! over k6 `constant-arrival-rate` when the co-resident generator must sustain tens of kRPS —
+//! k6's VU model often becomes the ceiling first (see `bench/methodology.md`).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -50,6 +56,7 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
 
+mod openloop;
 mod ws;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -945,6 +952,8 @@ async fn run_ws(a: WsArgs) -> Result<(), BoxError> {
 fn usage() -> ! {
     eprintln!(
         "usage:\n  plecto-loadgen rr --target URL [--total N] [--workers W] [--out FILE]\n  \
+         plecto-loadgen openloop --target URL --rate R [--duration S] [--warmup S] \
+         [--workers W] [--backlog-secs S] [--out FILE]\n  \
          plecto-loadgen ejection --target URL --toggle a=URL b=URL c=URL \
          [--rate R] [--duration S] [--warmup S] [--workers W] [--out FILE] [--events-out FILE]\n  \
          plecto-loadgen swap --target URL --exec-at SEC=CMD [--exec-at SEC=CMD ...] \
@@ -957,6 +966,36 @@ fn usage() -> ! {
          [--duration S] [--warmup S] [--workers W] [--out FILE]"
     );
     std::process::exit(2)
+}
+
+fn parse_openloop(rest: &[String]) -> openloop::OpenloopArgs {
+    let mut a = openloop::OpenloopArgs {
+        target: "http://127.0.0.1:28080/".to_string(),
+        rate: 0,
+        duration: 90,
+        warmup: 5,
+        workers: 64,
+        backlog_secs: 3,
+        out: "openloop.json".to_string(),
+    };
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--target" => a.target = take(&mut it, flag),
+            "--rate" => a.rate = take_num(&mut it, flag),
+            "--duration" => a.duration = take_num(&mut it, flag).max(1),
+            "--warmup" => a.warmup = take_num(&mut it, flag),
+            "--workers" => a.workers = take_num(&mut it, flag).max(1),
+            "--backlog-secs" => a.backlog_secs = take_num(&mut it, flag).max(1),
+            "--out" => a.out = take(&mut it, flag),
+            _ => usage(),
+        }
+    }
+    if a.rate == 0 {
+        eprintln!("openloop requires --rate R (target arrivals per second)");
+        std::process::exit(2)
+    }
+    a
 }
 
 fn take(it: &mut std::slice::Iter<'_, String>, flag: &str) -> String {
@@ -1171,6 +1210,7 @@ async fn main() {
     };
     let result = match cmd.as_str() {
         "rr" => run_rr(parse_rr(rest)).await,
+        "openloop" => openloop::run_openloop(parse_openloop(rest)).await,
         "ejection" => run_ejection(parse_ejection(rest)).await,
         "swap" => run_swap(parse_swap(rest)).await,
         "hold" => run_hold(parse_hold(rest)).await,

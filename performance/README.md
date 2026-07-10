@@ -21,15 +21,16 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   Absolute throughput shifts run-to-run with clock; the **ratios, shapes and time-constants** are
   the durable signal, so those are what we read.
 - **Generators, by phase.** [k6](https://grafana.com/docs/k6/latest/) drives the closed-loop
-  concurrency sweep (`constant-vus`), the open-loop tail (`constant-arrival-rate`), the mixed
-  short-circuit run, and the rate-limit / body scenarios; `plecto-loadgen` (a small Rust open-loop
-  driver in `bench/loadgen/`, tokio + hyper — it replaced the earlier Python drivers, whose
-  GIL-bound workers melted before the proxy did) runs the fault-injection timeline, the endpoint-set
-  swap timeline, the round-robin count, and the WebSocket handshake/echo scenarios; and
-  [oha](https://github.com/hatoo/oha) drives the single-route ceiling (plain h1, WASM W1, TLS) runs.
-  Different generators have different ceilings — **numbers are comparable within a section, and
-  across same-generator sections, but not blindly across all of them** (a lighter generator reveals
-  a higher proxy ceiling). Each section names its generator.
+  concurrency sweep (`constant-vus`), the mixed short-circuit run, and the rate-limit / body
+  scenarios; **`plecto-loadgen openloop`** is the **authoritative** open-loop tail driver
+  (constant arrival rate with **schedule-based latency** — the wrk2 / Gil Tene model; see
+  [`bench/methodology.md`](../bench/methodology.md)); `OPENLOOP_GEN=k6` keeps the older
+  `constant-arrival-rate` path for A/B. `plecto-loadgen` also runs the fault-injection timeline,
+  the endpoint-set swap timeline, the round-robin count, and the WebSocket / TLS-handshake
+  scenarios; and [oha](https://github.com/hatoo/oha) drives the single-route ceiling (plain h1,
+  WASM W1, TLS) runs. Different generators have different ceilings — **numbers are comparable
+  within a section, and across same-generator sections, but not blindly across all of them**.
+  Each section names its generator.
 - **Warm-up excluded.** Every measured window starts after a short warm-up (default 5 s) that
   sends load but is not recorded: in-script for k6 and plecto-loadgen, a discarded pre-run for
   oha. Cold-start seconds (route tables, upstream pools, allocator state) never enter a
@@ -37,8 +38,10 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   initial token-bucket burst *is* the measured signal.
 - **Ceilings vs tails.** Closed-loop full-throttle runs (oha, `constant-vus`) are read as
   *throughput ceilings*; their latencies are queueing-at-saturation, not service latency
-  ("never measure latency at max load"). Honest tails come from the fixed-rate runs: k6
-  `constant-arrival-rate` and oha `-q` + `--latency-correction`, both coordinated-omission-safe.
+  ("never measure latency at max load"). Honest tails come from the fixed-rate runs:
+  **`plecto-loadgen openloop`** (schedule-latency) and oha `-q` + `--latency-correction`, both
+  coordinated-omission-safe. The plain-h1 ceiling reports **RR** (keep-alive) and **CRR**
+  (cold TCP/req) KPIs in `ceiling.csv`.
 - **Fully local.** Generators, proxy and upstreams talk only over loopback; generator telemetry and
   the optional dashboard's phone-home are disabled. Nothing leaves the host during a load run —
   the 2026-07-04 snapshot below ran inside a network namespace with only loopback up, so this is a

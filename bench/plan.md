@@ -12,21 +12,24 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
   出力は `performance/data/*.csv` → [`../performance/plot.py`](../performance/plot.py) → `performance/img/*.webp`。
 - **負荷はこのマシン内で完結**: generator → proxy → in-process upstream はすべて loopback。telemetry は無効
   （`K6_NO_USAGE_REPORT=true`、Influx/Grafana の phone-home off）。**負荷実行時に外部へ通信しない**。
-  Docker image / generator binary の**取得（setup）は外部 OK**——禁じるのは「負荷をかける最中の外部通信」。
+  `REQUIRE_OFFLINE=1` でデフォルト IPv4 ルートがあると拒否（netns ラボ）。Docker image / generator binary の
+  **取得（setup）は別作業**——禁じるのは「負荷をかける最中の外部通信」。
 - **絶対値ではなく invariant を読む**: host / clock 依存の絶対 throughput ではなく、**比・曲線形・時定数・
   µs/req・enforcement の収束**を回帰の signal とする。loopback は kernel short-circuit で latency を過小評価する
   ため、数値は下界・回帰用として扱う（`performance/README.md` の caveat 参照）。
 - **open-loop を tail の権威に**: closed-loop（`constant-vus`）は throughput 天井、open-loop
-  （`constant-arrival-rate`）は coordinated-omission-safe な tail。両者を併記し、tail は open-loop を採る。
+  （**`plecto-loadgen openloop`** = schedule-latency / wrk2 形）は coordinated-omission-safe な tail。
+  k6 `constant-arrival-rate` は `OPENLOOP_GEN=k6` の比較用。方法論の一次記録は [`methodology.md`](methodology.md)。
 
 ## ツール
 
 | 用途 | ツール | 備考 |
 | --- | --- | --- |
-| closed/open-loop・rate-limit・body | [k6](https://grafana.com/docs/k6/latest/) | PATH の k6 を使用（download しない） |
-| single-route ceiling・TLS | [oha](https://github.com/hatoo/oha) | `~/.cargo/bin/oha`、軽い generator で proxy 天井を出す |
-| round-robin・fault/swap timeline・WebSocket | `plecto-loadgen`（`bench/loadgen/`, Rust） | open-loop 自前ペーシング。GIL 律速だった旧 Python driver を代替（`rr` / `ejection` / `swap` / `hold` / `ws` サブコマンド） |
-| 任意の live dashboard | InfluxDB + Grafana（`docker-compose.yml`） | `INFLUX=1` の時だけ起動（image 取得は setup） |
+| closed-loop・rate-limit・body・mix | [k6](https://grafana.com/docs/k6/latest/) | PATH の k6（download しない） |
+| single-route ceiling・WASM ladder・TLS keep-alive/h2 | [oha](https://github.com/hatoo/oha) | `~/.cargo/bin/oha` |
+| **open-loop tail（権威）**・rr・fault/swap・WebSocket・TLS handshake 分解 | `plecto-loadgen`（`bench/loadgen/`） | `openloop` = schedule-latency（wrk2 形）。`OPENLOOP_GEN=k6` で旧経路 |
+| 任意の live dashboard | InfluxDB + Grafana（`docker-compose.yml`） | `INFLUX=1` の時だけ（image 取得は setup） |
+| 方法論 | [`methodology.md`](methodology.md) | RFC 9411 / k6 / wrk2 / oha との対応表 |
 
 ## シナリオカタログ
 
@@ -37,14 +40,15 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
 | phase | subject | generator | 出力 | invariant |
 | --- | --- | --- | --- | --- |
 | `quick` | ceiling 1 点 + idle RSS の smoke check（~1 分、k6/Docker 不要） | oha | （非追跡・console のみ） | 動作確認のみ。回帰 baseline は `all` を使う |
+| `industry` | RFC 9411 形のコア KPI 束: RR/CRR ceiling + open-loop latency + mix | oha + loadgen + k6 | `ceiling.csv`, `openloop.json`, `mix.csv` | 方法論の最短回帰。詳細は `all` |
 
 ### Fast path（native）
 
 | phase | subject | generator | 出力 | invariant |
 | --- | --- | --- | --- | --- |
-| `ceiling` | plain HTTP/1.1 の canonical ceiling: keep-alive RPS + cold-connection CPS | oha（`--disable-keepalive`） | `ceiling.csv` | connection 再利用の価値。`wasm` / `tls` はこの数値を再利用し、自分では測り直さない |
+| `ceiling` | plain HTTP/1.1: keep-alive **RR** + cold-connection **CRR** | oha（`--disable-keepalive`） | `ceiling.csv`（`kpi` 列） | connection 再利用の価値。`wasm` / `tls` はこの数値を再利用 |
 | `sweep` | throughput/latency vs concurrency | k6 constant-vus（50–800 VU） | `sweep.csv` | 曲線形（plateau→graceful decline、cliff 無し） |
-| `openloop` | coordinated-omission-safe tail（`sweep` の knee の 70% を自動導出） | k6 constant-arrival-rate | `openloop.json` | 飽和点での tail 発散 |
+| `openloop` | coordinated-omission-safe tail（既定: schedule-latency） | **`plecto-loadgen openloop`**（`OPENLOOP_GEN=k6` 可） | `openloop.json` | 飽和点での tail。rate は sweep peak の 70% または `OPENLOOP_RATE` |
 | `rr` | round-robin の均等性 | `plecto-loadgen rr`（X-Instance 集計） | `rr.csv` | 1 req 精度で 1/3 ずつ |
 | `ejection` | health-eject + fail-closed（ADR 000017） | `plecto-loadgen ejection` | `ejection_*.csv` | ~1s 時定数・503 fail-closed・~1s 復帰 |
 | `swap` | endpoint-set の swap under load（ADR 000044、reload が health ではなくアドレス集合自体を変える） | `plecto-loadgen swap`（`--exec-at` で manifest 書換 + SIGHUP を時刻指定実行） | `swap.csv`, `swap_events.csv` | ejection と同じ ~1s 時定数で新集合に追従（同じ `ArcSwap` 差し替え経路） |
@@ -89,8 +93,11 @@ cd plecto && cargo build --release -p plecto-server --features bench-harnesses \
   --example load-balancing --example bench-server --example tls-http --example swap-bench
 
 # 1 phase か all。proxy を core 集合へ、generator を互いに素な集合へ pin して performance/data/*.csv を出力。
-# phases: quick ceiling sweep openloop rr ejection swap wasm tls h3 ws footprint ratelimit body mix all
+# phases: quick ceiling sweep openloop rr ejection swap wasm tls h3 ws footprint ratelimit body mix industry all
 bash bench/perf/run-perf.sh all
+
+# 業界コア KPI だけ（RFC 9411 形の短い束）
+bash bench/perf/run-perf.sh industry
 
 # すぐ試したいだけなら quick（~1 分、oha のみ、k6/Docker 不要、CSV 非出力の smoke check）
 bash bench/perf/run-perf.sh quick

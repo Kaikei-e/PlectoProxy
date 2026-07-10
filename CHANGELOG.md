@@ -29,6 +29,11 @@ All notable changes to Plecto are documented here. The format follows
   accepted ADRs. Positioning prose names extension-model types rather than other products.
   `plecto new-filter` is documented as fetching WIT via `wkg` today; ADR 000072's self-vendoring
   is noted as accepted but not yet landed. In-tree `filter-template/wit` refreshed to `@0.2.0`.
+- Benchmark methodology aligned to industry practice (RFC 9411 KPI shapes, wrk2 schedule-latency,
+  k6 open-model docs): authoritative open-loop is now `plecto-loadgen openloop` (CO-safe);
+  `ceiling.csv` adds RR/CRR KPI labels; new `industry` phase and `bench/methodology.md`. Load runs
+  stay loopback-only; `REQUIRE_OFFLINE=1` refuses a default IPv4 route. Legacy k6 open-loop via
+  `OPENLOOP_GEN=k6`.
 
 ## [0.2.6] - 2026-07-10
 

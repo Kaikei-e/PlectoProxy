@@ -1,6 +1,8 @@
-// Open-loop tail authority (Phase 2.2). constant-arrival-rate holds RATE req/s regardless of how
-// slow responses get (coordinated-omission-safe), so queueing surfaces in the tail. Emits a JSON
-// summary with p50/p95/p99/p99.9, dropped iterations, and failed rate.
+// Open-loop tail (optional / A/B). Prefer `plecto-loadgen openloop` (schedule-latency) as the
+// authoritative driver — see bench/methodology.md. This script remains for OPENLOOP_GEN=k6.
+// constant-arrival-rate holds RATE req/s regardless of how slow responses get; emits JSON with
+// p50/p95/p99/p99.9, dropped iterations, and failed rate. Latency here is iteration duration
+// (not wrk2 schedule-latency) — do not mix the two series blindly.
 //
 // VU allocation follows Little's law (needed VUs ≈ rate × in-flight latency): on loopback that is
 // tens of VUs, so preAllocatedVUs defaults to ~2% of RATE and maxVUs is capped at 4× that. When

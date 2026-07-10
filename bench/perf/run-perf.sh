@@ -16,9 +16,12 @@
 # / `churn` split each ran their own copy of this — see performance/README.md's consolidation note).
 #
 #   bash bench/perf/run-perf.sh <phase>
-#   phase ∈ quick ceiling sweep openloop rr ejection swap wasm tls h3 ws footprint ratelimit body mix all
+#   phase ∈ quick ceiling sweep openloop rr ejection swap wasm tls h3 ws footprint ratelimit body mix
+#           industry all
 #
 # Default ports avoid colliding with other local services (override with *_ADDR env).
+# Offline: load traffic stays on loopback. Set REQUIRE_OFFLINE=1 to refuse a default IPv4 route
+# (industry-style lab isolation; see bench/methodology.md). INFLUX=1 is opt-in local dashboard only.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +40,19 @@ _NCPU="$(nproc)"; _HALF="$(( _NCPU / 2 ))"
 PROXY_CPUS="${PROXY_CPUS:-0-$(( _HALF - 1 ))}"
 GEN_CPUS="${GEN_CPUS:-$_HALF-$(( _NCPU - 1 ))}"
 export K6_NO_USAGE_REPORT=true
+
+assert_offline(){
+  # Soft by default: generators already target 127.0.0.1 only. REQUIRE_OFFLINE=1 hard-fails if a
+  # default IPv4 route exists (typical laptop), so operators can force a netns lab:
+  #   sudo unshare -n -- bash -c 'ip link set lo up; REQUIRE_OFFLINE=1 bash bench/perf/run-perf.sh industry'
+  [[ "${REQUIRE_OFFLINE:-}" == "1" ]] || return 0
+  if command -v ip >/dev/null 2>&1 && ip -4 route show default 2>/dev/null | grep -q .; then
+    echo "REQUIRE_OFFLINE=1: default IPv4 route present — refusing to run (external path exists)."
+    echo "  Use an empty netns (unshare -n + lo up) or unset REQUIRE_OFFLINE."
+    return 1
+  fi
+}
+assert_offline || exit 1
 
 LB_ADDR="${LB_ADDR:-127.0.0.1:28080}"
 BENCH_ADDR="${BENCH_ADDR:-127.0.0.1:28085}"
@@ -145,10 +161,11 @@ phase_ceiling(){
   gen "$OHA" -z 30s -c 50 --no-tui --disable-keepalive --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/cold.json" 2>/dev/null
   echo "  cold (TCP/req)    -> $(oha_row "$tmp/cold.json")"
   stop_proxy
-  { echo "variant,rps,p50,p90,p95,p99"
-    add(){ read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$2")"; echo "$1,$rps,$p50,$p90,$p95,$p99"; }
-    add "keep-alive" "$tmp/ka.json"
-    add "cold (TCP/req)" "$tmp/cold.json"; } > "$DATA/ceiling.csv"
+  { echo "variant,kpi,rps,p50,p90,p95,p99"
+    add(){ read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$3")"; echo "$1,$2,$rps,$p50,$p90,$p95,$p99"; }
+    # RR = Request/Response on a persistent connection; CRR = Connect/Request/Response (RFC 9411 §7.2/7.3 shape).
+    add "keep-alive" "RR" "$tmp/ka.json"
+    add "cold (TCP/req)" "CRR" "$tmp/cold.json"; } > "$DATA/ceiling.csv"
   cat "$DATA/ceiling.csv"
 }
 
@@ -179,22 +196,54 @@ print("wrote sweep.csv")
   cat "$DATA/sweep.csv"
 }
 
-# ---------------------------------------------------------------- Phase 2.2 open-loop tail
+# ---------------------------------------------------------------- Phase 2.2 open-loop tail (authoritative: plecto-loadgen)
 phase_openloop(){
-  log "Phase 2.2 — open-loop tail at ~70% of closed-loop peak -> openloop.json"
+  log "Phase 2.2 — open-loop tail (schedule-latency / wrk2 model) -> openloop.json"
   local peak rate
   peak="$(python3 -c 'import json,csv,sys; rows=list(csv.DictReader(open(sys.argv[1]))); print(int(max(float(r["rps"]) for r in rows)))' "$DATA/sweep.csv" 2>/dev/null || echo 0)"
-  # The closed-loop peak is the *generator's* ceiling, not the proxy's; open-loop generation
-  # saturates lower, so OPENLOOP_RATE lets us pin a rate the generator sustains cleanly (a
-  # drowned generator inflates the tail with its own queueing, not the proxy's). Default 70%.
+  # Prefer a rate the *proxy* can serve with headroom. Default 70% of closed-loop peak; pin with
+  # OPENLOOP_RATE when the closed-loop peak is generator-bound (k6 VU ceiling), not proxy-bound.
   rate="${OPENLOOP_RATE:-$(python3 -c "print(max(500,int($peak*0.7)))")}"
-  echo "  closed-loop peak≈${peak} rps -> open-loop rate=${rate} rps"
+  echo "  closed-loop peak≈${peak} rps -> open-loop rate=${rate} rps (generator=${OPENLOOP_GEN:-loadgen})"
   launch load-balancing "$LB_ADDR" "http://$LB_ADDR/" || return 1
-  gen "$K6" run -q "${INFLUX_OUT[@]}" \
-    -e TARGET="http://$LB_ADDR/" -e RATE=$rate -e DUR=90s -e OUT="$DATA/openloop.json" \
-    "$BENCH/k6/lb-openloop.js" 2>&1 | tail -2
+  case "${OPENLOOP_GEN:-loadgen}" in
+    k6)
+      # Legacy path: k6 constant-arrival-rate. Kept for A/B; often generator-bound above ~60k/s.
+      gen "$K6" run -q "${INFLUX_OUT[@]}" \
+        -e TARGET="http://$LB_ADDR/" -e RATE=$rate -e DUR=90s -e OUT="$DATA/openloop.json" \
+        "$BENCH/k6/lb-openloop.js" 2>&1 | tail -2
+      ;;
+    loadgen|*)
+      loadgen openloop --target "http://$LB_ADDR/" --rate "$rate" --duration 90 --warmup 5 \
+        --workers "${OPENLOOP_WORKERS:-64}" --out "$DATA/openloop.json"
+      ;;
+  esac
   stop_proxy
   cat "$DATA/openloop.json"
+}
+
+# ---------------------------------------------------------------- Industry core KPIs (RFC 9411-shaped, fully local)
+phase_industry(){
+  # Throughput (RR+CRR) + CO-safe transaction latency at fixed arrival + application mix.
+  # Skips resilience timelines / WASM ladder / TLS decomposition — those stay in `all`.
+  log "Industry core — ceiling (RR/CRR) + open-loop latency + traffic mix"
+  phase_ceiling
+  if command -v k6 >/dev/null 2>&1 || [[ -n "${K6:-}" && -x "${K6}" ]]; then
+    phase_sweep
+  elif [[ -z "${OPENLOOP_RATE:-}" ]]; then
+    echo "industry: k6 not found and OPENLOOP_RATE unset — set OPENLOOP_RATE=<rps> or install k6 for sweep"
+    return 1
+  else
+    echo "industry: skipping sweep (no k6); using OPENLOOP_RATE=${OPENLOOP_RATE}"
+    echo "vus,rps,p50,p95,p99,p99_9,failed" > "$DATA/sweep.csv"
+    echo "0,${OPENLOOP_RATE},0,0,0,0,0" >> "$DATA/sweep.csv"
+  fi
+  phase_openloop
+  if command -v k6 >/dev/null 2>&1 || [[ -n "${K6:-}" && -x "${K6}" ]]; then
+    phase_mix
+  else
+    echo "industry: skipping mix (no k6)"
+  fi
 }
 
 # ---------------------------------------------------------------- Phase 2.3 round-robin
@@ -568,7 +617,7 @@ case "${1:-all}" in
   quick) phase_quick;; ceiling) phase_ceiling;;
   sweep) phase_sweep;; openloop) phase_openloop;; rr) phase_rr;; ejection) phase_ejection;; swap) phase_swap;;
   wasm) phase_wasm;; tls) phase_tls;; h3) phase_h3;; ws) phase_ws;; footprint) phase_footprint;;
-  ratelimit) phase_ratelimit;; body) phase_body;; mix) phase_mix;;
+  ratelimit) phase_ratelimit;; body) phase_body;; mix) phase_mix;; industry) phase_industry;;
   all) phase_ceiling; phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_swap; phase_wasm; \
        phase_tls; phase_h3; phase_ws; phase_ratelimit; phase_body; phase_mix; phase_footprint;;
   *) echo "unknown phase: $1"; exit 2;;

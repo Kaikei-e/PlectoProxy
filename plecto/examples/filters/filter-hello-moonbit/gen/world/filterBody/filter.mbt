@@ -34,6 +34,20 @@ fn text(s : String) -> FixedArray[Byte] {
   arr
 }
 
+///| Decode a header value (contract `list<u8>`, ADR 000071) as ASCII text, or `None` if it
+/// carries a byte outside that range — mirrors the reference guest's fail-gracefully
+/// `str::from_utf8(..).ok()`, scoped to ASCII since every value this filter reads is ASCII.
+fn ascii_text(bytes : FixedArray[Byte]) -> String? {
+  let buf = StringBuilder::new()
+  for b in bytes {
+    if b.to_int() > 127 {
+      return None
+    }
+    buf.write_char(b.to_int().unsafe_to_char())
+  }
+  Some(buf.to_string())
+}
+
 ///|
 pub fn init_() -> Unit {
   @hostCounter.increment("init-calls", 1L) |> ignore
@@ -46,13 +60,16 @@ pub fn on_request(req : @types.HttpRequest) -> @types.RequestDecision {
   @hostLog.log(@hostLog.INFO, "init-calls=\{inits}")
   if find_header(req.headers, "x-plecto-addheader") is Some(_) {
     return @types.RequestDecision::Modified(@types.RequestEdit::{
-      set_headers: [@types.Header::{ name: "x-plecto-added", value: "1" }],
+      set_headers: [@types.Header::{ name: "x-plecto-added", value: text("1") }],
       remove_headers: [],
     })
   }
   match find_header(req.headers, "x-plecto-ratelimit") {
     Some(rl) => {
-      let key = if rl.value == "" { "default" } else { rl.value }
+      let key = match ascii_text(rl.value) {
+        Some(s) => if s == "" { "default" } else { s }
+        None => "default"
+      }
       let outcome = @hostRatelimit.try_acquire(key, 1UL)
       if !outcome.allowed {
         return @types.RequestDecision::ShortCircuit(@types.HttpResponse::{
@@ -60,7 +77,7 @@ pub fn on_request(req : @types.HttpRequest) -> @types.RequestDecision {
           headers: [
             @types.Header::{
               name: "retry-after-ms",
-              value: outcome.retry_after_ms.to_string(),
+              value: text(outcome.retry_after_ms.to_string()),
             },
           ],
           body: text("rate limited by filter-hello-moonbit"),
@@ -72,7 +89,7 @@ pub fn on_request(req : @types.HttpRequest) -> @types.RequestDecision {
   if find_header(req.headers, "x-plecto-block") is Some(_) {
     return @types.RequestDecision::ShortCircuit(@types.HttpResponse::{
       status: 403,
-      headers: [@types.Header::{ name: "x-plecto", value: "blocked" }],
+      headers: [@types.Header::{ name: "x-plecto", value: text("blocked") }],
       body: text("blocked by filter-hello-moonbit"),
     })
   }
@@ -100,7 +117,7 @@ pub fn on_request_body(body : FixedArray[Byte]) -> @types.RequestBodyDecision {
       if hit {
         return @types.RequestBodyDecision::ShortCircuit(@types.HttpResponse::{
           status: 403,
-          headers: [@types.Header::{ name: "x-plecto", value: "blocked-body" }],
+          headers: [@types.Header::{ name: "x-plecto", value: text("blocked-body") }],
           body: text("blocked body by filter-hello-moonbit"),
         })
       }
@@ -119,7 +136,7 @@ pub fn on_response(resp : @types.HttpResponse) -> @types.ResponseDecision {
   if find_header(resp.headers, "x-plecto-respedit") is Some(_) {
     return @types.ResponseDecision::Modified(@types.ResponseEdit::{
       set_status: None,
-      set_headers: [@types.Header::{ name: "x-plecto-respadded", value: "1" }],
+      set_headers: [@types.Header::{ name: "x-plecto-respadded", value: text("1") }],
       remove_headers: [],
     })
   }

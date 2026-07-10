@@ -3,17 +3,21 @@
 //! own 90-day-plan phasing) — `go`/`moonbit`/`c`/`js` return a clear "not yet" error rather than
 //! silently doing nothing, so the CLI's surface honestly reflects what is built.
 //!
-//! The Rust template's `Cargo.toml` / `src/lib.rs` are embedded at COMPILE time via
-//! `include_str!` from `examples/filters/filter-template/` — the same file `just
-//! sync-template-wit` keeps current — so a released `plecto` binary ships a working scaffold
-//! without needing this repo checked out at runtime. The `plecto:filter` WIT contract itself is
-//! NOT embedded: it is fetched live via `wkg` (ADR 000064's distribution channel), which is the
-//! whole point of publishing it — an external filter author never clones Plecto.
+//! The Rust template's `Cargo.toml` / `src/lib.rs`, and the `plecto:filter` WIT contract itself,
+//! are all embedded at COMPILE time via `include_str!` from this same source tree
+//! (`examples/filters/filter-template/` and `wit/world.wit` respectively) — so a released
+//! `plecto` binary ships a working scaffold, on the exact contract version that binary's own
+//! host runs, without needing this repo checked out at runtime or a network round-trip to a WIT
+//! registry (self-vendoring, ADR 000072). The WIT text `new-filter` writes is the same file
+//! `plecto-host`'s bindgen resolves, so the CLI can no longer scaffold a different *package
+//! version* than the host loads. The guest Rust template (`lib.rs`) is a separate embed and must
+//! stay API-compatible with that WIT — a compile smoke test guards that coupling. `wkg`
+//! (ADR 000064) remains the distribution channel for filter authors who do NOT use this CLI
+//! (polyglot / out-of-tree).
 
 use std::path::Path;
-use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::dev_key;
 
@@ -21,10 +25,9 @@ const TEMPLATE_CARGO_TOML: &str =
     include_str!("../../../examples/filters/filter-template/Cargo.toml");
 const TEMPLATE_LIB_RS: &str = include_str!("../../../examples/filters/filter-template/src/lib.rs");
 
-/// wkg's namespace→registry mapping for `plecto:filter` (ADR 000064). Embedded the same way as
-/// the Rust template: a released binary needs this to resolve `ghcr.io/kaikei-e/wit/plecto:filter`
-/// without the caller having a copy of this repo's `wkg-registry.toml` on disk.
-const WKG_REGISTRY_CONFIG: &str = include_str!("../../../wkg-registry.toml");
+/// The canonical `plecto:filter` contract text — the same file `plecto-host`'s
+/// `wasmtime::component::bindgen!({ path: "../../wit", .. })` resolves.
+const FILTER_WIT: &str = include_str!("../../../wit/world.wit");
 
 pub(crate) fn run(lang: &str, name: &str, project_root: &Path) -> Result<()> {
     if lang != "rust" {
@@ -42,14 +45,16 @@ pub(crate) fn run(lang: &str, name: &str, project_root: &Path) -> Result<()> {
         bail!("{} already exists", dest.display());
     }
 
-    // The wkg fetch (network) or dev-key step can fail after the directory already has files in
-    // it (e.g. `wkg` not installed yet) — clean up on any failure so a retry, after the operator
-    // fixes the underlying problem, does not immediately trip the `dest.exists()` check above.
+    // The dev-key step can fail after the directory already has files in it (Cargo.toml / lib.rs
+    // / wit/) — clean up on any failure so a retry, after the operator fixes the underlying
+    // problem, does not immediately trip the `dest.exists()` check above.
     match scaffold(name, project_root, &dest) {
         Ok(signer) => {
             println!("created {}/", dest.display());
             println!("  Cargo.toml, src/lib.rs  — your filter (edit on_request in src/lib.rs)");
-            println!("  wit/world.wit           — the plecto:filter contract, fetched via wkg");
+            println!(
+                "  wit/world.wit           — the plecto:filter contract, vendored into this binary"
+            );
             println!(
                 "  manifest.toml           — a dev manifest, trusting your project's dev key ({})",
                 signer.public_key_pem().lines().next().unwrap_or_default()
@@ -85,7 +90,7 @@ fn scaffold(name: &str, project_root: &Path, dest: &Path) -> Result<plecto_contr
     std::fs::write(dest.join("src/lib.rs"), lib_rs)
         .with_context(|| format!("write {}/src/lib.rs", dest.display()))?;
 
-    fetch_wit(&dest.join("wit"))?;
+    write_wit(&dest.join("wit"))?;
 
     let signer = dev_key::load_or_create_dev_signer(project_root)?;
     // `dest` is always exactly `project_root.join(name)` (checked by the caller), one level
@@ -101,40 +106,13 @@ fn scaffold(name: &str, project_root: &Path, dest: &Path) -> Result<plecto_contr
     Ok(signer)
 }
 
-/// `wkg get plecto:filter@0.1.0 -o <dest> --format wit` (ADR 000064's published channel — the
-/// same command `wkg-registry.toml`'s own doc comment tells a filter author to run). Shelled
-/// out, not embedded via `wasm-pkg-core`: the research behind ADR 000065 could not confirm that
-/// library crate's stable public API, so the CLI subprocess (already proven in
-/// `examples/filters/filter-hello-go/build.sh` and the release workflow) is the lower-risk path.
-fn fetch_wit(dest: &Path) -> Result<()> {
-    let registry_config =
-        std::env::temp_dir().join(format!("plecto-wkg-registry-{}.toml", std::process::id()));
-    std::fs::write(&registry_config, WKG_REGISTRY_CONFIG)
-        .with_context(|| format!("write {}", registry_config.display()))?;
-    let result = Command::new("wkg")
-        .args(["get", "plecto:filter@0.1.0", "--config"])
-        .arg(&registry_config)
-        .arg("-o")
-        .arg(dest)
-        .args(["--format", "wit"])
-        .status();
-    if let Err(cleanup) = std::fs::remove_file(&registry_config) {
-        tracing::warn!(error = %cleanup, path = %registry_config.display(),
-            "could not remove the temporary wkg registry config");
-    }
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => bail!(
-            "wkg get plecto:filter@0.1.0 exited with {status}. Check your network connection to \
-             ghcr.io — the plecto:filter WIT contract is published there (ADR 000064)."
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "`wkg` is not on PATH. Install it from \
-             https://github.com/bytecodealliance/wasm-pkg-tools/releases (wasm-pkg-tools) — \
-             `plecto new-filter` fetches the plecto:filter WIT contract with it (ADR 000064)."
-        ),
-        Err(e) => Err(anyhow!("run wkg: {e}")),
-    }
+/// Write the vendored `plecto:filter` contract into the scaffold (self-vendoring, ADR 000072).
+/// No network, no subprocess: `FILTER_WIT` is compiled into this binary, so this can never
+/// scaffold a contract version other than the one the binary's own host runs.
+fn write_wit(dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    std::fs::write(dest.join("world.wit"), FILTER_WIT)
+        .with_context(|| format!("write {}/world.wit", dest.display()))
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -231,22 +209,65 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_wkg_fetch_leaves_no_partial_directory_for_a_retry() {
-        // Only meaningful where `wkg` is absent (this sandbox; CI's polyglot-guest-go job
-        // installs it, so skip there rather than attempt a flaky real network call). Where it
-        // does run, this exercises the real "wkg missing" failure path, not a mock:
-        // Cargo.toml/src/lib.rs get written, then `fetch_wit` fails, and `run` must roll the
-        // whole directory back so a retry (after `wkg` is installed) does not immediately trip
-        // the `dest.exists()` guard.
-        if Command::new("wkg").arg("--version").output().is_ok() {
-            return;
-        }
+    fn a_failed_dev_key_step_leaves_no_partial_directory_for_a_retry() {
+        // No network dependency left to fail post-000072, so force the OTHER fallible step
+        // (`dev_key::load_or_create_dev_signer`, which runs after Cargo.toml/src/lib.rs/wit/ are
+        // already written) by pre-creating its target path as a directory: `fs::read` on it then
+        // fails with something other than NotFound, instead of the "generate a fresh key"
+        // branch. This exercises the real rollback path, not a mock.
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".plecto/dev-key")).unwrap();
         let err = run("rust", "my-filter", dir.path()).unwrap_err();
-        assert!(err.to_string().contains("wkg"), "got: {err}");
+        assert!(err.to_string().contains("dev key"), "got: {err}");
         assert!(
             !dir.path().join("my-filter").exists(),
             "a failed scaffold must not leave a partial directory behind"
+        );
+    }
+
+    #[test]
+    fn scaffolded_wit_matches_the_canonical_current_contract() {
+        // Regression test for the exact defect ADR 000072 fixes: a scaffolded filter must never
+        // target a contract version other than the one this binary's own host runs.
+        let dir = tempfile::tempdir().unwrap();
+        run("rust", "my-filter", dir.path()).unwrap();
+        let scaffolded =
+            std::fs::read_to_string(dir.path().join("my-filter/wit/world.wit")).unwrap();
+        assert_eq!(scaffolded, FILTER_WIT);
+        assert!(
+            scaffolded.contains("package plecto:filter@0.2.0;"),
+            "got: {scaffolded}"
+        );
+        assert!(scaffolded.contains("value: list<u8>"), "got: {scaffolded}");
+    }
+
+    #[test]
+    fn scaffolded_rust_filter_compiles_against_vendored_wit() {
+        // Guards the residual coupling ADR 000072 leaves explicit: WIT is self-vendored from the
+        // host's contract file, but `src/lib.rs` is a separate embed. A contract-shaped breaking
+        // change that updates `world.wit` without the guest template must fail here, not at the
+        // operator's first `plecto new-filter` + build.
+        let dir = tempfile::tempdir().unwrap();
+        run("rust", "my-filter", dir.path()).unwrap();
+        let filter_dir = dir.path().join("my-filter");
+        let target_dir = dir.path().join("cargo-target");
+        let output = std::process::Command::new("cargo")
+            .current_dir(&filter_dir)
+            .args([
+                "build",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--target-dir",
+            ])
+            .arg(&target_dir)
+            .output()
+            .expect("spawn cargo build for the scaffolded filter");
+        assert!(
+            output.status.success(),
+            "scaffolded filter failed to compile against the vendored WIT\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }

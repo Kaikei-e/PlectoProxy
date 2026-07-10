@@ -27,13 +27,26 @@ All notable changes to Plecto are documented here. The format follows
   performance notes, writing-a-filter, ROADMAP, and the filter-template README now describe
   `plecto:filter@0.2.0`, six host capabilities including `host-config`, release `v0.2.6`, and 74
   accepted ADRs. Positioning prose names extension-model types rather than other products.
-  `plecto new-filter` is documented as fetching WIT via `wkg` today; ADR 000072's self-vendoring
-  is noted as accepted but not yet landed. In-tree `filter-template/wit` refreshed to `@0.2.0`.
+  `plecto new-filter` self-vendors the WIT contract at build time (ADR 000072) rather than
+  fetching it via `wkg`. In-tree `filter-template/wit` refreshed to `@0.2.0`.
 - Benchmark methodology aligned to industry practice (RFC 9411 KPI shapes, wrk2 schedule-latency,
   k6 open-model docs): authoritative open-loop is now `plecto-loadgen openloop` (CO-safe);
   `ceiling.csv` adds RR/CRR KPI labels; new `industry` phase and `bench/methodology.md`. Load runs
   stay loopback-only; `REQUIRE_OFFLINE=1` refuses a default IPv4 route. Legacy k6 open-loop via
   `OPENLOOP_GEN=k6`.
+
+### Fixed
+
+- `plecto new-filter --lang rust` (ADR 000072): no longer fetches the `plecto:filter` WIT
+  contract over the network via `wkg` — a scaffolded filter was generating against the deprecated
+  `plecto:filter@0.1.0` contract even after 0.2.0 became current (ADR 000071), because the
+  contract version lived as a string the CLI's own subprocess call had to be hand-bumped in
+  lockstep with the host. The contract is now self-vendored: `include_str!`-embedded from the
+  same `plecto/wit/world.wit` the host's own bindgen reads, and written into the scaffold at
+  scaffold time. A released `plecto` binary can now only ever generate the contract version its
+  own host runs, offline, with no dependency on registry reachability or publish ordering. The
+  `wkg`/OCI distribution channel (ADR 000064) is unchanged for filter authors who don't use this
+  CLI.
 
 ## [0.2.6] - 2026-07-10
 

@@ -8,6 +8,12 @@
 # install the `wasm32-unknown-unknown` target BEFORE any host build/test, or the
 # host build script fails.
 #
+# Cache policy (Swatinem/rust-cache + GitHub 10GB repo limit):
+# - Save only on `main` (`save-if`). PR caches are scoped to `refs/pull/N/merge` and
+#   cannot be read by sibling PRs — writing them is pure budget burn and thrash.
+# - Polyglot host tests run IN the `build` job (warm `target/`). A separate job cannot
+#   see another job's `target/` within the same PR run once saves are main-only.
+#
 # Hardening follow-up (Plecto supply-chain stance, ADR 000006 / OWASP A08):
 # pin these third-party actions to full commit SHAs once we vendor a review.
 
@@ -29,6 +35,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI is cold-start oriented; incremental artifacts bloat the cache without helping
+  # cross-run hits (Swatinem/rust-cache + corrode CI guidance).
+  CARGO_INCREMENTAL: "0"
 
 defaults:
   run:
@@ -61,10 +70,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - run: python3 scripts/check_adr_graph.py
 
-  # Main gate: clippy -> test -> build, sharing one compile cache.
+  # Main gate: clippy -> test -> feature suites -> release -> polyglot (same warm target/).
   # `cargo test`/`build` transitively compile + componentize the guest via build.rs.
   build:
-    name: clippy + test + build
+    name: clippy + test + build + polyglot
     runs-on: ubuntu-latest
     env:
       # No debug-info in the debug builds (the test profile inherits dev): every integration
@@ -96,6 +105,8 @@ jobs:
         with:
           shared-key: plecto
           cache-on-failure: true
+          # PR caches cannot seed sibling PRs (GitHub ref scope) — only main writes.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Cache the workspace target/ and the excluded guests' own target/.
           workspaces: |
             plecto
@@ -103,63 +114,15 @@ jobs:
             plecto/examples/filters/filter-streaming
             plecto/examples/filters/filter-extauthz
             plecto/examples/filters/filter-tcp-gate
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all
-      # Experimental streaming body filter (OFF by default): exercise it so it cannot bit-rot.
-      - run: cargo test -p plecto-host --features streaming-body
-      # Outbound TCP capability (ADR 000060, OFF by default): the E2E suite pins the invariants
-      # (SSRF floor unopenable / IP pin / connect budget) — run it, don't just compile it.
-      - run: cargo test -p plecto-host --features outbound-tcp
-      - run: cargo test -p plecto-control --features outbound-tcp
-      # Fat guest (ADR 000063, OFF by default): the stdio bridge / manifest-toggle unit tests run
-      # here (no TinyGo toolchain needed — that's `polyglot-guest-go` below, which builds and
-      # exercises the real Go component against this same feature).
-      - run: cargo test -p plecto-host --features fat-guest
-      - run: cargo test -p plecto-control --features fat-guest
-      # Combined with outbound-tcp: proves the fat-guest grant alone does NOT satisfy a
-      # `wasi:sockets` import (ADR 000063 Decision 4's structural-deny half, tcp_gate.rs).
-      - run: cargo test -p plecto-host --features outbound-tcp,fat-guest --test tcp_gate
-      - run: cargo build --release
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all --locked
+      # Feature-gated suites as one host + one control invocation (additive features;
+      # avoids six separate re-links). Includes tcp_gate's fat-guest × outbound-tcp case.
+      - run: cargo test -p plecto-host --features streaming-body,outbound-tcp,fat-guest --locked
+      - run: cargo test -p plecto-control --features outbound-tcp,fat-guest --locked
+      - run: cargo build --release --locked
 
-  # Lint the excluded WASM guest against its real target.
-  guest-lint:
-    name: filter-hello (wasm32-unknown-unknown)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: plecto/examples/filters/filter-hello
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: plecto-guest
-          workspaces: plecto/examples/filters/filter-hello
-      - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
-
-  # Polyglot guests: build the non-Rust example filters (MoonBit / JS / C — all zero-WASI
-  # components, each by its own toolchain) and run the SAME conformance assertions against
-  # them (crates/host/tests/polyglot.rs). This is the falsifiable form of the polyglot claim;
-  # without this job the examples would bit-rot silently. Tool tarballs are sha256-pinned
-  # (supply-chain stance, A08); MoonBit only distributes `latest`, so it installs unpinned —
-  # pin it too once versioned artifacts are published.
-  polyglot-guests:
-    name: polyglot guests (MoonBit / JS / C)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
-        with:
-          # build.rs still componentizes the Rust test fixtures during `cargo test`.
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: plecto-polyglot
-          cache-on-failure: true
-          workspaces: plecto
+      # --- Polyglot Tier A (MoonBit / JS / C): guests then conformance on warm host ---
       - name: Install wasm-tools / wit-bindgen / wasi-sdk (sha256-pinned)
         working-directory: ${{ runner.temp }}
         run: |
@@ -179,56 +142,57 @@ jobs:
           set -euo pipefail
           curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
           echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
-      - name: Build the three guests (each asserts zero WASI imports)
+      - name: Build Tier A polyglot guests (each asserts zero WASI imports)
         run: |
           ./examples/filters/filter-hello-c/build.sh
           ./examples/filters/filter-hello-moonbit/build.sh
           ./examples/filters/filter-hello-js/build.sh
-      - name: Same contract, same assertions, three languages
-        run: cargo test -p plecto-host --features polyglot-conformance --test polyglot
+      - name: Polyglot Tier A conformance (same contract, three languages)
+        run: cargo test -p plecto-host --features polyglot-conformance --test polyglot --locked
 
-  # Tier B polyglot guest: filter-hello-go, the first "fat guest" (ADR 000063) — TinyGo's wasip2
-  # runtime assumes WASI is present, so this is NOT zero-WASI like the Tier A trio above. Its own
-  # job (separate toolchain: TinyGo + wkg + wit-bindgen-go, none of which Tier A needs) builds it
-  # and runs the Tier B conformance suite (crates/host/tests/polyglot_tier_b.rs) against the
-  # `fat-guest` feature — the falsifiable proof that the minimal-WASI grant links a real TinyGo
-  # guest while still denying it outside that grant.
-  polyglot-guest-go:
-    name: polyglot guest (Go / TinyGo, Tier B)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: plecto-polyglot-go
-          cache-on-failure: true
-          workspaces: plecto
+      # --- Polyglot Tier B (Go / TinyGo): fat-guest grant against a real TinyGo component ---
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.26.4"
-      - name: Install TinyGo / wasm-tools / wkg (sha256-pinned)
+      - name: Install TinyGo / wkg (sha256-pinned; wasm-tools already on PATH)
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
           curl -sSL -o tinygo.tar.gz https://github.com/tinygo-org/tinygo/releases/download/v0.41.1/tinygo0.41.1.linux-amd64.tar.gz
           echo "e156d1d93a376eef639a4143d13be07e8c463fb6cf2d7d447698ed4474d23e91  tinygo.tar.gz" | sha256sum -c -
-          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
-          echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
           curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
           echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
           chmod +x wkg
           mkdir -p wkg-bin && mv wkg wkg-bin/
-          tar xzf tinygo.tar.gz && tar xzf wasm-tools.tar.gz
+          tar xzf tinygo.tar.gz
           echo "${{ runner.temp }}/tinygo/bin" >> "$GITHUB_PATH"
-          echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "${{ runner.temp }}/wkg-bin" >> "$GITHUB_PATH"
           go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Build filter-hello-go (asserts the Tier B WASI allowlist)
         run: ./examples/filters/filter-hello-go/build.sh
-      - name: Tier B conformance (fat-guest grant, deny-by-default, stdio bridge)
-        run: cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyglot_tier_b
+      - name: Polyglot Tier B conformance (fat-guest grant, deny-by-default, stdio bridge)
+        run: cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyglot_tier_b --locked
+
+  # Lint the excluded WASM guest against its real target.
+  guest-lint:
+    name: filter-hello (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plecto/examples/filters/filter-hello
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: plecto-guest
+          workspaces: plecto/examples/filters/filter-hello
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
 
   # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).
   # A security vulnerability, unmaintained crate, or yanked version fails CI — supply-chain

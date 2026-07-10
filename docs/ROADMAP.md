@@ -5,7 +5,7 @@ Plecto Proxy is built ADR-first; each milestone realizes specific design decisio
 [README](../README.md#roadmap) carries only a compact status table with a link back here.
 
 - **M0 — Foundation** ✅ *(done)*
-  The `plecto:filter@0.1.0` contract, a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](ADR/000001.md) · [2](ADR/000002.md) · [10](ADR/000010.md)
+  The `plecto:filter@0.1.0` contract (frozen at `wit/v0.1.0/`), **`plecto:filter@0.2.0`** with byte-valued headers ([ADR 71](ADR/000071.md)), a wasmtime host that loads & runs filters, a deny-by-default capability boundary (log / clock / kv), an example filter, E2E/conformance/unit tests, and CI. — [ADR 1](ADR/000001.md) · [2](ADR/000002.md) · [10](ADR/000010.md)
 
 - **M1 — Filter runtime hardening** ✅ *(landed)*
   Trust-branched instances: trusted filters reuse a fixed-capacity, lazily-filled **pool** checked out per request (bounded-wait fail-closed, pool-wide circuit breaker, recycle-after-N); untrusted run **fresh-per-request** (linear memory fresh by construction). redb-backed host KV + atomic counters + **host-native token-bucket rate limiting** (bucket spec host-set in the manifest, keyed per request — an untrusted filter cannot widen its own limit, [ADR 26](ADR/000026.md)), per-filter key namespacing, **per-filter + host-wide quotas** on that state (fail-closed over quota, untrusted `init` deadline tightened — [ADR 27](ADR/000027.md)), and **epoch metering + memory/table limits**. The trusted/untrusted split is *forced* (not just perf) by the init/zeroization knot.

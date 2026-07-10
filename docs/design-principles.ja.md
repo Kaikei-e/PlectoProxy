@@ -38,9 +38,11 @@ fast path と extension plane は上下関係でも主従関係でもなく、**
 
 この原則は「存在」だけでなく**「不在」にも及ぶ**。契約は header-only の `filter` world と body-reading の `filter-body` world に分かれており、`on-request-body` export の**不在そのもの**が「このフィルタはボディを読まない」という機械検証可能な事実となり、ホストはそれを根拠にボディのバッファリングを丸ごとスキップする（zero-copy passthrough、ADR 000005 / 000025 / 000038）。性能最適化を運用者の注意力ではなく**契約の形から導出する**——これが Plecto Proxy の型設計の核心である。
 
+`plecto:filter@0.2.0`（ADR 000071）以降、HTTP ヘッダ**値**は契約上 `list<u8>`——fast path とフィルタは wire 原文を運び、lossy UTF-8 投影は行わない。テキストが必要なフィルタは UTF-8 を明示的にデコードする。
+
 ### P4 — deny-by-default、そして fail-closed
 
-フィルタが import できる能力は、ホストが明示的に貸した interface のみ: **host-log / host-clock / host-kv / host-counter / host-ratelimit の5つ**であり、それ以外の import は Linker に存在しない（ADR 000006）。WASI import はゼロが既定（zero-WASI guest、Tier A）で、追加の宣言なしに deny-by-default の Linker が instantiate できる形である（ADR 000055）。ランタイムが最小限の WASI 存在を前提とする fat guest（TinyGo/Go、Tier B）には、固定・最小・off-by-default のスライス——`wasi:io` / `clocks` / `random` / `cli`、および一部ランタイムの起動処理が無条件に import する空の `wasi:filesystem`——を貸せる。fs アクセスも sockets も一切なく、host のビルドとフィルタの manifest 宣言の両方が opt-in したときのみ有効（ADR 000063）。どちらか片方でも欠ければ instantiate に失敗する deny-by-default のままである。
+フィルタが import できる能力は、ホストが明示的に貸した interface のみ: **host-log / host-clock / host-kv / host-counter / host-ratelimit / host-config の6つ（基本 capability）**であり、それ以外の import は Linker に存在しない（ADR 000006 / 000066）。outbound HTTP / outbound TCP は **feature-gated** のオプション（ADR 000036 / 000060）。WASI import はゼロが既定（zero-WASI guest、Tier A）で、追加の宣言なしに deny-by-default の Linker が instantiate できる形である（ADR 000055）。ランタイムが最小限の WASI 存在を前提とする fat guest（TinyGo/Go、Tier B）には、固定・最小・off-by-default のスライス——`wasi:io` / `clocks` / `random` / `cli`、および一部ランタイムの起動処理が無条件に import する空の `wasi:filesystem`——を貸せる。fs アクセスも sockets も一切なく、host のビルドとフィルタの manifest 宣言の両方が opt-in したときのみ有効（ADR 000063）。どちらか片方でも欠ければ instantiate に失敗する deny-by-default のままである。
 
 失敗は常に閉じる側に倒す: フィルタの trap / epoch deadline 超過は素通り（fail-open）させない。unhealthy な upstream しか無ければ 503。quota 超過は拒否。バケット状態の破損は「全許可」ではなく「空＝deny + self-heal」。署名の欠落・不一致はロード前に Err。path 正規化で解釈できない迂回表現は拒否。バッファ permit のエラーも fail-closed（直近の `dfab595` に至るまで一貫）。**「安全側に倒すか迷ったら、既に答えは出ている」**が本原則の運用形である。
 

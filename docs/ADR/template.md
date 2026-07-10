@@ -6,6 +6,10 @@ tags: [<許可タグから最大5>]
 affected_components:
   - <component — 変更概要を1行>
 aliases: ["ADR-NNN", "ADR-000NNN"]
+# Optional graph edges (append-only history; do not rewrite Decision bodies in place):
+# amends: ["000052"]       # this ADR refines / corrects an earlier decision
+# supersedes: ["000037"]   # this ADR replaces an earlier decision entirely
+# amends_tenets: ["P4"]     # when this ADR changes a design principle (rare; principles live in design-principles.md)
 ---
 
 # <タイトル>

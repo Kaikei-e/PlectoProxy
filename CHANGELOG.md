@@ -21,6 +21,36 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-10
+
+### Added
+
+- `plecto:filter@0.2.0` (ADR 000071): the WIT contract's `header.value` moves from `string` to
+  `list<u8>`, so non-UTF-8 header bytes survive the filter boundary end-to-end instead of being
+  lossily re-encoded. `plecto:filter@0.1.0` is frozen at `wit/v0.1.0/` and stays loadable — the
+  host dual-binds both versions, detecting which one a component targets from its decoded WIT
+  imports (not a byte scan, so it can't be fooled by a string a guest merely embeds) and lossily
+  projecting headers into a 0.1 guest only for the duration of its call (`continue` never
+  rewrites headers, so a value the guest left untouched still flows on as native bytes). Loading
+  a 0.1 component now logs a one-time deprecation warning.
+- ADR append-only graph checker (`scripts/check_adr_graph.py`, CI-enforced): validates
+  `amends`/`supersedes` edges, `status`, and `[[NNNNNN]]` wikilinks across the ADR corpus.
+
+### Changed
+
+- Fast path header handling (`crates/server/src/headers.rs`): ingress/egress now carry header
+  values as raw bytes (`HeaderValue::from_bytes`) instead of a lossy UTF-8 projection, and the
+  `copy_headers_preserving` byte-recovery heuristic is removed as no longer needed — the contract
+  itself now carries the wire bytes.
+- A guest-returned header that violates the contract's byte-level rules (CRLF, a control byte, a
+  non-token name, oversize) now fails closed as its own `invalid-output` fault (502), kept apart
+  from `trap` so a misbehaving-but-alive filter is distinguishable from a crashing one in
+  telemetry.
+- The example filter fleet — the in-tree Rust filters and the C / MoonBit / JS polyglot
+  conformance fixtures alike — moves to `plecto:filter@0.2.0`'s byte-valued headers.
+- `design-principles.md`/`.ja.md`, `CLAUDE.md`, and `ROADMAP.md` synced to the current ADR count,
+  the sixth basic capability (`host-config`, ADR 000066), and the byte-valued header contract.
+
 ## [0.2.5] - 2026-07-10
 
 ### Added

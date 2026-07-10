@@ -3,7 +3,7 @@
 English · [日本語](design-principles.ja.md)
 
 > **Established**: 2026-07-06 (adopted into `docs/` alongside [ADR 000056](ADR/000056.md))
-> **Basis**: Derived from the primary sources of the Plecto repository at HEAD (2026-07-10), including the WIT contract (`plecto/wit/world.wit` @ 0.2.0), 70 ADRs (append-only graph with `amends` / `supersedes`), `CLAUDE.md`, `CONTEXT-MAP.md`, crate `CONTEXT.md` files, `docs/ROADMAP.md`, and operational docs.
+> **Basis**: Derived from the primary sources of the Plecto repository at HEAD (2026-07-11), including the WIT contract (`plecto/wit/world.wit` @ 0.2.0), 74 ADRs (append-only graph with `amends` / `supersedes`), `CLAUDE.md`, `CONTEXT-MAP.md`, crate `CONTEXT.md` files, `docs/ROADMAP.md`, and operational docs.
 > **Nature**: This document crystallises Plecto Proxy's design philosophy in three layers — **principles** (what does not change), **policy** (how structure is chosen), and **guidelines** (how day-to-day judgment is applied). The primary record of individual decisions lives in `docs/ADR/`; the contract's authoritative text lives in `wit/`. Where this document disagrees with an ADR or the WIT, the ADR/WIT wins and this document is revised (Chapter 7).
 
 ---
@@ -26,7 +26,7 @@ These principles constitute Plecto Proxy's identity. A proposal that changes the
 
 ### P1 — The simultaneous satisfaction of four conditions is the reason to exist
 
-The traditional three options for placing custom gateway logic — config/DSL (a ceiling on expressiveness), recompiled-in native extensions (no untrusted code, one language, whole-process blast radius), and out-of-process callouts (a network round trip on every request) — **cannot simultaneously deliver "in-process speed", "sandboxed safety", "freedom of language", and "zero-downtime replacement".** WASM is effectively the only technology that satisfies all four at once, and Plecto Proxy stands on that single point (ADR 000001). The insight that "data-plane filters belong in WASM" is a conclusion Envoy/proxy-wasm spent roughly a decade proving; Plecto Proxy explicitly acknowledges that debt while building **natively** on the typed, polyglot, composable foundation of the Component Model / WIT that proxy-wasm never reached. Any design that permanently sacrifices one of the four conditions violates this principle.
+The traditional three options for placing custom gateway logic — config/DSL (a ceiling on expressiveness), recompiled-in native extensions (no untrusted code, one language, whole-process blast radius), and out-of-process callouts (a network round trip on every request) — **cannot simultaneously deliver "in-process speed", "sandboxed safety", "freedom of language", and "zero-downtime replacement".** WASM is effectively the only technology that satisfies all four at once, and Plecto Proxy stands on that single point (ADR 000001). A decade of module-ABI data-plane filters proved the in-process WASM shape; Plecto Proxy builds **natively** on the typed, polyglot, composable foundation of the Component Model / WIT that those earlier ABIs did not provide. Any design that permanently sacrifices one of the four conditions violates this principle.
 
 ### P2 — Two complementary halves, joined by a typed contract
 
@@ -56,7 +56,7 @@ And **the supply-chain discipline imposed on filters applies to Plecto Proxy's o
 
 "Stateless" is defined precisely: what is forbidden is holding **mutable business state** inside an instance; keeping **immutable init derivatives** resident (compiled regexes, built schemas) is allowed and encouraged (ADR 000011; Tenet 4: heavy initialisation goes into the `init` hook, the hot path stays light). Mutable state goes to the host through host-kv (redb-backed, namespaced by filter identity — no filter can forge its way into another's keyspace), host-counter, and host-ratelimit.
 
-All host-held state is **node-local**. That is not an immaturity of the implementation but a **declared semantics** (ADR 000053), documented in the hardening guide down to its consequence ("effective rate = configured value × N replicas"). When truly global shared state is needed, the receptacle is not native but the extension plane (Fork 6: user-policy goes to filters) — matching the industry's settled shape, where even Envoy delegates distributed rate limiting to an external service.
+All host-held state is **node-local**. That is not an immaturity of the implementation but a **declared semantics** (ADR 000053), documented in the hardening guide down to its consequence ("effective rate = configured value × N replicas"). When truly global shared state is needed, the receptacle is not native but the extension plane (Fork 6: user-policy goes to filters) — matching the industry's settled local-floor + external-store shape for distributed rate limiting.
 
 ### P7 — Single-node first; configuration is declarative and static, change is zero-downtime reload
 
@@ -100,16 +100,16 @@ Plecto Proxy's Rust workspace consists of three crates = three contexts, each wi
 
 Three relations: **Fast path → Extension plane** (drives the chain per request), **Control → Extension plane** (the manifest digest-pins filters and declares chain order and trust roots; reload swaps atomically), **Control → Fast path** (the manifest declares routes and targets; the fast path takes a per-request `ConfigSnapshot` to select routes). The contract `wit/` sits at the workspace root, belonging to no crate — the contract is shared property between contexts, owned by none of them.
 
-### 2.2 Contract architecture (`plecto:filter@0.1.0`)
+### 2.2 Contract architecture (`plecto:filter@0.2.0`)
 
-The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. The current contract's structure:
+The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. Header values are `list<u8>` (ADR 000071); `0.1.0` remains loadable via a frozen tree + host adapter. The current contract's structure:
 
-- **types**: `http-request` (header-only), `http-response`, `request-edit` / `response-edit` (rewrites expressed as diffs), and the three-way decision variants.
-- **host-API (five capabilities; 1 interface = 1 capability)**: `host-log` (levelled logging) / `host-clock` (returns a **wall-clock snapshot captured once at request start** — repeated calls within one request return the same value, making TTL and rate-limit logic deterministic) / `host-kv` (mutable business state namespaced by filter identity) / `host-counter` (atomic counters isomorphic to `wasi:keyvalue/atomics` — a deliberate shape-match so polyglot filters meet a familiar contract) / `host-ratelimit` (the token bucket stays **host-native**; refill and accounting never cross the WASM boundary. Bucket specs are host-set in the manifest — a filter cannot neuter its own limiter by self-declaration. An unconfigured bucket denies; a backend error denies).
+- **types**: `http-request` / `http-response` (header values are raw bytes), `request-edit` / `response-edit` (rewrites expressed as diffs), and the three-way decision variants.
+- **host-API (six capabilities; 1 interface = 1 capability)**: `host-log` / `host-clock` (wall-clock snapshot captured once at request start) / `host-kv` / `host-counter` / `host-ratelimit` (token bucket stays **host-native**) / `host-config` (read-only manifest `[filter.config]`, ADR 000066).
 - **Two worlds**: `filter` (header-only) and `filter-body` (+ `on-request-body`, buffer-then-decide, `list<u8>` in v1). The duplication instead of `include` is a deliberate workaround for WIT's `use`-propagation semantics, with the reason recorded in comments — **the contract file carrying its own design annotations is this repository's house style.**
 - **Experimental**: `plecto:filter-streaming` (`stream<u8>`, async) is quarantined behind the off-by-default `streaming-body` feature and stays out of the default build until `wasm32-wasip3` reaches Tier 2.
 
-Contract-evolution policy: changes are additive by default; true streaming of bodies has a reserved seat in the contract as the `list<u8>` → `stream<u8>` swap. Hot-path work (rate-limit refill and the like) drops out of the contract into native — "the WASM tax is paid only on decision logic."
+Contract-evolution policy: changes are additive by default; true streaming of bodies has a reserved seat in the contract as the `list<u8>` → `stream<u8>` swap. Hot-path work (rate-limit refill and the like) drops out of the contract into native — "the WASM tax is paid only on decision logic." `plecto new-filter` fetches the published contract via `wkg` today (ADR 000064 / 000065); ADR 000072 accepts offline self-vendoring of the same `wit/world.wit` the host bindgen reads as the follow-on.
 
 ### 2.3 Execution model: a lifecycle that branches on trust
 
@@ -179,11 +179,11 @@ These are **decisions**, not neglect; each row has a grounding ADR. Lifting one 
 | Non-goal | Grounds | Note |
 |---|---|---|
 | Becoming a general-purpose compute platform (long-lived stateful execution) | Founding decision | Filters are stateless (P6). Learn from scope-bloat cautionary tales |
-| Cloning Envoy's full feature set | ADR 000029 | Maturity is role-driven; we don't compete on feature count |
+| Cloning a full L7 feature catalogue | ADR 000029 | Maturity is role-driven; we don't compete on feature count |
 | Native distributed state (gossip / central counters / shared-store dependency) | ADR 000053 | Shared state goes to the extension plane per Fork 6 |
 | Native WAF | ADR 000037 | User-policy goes to the extension plane |
 | Native response caching / AI·LLM gateway | ADR 000043 | Outside the declared role |
-| Legacy proxy-wasm ABI compatibility | ADR 000001 | Being Component Model-native is the reason to exist |
+| Legacy module-ABI filter compatibility | ADR 000001 | Being Component Model-native is the reason to exist |
 | xDS-style dynamic config push | ADR 000008 | Declarative static config + zero-downtime reload (P7) |
 | h2c (plaintext HTTP/2) | ADR 000015 | Rejected even via the Upgrade allowlist, at validation |
 | TLS 0-RTT | ADR 000052 | No replay surface. An invariant |

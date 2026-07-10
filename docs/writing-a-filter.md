@@ -386,9 +386,10 @@ First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain o
 
 Everything above assumes you have `plecto/wit/`. If your filter lives outside this repository —
 which is the normal case for a real filter — fetch the contract with the standard WIT toolchain
-instead of copying files by hand (ADR 000064). `plecto new-filter --lang rust` (§2) runs exactly
-the `wkg get` command below for you; read on if you want the manual steps, are scaffolding another
-language by hand, or just want to know what the CLI is doing under the hood.
+instead of copying files by hand (ADR 000064). `plecto new-filter --lang rust` (§2) runs a `wkg get`
+for you today; read on if you want the manual steps, are scaffolding another language by hand, or
+just want to know what the CLI is doing under the hood. (ADR 000072 accepts embedding the same
+`wit/world.wit` the host bindgen reads so the scaffold no longer needs the network — not landed yet.)
 
 The contract is published on every tagged release as a [CNCF Wasm OCI
 Artifact](https://tag-runtime.cncf.io/wgs/wasm/deliverables/wasm-oci-artifact/) to `ghcr.io`, the
@@ -404,7 +405,7 @@ registry = "ghcr.io"
 metadata = { oci = { registry = "ghcr.io", namespacePrefix = "kaikei-e/wit/" } }
 EOF
 
-wkg get plecto:filter@0.1.0 --config wkg-registry.toml -o wit/ --format wit
+wkg get plecto:filter@0.2.0 --config wkg-registry.toml -o wit/ --format wit
 ```
 
 That writes the plain-text WIT to `wit/`, ready for `wit_bindgen::generate!` (or any other
@@ -421,7 +422,7 @@ disappear without a major bump. Do not depend on it outside an explicit opt-in b
 ### Compatibility policy
 
 The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
-versioning policy already says so. `plecto:filter@0.1.0` and a `plecto` binary at `0.2.3` is the
+versioning policy already says so. `plecto:filter@0.2.0` and a `plecto` binary at `0.2.6` is the
 normal, expected state.
 
 - **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional

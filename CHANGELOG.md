@@ -21,6 +21,15 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Docs sync to current code (HRT): README / README.ja, design-principles, operations, hardening,
+  performance notes, writing-a-filter, ROADMAP, and the filter-template README now describe
+  `plecto:filter@0.2.0`, six host capabilities including `host-config`, release `v0.2.6`, and 74
+  accepted ADRs. Positioning prose names extension-model types rather than other products.
+  `plecto new-filter` is documented as fetching WIT via `wkg` today; ADR 000072's self-vendoring
+  is noted as accepted but not yet landed. In-tree `filter-template/wit` refreshed to `@0.2.0`.
+
 ## [0.2.6] - 2026-07-10
 
 ### Added
@@ -297,7 +306,7 @@ pre-release history are summarised first, the final pre-tag additions follow.
   ALPN-negotiated HTTP/2 / HTTP/1.1, optional custom CA (`ca_path`), `TE: trailers` pass-through
   and response-trailer forwarding — gRPC now works end-to-end through the proxy. Health probes
   follow the upstream scheme; certificate verification has no off switch (fail-closed).
-- `plecto validate <manifest>` (the `nginx -t` shape): static manifest validation for CI and
+- `plecto validate <manifest>` (config-test shape): static manifest validation for CI and
   pre-reload checks — strict parse plus every fail-closed startup check that needs no artifact —
   and `plecto --version`.
 - `[listen]` manifest section: the data-plane bind address (`addr`) and the Alt-Svc h3

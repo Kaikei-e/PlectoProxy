@@ -23,7 +23,7 @@ Plecto Proxy pairs **two complementary halves** through a typed [WIT](https://co
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (66 ADRs, 63 accepted) and the foundation runs end to end: the `plecto:filter` contract, a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `--version`); every tagged release (currently `v0.2.3`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (**74** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.2.0` contract (byte-valued headers; `0.1.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.2.6`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto Proxy?
 
@@ -36,7 +36,7 @@ Every gateway eventually faces the same question: **where does custom logic go?*
 | Out-of-process (`ext_proc`, sidecar) | ❌ | ✅ | ✅ | ✅ |
 | **WASM filters — Plecto Proxy** | ✅ | ✅ | ✅ | ✅ |
 
-WASM data-plane filters are an idea **Envoy and proxy-wasm pioneered** — proxy-wasm targets the earlier WASM ABI (v0.2.1); the **Component Model and WIT** have since matured into a typed, polyglot, composable foundation, and Plecto Proxy builds on them natively. High-performance Rust proxies like **Cloudflare's Pingora** show how fast a native data path can be; Plecto Proxy's focus is **pairing that speed with a Component-Model extension plane**, for teams who want to self-host and keep traffic and secrets on their own infrastructure — **data sovereignty** as a first principle.
+Earlier data-plane filter work proved that **in-process WASM** can carry gateway policy; it typically sat on the older **module ABI**. The **Component Model and WIT** have since matured into a typed, polyglot, composable foundation, and Plecto Proxy builds on that natively — pairing a fast native data path with a sandboxed extension plane — for teams who want to self-host and keep traffic and secrets on their own infrastructure (**data sovereignty** as a first principle). Positioning is by extension-model type, not by product catalogue ([ADR 000067](docs/ADR/000067.md)).
 
 See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alternatives.
 
@@ -44,7 +44,7 @@ See [ADR 000001](docs/ADR/000001.md) for the full rationale and rejected alterna
 
 > Safety × portability × self-hostability × operational simplicity **＞** feature breadth × broad privilege × distributed-by-default.
 
-- **Deny-by-default capabilities** — a filter can reach nothing but the host-API explicitly lent to it (KV, counter, metrics, log, clock, random). No outbound network, filesystem, or sockets unless granted. Enforced by the Component Model sandbox.
+- **Deny-by-default capabilities** — a filter can reach nothing but the host-API explicitly lent to it (log, clock, KV, counter, rate-limit, config). No outbound network, filesystem, or sockets unless granted. Enforced by the Component Model sandbox.
 - **Decisions are typed** — a filter returns a `decision` variant: `continue` / `modified` / `short-circuit`. Never an ambiguous flag or an implicit side effect.
 - **Init vs per-request** — expensive setup (regex compile, schema build) goes in an `init` hook; the per-request hot path stays lean.
 - **Filters are stateless** — rate-limit, session, and cache state live in host KV, so filters pool, scale, and hot-swap cleanly.
@@ -128,16 +128,19 @@ The native fast path has matured well past "a proxy that works." A snapshot of w
 | **Rate limiting** | **two-tier model** ([ADR 61](docs/ADR/000061.md)): a native L7 token-bucket **local floor** per **route** / **client-IP** (node-local, sheds bursts before they cost a round trip) plus [`filter-ratelimit-redis`](plecto/examples/filters/filter-ratelimit-redis), a reference **global** filter that consults a RESP-compatible store (Redis/Valkey) over the outbound-TCP capability — recommended together, see the [hardening guide](docs/hardening.md) — [33](docs/ADR/000033.md) · [53](docs/ADR/000053.md) · [60](docs/ADR/000060.md) · [66](docs/ADR/000066.md) |
 | **Extension plane** | `plecto:filter` chain over headers and, for opted-in filters, the body (header-only filters skip buffering — zero-copy); typed `decision`; trusted **pooled** / untrusted **fresh** instances; deny-by-default host-API with per-filter + host-wide quotas; feature-gated **outbound HTTP** and **outbound TCP** (both SSRF-guarded); a feature-gated **fat-guest** minimal-WASI grant (off by default) unlocks Go/TinyGo filters without widening the zero-WASI default; a `host-config` capability lends filter business settings declared in the manifest — [1](docs/ADR/000001.md) · [25](docs/ADR/000025.md) · [38](docs/ADR/000038.md) · [60](docs/ADR/000060.md) · [63](docs/ADR/000063.md) · [66](docs/ADR/000066.md) |
 | **Client IP** | edge-model propagation — re-issues `X-Forwarded-For` / `X-Real-IP` from the real peer before the chain runs — [18](docs/ADR/000018.md) |
-| **Supply chain & ops** | cosign + SBOM-verified filter loading; zero-downtime SIGHUP reload + graceful shutdown wired into the shipped binary; W3C trace propagation, RED metrics, OTLP export; `plecto validate` / `schema` / `--version`; Plecto Proxy's own binary and container image carry the same signed-artifact discipline — [6](docs/ADR/000006.md) · [39](docs/ADR/000039.md) · [46](docs/ADR/000046.md) · [47](docs/ADR/000047.md) |
+| **Supply chain & ops** | cosign + SBOM-verified filter loading; zero-downtime SIGHUP reload + graceful shutdown wired into the shipped binary; W3C trace propagation, RED metrics, OTLP export; `plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`; Plecto Proxy's own binary and container image carry the same signed-artifact discipline — [6](docs/ADR/000006.md) · [39](docs/ADR/000039.md) · [46](docs/ADR/000046.md) · [47](docs/ADR/000047.md) · [64](docs/ADR/000064.md) · [65](docs/ADR/000065.md) |
 
 ## The filter contract
 
 The heart of Plecto Proxy is the `plecto:filter` WIT world — a custom world that defines Plecto Proxy's own vocabulary (the typed `decision`, init/per-request hooks, the deny-by-default host-API) while reusing standard types for polyglot compatibility.
 
 ```wit
-package plecto:filter@0.1.0;
+package plecto:filter@0.2.0;
 
 interface types {
+  // Header values are raw bytes (ADR 000071) — not lossy UTF-8 strings.
+  record header { name: string, value: list<u8>, }
+
   // The typed outcome of a request-side filter. Never a bare flag.
   variant request-decision {
     %continue,                       // pass unchanged to the next filter
@@ -150,6 +153,7 @@ interface types {
 interface host-kv      { get: func(key: string) -> option<list<u8>>; set: func(key: string, value: list<u8>); /* … */ }
 interface host-counter { increment: func(key: string, delta: s64) -> s64; /* atomic named counter */ }
 interface host-log     { log: func(level: level, message: string); }
+interface host-config  { get: func(key: string) -> option<string>; }  // manifest [filter.config]
 // host-ratelimit keeps the token bucket host-native — the hot-path refill/counting never crosses
 // the WASM boundary. The bucket spec (capacity/refill) is host-configured in the manifest; the
 // filter passes only (key, cost), so an untrusted filter cannot widen its own limit (ADR 000005 / 000026).
@@ -158,7 +162,8 @@ interface host-log     { log: func(level: level, message: string); }
 // reads the ABSENCE of `on-request-body` as the signal to skip buffering the body entirely —
 // zero-copy passthrough for filters that never touch it (ADR 000038).
 world filter {
-  import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
+  import host-log;  import host-clock;  import host-kv;  import host-counter;
+  import host-ratelimit;  import host-config;
   export init: func();                                                // heavy, once per instance
   export on-request:  func(req: http-request)  -> request-decision;   // hot path (headers)
   export on-response: func(resp: http-response) -> response-decision; // hot path (headers)
@@ -167,7 +172,8 @@ world filter {
 // Body-reading contract: `filter` plus `on-request-body`. Its PRESENCE is what makes the host
 // buffer the request body and run this hook (buffer-then-decide, ADR 000025).
 world filter-body {
-  import host-log;  import host-clock;  import host-kv;  import host-counter;  import host-ratelimit;
+  import host-log;  import host-clock;  import host-kv;  import host-counter;
+  import host-ratelimit;  import host-config;
   export init: func();
   export on-request:      func(req: http-request)  -> request-decision;
   export on-request-body: func(body: list<u8>)     -> request-body-decision;  // buffered body hook
@@ -175,7 +181,7 @@ world filter-body {
 }
 ```
 
-> v0.1.0 started **sync + header-only**; the request-side **body hook** (`on-request-body`, a buffered `list<u8>` in v1, [ADR 000025](docs/ADR/000025.md)) now runs end-to-end for filters targeting `filter-body`. An **experimental, feature-gated** `stream<u8>` body world ([ADR 000020](docs/ADR/000020.md)) and `wasi:http` type reuse are next, gated on the P3 guest toolchain.
+> Current contract is **`plecto:filter@0.2.0`** (byte-valued headers, [ADR 000071](docs/ADR/000071.md)); `0.1.0` remains loadable with a deprecation warning. The request-side **body hook** (`on-request-body`, buffered `list<u8>`, [ADR 000025](docs/ADR/000025.md)) runs end-to-end for filters targeting `filter-body`. An **experimental, feature-gated** `stream<u8>` body world ([ADR 000020](docs/ADR/000020.md)) and `wasi:http` type reuse are next, gated on the P3 guest toolchain.
 
 ## Writing a filter
 
@@ -198,7 +204,10 @@ impl Guest for FilterQuickstart {
         // touched the response.
         ResponseDecision::Modified(ResponseEdit {
             set_status: None,
-            set_headers: vec![Header { name: "x-plecto".into(), value: "hello-from-wasm".into() }],
+            set_headers: vec![Header {
+                name: "x-plecto".into(),
+                value: b"hello-from-wasm".to_vec(), // list<u8> header values (@0.2.0)
+            }],
             remove_headers: vec![],
         })
     }
@@ -214,7 +223,7 @@ A filter that needs the body targets `filter-body` and adds one export — see
 
 Because the contract is WIT, **any language that compiles to a WASM component can write a filter** — proven two ways. **Tier A (zero-WASI, the default)**: the same conformance subset ported to **MoonBit** (~22 KB), **JavaScript/TypeScript** (ComponentizeJS, ~12 MB engine constant), and **C** (wasi-sdk), each building to a component with **zero WASI imports** that the unchanged deny-by-default host loads and runs through the same assertion suite as the Rust fixture (`plecto/crates/host/tests/polyglot.rs`, CI job `polyglot-guests`). Python fits the same shape (`componentize-py --stub-wasi`, ~17 MB — works, but heavy for a filter). **Tier B (fat guest, feature-gated `fat-guest`, off by default, [ADR 000063](docs/ADR/000063.md))**: languages whose runtime hard-wires a WASI baseline get a fixed, minimal slice — `wasi:io` / `wasi:clocks` / `wasi:random` / `wasi:cli`, still zero filesystem and zero sockets — opt-in per filter via manifest `wasi = "minimal"`. **Go/TinyGo** is the first Tier B guest (`filter-hello-go`); its stdout/stderr bridges into `host-log` so a panic's own diagnostic still reaches the request's trace span, and a dedicated suite (`polyglot_tier_b.rs`, CI job `polyglot-guest-go`) verifies the grant stays fail-closed. Per-language recipes: [Writing a filter §7](docs/writing-a-filter.md#7-other-languages); polyglot filter **SDKs** (scaffolding beyond one fixture per language) remain on the [roadmap](#roadmap).
 
-A complete how-to — scaffold, build, the manifest field reference, signing, and local testing — is in [**Writing a filter**](docs/writing-a-filter.md). A copy-ready starting point with the contract already vendored lives in [`examples/filters/filter-template`](plecto/examples/filters/filter-template).
+Fastest start: `plecto new-filter --lang rust my-filter` — scaffolds the crate, fetches the WIT contract via `wkg` ([ADR 000064](docs/ADR/000064.md)), and writes a ready-to-run dev manifest ([ADR 000065](docs/ADR/000065.md); [ADR 000072](docs/ADR/000072.md) accepts offline self-vendoring as the follow-on). Full how-to — scaffold, build, manifest fields, signing, local testing — is in [**Writing a filter**](docs/writing-a-filter.md). A copy-ready in-tree starter also lives in [`examples/filters/filter-template`](plecto/examples/filters/filter-template).
 
 ## Try it
 
@@ -262,7 +271,7 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 
 | Milestone | Status | Covers |
 | --- | --- | --- |
-| **M0** — Foundation | ✅ done | `plecto:filter@0.1.0` contract, wasmtime host, capability boundary, CI |
+| **M0** — Foundation | ✅ done | `plecto:filter@0.2.0` contract (0.1 frozen + load adapter), wasmtime host, capability boundary, CI |
 | **M1** — Filter runtime hardening | ✅ landed | trusted pool / untrusted fresh-per-request, redb KV, host-native rate limiting, quotas |
 | **M2** — The data path (fast path) | 🚧 maturing | HTTP/1–3 + TLS, routing / LB / resilience, upstream TLS + periodic DNS re-resolve, WebSocket tunnelling |
 | **M3** — Async & bodies | 🚧 Stages 1–2 landed | wasmtime-46 async, header/body-world split, buffer-then-decide body hook; `stream<u8>` is experimental |
@@ -292,14 +301,14 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 │           ├── filter-hello-js/   # zero-WASI conformance port — JS/TS via ComponentizeJS (Tier A)
 │           ├── filter-hello-c/    # zero-WASI conformance port — C via wasi-sdk (Tier A)
 │           ├── filter-hello-go/   # fat-guest conformance port — Go/TinyGo, minimal WASI (Tier B, ADR 000063)
-│           ├── filter-template/ # copy-ready starter (vendored WIT)
+│           ├── filter-template/ # copy-ready starter (or prefer `plecto new-filter`)
 │           ├── filter-streaming/ # experimental stream<u8> filter (feature-gated)
 │           ├── filter-extauthz/ # ext_authz over outbound HTTP (feature-gated)
 │           ├── filter-tcp-gate/ # raw-TCP consult gate over outbound TCP (feature-gated)
 │           └── filter-ratelimit-redis/ # Redis-backed global rate-limit reference filter (feature-gated)
 ├── bench/                     # benchmark harnesses + runbook (k6/oha; harnesses/, filters/, perf/)
 ├── performance/              # the benchmark write-up + results (see performance/README.md)
-├── docs/ADR/                  # Architecture Decision Records (000001–000066)
+├── docs/ADR/                  # Architecture Decision Records (000001–000074)
 ├── CHANGELOG.md               # Keep a Changelog + pre-1.0 versioning policy
 ├── CLAUDE.md                  # project conventions & design summary
 ├── CONTEXT-MAP.md             # domain glossary map (split per context)
@@ -308,7 +317,7 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 
 ## Design decisions
 
-Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All 66 (63 accepted, 3 proposed) live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All **74** accepted ADRs live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
 
 ## Contributing
 
@@ -325,8 +334,8 @@ cargo test --all
 
 ## License
 
-Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE). The Apache-2.0 patent grant suits an infrastructure project; it is the license used by Envoy, Linkerd, and containerd.
+Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE). The Apache-2.0 patent grant suits an infrastructure project and is widely used across the cloud-native and container ecosystems.
 
 ## Prior art & acknowledgements
 
-Plecto Proxy stands on the shoulders of [Envoy](https://www.envoyproxy.io/) / [proxy-wasm](https://github.com/proxy-wasm), [Cloudflare Pingora](https://github.com/cloudflare/pingora), and the [Bytecode Alliance](https://bytecodealliance.org/) — [wasmtime](https://wasmtime.dev/), [WIT, and the Component Model](https://component-model.bytecodealliance.org/).
+Plecto Proxy builds on the [Bytecode Alliance](https://bytecodealliance.org/) stack — [wasmtime](https://wasmtime.dev/), [WIT, and the Component Model](https://component-model.bytecodealliance.org/) — and on a decade of industry work that showed in-process WASM can carry data-plane policy. Positioning relative to other extension models is recorded in [ADR 000067](docs/ADR/000067.md) (by model type, not by product name).

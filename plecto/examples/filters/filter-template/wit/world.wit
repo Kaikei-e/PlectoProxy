@@ -8,13 +8,13 @@
 // CONVERGE these types onto wasi:http (proxy / middleware) in M3 (ADR 000020).
 // Until that migration this world stays buildable+runnable on the stable
 // toolchain with no experimental flags.
-package plecto:filter@0.1.0;
+package plecto:filter@0.2.0;
 
 interface types {
     // A single HTTP header field.
     record header {
         name: string,
-        value: string,
+        value: list<u8>,
     }
 
     // The request as seen by a filter. Header-only in v0.1.0 (no body).

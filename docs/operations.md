@@ -47,8 +47,8 @@ starts, those clients see refused connections — the exact blip the contract ex
 | --- | --- |
 | No LB (direct clients, single instance) | `0` (the default). Nothing watches `/readyz`; a grace only delays shutdown. |
 | Kubernetes | ≥ readiness probe `periodSeconds × failureThreshold` of the Pod. Point the readinessProbe at `/readyz`, the livenessProbe at `/healthz`. |
-| nginx / HAProxy active checks | ≥ check `interval × fall` (nginx plus: `fail_timeout`). |
-| Envoy | ≥ `health_checks.interval × unhealthy_threshold`. |
+| Active health checks (interval × consecutive failures) | ≥ that product (plus any post-fail hold-down your front LB applies). |
+| Passive-plane health checks (interval × unhealthy threshold) | ≥ that product. |
 | DNS-based routing | ≥ record TTL. If the TTL is minutes, prefer removing the record first and only then signalling. |
 
 Orchestrators that remove the replica from rotation *before* delivering `SIGTERM` (Kubernetes

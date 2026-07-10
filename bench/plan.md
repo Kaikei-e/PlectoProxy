@@ -78,7 +78,7 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
 | phase | subject | generator | 出力 | invariant |
 | --- | --- | --- | --- | --- |
 | `mix` | 重み付き request mix（60/25/10/5 read/auth/write/large）+ 同レート read-only 対照 | k6 constant-arrival-rate | `mix.csv` | blend のコストが offered load ではなく traffic 構成に帰属する |
-| `h3` | HTTP/3 の機能確認のみ（負荷は deferred — oha/k6 に native H3 無し。h2load `--npn-list h3` か Nighthawk が候補） | curl `--http3-only` | `h3.txt` | status=200 http_version=3 |
+| `h3` | HTTP/3 の機能確認のみ（負荷は deferred — oha/k6 に native H3 無し。h2load `--npn-list h3` 等が候補） | curl `--http3-only` | `h3.txt` | status=200 http_version=3 |
 
 ## 実行
 

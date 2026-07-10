@@ -6,13 +6,19 @@ Plecto Proxy repo.
 
 ## Start a new filter
 
-Either copy this directory:
+Preferred: the Filter Dev Kit CLI scaffolds the crate and fetches the published WIT via `wkg`:
+
+```bash
+plecto new-filter --lang rust my-filter
+```
+
+(ADR 000072 accepts offline self-vendoring of that contract as a follow-on; until it lands, the CLI uses the registry channel.)
+
+Or copy this directory / use `cargo generate`:
 
 ```bash
 cp -r plecto/examples/filters/filter-template my-filter
 ```
-
-…or generate it with [`cargo generate`](https://github.com/cargo-generate/cargo-generate):
 
 ```bash
 cargo generate --git https://github.com/Kaikei-e/PlectoProxy.git \

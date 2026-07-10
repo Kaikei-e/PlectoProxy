@@ -27,7 +27,7 @@ so a burst never spends WASM CPU or reaches a shared backend. On top of it,
 [`filter-ratelimit-redis`](../plecto/examples/filters/filter-ratelimit-redis) is the **global
 layer**: it consults a RESP-compatible store (Redis, Valkey, ...) over the lent `outbound-tcp`
 capability ([ADR 000060](ADR/000060.md)) to hold the actual fleet-wide cap. This mirrors the
-combined local + global pattern Envoy Gateway documents for the same problem — local absorbs
+combined local + global pattern established for the same problem — local absorbs
 bursts before they reach the shared limiter; global holds the real number. Configure the
 per-replica floor everywhere (cheap, always on) and add the filter on any route that needs an
 exact fleet-wide quota rather than the engineering approximations below.
@@ -73,8 +73,8 @@ give you an engineering approximation. If your product requires a strict fleet-w
 hard per-tenant API quota that must hold regardless of which replica or how many), that is
 **shared state**, and Plecto Proxy's placement rule keeps shared state out of the native fast path
 ([ADR 000029](ADR/000029.md), [ADR 000053](ADR/000053.md)). The supported path is a **filter** that
-consults an external store over a lent outbound capability, the same shape Envoy uses for its
-external global rate limit service — and Plecto Proxy's version of that service IS the filter itself
+consults an external store over a lent outbound capability, the same shape the industry uses for an
+external global rate-limit service — except in Plecto Proxy that "service" is itself a filter
 (no separate process, ADR 000061's single-binary win).
 
 [`filter-ratelimit-redis`](../plecto/examples/filters/filter-ratelimit-redis) is the reference

@@ -715,8 +715,8 @@ curl --http3-only https://…/api/hello  ->  status=200 http_version=3
 ```
 
 A **rigorous, coordinated-omission-safe H3 *load* benchmark is deferred**: oha and k6 have no native
-HTTP/3, and a correct tail needs an H3-capable open-loop generator (**Nighthawk** or **h2load**,
-`--npn-list h3`). Rather than publish process-spawn-bound `curl`-loop numbers, the H3 load figure
+HTTP/3, and a correct tail needs an H3-capable open-loop generator (**h2load** with
+`--npn-list h3`, or an equivalent H3 load tool). Rather than publish process-spawn-bound `curl`-loop numbers, the H3 load figure
 stays absent until that tooling is in place — server support is verified, not throughput.
 
 ## WebSocket Upgrade tunnel (ADR 000048)
@@ -724,8 +724,8 @@ stays absent until that tooling is in place — server support is verified, not 
 Plecto Proxy's HTTP/1.1 Upgrade path (ADR 000048): a route declaring `[route.upgrade] protocols =
 ["websocket"]` forwards the client's handshake (controlled re-issue — hop-by-hop stripping stays
 the default for every other route), and on the upstream's 101 the proxy splices the two connections
-into an opaque bidirectional byte tunnel — the same relay technique nginx `proxy_pass`, Envoy's
-generic TCP proxy, and HAProxy's `mode tcp` all use post-upgrade. This is a **different load shape**
+into an opaque bidirectional byte tunnel — the same post-upgrade relay shape used by typical
+L7 `Upgrade` / TCP tunnel modes. This is a **different load shape**
 than every other scenario in this report: a long-lived, stateful connection instead of a
 short-lived request, so it exercises axes nothing else here does — connection-permit accounting
 (the circuit breaker / least-request in-flight counters follow the tunnel for its whole lifetime,
@@ -865,8 +865,8 @@ artifacts. See `bench/plan.md`.)
 - [k6 executors](https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/) — closed-loop (`constant-vus`) vs open-loop (`constant-arrival-rate`) models.
 - [oha](https://github.com/hatoo/oha) — the single-connection-pool HTTP load generator used for the ceiling, WASM overhead, and TLS runs.
 - [criterion.rs](https://bheisler.github.io/criterion.rs/book/) — the in-process micro-benchmark harness (LB pick, route match, WASM per-request cost) and its baseline-comparison regression gate.
-- [Nighthawk](https://github.com/envoyproxy/nighthawk) — Envoy's open-loop, HTTP/1–2–3 load generator; one tool an HTTP/3 *load* benchmark would use (deferred here).
-- [h2load](https://nghttp2.org/documentation/h2load-howto.html) — nghttp2's load generator; supports HTTP/3 (`--npn-list h3`) with qlog output, and — like Nighthawk — a candidate for the deferred H3 load run.
+- Open-loop HTTP/1–2–3 load generators suitable for an HTTP/3 *load* benchmark (deferred here).
+- [h2load](https://nghttp2.org/documentation/h2load-howto.html) — nghttp2's load generator; supports HTTP/3 (`--npn-list h3`) with qlog output, and a candidate for the deferred H3 load run.
 - [wrk2](https://github.com/giltene/wrk2) — constant throughput with corrected latency recording.
 - [Wasmtime](https://docs.wasmtime.dev/) — the pooling allocator and epoch interruption behind pooled vs on-demand filter instances.
 - [WebAssembly Component Model](https://component-model.bytecodealliance.org/) — the `plecto:filter` contract is a Component Model world.

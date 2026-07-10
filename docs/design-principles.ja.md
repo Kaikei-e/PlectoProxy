@@ -3,7 +3,7 @@
 [English](design-principles.md) · 日本語
 
 > **策定日**: 2026-07-06（[ADR 000056](ADR/000056.md) と同日に docs/ へ採録）
-> **根拠**: `github.com/Kaikei-e/PlectoProxy` を本日 fresh clone（キャッシュなし）し、HEAD `c5274db61a9dc10775200dd296e2dd3d4e0725e2`（最新タグ `v0.1.3`）の一次情報——WIT 契約原文（`plecto/wit/world.wit`）・ADR 全55本（accepted 54 / proposed 1 相当）・`CLAUDE.md`・`CONTEXT-MAP.md`・各 crate の `CONTEXT.md`・`docs/ROADMAP.md`・`docs/hardening.ja.md`・`performance/README.md`・README——から直接策定した。
+> **根拠**: リポジトリ HEAD（2026-07-11）の一次情報——WIT 契約（`plecto/wit/world.wit` @ 0.2.0）・accepted ADR 74 本（`amends` / `supersedes` の append-only グラフ）・`CLAUDE.md`・`CONTEXT-MAP.md`・各 crate の `CONTEXT.md`・`docs/ROADMAP.md`・運用ドキュメント——から直接策定・同期した。最新タグは `v0.2.6`。
 > **性格**: 本書は Plecto Proxy の設計思想を「原則（変わらないもの）」「方針（構造の選び方）」「指針（日々の判断の当て方）」の三層で一冊に定礎する原典である。個別判断の一次記録は `docs/ADR/` にあり、契約の正文は `wit/` にある。本書と ADR/WIT が食い違う場合は ADR/WIT を正とし、本書を改訂する（第7章）。英語版 [design-principles.md](design-principles.md) と同期して保守する。
 
 ---
@@ -26,7 +26,7 @@
 
 ### P1 — 四条件の同時充足が存在理由である
 
-ゲートウェイのカスタムロジック配置における従来の三択——設定/DSL（表現力に天井）、本体再コンパイル組込（untrusted 不可・言語固定・全体巻き込み）、別プロセス呼出（毎リクエスト往復で遅い）——は、**「プロセス内の速さ」「サンドボックスの安全」「言語の自由」「無停止差し替え」を同時に満たせない**。この四条件を同時に満たす事実上唯一の技術が WASM であり、Plecto Proxy はこの一点の上に立つ（ADR 000001）。「データプレーンのフィルタは WASM」という洞察は Envoy/proxy-wasm が約10年かけて実証した結論であり、Plecto Proxy はそれに多くを負うことを明記しつつ、proxy-wasm が到達しなかった Component Model / WIT の型付き・多言語・合成可能な基盤の上に**ネイティブに**築く。四条件のいずれかを恒常的に犠牲にする設計は、原則違反である。
+ゲートウェイのカスタムロジック配置における従来の三択——設定/DSL（表現力に天井）、本体再コンパイル組込（untrusted 不可・言語固定・全体巻き込み）、別プロセス呼出（毎リクエスト往復で遅い）——は、**「プロセス内の速さ」「サンドボックスの安全」「言語の自由」「無停止差し替え」を同時に満たせない**。この四条件を同時に満たす事実上唯一の技術が WASM であり、Plecto Proxy はこの一点の上に立つ（ADR 000001）。module ABI 時代のデータプレーン向け WASM フィルタが約10年かけてプロセス内 WASM の形を実証し、Plecto Proxy はその上で、当時の ABI が提供しなかった Component Model / WIT の型付き・多言語・合成可能な基盤の上に**ネイティブに**築く。四条件のいずれかを恒常的に犠牲にする設計は、原則違反である。
 
 ### P2 — 相補関係にある二つの構成要素を、型契約で結ぶ
 
@@ -56,7 +56,7 @@ fast path と extension plane は上下関係でも主従関係でもなく、**
 
 「ステートレス」は精密に定義される: 禁じられるのは**可変業務状態**のインスタンス内保持であり、**不変の init 派生物**（コンパイル済み regex・構築済みスキーマ等）の常駐は許され、むしろ推奨される（ADR 000011、Tenet 4: 重い初期化は `init` フックへ、ホット経路は軽く保つ）。可変状態は host-kv（redb バック、フィルタ identity で名前空間化——他フィルタの keyspace には偽造不能に到達できない）・host-counter・host-ratelimit を通じてホストに置く。
 
-そしてホスト保持の状態は**すべてノードローカル**である。これは実装の未熟ではなく**宣言された意味論**であり（ADR 000053）、「実効レート = 設定値 × レプリカ数 N」という帰結ごと hardening ガイドに文書化される。真にグローバルな共有状態が要る場合の受け皿は native ではなく extension plane（Fork 6: user-policy はフィルタへ）——Envoy ですら分散レートリミットを外部サービスへ外出ししているという業界の確立形に整合する配置である。
+そしてホスト保持の状態は**すべてノードローカル**である。これは実装の未熟ではなく**宣言された意味論**であり（ADR 000053）、「実効レート = 設定値 × レプリカ数 N」という帰結ごと hardening ガイドに文書化される。真にグローバルな共有状態が要る場合の受け皿は native ではなく extension plane（Fork 6: user-policy はフィルタへ）——業界の確立形である local floor ＋ 外部ストア型の分散レートリミット配置に整合する。
 
 ### P7 — 単一ノード・ファースト。設定は宣言的・静的、変更は無停止 reload
 
@@ -100,16 +100,16 @@ Plecto Proxy の Rust workspace は三つの crate = 三つの文脈から成り
 
 関係は三本: **Fast path → Extension plane**（per-request に chain を駆動）、**Control → Extension plane**（manifest が filter を digest pin し chain 順と trust root を宣言、reload が atomic に差し替え）、**Control → Fast path**（manifest が route と転送先を宣言し、fast path は per-request に `ConfigSnapshot` を取って route を選ぶ）。契約 `wit/` は workspace 直下に置かれ、どの crate にも属さない——契約は文脈間の共有財であって、どれかの所有物ではない。
 
-### 2.2 契約アーキテクチャ（`plecto:filter@0.1.0`）
+### 2.2 契約アーキテクチャ（`plecto:filter@0.2.0`）
 
-契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。現行契約の構造:
+契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。ヘッダ値は `list<u8>`（ADR 000071）。`0.1.0` は凍結ツリー＋ホストアダプタでロード可能。現行契約の構造:
 
-- **types**: `http-request`（header-only）・`http-response`・`request-edit` / `response-edit`（書換は差分で表現）・三種の decision variant。
-- **host-API（5能力・1 interface = 1 capability）**: `host-log`（レベル付きログ）/ `host-clock`（**リクエスト開始時に一度だけ捕捉した wall-clock スナップショット**を返す——同一リクエスト内の反復呼出は同値で、TTL・rate-limit ロジックを決定的にする）/ `host-kv`（フィルタ identity で名前空間化された可変業務状態）/ `host-counter`（`wasi:keyvalue/atomics` と同形の atomic counter——多言語フィルタが既知の契約形に出会うための意図的な形合わせ）/ `host-ratelimit`（token bucket は **host-native** に留まり、refill と計数は WASM 境界を越えない。バケット仕様は manifest でホスト側が定め、フィルタは自分の limiter を自己申告で骨抜きにできない。バケット未設定は deny、backend エラーも deny）。
+- **types**: `http-request` / `http-response`（ヘッダ値は原文バイト）・`request-edit` / `response-edit`（書換は差分で表現）・三種の decision variant。
+- **host-API（6能力・1 interface = 1 capability）**: `host-log` / `host-clock`（リクエスト開始時スナップショット）/ `host-kv` / `host-counter` / `host-ratelimit`（token bucket は **host-native**）/ `host-config`（manifest `[filter.config]` の読み取り専用、ADR 000066）。
 - **二つの world**: `filter`（header-only）と `filter-body`（+ `on-request-body`、buffer-then-decide、v1 は `list<u8>`）。`include` ではなく敢えて重複記述しているのは WIT の `use` 伝播仕様への対処であり、コメントで理由が明記される——**契約ファイル自身が設計判断の注釈を持つ**のがこのリポジトリの流儀である。
 - **実験系**: `plecto:filter-streaming`（`stream<u8>`・async）は off-by-default の `streaming-body` feature に隔離され、`wasm32-wasip3` の Tier-2 到達まで既定ビルドに入らない。
 
-契約進化の方針: 変更は additive を基本とし、body の真のストリーミング化は `list<u8>` → `stream<u8>` の差し替えとして契約に席を確保済み。ホット経路（rate limit の refill 等）は契約の外＝native に落とす——「WASM 税は判断ロジックにのみ払う」。
+契約進化の方針: 変更は additive を基本とし、body の真のストリーミング化は `list<u8>` → `stream<u8>` の差し替えとして契約に席を確保済み。ホット経路（rate limit の refill 等）は契約の外＝native に落とす——「WASM 税は判断ロジックにのみ払う」。`plecto new-filter` は現状 `wkg` 経由で公開契約を取得する（ADR 000064 / 000065）。オフライン self-vendoring（ホスト bindgen と同じ `wit/world.wit` の同梱）は ADR 000072 で採択済み・実装は後続。
 
 ### 2.3 実行モデル: 信頼で分岐するライフサイクル
 
@@ -179,11 +179,11 @@ ADR は `docs/ADR/NNNNNN.md`、frontmatter + wikilink、テンプレは `templat
 | 非目標 | 根拠 | 備考 |
 |---|---|---|
 | 汎用コンピュート・プラットフォーム化（長命ステートフル実行基盤） | 創設判断 | フィルタはステートレス（P6）。スコープ肥大の警告例に学ぶ |
-| Envoy 全機能クローン | ADR 000029 | 成熟は役割駆動。機能数で張り合わない |
+| L7 機能カタログの全量クローン | ADR 000029 | 成熟は役割駆動。機能数で張り合わない |
 | native な分散状態（gossip / 中央カウンタ / 共有ストア依存） | ADR 000053 | 共有状態は Fork 6 で extension plane へ |
 | WAF の native 実装 | ADR 000037 | user-policy は extension plane へ |
 | response caching / AI・LLM gateway の native 化 | ADR 000043 | 役割宣言の外 |
-| legacy proxy-wasm ABI 互換 | ADR 000001 | Component Model ネイティブが存在意義 |
+| legacy module-ABI フィルタ互換 | ADR 000001 | Component Model ネイティブが存在意義 |
 | xDS 的な動的 config push | ADR 000008 | 宣言的静的設定 + 無停止 reload（P7） |
 | h2c（平文 HTTP/2） | ADR 000015 | Upgrade allowlist でも validation 拒否 |
 | TLS 0-RTT | ADR 000052 | リプレイ面を持ち込まない。不変条件 |

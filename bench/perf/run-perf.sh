@@ -486,8 +486,8 @@ print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d
 # ---------------------------------------------------------------- Phase 4b HTTP/3 functional check
 phase_h3(){
   # HTTP/3 is a first-class server feature (tls-http serves it over QUIC). A rigorous, CO-safe H3
-  # LOAD benchmark needs an H3-capable open-loop generator (e.g. h2load --npn-list h3, or
-  # Nighthawk); oha and k6 lack native H3, so we VERIFY H3 works end-to-end here and defer the load
+  # LOAD benchmark needs an H3-capable open-loop generator (e.g. h2load --npn-list h3);
+  # oha and k6 lack native H3, so we VERIFY H3 works end-to-end here and defer the load
   # numbers (see performance/README.md).
   log "Phase 4b — HTTP/3 functional check (curl --http3-only over QUIC) -> h3.txt"
   curl --version 2>/dev/null | grep -qi HTTP3 || { echo "curl lacks HTTP/3; skipping" | tee "$DATA/h3.txt"; return 0; }

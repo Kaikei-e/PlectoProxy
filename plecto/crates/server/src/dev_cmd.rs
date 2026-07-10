@@ -48,7 +48,10 @@ pub(crate) async fn run(filter_dir: &Path, project_root: &Path) -> Result<()> {
     build_sign_and_gate(&filter_dir, &manifest_path, &filter_id, &signer)?;
     println!("plecto dev: initial build is conformant");
 
-    let control = Arc::new(Control::from_manifest_path(&manifest_path)?);
+    let control = Arc::new(
+        Control::from_manifest_path(&manifest_path)
+            .map_err(|e| anyhow!(plecto_control::diagnosed_message(&e)))?,
+    );
 
     #[cfg(unix)]
     {
@@ -79,14 +82,16 @@ pub(crate) async fn run(filter_dir: &Path, project_root: &Path) -> Result<()> {
 /// The watch → rebuild → gate → self-SIGHUP loop, on its own thread (mirrors `serve_reloads`'s
 /// own blocking-loop-on-a-thread shape — the control plane stays sync/no-tokio by design).
 /// Watches ONLY `<filter-dir>/src` (recursive) — never `Cargo.toml`/`Cargo.lock`/`filter_dir`
-/// itself. Manual testing found that a `notify` watch on a single FILE gets registered on its
-/// PARENT DIRECTORY (an inotify-backend limitation) and then misattributes OTHER files' events
-/// in that same directory to the watched filename — so a `Cargo.toml` watch on `filter_dir`
-/// reported this loop's own `target/`/`artifacts/`/`manifest.toml` writes as "Cargo.toml
-/// changed", a self-sustaining rebuild loop that no path-based filtering on the reported path
-/// could fix (the report itself was wrong). `src/` never contains build output — everything
-/// this loop writes lives at `filter_dir`'s top level, a sibling of `src/`, so watching only
-/// `src/` sidesteps the whole class of bug. A `Cargo.toml` dependency edit needs a restart of
+/// itself. Manual testing found that with a `notify` watch on the single file `Cargo.toml`,
+/// events for OTHER files in that same directory (this loop's own
+/// `target/`/`artifacts/`/`manifest.toml` writes) were reported as "Cargo.toml changed" — a
+/// self-sustaining rebuild loop that no path-based filtering on the reported path could fix
+/// (the report itself was wrong). Upstream documents single-file watches as fragile territory
+/// (an inode watch breaks under rename-replace saves; the recommended robust pattern is
+/// watching a directory), so rather than depend on exact single-file semantics we watch no
+/// file outside `src/` at all. `src/` never contains build output — everything this loop
+/// writes lives at `filter_dir`'s top level, a sibling of `src/`, so watching only `src/`
+/// sidesteps the whole class of bug. A `Cargo.toml` dependency edit needs a restart of
 /// `plecto dev` — a deliberate, documented scope cut, not an oversight.
 fn spawn_watch_loop(
     filter_dir: PathBuf,

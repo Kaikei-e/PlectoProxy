@@ -165,7 +165,13 @@ async fn run() -> anyhow::Result<()> {
     };
     let listen_arg = args.next();
 
-    let control = Arc::new(Control::from_manifest_path(Path::new(&manifest))?);
+    // A load failure at startup is where a newcomer first meets the signature gate — render
+    // the registered PLECTO-E diagnostic (four-part: code/cause/suggestion/docs, ADR 000065
+    // decision 5) alongside the error instead of the bare thiserror message.
+    let control = Arc::new(
+        Control::from_manifest_path(Path::new(&manifest))
+            .map_err(|e| anyhow::anyhow!(plecto_control::diagnosed_message(&e)))?,
+    );
 
     // Bind precedence: the explicit CLI arg (operator override) > the manifest's `[listen] addr`
     // (the static single source, field report §3.2) > the loopback default.

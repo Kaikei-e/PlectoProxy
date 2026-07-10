@@ -617,6 +617,7 @@ mod tests {
     use crate::MemoryBackend;
     use crate::options::DEFAULT_MAX_MEMORY_BYTES;
     use host_clock::Host as ClockHost;
+    use host_config::Host as ConfigHost;
     use host_counter::Host as CounterHost;
     use host_kv::Host as KvHost;
     use host_log::Host as LogHost;
@@ -644,6 +645,30 @@ mod tests {
             #[cfg(feature = "outbound-tcp")]
             crate::outbound_tcp::TcpGuard::deny_all(),
         )
+    }
+
+    #[test]
+    fn config_get_is_a_readonly_passthrough_of_declared_keys() {
+        // host-config (ADR 000066): a declared `[filter.config]` key comes back verbatim, an
+        // undeclared one is None — the host never interprets or defaults anything.
+        let mut s = HostState::new(
+            HostStateInit {
+                config: Arc::new(BTreeMap::from([(
+                    "on_backend_error".to_string(),
+                    "deny".to_string(),
+                )])),
+                ..init_for("cfg\u{1f}")
+            },
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
+        );
+        assert_eq!(
+            ConfigHost::get(&mut s, "on_backend_error".into()),
+            Some("deny".to_string())
+        );
+        assert_eq!(ConfigHost::get(&mut s, "window_secs".into()), None);
     }
 
     #[test]

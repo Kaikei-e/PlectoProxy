@@ -59,7 +59,10 @@ pub(crate) fn run(lang: &str, name: &str, project_root: &Path) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dest);
+            if let Err(cleanup) = std::fs::remove_dir_all(&dest) {
+                tracing::warn!(error = %cleanup, path = %dest.display(),
+                    "could not roll back the partial scaffold");
+            }
             Err(e)
         }
     }
@@ -115,7 +118,10 @@ fn fetch_wit(dest: &Path) -> Result<()> {
         .arg(dest)
         .args(["--format", "wit"])
         .status();
-    let _ = std::fs::remove_file(&registry_config);
+    if let Err(cleanup) = std::fs::remove_file(&registry_config) {
+        tracing::warn!(error = %cleanup, path = %registry_config.display(),
+            "could not remove the temporary wkg registry config");
+    }
     match result {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => bail!(

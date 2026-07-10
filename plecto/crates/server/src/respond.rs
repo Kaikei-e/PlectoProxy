@@ -117,16 +117,18 @@ pub(crate) fn synth_retry_after(
 /// already-synthesised fail-closed response. Only the faults with a registered
 /// `plecto_control::Diagnostic` get this header — most `x-plecto-fault` values don't (the same
 /// selective code-assignment principle rustc's own diagnostics use: reserve a code for the
-/// messages that need more than the message). `diagnostic.code` is one of our own `PLECTO-E`
-/// constants, always valid header-value ASCII, so this stays infallible.
+/// messages that need more than the message). Only the CODE crosses the wire: the cause /
+/// suggestion / docs parts render at the operator-facing surfaces (startup, reload log,
+/// `plecto validate`), not to an arbitrary client. `diagnostic.code` is one of our own
+/// `PLECTO-E` constants (always valid header ASCII), but stay total like the rest of this
+/// module rather than trusting that at a distance.
 pub(crate) fn with_error_code(
     mut resp: Response<ResponseBody>,
     diagnostic: &plecto_control::Diagnostic,
 ) -> Response<ResponseBody> {
-    resp.headers_mut().insert(
-        X_PLECTO_ERROR_CODE,
-        HeaderValue::from_static(diagnostic.code),
-    );
+    let code = HeaderValue::from_str(diagnostic.code)
+        .unwrap_or_else(|_| HeaderValue::from_static("PLECTO-E0000"));
+    resp.headers_mut().insert(X_PLECTO_ERROR_CODE, code);
     resp
 }
 

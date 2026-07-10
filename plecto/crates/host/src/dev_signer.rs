@@ -10,16 +10,41 @@
 //! control/CONTEXT.md "Dev key" for the surrounding vocabulary.
 
 use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
 use sigstore::crypto::signing_key::SigStoreSigner;
 use sigstore::crypto::signing_key::ecdsa::{ECDSAKeys, EllipticCurve};
 use zeroize::Zeroizing;
 
 use crate::TrustPolicy;
+
+/// Typed dev-key errors (bp-rust: a library's public surface stays `thiserror`; `anyhow` is
+/// for binary entry points). The CLI callers absorb this into `anyhow` at their edge.
+#[derive(Debug, thiserror::Error)]
+pub enum DevKeyError {
+    /// A sigstore crypto operation failed (key generation, PEM encode/decode, signing).
+    #[error("{op}: {source}")]
+    Crypto {
+        op: &'static str,
+        #[source]
+        source: sigstore::errors::SigstoreError,
+    },
+    /// A key file could not be created, read, or written.
+    #[error("{op} {}: {source}", path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The public key did not build a `TrustPolicy` — cannot happen for a key this module
+    /// generated, surfaced instead of unwrapped (`TrustPolicy::from_pem_keys` reports a plain
+    /// message, so no source chain to keep).
+    #[error("build trust policy from the dev public key: {0}")]
+    Trust(String),
+}
 
 /// Prefixed onto a persisted dev public-key file, before the PEM block. Plain text ahead of
 /// `-----BEGIN...` is not part of the PEM grammar (parsers skip straight to the marker), so
@@ -39,13 +64,18 @@ impl DevSigner {
     /// Generate a fresh key pair. Returns the ready-to-use signer plus the PKCS8 PEM private
     /// key, so the caller decides whether to persist it (`load_or_create`) or sign once and
     /// drop it (an ephemeral self-signed conformance check, no file ever written).
-    pub fn generate() -> Result<(Self, Zeroizing<String>)> {
-        let keys =
-            ECDSAKeys::new(EllipticCurve::P256).map_err(|e| anyhow!("generate dev key: {e}"))?;
-        let private_key_pem = keys
-            .as_inner()
-            .private_key_to_pem()
-            .map_err(|e| anyhow!("export dev private key: {e}"))?;
+    pub fn generate() -> Result<(Self, Zeroizing<String>), DevKeyError> {
+        let keys = ECDSAKeys::new(EllipticCurve::P256).map_err(|e| DevKeyError::Crypto {
+            op: "generate dev key",
+            source: e,
+        })?;
+        let private_key_pem =
+            keys.as_inner()
+                .private_key_to_pem()
+                .map_err(|e| DevKeyError::Crypto {
+                    op: "export dev private key",
+                    source: e,
+                })?;
         let signer = Self::from_keys(keys)?;
         Ok((signer, private_key_pem))
     }
@@ -53,19 +83,26 @@ impl DevSigner {
     /// Rebuild from a previously persisted PKCS8 PEM private key. The elliptic curve is
     /// detected from the key's own OID (sigstore-rs), so this works for any dev key this
     /// module has ever generated.
-    pub fn from_private_key_pem(pem: &[u8]) -> Result<Self> {
-        let keys = ECDSAKeys::from_pem(pem).map_err(|e| anyhow!("load dev key: {e}"))?;
+    pub fn from_private_key_pem(pem: &[u8]) -> Result<Self, DevKeyError> {
+        let keys = ECDSAKeys::from_pem(pem).map_err(|e| DevKeyError::Crypto {
+            op: "load dev key",
+            source: e,
+        })?;
         Self::from_keys(keys)
     }
 
-    fn from_keys(keys: ECDSAKeys) -> Result<Self> {
-        let public_key_pem = keys
-            .as_inner()
-            .public_key_to_pem()
-            .map_err(|e| anyhow!("export dev public key: {e}"))?;
-        let signer = keys
-            .to_sigstore_signer()
-            .map_err(|e| anyhow!("build dev signer: {e}"))?;
+    fn from_keys(keys: ECDSAKeys) -> Result<Self, DevKeyError> {
+        let public_key_pem =
+            keys.as_inner()
+                .public_key_to_pem()
+                .map_err(|e| DevKeyError::Crypto {
+                    op: "export dev public key",
+                    source: e,
+                })?;
+        let signer = keys.to_sigstore_signer().map_err(|e| DevKeyError::Crypto {
+            op: "build dev signer",
+            source: e,
+        })?;
         Ok(Self {
             signer,
             public_key_pem,
@@ -77,9 +114,14 @@ impl DevSigner {
     /// written alongside at `<private_key_path>.pub`, prefixed with [`DEV_KEY_MARKER`].
     /// Does NOT touch `.gitignore` — that is the CLI caller's job (it knows the project root;
     /// this function only knows the one key path it was given).
-    pub fn load_or_create(private_key_path: &Path) -> Result<Self> {
+    pub fn load_or_create(private_key_path: &Path) -> Result<Self, DevKeyError> {
         match fs::read(private_key_path) {
-            Ok(pem) => Self::from_private_key_pem(&pem),
+            Ok(pem) => {
+                // The read buffer holds the private key — zeroize it on drop, the same
+                // discipline `generate` applies to the PEM it returns.
+                let pem = Zeroizing::new(pem);
+                Self::from_private_key_pem(&pem)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let (signer, private_key_pem) = Self::generate()?;
                 write_dev_key_files(
@@ -89,15 +131,20 @@ impl DevSigner {
                 )?;
                 Ok(signer)
             }
-            Err(e) => {
-                Err(e).with_context(|| format!("read dev key {}", private_key_path.display()))
-            }
+            Err(e) => Err(DevKeyError::Io {
+                op: "read dev key",
+                path: private_key_path.to_path_buf(),
+                source: e,
+            }),
         }
     }
 
     /// Raw DER ECDSA signature over `msg` (the shape `SignedArtifact` expects).
-    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
-        self.signer.sign(msg).map_err(|e| anyhow!("sign: {e}"))
+    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, DevKeyError> {
+        self.signer.sign(msg).map_err(|e| DevKeyError::Crypto {
+            op: "sign",
+            source: e,
+        })
     }
 
     pub fn public_key_pem(&self) -> &str {
@@ -105,8 +152,9 @@ impl DevSigner {
     }
 
     /// A `TrustPolicy` that trusts exactly this signer's key.
-    pub fn trust_policy(&self) -> Result<TrustPolicy> {
+    pub fn trust_policy(&self) -> Result<TrustPolicy, DevKeyError> {
         TrustPolicy::from_pem_keys([self.public_key_pem.as_bytes()])
+            .map_err(|e| DevKeyError::Trust(e.to_string()))
     }
 }
 
@@ -123,26 +171,33 @@ fn write_dev_key_files(
     private_key_path: &Path,
     private_key_pem: &[u8],
     public_key_pem: &str,
-) -> Result<()> {
+) -> Result<(), DevKeyError> {
+    let io_err = |op: &'static str, path: &Path| {
+        let path = path.to_path_buf();
+        move |source| DevKeyError::Io { op, path, source }
+    };
     if let Some(parent) = private_key_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(io_err("create", parent))?;
     }
-    fs::write(private_key_path, private_key_pem)
-        .with_context(|| format!("write dev key {}", private_key_path.display()))?;
-    let mut perms = fs::metadata(private_key_path)
-        .with_context(|| format!("stat dev key {}", private_key_path.display()))?
-        .permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(private_key_path, perms)
-        .with_context(|| format!("chmod 0600 {}", private_key_path.display()))?;
+    // 0600 from the very first byte: creating with the default umask and chmodding afterwards
+    // would leave a window in which another local user can read the private key. `create_new`
+    // also refuses to clobber a key that appeared concurrently.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(private_key_path)
+        .map_err(io_err("create dev key", private_key_path))?
+        .write_all(private_key_pem)
+        .map_err(io_err("write dev key", private_key_path))?;
 
     let public_key_path = public_key_path_for(private_key_path);
     let marked = format!("{DEV_KEY_MARKER}\n{public_key_pem}");
     fs::write(&public_key_path, marked)
-        .with_context(|| format!("write dev public key {}", public_key_path.display()))?;
+        .map_err(io_err("write dev public key", &public_key_path))?;
     Ok(())
 }
 
@@ -163,6 +218,8 @@ pub fn bound_sbom(component: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]

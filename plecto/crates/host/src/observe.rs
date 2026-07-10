@@ -157,6 +157,9 @@ pub enum SpanOutcome {
     Trap,
     InstantiateError,
     Unavailable,
+    /// The guest returned cleanly but its output failed header validation (ADR 000071) —
+    /// distinct from `Trap` so a misbehaving-but-alive filter is tellable from a crashing one.
+    InvalidOutput,
 }
 
 impl SpanOutcome {
@@ -170,6 +173,7 @@ impl SpanOutcome {
             SpanOutcome::Trap => "trap",
             SpanOutcome::InstantiateError => "instantiate-error",
             SpanOutcome::Unavailable => "unavailable",
+            SpanOutcome::InvalidOutput => "invalid-output",
         }
     }
 
@@ -180,7 +184,8 @@ impl SpanOutcome {
             SpanOutcome::Deadline
             | SpanOutcome::Trap
             | SpanOutcome::InstantiateError
-            | SpanOutcome::Unavailable => Status::Error {
+            | SpanOutcome::Unavailable
+            | SpanOutcome::InvalidOutput => Status::Error {
                 description: self.as_str().into(),
             },
         }
@@ -213,6 +218,7 @@ impl From<&RunError> for SpanOutcome {
             RunError::Trap(_) => SpanOutcome::Trap,
             RunError::Instantiate(_) => SpanOutcome::InstantiateError,
             RunError::Unavailable => SpanOutcome::Unavailable,
+            RunError::InvalidOutput => SpanOutcome::InvalidOutput,
         }
     }
 }
@@ -432,7 +438,8 @@ impl TelemetrySink for MetricsSink {
             SpanOutcome::Deadline
             | SpanOutcome::Trap
             | SpanOutcome::InstantiateError
-            | SpanOutcome::Unavailable => {
+            | SpanOutcome::Unavailable
+            | SpanOutcome::InvalidOutput => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
             }
             SpanOutcome::Continue | SpanOutcome::Modified => {}

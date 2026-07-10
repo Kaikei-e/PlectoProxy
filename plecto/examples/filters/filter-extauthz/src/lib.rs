@@ -29,7 +29,7 @@ fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 fn forbid(reason: &str) -> RequestDecision {
@@ -37,7 +37,7 @@ fn forbid(reason: &str) -> RequestDecision {
         status: 403,
         headers: vec![Header {
             name: "content-type".to_string(),
-            value: "text/plain".to_string(),
+            value: b"text/plain".to_vec(),
         }],
         body: format!("ext_authz denied: {reason}").into_bytes(),
     })

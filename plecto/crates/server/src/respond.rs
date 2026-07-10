@@ -8,7 +8,7 @@ use plecto_control::{Header, HttpResponse};
 
 use crate::ResponseBody;
 use crate::body::full;
-use crate::headers::{copy_headers, copy_headers_direct, copy_headers_preserving};
+use crate::headers::{copy_headers, copy_headers_direct};
 
 const X_PLECTO_FAULT: HeaderName = HeaderName::from_static("x-plecto-fault");
 const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
@@ -49,19 +49,16 @@ pub(crate) fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
 }
 
 /// A forwarded response: the chain-edited status + headers, with the upstream body streamed.
-/// `original` is the upstream's inbound header map, so headers a response filter left untouched
-/// stream back to the client byte-for-byte (P3#6), not via a lossy `string` round-trip. `body` is
-/// already boxed into `ResponseBody` — both the real `HyperUpstreamClient` and a test double box
-/// their response bodies identically, so this has no transport-specific type to accept.
+/// `body` is already boxed into `ResponseBody` — both the real `HyperUpstreamClient` and a test
+/// double box their response bodies identically, so this has no transport-specific type to accept.
 pub(crate) fn stream_response(
     status: u16,
     headers: &[Header],
-    original: &hyper::HeaderMap,
     body: ResponseBody,
 ) -> Response<ResponseBody> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
-    copy_headers_preserving(builder.headers_mut(), headers, original);
+    copy_headers(builder.headers_mut(), headers);
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(full(b"response build error".to_vec())))
@@ -139,7 +136,7 @@ mod tests {
     fn header(name: &str, value: &str) -> Header {
         Header {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

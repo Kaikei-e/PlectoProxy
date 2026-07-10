@@ -64,7 +64,7 @@ fn request(authz_url: &str) -> HttpRequest {
         scheme: "https".to_string(),
         headers: vec![Header {
             name: "x-authz-url".to_string(),
-            value: authz_url.to_string(),
+            value: authz_url.as_bytes().to_vec(),
         }],
     }
 }

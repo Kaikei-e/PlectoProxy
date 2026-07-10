@@ -505,12 +505,7 @@ async fn proxy_core_inner(
     // non-empty body means "use the synthetic response, drop the upstream stream"; an empty body
     // means "send the edited status + headers and stream the upstream body through".
     if edited.body.is_empty() {
-        Ok(stream_response(
-            edited.status,
-            &edited.headers,
-            &uparts.headers,
-            ubody,
-        ))
+        Ok(stream_response(edited.status, &edited.headers, ubody))
     } else {
         Ok(http_response(edited))
     }

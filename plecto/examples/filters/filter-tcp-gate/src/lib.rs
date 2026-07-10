@@ -37,7 +37,7 @@ fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 fn short_circuit(status: u16, reason: &str) -> RequestDecision {
@@ -45,7 +45,7 @@ fn short_circuit(status: u16, reason: &str) -> RequestDecision {
         status,
         headers: vec![Header {
             name: "content-type".to_string(),
-            value: "text/plain".to_string(),
+            value: b"text/plain".to_vec(),
         }],
         body: format!("tcp-gate: {reason}").into_bytes(),
     })

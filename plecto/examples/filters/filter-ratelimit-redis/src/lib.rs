@@ -127,18 +127,18 @@ fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 fn short_circuit(status: u16, reason: &str, retry_after_secs: Option<u64>) -> RequestDecision {
     let mut headers = vec![Header {
         name: "content-type".to_string(),
-        value: "application/json".to_string(),
+        value: b"application/json".to_vec(),
     }];
     if let Some(secs) = retry_after_secs {
         headers.push(Header {
             name: "retry-after".to_string(),
-            value: secs.to_string(),
+            value: secs.to_string().into_bytes(),
         });
     }
     RequestDecision::ShortCircuit(HttpResponse {

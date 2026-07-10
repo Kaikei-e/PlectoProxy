@@ -132,15 +132,15 @@ pub(crate) fn set_forwarded(headers: &mut Vec<Header>, peer: IpAddr, scheme: &st
     };
     headers.push(Header {
         name: "x-forwarded-for".to_string(),
-        value: client_ip.clone(),
+        value: client_ip.clone().into_bytes(),
     });
     headers.push(Header {
         name: "x-real-ip".to_string(),
-        value: client_ip,
+        value: client_ip.into_bytes(),
     });
     headers.push(Header {
         name: "x-forwarded-proto".to_string(),
-        value: scheme.to_string(),
+        value: scheme.as_bytes().to_vec(),
     });
 }
 
@@ -178,11 +178,11 @@ pub(crate) fn to_http_request(parts: &hyper::http::request::Parts, scheme: &str)
     }
 }
 
-/// Convert a hyper `HeaderMap` to the contract's `Vec<Header>`, lossily decoding values (HTTP
-/// permits non-UTF-8 bytes; the contract is `string`). Both the static hop-by-hop set AND any
-/// header dynamically named by `Connection` are dropped (RFC 9110 §7.6.1) — this is the single
-/// ingress point for both the request (from `parts`) and the response (from the upstream parts),
-/// so a connection-specific header can never be carried into the contract and forwarded.
+/// Convert a hyper `HeaderMap` to the contract's `Vec<Header>` (byte-preserving). Both the static
+/// hop-by-hop set AND any header dynamically named by `Connection` are dropped (RFC 9110 §7.6.1) —
+/// this is the single ingress point for both the request (from `parts`) and the response (from the
+/// upstream parts), so a connection-specific header can never be carried into the contract and
+/// forwarded.
 pub(crate) fn headers_to_vec(map: &hyper::HeaderMap) -> Vec<Header> {
     let named = connection_named(map);
     map.iter()
@@ -193,7 +193,7 @@ pub(crate) fn headers_to_vec(map: &hyper::HeaderMap) -> Vec<Header> {
         })
         .map(|(name, value)| Header {
             name: name.as_str().to_string(),
-            value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            value: value.as_bytes().to_vec(),
         })
         .collect()
 }
@@ -208,64 +208,17 @@ pub(crate) fn copy_headers(dst: Option<&mut hyper::HeaderMap>, headers: &[Header
         }
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(h.name.as_bytes()),
-            HeaderValue::from_str(&h.value),
+            HeaderValue::from_bytes(&h.value),
         ) {
             dst.append(name, value);
         }
     }
 }
 
-/// Like [`copy_headers`], but restores byte-equivalence for headers a filter never touched (P3#6).
-/// The contract carries each header value as a lossy-UTF-8 `string`, so a value holding non-UTF-8
-/// bytes (HTTP permits them) reaches the chain `U+FFFD`-mangled and would be re-encoded from that
-/// mangled form — or dropped entirely by `HeaderValue::from_str`. For every contract header whose
-/// `(name, value)` still matches an `original` inbound header's lossy projection (i.e. the filter
-/// passed it through unchanged), the ORIGINAL bytes are forwarded verbatim; a value a filter set or
-/// changed no longer matches and is encoded from the contract string exactly as `copy_headers` does.
-/// This keeps pass-through headers byte-exact WITHOUT widening the WIT contract — the typed
-/// `wasi:http` byte distinction is the eventual M3-convergence form (ADR 000020); this is the
-/// host-side interim that needs no contract churn. It can only forward bytes the peer actually sent
-/// under that name, and never resurrects a header the chain removed or replaced (we iterate the
-/// chain's output), so it carries no smuggling/spoofing regression over `copy_headers`.
-pub(crate) fn copy_headers_preserving(
-    dst: Option<&mut hyper::HeaderMap>,
-    headers: &[Header],
-    original: &hyper::HeaderMap,
-) {
-    let Some(dst) = dst else { return };
-    for h in headers {
-        if is_hop_by_hop(&h.name) {
-            continue;
-        }
-        let Ok(name) = HeaderName::from_bytes(h.name.as_bytes()) else {
-            continue;
-        };
-        // Prefer the original bytes when the chain left this header untouched: find an inbound value
-        // under the same name whose lossy decoding equals the contract string. A match means the
-        // filter passed it through, so forward the bytes verbatim; otherwise the filter set or
-        // changed it and we encode from the contract string (dropping a value hyper rejects).
-        let preserved = original
-            .get_all(&name)
-            .iter()
-            .find(|v| String::from_utf8_lossy(v.as_bytes()) == h.value)
-            .cloned();
-        match preserved {
-            Some(value) => {
-                dst.append(name, value);
-            }
-            None => {
-                if let Ok(value) = HeaderValue::from_str(&h.value) {
-                    dst.append(name, value);
-                }
-            }
-        }
-    }
-}
-
 /// Copy a hyper `HeaderMap` into another directly — the filterless fast path. Drops the static
 /// hop-by-hop set AND any header dynamically named by `Connection` (RFC 9110 §7.6.1), exactly like
-/// `headers_to_vec` + `copy_headers_preserving` compose, but without the contract projection: the
-/// original bytes forward verbatim (`HeaderName`/`HeaderValue` clones are refcounted, no copy).
+/// `headers_to_vec` + `copy_headers` compose, but without the contract projection: the original
+/// bytes forward verbatim (`HeaderName`/`HeaderValue` clones are refcounted, no copy).
 pub(crate) fn copy_headers_direct(dst: Option<&mut hyper::HeaderMap>, src: &hyper::HeaderMap) {
     let Some(dst) = dst else { return };
     let named = connection_named(src);
@@ -323,7 +276,7 @@ mod tests {
     fn header(name: &str, value: &str) -> Header {
         Header {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -435,73 +388,23 @@ mod tests {
     }
 
     #[test]
-    fn copy_headers_preserving_keeps_untouched_non_utf8_bytes() {
-        // P3#6: a header value with non-UTF-8 bytes reaches the chain as a lossy `string`. When the
-        // filter passes it through unchanged, the upstream must still receive the ORIGINAL bytes —
-        // not the `U+FFFD`-mangled re-encoding, and not a drop (which is what `from_str` would do).
+    fn copy_headers_forwards_non_utf8_bytes() {
+        // P3#6: the contract carries header values as bytes, so pass-through headers stay
+        // byte-exact on egress — not re-encoded from a lossy string and not dropped.
         let raw: &[u8] = &[0xC3, 0x28]; // invalid UTF-8
-        let mut original = hyper::HeaderMap::new();
-        original.insert("x-blob", HeaderValue::from_bytes(raw).unwrap());
-
-        // the chain's view of that header == the lossy projection `headers_to_vec` produced.
-        let contract = vec![header("x-blob", &String::from_utf8_lossy(raw))];
+        let contract = vec![Header {
+            name: "x-blob".to_string(),
+            value: raw.to_vec(),
+        }];
 
         let mut dst = hyper::HeaderMap::new();
-        copy_headers_preserving(Some(&mut dst), &contract, &original);
+        copy_headers(Some(&mut dst), &contract);
 
         assert_eq!(
             dst.get("x-blob").map(|v| v.as_bytes()),
             Some(raw),
-            "an untouched header forwards byte-for-byte, not via the lossy string"
+            "a byte-valued header forwards byte-for-byte"
         );
-    }
-
-    #[test]
-    fn copy_headers_preserving_uses_the_filter_value_when_changed() {
-        // A header the filter REWROTE no longer matches the original's lossy projection, so the
-        // chain's new value must win — preservation must never shadow an intentional edit.
-        let mut original = hyper::HeaderMap::new();
-        original.insert("x-user", HeaderValue::from_static("client-claim"));
-        let contract = vec![header("x-user", "real-user")];
-
-        let mut dst = hyper::HeaderMap::new();
-        copy_headers_preserving(Some(&mut dst), &contract, &original);
-
-        assert_eq!(
-            dst.get("x-user").and_then(|v| v.to_str().ok()),
-            Some("real-user"),
-            "a rewritten header forwards the chain's value, not the original"
-        );
-    }
-
-    #[test]
-    fn copy_headers_preserving_does_not_resurrect_a_removed_header() {
-        // A header the chain dropped is absent from its output, so it must not reappear from
-        // `original` — the reconciliation iterates the chain's output, never the original map.
-        let mut original = hyper::HeaderMap::new();
-        original.insert("x-secret", HeaderValue::from_static("leak"));
-        let contract: Vec<Header> = vec![]; // filter removed it
-
-        let mut dst = hyper::HeaderMap::new();
-        copy_headers_preserving(Some(&mut dst), &contract, &original);
-
-        assert!(
-            !dst.contains_key("x-secret"),
-            "a removed header is never resurrected from the original map"
-        );
-    }
-
-    #[test]
-    fn copy_headers_preserving_still_skips_hop_by_hop() {
-        // The smuggling defence in `copy_headers` (CWE-444) must hold on this path too.
-        let original = hyper::HeaderMap::new();
-        let contract = vec![header("connection", "keep-alive"), header("x-keep", "1")];
-
-        let mut dst = hyper::HeaderMap::new();
-        copy_headers_preserving(Some(&mut dst), &contract, &original);
-
-        assert!(!dst.contains_key("connection"), "hop-by-hop is dropped");
-        assert!(dst.contains_key("x-keep"), "an end-to-end header survives");
     }
 
     #[test]
@@ -523,7 +426,7 @@ mod tests {
         let xff: Vec<&str> = headers
             .iter()
             .filter(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
-            .map(|h| h.value.as_str())
+            .map(|h| std::str::from_utf8(&h.value).expect("utf-8"))
             .collect();
         assert_eq!(
             xff,
@@ -533,7 +436,7 @@ mod tests {
         let xrealip: Vec<&str> = headers
             .iter()
             .filter(|h| h.name.eq_ignore_ascii_case("x-real-ip"))
-            .map(|h| h.value.as_str())
+            .map(|h| std::str::from_utf8(&h.value).expect("utf-8"))
             .collect();
         assert_eq!(
             xrealip,
@@ -556,7 +459,7 @@ mod tests {
             headers
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-proto"))
-                .map(|h| h.value.as_str()),
+                .and_then(|h| std::str::from_utf8(&h.value).ok()),
             Some("https"),
             "X-Forwarded-Proto reflects the connection scheme"
         );
@@ -578,7 +481,7 @@ mod tests {
                 headers
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case(name))
-                    .map(|h| h.value.as_str()),
+                    .and_then(|h| std::str::from_utf8(&h.value).ok()),
                 Some("203.0.113.5"),
                 "an IPv4-mapped peer normalises to dotted IPv4 in {name}"
             );
@@ -591,7 +494,7 @@ mod tests {
             headers
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
-                .map(|h| h.value.as_str()),
+                .and_then(|h| std::str::from_utf8(&h.value).ok()),
             Some("2001:db8::1"),
             "a real IPv6 peer is kept as-is"
         );

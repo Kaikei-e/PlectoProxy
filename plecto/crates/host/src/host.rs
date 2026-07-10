@@ -8,7 +8,9 @@ use anyhow::Result;
 use wasmtime::Engine;
 use wasmtime::component::{Component, HasSelf, Linker};
 
-use crate::bindings::{Filter, FilterPre};
+use crate::contract::{
+    ContractVersion, FilterPreV01, FilterPreV02, FilterV01, FilterV02, detect_contract_version,
+};
 use crate::engine::{Allocation, EpochTicker, TRUSTED_POOL_MAX, build_engine};
 use crate::errors::{LoadError, sbom_binds_component};
 use crate::filter::LoadedFilter;
@@ -19,7 +21,7 @@ use crate::outbound_http;
 use crate::outbound_tcp;
 use crate::pool::{LoadedInner, TrustedPool};
 use crate::quota::KvQuota;
-use crate::runtime::{FilterRuntime, WasmtimeRuntime};
+use crate::runtime::{FilterPreBinding, FilterRuntime, WasmtimeRuntime};
 #[cfg(any(
     feature = "outbound-http",
     feature = "outbound-tcp",
@@ -186,10 +188,38 @@ impl Host {
             Isolation::Untrusted => &self.untrusted_engine,
         };
         let component = Component::from_binary(engine, component_bytes)?;
+        let version = detect_contract_version(&component, engine);
+        if version == ContractVersion::V01 {
+            // Once per process, not per load (ADR 000071): the operator needs the nudge, not a
+            // log line per hot-reload of the same fleet of legacy filters.
+            static V01_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !V01_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    filter = %filter_id,
+                    "plecto:filter@0.1.0 is deprecated; rebuild filters for 0.2.0 (byte-valued headers)"
+                );
+            }
+        }
         let mut linker = Linker::<HostState>::new(engine);
-        // deny-by-default: lend ONLY the plecto host-API (every basic capability in one call).
-        // No WASI is added — unless this filter has an outbound policy (below).
-        Filter::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)?;
+        // deny-by-default: lend ONLY the plecto host-API (every basic capability in one call),
+        // at the interface version this component targets — 0.1 and 0.2 instance names are
+        // distinct semver tracks and never cross-resolve. No WASI is added — unless this filter
+        // has an outbound policy (below).
+        match version {
+            ContractVersion::V02 => {
+                FilterV02::add_to_linker::<_, HasSelf<HostState>>(
+                    &mut linker,
+                    |s: &mut HostState| s,
+                )?;
+            }
+            ContractVersion::V01 => {
+                FilterV01::add_to_linker::<_, HasSelf<HostState>>(
+                    &mut linker,
+                    |s: &mut HostState| s,
+                )?;
+            }
+        }
 
         // Outbound capabilities (ADR 000036 HTTP / ADR 000060 TCP): only when the operator lent
         // this filter an allowlist do we add the MINIMAL WASI base (io / clocks / random / stdio +
@@ -285,7 +315,15 @@ impl Host {
             )?;
         }
 
-        let pre = FilterPre::new(linker.instantiate_pre(&component)?)?;
+        let pre = match version {
+            ContractVersion::V02 => {
+                FilterPreBinding::V02(FilterPreV02::new(linker.instantiate_pre(&component)?)?)
+            }
+            ContractVersion::V01 => {
+                FilterPreBinding::V01(FilterPreV01::new(linker.instantiate_pre(&component)?)?)
+            }
+        };
+
         // Zero-copy body bypass (ADR 000038 / ADR 000005 mechanism 2): a filter that inspects or
         // transforms the request body ALSO exports `on-request-body` (world `filter-body`). Detect
         // that export ONCE here; its absence tells the fast path the body never enters guest memory,

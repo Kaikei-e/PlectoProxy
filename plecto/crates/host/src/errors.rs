@@ -29,13 +29,29 @@ pub enum RunError {
     /// re-init'ing every request (circuit-breaker, review f000003 #5). Fail-closed mapping: 503.
     #[error("filter is in trap-cooldown (circuit open)")]
     Unavailable,
+    /// The guest returned cleanly but its output violates the contract's byte-level header rules
+    /// (CRLF / CTL in a value, a non-tchar name, oversize — ADR 000071). Distinct from `Trap` so
+    /// operators can tell a misbehaving-but-alive filter from a crashing one; the fail-closed
+    /// mapping is the same 502.
+    #[error("filter returned an invalid header (malformed name/value)")]
+    InvalidOutput,
 }
 
+/// Marker the runtime wraps in a `wasmtime::Error` when guest output fails header validation, so
+/// [`RunError::from_call`] can classify it as [`RunError::InvalidOutput`] instead of a trap.
+#[derive(Debug, thiserror::Error)]
+#[error("filter returned an invalid header (malformed name/value); failing closed")]
+pub(crate) struct InvalidGuestOutput;
+
 impl RunError {
-    /// Classify the error from a guest call: an epoch interrupt is a `Deadline`, anything
-    /// else is a `Trap`. (`wasmtime 45` returns its own `wasmtime::Error`, distinct from
-    /// `anyhow::Error`; we convert into `anyhow::Error` for storage.)
+    /// Classify the error from a guest call: an epoch interrupt is a `Deadline`, a validation
+    /// marker is `InvalidOutput`, anything else is a `Trap`. (`wasmtime 45` returns its own
+    /// `wasmtime::Error`, distinct from `anyhow::Error`; we convert into `anyhow::Error` for
+    /// storage.)
     pub(crate) fn from_call(e: wasmtime::Error) -> Self {
+        if e.downcast_ref::<InvalidGuestOutput>().is_some() {
+            return RunError::InvalidOutput;
+        }
         match e.downcast_ref::<wasmtime::Trap>() {
             Some(wasmtime::Trap::Interrupt) => RunError::Deadline,
             _ => RunError::Trap(anyhow::Error::from(e)),
@@ -50,12 +66,13 @@ impl RunError {
             RunError::Trap(_) => (502, "trap", "filter trapped"),
             RunError::Instantiate(_) => (502, "instantiate", "filter instantiation failed"),
             RunError::Unavailable => (503, "unavailable", "filter temporarily unavailable"),
+            RunError::InvalidOutput => (502, "invalid-output", "filter returned invalid output"),
         };
         HttpResponse {
             status,
             headers: vec![Header {
                 name: "x-plecto-fault".to_string(),
-                value: fault.to_string(),
+                value: fault.to_string().into_bytes(),
             }],
             body: msg.as_bytes().to_vec(),
         }
@@ -141,7 +158,7 @@ mod tests {
             deadline
                 .headers
                 .iter()
-                .any(|h| h.name == "x-plecto-fault" && h.value == "deadline")
+                .any(|h| h.name == "x-plecto-fault" && h.value.as_slice() == b"deadline")
         );
 
         let trap = RunError::Trap(anyhow::anyhow!("boom")).fail_closed_response();
@@ -149,7 +166,23 @@ mod tests {
         assert!(
             trap.headers
                 .iter()
-                .any(|h| h.name == "x-plecto-fault" && h.value == "trap")
+                .any(|h| h.name == "x-plecto-fault" && h.value.as_slice() == b"trap")
+        );
+    }
+
+    #[test]
+    fn invalid_guest_output_is_classified_apart_from_a_trap() {
+        // A guest that returns cleanly but violates the header rules (ADR 000071) must be
+        // observable as `invalid-output`, not conflated with a crash.
+        let e = wasmtime::Error::new(InvalidGuestOutput);
+        assert!(matches!(RunError::from_call(e), RunError::InvalidOutput));
+
+        let resp = RunError::InvalidOutput.fail_closed_response();
+        assert_eq!(resp.status, 502);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|h| h.name == "x-plecto-fault" && h.value.as_slice() == b"invalid-output")
         );
     }
 }

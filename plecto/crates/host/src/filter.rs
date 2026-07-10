@@ -70,9 +70,7 @@ impl LoadedFilter {
 
     fn run_on_request(&self, req: &HttpRequest) -> HookResult<RequestDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
-            self.inner
-                .runtime
-                .drive_call(inst.filter.call_on_request(&mut inst.store, req))
+            self.inner.runtime.call_on_request(inst, req)
         })
     }
 
@@ -180,9 +178,7 @@ impl LoadedFilter {
 
     fn run_on_response(&self, resp: &HttpResponse) -> HookResult<ResponseDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
-            self.inner
-                .runtime
-                .drive_call(inst.filter.call_on_response(&mut inst.store, resp))
+            self.inner.runtime.call_on_response(inst, resp)
         })
     }
 }

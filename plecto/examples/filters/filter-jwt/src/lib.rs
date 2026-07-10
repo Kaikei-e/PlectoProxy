@@ -125,7 +125,7 @@ fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 fn bearer_token(req: &HttpRequest) -> Option<&str> {
@@ -143,11 +143,11 @@ fn unauthorized_missing(realm: &str) -> RequestDecision {
         headers: vec![
             Header {
                 name: "www-authenticate".to_string(),
-                value: format!("Bearer realm=\"{realm}\""),
+                value: format!("Bearer realm=\"{realm}\"").into_bytes(),
             },
             Header {
                 name: "content-type".to_string(),
-                value: "application/json".to_string(),
+                value: b"application/json".to_vec(),
             },
         ],
         body: br#"{"error":"missing_token"}"#.to_vec(),
@@ -169,11 +169,11 @@ fn unauthorized_invalid(realm: &str) -> RequestDecision {
         headers: vec![
             Header {
                 name: "www-authenticate".to_string(),
-                value: www,
+                value: www.into_bytes(),
             },
             Header {
                 name: "content-type".to_string(),
-                value: "application/json".to_string(),
+                value: b"application/json".to_vec(),
             },
         ],
         body: serde_json::json!({
@@ -543,11 +543,11 @@ impl Guest for FilterJwt {
                     set_headers: vec![
                         Header {
                             name: "x-authenticated-user".to_string(),
-                            value: sub,
+                            value: sub.into_bytes(),
                         },
                         Header {
                             name: "x-jwt-issuer".to_string(),
-                            value: iss,
+                            value: iss.into_bytes(),
                         },
                     ],
                     remove_headers: vec![],

@@ -87,7 +87,7 @@ fn request(headers: &[(&str, &str)]) -> HttpRequest {
             .iter()
             .map(|(n, v)| Header {
                 name: (*n).to_string(),
-                value: (*v).to_string(),
+                value: v.as_bytes().to_vec(),
             })
             .collect(),
     }
@@ -145,7 +145,7 @@ fn every_language_short_circuits_the_block_header() {
                 assert!(
                     resp.headers
                         .iter()
-                        .any(|h| h.name == "x-plecto" && h.value == "blocked"),
+                        .any(|h| h.name == "x-plecto" && h.value.as_slice() == b"blocked"),
                     "{name}: short-circuit must carry the filter's header"
                 );
             }
@@ -164,7 +164,7 @@ fn every_language_returns_a_typed_request_edit() {
                 assert!(
                     edit.set_headers
                         .iter()
-                        .any(|h| h.name == "x-plecto-added" && h.value == "1"),
+                        .any(|h| h.name == "x-plecto-added" && h.value.as_slice() == b"1"),
                     "{name}: the edit must add x-plecto-added: 1"
                 );
                 assert!(edit.remove_headers.is_empty());
@@ -259,7 +259,7 @@ fn every_language_edits_the_response_only_when_asked() {
             status: 200,
             headers: vec![Header {
                 name: "x-plecto-respedit".to_string(),
-                value: "1".to_string(),
+                value: b"1".to_vec(),
             }],
             body: vec![],
         };
@@ -269,7 +269,7 @@ fn every_language_edits_the_response_only_when_asked() {
                 assert!(
                     edit.set_headers
                         .iter()
-                        .any(|h| h.name == "x-plecto-respadded" && h.value == "1"),
+                        .any(|h| h.name == "x-plecto-respadded" && h.value.as_slice() == b"1"),
                     "{name}: the edit must add x-plecto-respadded: 1"
                 );
                 assert!(edit.set_status.is_none());

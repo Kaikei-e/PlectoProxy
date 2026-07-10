@@ -1,13 +1,7 @@
-//! E2E (tdd-workflow Phase 0) for **header byte-equivalence pass-through** (P3#6). The filter
-//! contract carries header values as a lossy-UTF-8 `string`, so before this fix a value holding
-//! non-UTF-8 bytes was re-encoded from its `U+FFFD`-mangled form (or dropped) on the way to the
-//! upstream — even for a route whose chain never touched it. The contract round-trip happens for
-//! EVERY proxied request (the upstream request is rebuilt from the chain's header view), so a
-//! filterless route is enough to exercise it; the precise filter-touched / removed / replaced
-//! semantics are covered by the `copy_headers_preserving` unit tests.
-//!
-//! The fake upstream reflects the inbound `x-blob` header bytes into its response BODY, so what the
-//! upstream actually received is observable byte-for-byte from the client side.
+//! E2E (tdd-workflow Phase 0) for **header byte-equivalence** (`plecto:filter@0.2.0`, ADR 000071).
+//! The contract carries header values as `list<u8>`, so non-UTF-8 bytes survive the filter boundary
+//! on `continue`. A filterless route exercises the fast-path projection; a filter-hello route exercises
+//! the WASM boundary. The fake upstream reflects `x-blob` into its response body.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -24,8 +18,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
-use plecto_control::{Control, Host, Manifest, MemoryStore};
-use plecto_host::test_support::TestSigner;
+use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
+use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
 use plecto_server::serve;
 
 /// Reflects the inbound `x-blob` header's RAW bytes into the response body (so the test sees exactly
@@ -93,6 +87,51 @@ path_prefix = "/api"
     Arc::new(Control::load(host, &manifest, Box::new(MemoryStore::new())).unwrap())
 }
 
+/// Same as [`control_for`] but routes through signed filter-hello (trusted) before upstream.
+fn control_with_filter(upstream_addr: SocketAddr) -> Arc<Control> {
+    let component = filter_hello_component();
+    let signer = TestSigner::new().unwrap();
+    let component_signature = signer.sign(&component).unwrap();
+    let sbom = bound_sbom(&component);
+    let sbom_signature = signer.sign(&sbom).unwrap();
+    let mut store = MemoryStore::new();
+    let digest = store.insert(
+        "fh",
+        ResolvedArtifact {
+            component,
+            component_signature,
+            sbom,
+            sbom_signature,
+        },
+    );
+    let toml = format!(
+        r#"
+[[filter]]
+id = "fh"
+source = "fh"
+digest = "{digest}"
+isolation = "trusted"
+
+[[upstream]]
+name = "backend"
+addresses = ["{upstream_addr}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+filters = ["fh"]
+upstream = "backend"
+strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    Arc::new(Control::load(host, &manifest, Box::new(store)).unwrap())
+}
+
 fn client() -> Client<HttpConnector, Empty<Bytes>> {
     Client::builder(TokioExecutor::new()).build_http()
 }
@@ -140,8 +179,8 @@ async fn non_utf8_header_passes_through_byte_for_byte() {
     let client = client();
     wait_ready(&client, proxy).await;
 
-    // An `x-blob` value that is NOT valid UTF-8 (a truncated 2-byte sequence). The lossy `string`
-    // the contract would carry is `U+FFFD '('` = bytes EF BF BD 28 — the upstream must NOT see that.
+    // An `x-blob` value that is NOT valid UTF-8 (a truncated 2-byte sequence). The contract
+    // carries the original bytes, so the upstream must see them verbatim.
     let raw: &[u8] = &[0xC3, 0x28];
     let (status, seen) = get_blob(&client, proxy, "/api/x", Some(raw)).await;
 
@@ -149,7 +188,27 @@ async fn non_utf8_header_passes_through_byte_for_byte() {
     assert_eq!(
         seen.as_ref(),
         raw,
-        "the upstream received the original header bytes, not the U+FFFD re-encoding"
+        "the upstream received the original header bytes, not a re-encoding"
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_header_passes_through_filter_chain_byte_for_byte() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_with_filter(upstream)).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    // filter-hello (a 0.2 guest) sees the raw bytes and `continue`s by default — the native
+    // bytes must survive the whole contract round-trip to the upstream (ADR 000071).
+    let raw: &[u8] = &[0xC3, 0x28];
+    let (status, seen) = get_blob(&client, proxy, "/api/x", Some(raw)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        seen.as_ref(),
+        raw,
+        "non-UTF-8 header bytes must survive the filter chain unchanged"
     );
 }
 

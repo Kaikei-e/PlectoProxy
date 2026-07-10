@@ -44,7 +44,7 @@ fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .and_then(|h| std::str::from_utf8(&h.value).ok())
 }
 
 fn unauthorized(reason: &str) -> RequestDecision {
@@ -53,11 +53,11 @@ fn unauthorized(reason: &str) -> RequestDecision {
         headers: vec![
             Header {
                 name: "www-authenticate".to_string(),
-                value: "ApiKey".to_string(),
+                value: b"ApiKey".to_vec(),
             },
             Header {
                 name: "content-type".to_string(),
-                value: "application/json".to_string(),
+                value: b"application/json".to_vec(),
             },
         ],
         body: format!("{{\"error\":\"{reason}\"}}").into_bytes(),
@@ -105,7 +105,7 @@ impl Guest for FilterApiKey {
         RequestDecision::Modified(RequestEdit {
             set_headers: vec![Header {
                 name: "x-authenticated-user".to_string(),
-                value: user,
+                value: user.as_bytes().to_vec(),
             }],
             remove_headers: vec![],
         })

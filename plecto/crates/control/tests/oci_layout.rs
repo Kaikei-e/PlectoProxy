@@ -20,7 +20,7 @@ fn req(headers: &[(&str, &str)]) -> HttpRequest {
             .iter()
             .map(|(n, v)| Header {
                 name: (*n).to_string(),
-                value: (*v).to_string(),
+                value: v.as_bytes().to_vec(),
             })
             .collect(),
     }

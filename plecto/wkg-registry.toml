@@ -11,7 +11,7 @@
 # separate `[registry."ghcr.io".oci].auth` block here.
 #
 # Consumer usage:
-#   wkg get plecto:filter@0.1.0 --config wkg-registry.toml -o wit/ --format wit
+#   wkg get plecto:filter@0.2.0 --config wkg-registry.toml -o wit/ --format wit
 
 [namespace_registries.plecto]
 registry = "ghcr.io"

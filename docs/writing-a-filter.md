@@ -41,8 +41,9 @@ Component Model sandbox, not by convention.
 ## 2. Scaffold
 
 The fastest path, and the one this guide's other examples assume, is the Filter Dev Kit CLI
-(ADR 000065) — it scaffolds the crate, fetches the WIT contract via `wkg` (ADR 000064), and
-writes a ready-to-run dev manifest in one step:
+(ADR 000065) — it scaffolds the crate, writes out the WIT contract vendored into the `plecto`
+binary itself (self-vendoring, ADR 000072 — no network, and always the exact version that binary's
+own host runs), and writes a ready-to-run dev manifest in one step:
 
 ```bash
 plecto new-filter --lang rust my-filter
@@ -386,10 +387,10 @@ First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain o
 
 Everything above assumes you have `plecto/wit/`. If your filter lives outside this repository —
 which is the normal case for a real filter — fetch the contract with the standard WIT toolchain
-instead of copying files by hand (ADR 000064). `plecto new-filter --lang rust` (§2) runs a `wkg get`
-for you today; read on if you want the manual steps, are scaffolding another language by hand, or
-just want to know what the CLI is doing under the hood. (ADR 000072 accepts embedding the same
-`wit/world.wit` the host bindgen reads so the scaffold no longer needs the network — not landed yet.)
+instead of copying files by hand (ADR 000064). `plecto new-filter --lang rust` (§2) does NOT need
+this — it vendors the contract into the binary itself (ADR 000072) — but you do, if you are
+scaffolding another language by hand, pinning a specific past contract version, or working with
+the experimental streaming contract below.
 
 The contract is published on every tagged release as a [CNCF Wasm OCI
 Artifact](https://tag-runtime.cncf.io/wgs/wasm/deliverables/wasm-oci-artifact/) to `ghcr.io`, the

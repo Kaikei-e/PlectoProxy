@@ -160,7 +160,11 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 prost = "0.14"
 # filter-jwt host tests (ADR 000070): mint ES256/RS256 test tokens and hand-build an alg=none
 # token (jsonwebtoken refuses to encode one) to exercise the alg-allowlist gate directly.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+# `aws_lc_rs`, not `rust_crypto`: the latter's RSA path goes through RustCrypto's `rsa` crate,
+# which is still open on RUSTSEC-2023-0071 (Marvin Attack timing side-channel) with no patched
+# version — `deny.toml` blocks it on sight and clears advisories by replacing the crate, not by
+# an ignore-list entry.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 serde = { workspace = true, features = ["derive"] }
 base64 = "0.22"
 

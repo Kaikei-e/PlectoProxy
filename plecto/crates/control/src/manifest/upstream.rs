@@ -104,6 +104,18 @@ pub struct UpstreamTls {
     /// (the pre-000050 behaviour). Only the name rides the content hash, like `ca_path`.
     #[serde(default)]
     pub sni: Option<String>,
+    /// Manifest-relative path to the PEM certificate chain Plecto PRESENTS to this upstream
+    /// (upstream mTLS, ADR 000078) — for backends that require client authentication. Must be
+    /// set together with `client_key_path`; one without the other fails the build closed.
+    /// Every TLS leg to this upstream presents it — forwarded requests AND health probes,
+    /// which share one connector (ADR 000042 decision 5). `None` = no client certificate.
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    /// Manifest-relative path to the PEM private key for `client_cert_path`. The file must be
+    /// owner-only on unix (group/other-readable fails the build closed, the STEK file
+    /// discipline of ADR 000062 (d) applied to this slice's new key material).
+    #[serde(default)]
+    pub client_key_path: Option<String>,
 }
 
 /// Per-upstream load-balancing algorithm (ADR 000035). `round_robin` is the default and keeps the

@@ -147,6 +147,108 @@ async fn spawn_tls_upstream(cert: &TestCert) -> SocketAddr {
     addr
 }
 
+/// [`make_cert`] with the private key made owner-only — the shape `[upstream.tls]`
+/// client_key_path requires (the ADR 000062 (d) key-file discipline, applied to upstream mTLS).
+fn make_client_cert() -> TestCert {
+    let cert = make_cert();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cert.key_pem_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    cert
+}
+
+/// Spawn a TLS upstream that REQUIRES a client certificate chaining to `client_ca` (upstream
+/// mTLS, ADR 000078) — the backend shape `[upstream.tls] client_cert_path` exists for. A peer
+/// presenting no (or an untrusted) certificate fails the handshake; an authenticated one gets
+/// 200 `mtls-upstream-ok`.
+async fn spawn_mtls_upstream(cert: &TestCert, client_ca: CertificateDer<'static>) -> SocketAddr {
+    let mut roots = RootCertStore::empty();
+    roots.add(client_ca).unwrap();
+    let verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(aws_lc_rs::default_provider()),
+    )
+    .build()
+    .unwrap();
+    let mut config = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
+        aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(vec![cert.cert_der.clone()], cert.key_der.clone_key())
+    .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return; // an unauthenticated peer failing the handshake is the point
+                };
+                let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .body(http_body_util::Full::new(Bytes::from_static(
+                                b"mtls-upstream-ok",
+                            )))
+                            .unwrap(),
+                    )
+                });
+                if h2 {
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                } else {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// [`manifest_toml`] plus an `[upstream.tls]` client identity (upstream mTLS, ADR 000078).
+fn manifest_toml_with_client_identity(
+    upstream_port: u16,
+    ca_path: &str,
+    client_cert_path: &str,
+    client_key_path: &str,
+) -> String {
+    format!(
+        r#"
+[[upstream]]
+name = "echo"
+addresses = ["localhost:{upstream_port}"]
+[upstream.tls]
+ca_path = "{ca_path}"
+client_cert_path = "{client_cert_path}"
+client_key_path = "{client_key_path}"
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+upstream = "echo"
+strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
+"#
+    )
+}
+
 /// A filterless manifest: one route `/api` → the TLS upstream at `localhost:<port>` trusted via
 /// `[upstream.tls] ca_path`, plus an optional downstream `[[tls]]` block.
 fn manifest_toml(upstream_port: u16, ca_path: &str, tls_block: &str) -> String {
@@ -437,4 +539,60 @@ async fn te_trailers_and_response_trailers_pass_through_on_the_h2_path() {
         "response trailers (grpc-status) must be forwarded end-to-end"
     );
     assert_eq!(collected.to_bytes(), Bytes::from_static(b"tls-upstream-ok"));
+}
+
+/// Upstream mTLS happy path (ADR 000078): the backend requires a client certificate, the
+/// manifest declares one, and the forward leg presents it. `get_when_ready` passing is ALSO the
+/// health-probe assertion — instances start pessimistic (ADR 000017), so the upstream only
+/// enters rotation if the probe's TLS leg presented the same identity.
+#[tokio::test]
+async fn presents_a_client_certificate_when_the_upstream_requires_one() {
+    let upstream_cert = make_cert();
+    let identity = make_client_cert();
+    let upstream = spawn_mtls_upstream(&upstream_cert, identity.cert_der.clone()).await;
+    let control = loaded_control(&manifest_toml_with_client_identity(
+        upstream.port(),
+        &upstream_cert.cert_pem_path,
+        &identity.cert_pem_path,
+        &identity.key_pem_path,
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let (status, _, body) = get_when_ready(proxy, "/api/hello").await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the forward leg must present the declared client certificate"
+    );
+    assert_eq!(body, "mtls-upstream-ok");
+}
+
+/// The fail-closed control: the backend requires a client certificate but the manifest declares
+/// none — every handshake (health probe included) fails, so the instance never enters rotation.
+/// Pins that no identity is ever presented implicitly and no insecure fallback exists.
+#[tokio::test]
+async fn upstream_requiring_a_client_certificate_fails_closed_without_one() {
+    let upstream_cert = make_cert();
+    let somebody = make_cert(); // an identity the upstream would trust — but the manifest omits it
+    let upstream = spawn_mtls_upstream(&upstream_cert, somebody.cert_der.clone()).await;
+    let control = loaded_control(&manifest_toml(
+        upstream.port(),
+        &upstream_cert.cert_pem_path,
+        "",
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    for _ in 0..10 {
+        let (status, _, _) = http_get(proxy, "/api/hello").await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream requiring a client certificate must stay out of rotation when the \
+             manifest declares none"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 }

@@ -32,6 +32,28 @@ pub struct Listen {
     /// moment the signal lands, with the 30 s default window.
     #[serde(default)]
     pub drain: Option<Drain>,
+    /// `[listen.client_auth]` (ADR 000078): downstream mTLS — the section's presence makes a
+    /// verified client certificate REQUIRED on every TLS handshake this listener terminates
+    /// (TCP and QUIC alike; a peer presenting none, or one that does not chain to `ca_path`,
+    /// is refused at the handshake). Absent = no client authentication (the default). There is
+    /// no "optional" mode: requesting a certificate without requiring it only pays off once a
+    /// verified identity propagates to filters, which ADR 000078 declares deferred.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// `[listen.client_auth]` (ADR 000078): downstream client-certificate verification. Granularity
+/// is the listener — which today is the whole data plane (one `[listen]`), and generalises
+/// per-listener if Plecto ever grows more. Mutually exclusive with `[resumption]` shared STEK
+/// (ADR 000062 (b)): a resumption ticket minted before a peer was authenticated must never let
+/// it skip authentication on another replica, so the combination fails the build closed.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAuth {
+    /// Manifest-relative path to a PEM bundle of trust anchors that client certificates must
+    /// chain to. Anchors only — intermediates belong in the chain the CLIENT presents, per
+    /// X.509 path building. Empty or unparsable fails the build closed.
+    pub ca_path: String,
 }
 
 /// `[listen.drain]` (ADR 000059): the two knobs of the documented shutdown order —
@@ -130,6 +152,7 @@ mod tests {
                 trusted: trusted.iter().map(|s| (*s).to_string()).collect(),
             }),
             drain: None,
+            client_auth: None,
         }
     }
 

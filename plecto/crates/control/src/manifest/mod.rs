@@ -40,7 +40,7 @@ pub use filter_entry::{
 // schema type (module doc above).
 #[allow(unused_imports)]
 pub use filter_entry::{AllowDest, RateLimitConfig, SchemeKind, TcpAllowDest};
-pub use listen::{Listen, ProxyProtocolTrust};
+pub use listen::{ClientAuth, Listen, ProxyProtocolTrust};
 // `ProxyProtocol` / `Drain` are schema fields reached through `Listen` rather than by name
 // elsewhere in this crate; re-exported for the same schema-type completeness reason as
 // `AllowDest` below.

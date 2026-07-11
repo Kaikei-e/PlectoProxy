@@ -416,6 +416,7 @@ mod tests {
         up.tls = Some(crate::manifest::UpstreamTls {
             ca_path: Some(ca_path),
             sni: Some("backend.internal".to_string()),
+            ..Default::default()
         });
 
         let reg = UpstreamRegistry::new();
@@ -446,6 +447,7 @@ mod tests {
         up.tls = Some(crate::manifest::UpstreamTls {
             ca_path: None,
             sni: Some("not a valid sni!!".to_string()),
+            ..Default::default()
         });
         let err = reg.reconcile(&[up], std::path::Path::new("."));
         assert!(

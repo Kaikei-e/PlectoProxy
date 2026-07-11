@@ -178,4 +178,23 @@ pub enum ControlError {
         sni: String,
         reason: String,
     },
+
+    /// An `[upstream.tls]` client identity (upstream mTLS, ADR 000078) could not be built:
+    /// `client_cert_path` / `client_key_path` set without the other, an unreadable / unparsable
+    /// PEM, a key file readable by group or other (the ADR 000062 (d) key-file discipline), or
+    /// a chain/key pair rustls rejects. Fail-closed at build, like `UpstreamTlsCa`: the forward
+    /// leg never silently connects WITHOUT the identity the backend requires.
+    #[error("upstream {upstream:?} client certificate ({path:?}): {reason}")]
+    UpstreamClientCert {
+        upstream: String,
+        path: String,
+        reason: String,
+    },
+
+    /// The `[listen.client_auth]` downstream-mTLS config (ADR 000078) is invalid: no `[[tls]]`
+    /// cert to terminate with, or a `ca_path` that is unreadable / unparsable / yields no
+    /// usable trust anchor. Fail-closed at build: the listener never comes up accepting
+    /// clients it was told to authenticate but cannot.
+    #[error("[listen.client_auth] ca_path {path:?}: {reason}")]
+    ClientAuthCa { path: String, reason: String },
 }

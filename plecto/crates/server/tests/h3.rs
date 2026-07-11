@@ -19,7 +19,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::net::TcpListener;
-use tokio_rustls::rustls::pki_types::CertificateDer;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
@@ -35,6 +35,7 @@ struct TestCert {
     cert_path: String,
     key_path: String,
     cert_der: CertificateDer<'static>,
+    key_der: PrivateKeyDer<'static>,
 }
 
 fn make_cert() -> TestCert {
@@ -46,6 +47,7 @@ fn make_cert() -> TestCert {
     std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
     TestCert {
         cert_der: generated.cert.der().clone(),
+        key_der: PrivateKeyDer::try_from(generated.key_pair.serialize_der()).unwrap(),
         cert_path: cert_path.to_str().unwrap().to_string(),
         key_path: key_path.to_str().unwrap().to_string(),
         _dir: dir,
@@ -546,4 +548,124 @@ key_path = "{key_path}"
     std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(body.as_slice()), &mut out)
         .unwrap();
     assert_eq!(out, big_text().as_bytes());
+}
+
+// ----- ADR 000078: downstream client-certificate verification on the h3 (QUIC) path -----
+
+/// [`h3_client_endpoint`] presenting `identity` as a client certificate — the quinn endpoint
+/// wraps the same rustls `ClientConfig` surface, so the identity rides the QUIC handshake.
+fn h3_client_endpoint_with_identity(
+    root: CertificateDer<'static>,
+    identity: &TestCert,
+) -> quinn::Endpoint {
+    let mut roots = RootCertStore::empty();
+    roots.add(root).unwrap();
+    let mut tls = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![identity.cert_der.clone()],
+            identity.key_der.clone_key(),
+        )
+        .unwrap();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config);
+    endpoint
+}
+
+/// Downstream mTLS on the h3 path (ADR 000078): the QUIC `ServerConfig` shares the TCP config's
+/// client-cert verifier, so an authenticated client is served over h3 and an anonymous QUIC
+/// handshake fails outright.
+#[tokio::test]
+async fn client_auth_listener_serves_h3_only_to_an_authenticated_client() {
+    let cert = make_cert();
+    let identity = {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["plecto-client".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        TestCert {
+            cert_der: generated.cert.der().clone(),
+            key_der: PrivateKeyDer::try_from(generated.key_pair.serialize_der()).unwrap(),
+            cert_path: cert_path.to_str().unwrap().to_string(),
+            key_path: String::new(), // the client key never enters the manifest here
+            _dir: dir,
+        }
+    };
+    let upstream = spawn_upstream().await;
+    let extra = format!(
+        "[listen.client_auth]\nca_path = \"{}\"\n",
+        identity.cert_path
+    );
+    let control = loaded_control(&manifest_toml(upstream, "{digest}", &cert, &extra));
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    // Authenticated h3 client: served (past the pessimistic-start 503 window).
+    let endpoint = h3_client_endpoint_with_identity(cert.cert_der.clone(), &identity);
+    let r = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let connecting = endpoint.connect(proxy, "localhost").unwrap();
+            let conn = connecting
+                .await
+                .expect("authenticated QUIC connect succeeds");
+            let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+                .await
+                .unwrap();
+            let drive =
+                tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+            let req = hyper::http::Request::builder()
+                .method("GET")
+                .uri("https://localhost/api/hello")
+                .body(())
+                .unwrap();
+            let mut stream = send_request.send_request(req).await.unwrap();
+            stream.finish().await.unwrap();
+            let resp = stream.recv_response().await.unwrap();
+            let status = resp.status().as_u16();
+            while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+                let _ = chunk.copy_to_bytes(chunk.remaining());
+            }
+            drop(send_request);
+            let _ = drive.await;
+            if status != 503 {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("upstream never became healthy");
+    assert_eq!(r, 200, "an authenticated h3 client must be served");
+
+    // Anonymous h3 client: refused at the TLS layer. TLS 1.3 client auth completes after the
+    // client's own Finished, so quinn may report the connection up BEFORE the server's
+    // certificate_required alert lands — the refusal then arrives as an immediate close
+    // instead of a connect error. Both shapes are the same refusal; a connection that stays
+    // open (the bug this guards against) trips the timeout instead.
+    let anon = h3_client_endpoint(cert.cert_der.clone());
+    let connecting = anon.connect(proxy, "localhost").unwrap();
+    match tokio::time::timeout(Duration::from_secs(8), connecting)
+        .await
+        .expect("the refusal must arrive as a handshake error, not a hang")
+    {
+        Err(_handshake_refused) => {}
+        Ok(conn) => {
+            let reason = tokio::time::timeout(Duration::from_secs(8), conn.closed())
+                .await
+                .expect("the server must close an unauthenticated QUIC connection");
+            assert!(
+                matches!(
+                    reason,
+                    quinn::ConnectionError::TransportError(_)
+                        | quinn::ConnectionError::ConnectionClosed(_)
+                ),
+                "the close must be the server's TLS refusal, got: {reason:?}"
+            );
+        }
+    }
 }

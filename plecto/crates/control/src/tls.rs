@@ -23,7 +23,7 @@ use rustls::server::{ClientHello, NoServerSessionStorage, ProducesTickets, Resol
 use rustls::sign::CertifiedKey;
 
 use crate::error::ControlError;
-use crate::manifest::{Resumption, TlsCert};
+use crate::manifest::{ClientAuth, Resumption, TlsCert};
 use crate::stek::SharedStekTicketer;
 
 /// SNI cert selection (ADR 000014): a per-host cert map plus an optional default. `resolve` is
@@ -86,8 +86,10 @@ pub(crate) struct TlsConfigs {
 pub(crate) fn build_server_configs(
     entries: &[TlsCert],
     resumption: Option<&Resumption>,
+    client_auth: Option<&ClientAuth>,
     base_dir: &Path,
 ) -> Result<Option<TlsConfigs>, ControlError> {
+    let _ = client_auth; // wired by the GREEN half of this slice (ADR 000078)
     if entries.is_empty() {
         // `[resumption]` without any `[[tls]]` is a config mistake, not a no-op: the operator
         // asked for cross-replica resumption on a proxy that terminates no TLS. Fail closed.
@@ -402,7 +404,7 @@ mod tests {
     #[test]
     fn builds_tcp_and_quic_configs_with_distinct_alpn() {
         let (dir, entry) = default_cert_entry();
-        let configs = build_server_configs(&[entry], None, dir.path())
+        let configs = build_server_configs(&[entry], None, None, dir.path())
             .unwrap()
             .expect("a cert entry yields TCP + QUIC configs");
         // TCP advertises h2 then http/1.1 (ADR 000015); QUIC advertises only h3 (ADR 000016).
@@ -423,7 +425,7 @@ mod tests {
         // ADR 000052's invariants, pinned per path so a rustls default change (or a refactor that
         // touches only one config) cannot silently reintroduce the stateful cache or 0-RTT.
         let (dir, entry) = default_cert_entry();
-        let configs = build_server_configs(&[entry], None, dir.path())
+        let configs = build_server_configs(&[entry], None, None, dir.path())
             .unwrap()
             .expect("a cert entry yields TCP + QUIC configs");
         for (label, config) in [("tcp", &configs.tcp), ("quic", &configs.quic)] {
@@ -454,10 +456,10 @@ mod tests {
         // the SAME producer across rebuilds — a manifest reload must not invalidate outstanding
         // tickets (ADR 000052: process-lifetime, node-local key).
         let (dir, entry) = default_cert_entry();
-        let a = build_server_configs(std::slice::from_ref(&entry), None, dir.path())
+        let a = build_server_configs(std::slice::from_ref(&entry), None, None, dir.path())
             .unwrap()
             .unwrap();
-        let b = build_server_configs(&[entry], None, dir.path())
+        let b = build_server_configs(&[entry], None, None, dir.path())
             .unwrap()
             .unwrap();
         assert!(
@@ -473,7 +475,7 @@ mod tests {
     #[test]
     fn no_tls_entries_yields_none() {
         assert!(
-            build_server_configs(&[], None, std::path::Path::new("."))
+            build_server_configs(&[], None, None, std::path::Path::new("."))
                 .unwrap()
                 .is_none(),
             "no [[tls]] means no TLS/QUIC configs (plain HTTP/1.1, no h3)"
@@ -496,7 +498,7 @@ mod tests {
             cert_path: cert_path.to_str().unwrap().to_string(),
             key_path: key_path.to_str().unwrap().to_string(),
         };
-        let err = match build_server_configs(&[entry], None, dir.path()) {
+        let err = match build_server_configs(&[entry], None, None, dir.path()) {
             Err(e) => e,
             Ok(_) => panic!("a mismatched cert/key pair must be rejected at build"),
         };
@@ -512,7 +514,7 @@ mod tests {
         // hint becomes max_age_hours (the acceptance window the key file discipline enforces).
         let (dir, entry) = default_cert_entry();
         let resumption = resumption_entry(dir.path(), 7);
-        let configs = build_server_configs(&[entry], Some(&resumption), dir.path())
+        let configs = build_server_configs(&[entry], Some(&resumption), None, dir.path())
             .unwrap()
             .unwrap();
         for (label, config) in [("tcp", &configs.tcp), ("quic", &configs.quic)] {
@@ -541,10 +543,15 @@ mod tests {
         // function of (file, cert set). Pin that: a ticket sealed by build A opens in build B.
         let (dir, entry) = default_cert_entry();
         let resumption = resumption_entry(dir.path(), 7);
-        let a = build_server_configs(std::slice::from_ref(&entry), Some(&resumption), dir.path())
-            .unwrap()
-            .unwrap();
-        let b = build_server_configs(&[entry], Some(&resumption), dir.path())
+        let a = build_server_configs(
+            std::slice::from_ref(&entry),
+            Some(&resumption),
+            None,
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let b = build_server_configs(&[entry], Some(&resumption), None, dir.path())
             .unwrap()
             .unwrap();
         assert!(
@@ -566,10 +573,10 @@ mod tests {
         let (dir_a, entry_a) = default_cert_entry();
         let (dir_b, entry_b) = default_cert_entry(); // a different self-signed key pair
         let resumption = resumption_entry(dir_a.path(), 7);
-        let a = build_server_configs(&[entry_a], Some(&resumption), dir_a.path())
+        let a = build_server_configs(&[entry_a], Some(&resumption), None, dir_a.path())
             .unwrap()
             .unwrap();
-        let b = build_server_configs(&[entry_b], Some(&resumption), dir_b.path())
+        let b = build_server_configs(&[entry_b], Some(&resumption), None, dir_b.path())
             .unwrap()
             .unwrap();
         let ticket = a.tcp.ticketer.encrypt(b"session-state").unwrap();
@@ -584,7 +591,7 @@ mod tests {
     fn resumption_without_tls_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let resumption = resumption_entry(dir.path(), 7);
-        let err = match build_server_configs(&[], Some(&resumption), dir.path()) {
+        let err = match build_server_configs(&[], Some(&resumption), None, dir.path()) {
             Err(e) => e,
             Ok(_) => panic!("[resumption] with no [[tls]] must fail the build"),
         };
@@ -597,21 +604,162 @@ mod tests {
         let (dir, entry) = default_cert_entry();
         let mut resumption = resumption_entry(dir.path(), 7);
         std::fs::write(&resumption.stek_file, [7u8; 48]).unwrap();
-        let err =
-            match build_server_configs(std::slice::from_ref(&entry), Some(&resumption), dir.path())
-            {
-                Err(e) => e,
-                Ok(_) => panic!("a 48-byte file must be rejected"),
-            };
+        let err = match build_server_configs(
+            std::slice::from_ref(&entry),
+            Some(&resumption),
+            None,
+            dir.path(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a 48-byte file must be rejected"),
+        };
         assert!(matches!(err, ControlError::Stek { .. }));
 
         // Out-of-range max_age_hours is rejected before the file is touched.
         resumption = resumption_entry(dir.path(), 7);
         resumption.max_age_hours = 169;
-        let err = match build_server_configs(&[entry], Some(&resumption), dir.path()) {
+        let err = match build_server_configs(&[entry], Some(&resumption), None, dir.path()) {
             Err(e) => e,
             Ok(_) => panic!("max_age_hours over the RFC 8446 cap must be rejected"),
         };
         assert!(matches!(err, ControlError::Stek { .. }));
+    }
+
+    // ----- ADR 000078: mTLS — [listen.client_auth] / [upstream.tls] client identity -----
+
+    /// A `[listen.client_auth]` whose `ca_path` file holds `ca_pem`, written into `dir`.
+    fn client_auth_entry(dir: &Path, ca_pem: &[u8]) -> ClientAuth {
+        let path = dir.join("client-ca.pem");
+        std::fs::write(&path, ca_pem).unwrap();
+        ClientAuth {
+            ca_path: path.to_str().unwrap().to_string(),
+        }
+    }
+
+    /// A PEM trust anchor a client_auth test can point `ca_path` at.
+    fn some_ca_pem() -> Vec<u8> {
+        rcgen::generate_simple_self_signed(vec!["client-ca".to_string()])
+            .unwrap()
+            .cert
+            .pem()
+            .into_bytes()
+    }
+
+    /// A fresh self-signed client identity (cert + owner-only key PEM) for `[upstream.tls]`.
+    fn upstream_client_identity(dir: &Path) -> (String, String) {
+        let generated = rcgen::generate_simple_self_signed(vec!["plecto".to_string()]).unwrap();
+        let cert_path = dir.join("client-cert.pem");
+        let key_path = dir.join("client-key.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        (
+            cert_path.to_str().unwrap().to_string(),
+            key_path.to_str().unwrap().to_string(),
+        )
+    }
+
+    fn upstream_tls_with_identity(
+        cert: Option<String>,
+        key: Option<String>,
+    ) -> crate::manifest::UpstreamTls {
+        crate::manifest::UpstreamTls {
+            client_cert_path: cert,
+            client_key_path: key,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upstream_client_cert_without_key_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _key) = upstream_client_identity(dir.path());
+        let tls = upstream_tls_with_identity(Some(cert), None);
+        let err = match build_upstream_client_config("u", &tls, dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("client_cert_path without client_key_path must fail the build"),
+        };
+        assert!(matches!(err, ControlError::UpstreamClientCert { .. }));
+    }
+
+    #[test]
+    fn upstream_client_key_without_cert_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cert, key) = upstream_client_identity(dir.path());
+        let tls = upstream_tls_with_identity(None, Some(key));
+        let err = match build_upstream_client_config("u", &tls, dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("client_key_path without client_cert_path must fail the build"),
+        };
+        assert!(matches!(err, ControlError::UpstreamClientCert { .. }));
+    }
+
+    #[test]
+    fn upstream_client_identity_is_loaded_into_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = upstream_client_identity(dir.path());
+        let tls = upstream_tls_with_identity(Some(cert), Some(key));
+        let config = build_upstream_client_config("u", &tls, dir.path()).unwrap();
+        assert!(
+            config.client_auth_cert_resolver.has_certs(),
+            "the declared client identity must be presented when the upstream requests one"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upstream_client_key_readable_by_group_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = upstream_client_identity(dir.path());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let tls = upstream_tls_with_identity(Some(cert), Some(key));
+        let err = match build_upstream_client_config("u", &tls, dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("a group-readable client key must fail the build (ADR 000062 (d))"),
+        };
+        assert!(matches!(err, ControlError::UpstreamClientCert { .. }));
+    }
+
+    #[test]
+    fn client_auth_with_shared_stek_fails_closed() {
+        // ADR 000062 (b) / 000078: a resumption ticket minted before the peer authenticated must
+        // never let it skip authentication on another replica — the combination is refused.
+        let (dir, entry) = default_cert_entry();
+        let resumption = resumption_entry(dir.path(), 7);
+        let auth = client_auth_entry(dir.path(), &some_ca_pem());
+        let err = match build_server_configs(&[entry], Some(&resumption), Some(&auth), dir.path()) {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("[listen.client_auth] with [resumption] shared STEK must fail the build")
+            }
+        };
+        assert!(matches!(err, ControlError::Stek { .. }));
+    }
+
+    #[test]
+    fn client_auth_without_tls_entries_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = client_auth_entry(dir.path(), &some_ca_pem());
+        let err = match build_server_configs(&[], None, Some(&auth), dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("[listen.client_auth] with no [[tls]] must fail the build"),
+        };
+        assert!(matches!(err, ControlError::ClientAuthCa { .. }));
+    }
+
+    #[test]
+    fn client_auth_ca_with_no_usable_root_fails_closed() {
+        let (dir, entry) = default_cert_entry();
+        let auth = client_auth_entry(dir.path(), b"not a pem at all");
+        let err = match build_server_configs(&[entry], None, Some(&auth), dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("an unusable client-auth CA bundle must fail the build"),
+        };
+        assert!(matches!(err, ControlError::ClientAuthCa { .. }));
     }
 }

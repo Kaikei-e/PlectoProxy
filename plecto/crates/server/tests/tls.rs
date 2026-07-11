@@ -15,7 +15,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore, crypto::aws_lc_rs};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
@@ -29,6 +29,7 @@ struct TestCert {
     cert_path: String,
     key_path: String,
     cert_der: CertificateDer<'static>,
+    key_der: PrivateKeyDer<'static>,
 }
 
 fn make_cert() -> TestCert {
@@ -44,6 +45,7 @@ fn make_cert_for(host: &str) -> TestCert {
     std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
     TestCert {
         cert_der: generated.cert.der().clone(),
+        key_der: PrivateKeyDer::try_from(generated.key_pair.serialize_der()).unwrap(),
         cert_path: cert_path.to_str().unwrap().to_string(),
         key_path: key_path.to_str().unwrap().to_string(),
         _dir: dir,
@@ -203,6 +205,59 @@ fn resuming_client_config_with_roots(
             .with_root_certificates(roots)
             .with_no_client_auth(),
     )
+}
+
+/// A resuming client config that ALSO presents `identity` as a client certificate (downstream
+/// mTLS, ADR 000078), trusting `root` for the server side.
+fn client_config_with_identity(
+    root: CertificateDer<'static>,
+    identity: &TestCert,
+) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.add(root).unwrap();
+    Arc::new(
+        ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![identity.cert_der.clone()],
+                identity.key_der.clone_key(),
+            )
+            .unwrap(),
+    )
+}
+
+/// One HTTPS GET that reports failure instead of panicking — for asserting a client-auth
+/// listener REFUSES a peer. A required-client-cert refusal can surface at the connect (alert
+/// during the handshake) or on the first request (TLS 1.3 post-handshake alert), so both legs
+/// fold into `Err`.
+async fn try_https_get(
+    proxy: SocketAddr,
+    config: Arc<ClientConfig>,
+    path: &str,
+) -> Result<StatusCode, String> {
+    let connector = TlsConnector::from(config);
+    let tcp = TcpStream::connect(proxy).await.map_err(|e| e.to_string())?;
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
+    Ok(resp.status())
 }
 
 /// A fresh shared STEK file (ADR 000062): 64 raw random-ish bytes, owner-only. Returns the dir
@@ -547,4 +602,118 @@ async fn bad_cert_path_fails_closed_at_load() {
         }
         Err(e) => panic!("expected a TlsCert error, got: {e}"),
     }
+}
+
+// ----- ADR 000078: downstream client-certificate verification ([listen.client_auth]) -----
+
+/// The `[[tls]]` + `[listen.client_auth]` manifest block: terminate with `server`, require
+/// client certificates chaining to `client_ca` (here: the self-signed client cert itself).
+fn client_auth_block(server: &TestCert, client_ca: &TestCert) -> String {
+    format!(
+        "\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n\n[listen.client_auth]\nca_path = \"{}\"\n",
+        server.cert_path, server.key_path, client_ca.cert_path
+    )
+}
+
+/// Poll one authenticated GET past the pessimistic-start 503 window (ADR 000017).
+async fn https_get_kind_ready(
+    proxy: SocketAddr,
+    config: Arc<ClientConfig>,
+    path: &str,
+) -> (StatusCode, HandshakeKind) {
+    for _ in 0..100 {
+        let r = https_get_kind(proxy, config.clone(), path).await;
+        if r.0 != StatusCode::SERVICE_UNAVAILABLE {
+            return r;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("upstream never became healthy within the readiness window");
+}
+
+/// Downstream mTLS over HTTP/1.1 (ADR 000078): a client presenting a certificate that chains to
+/// `ca_path` is served; an anonymous client is refused AT THE HANDSHAKE — required mode has no
+/// "request but allow none" fallback.
+#[tokio::test]
+async fn client_auth_listener_serves_an_authenticated_client_and_refuses_an_anonymous_one() {
+    let server = make_cert();
+    let identity = make_cert_for("plecto-client");
+    let upstream = spawn_upstream().await;
+    let control = loaded_control(&manifest_toml(
+        upstream,
+        "{digest}",
+        &client_auth_block(&server, &identity),
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let authed = client_config_with_identity(server.cert_der.clone(), &identity);
+    let (status, _) = https_get_kind_ready(proxy, authed, "/api/hello").await;
+    assert_eq!(status, StatusCode::OK, "an authenticated client is served");
+
+    let anon = resuming_client_config(server.cert_der.clone());
+    assert!(
+        try_https_get(proxy, anon, "/api/hello").await.is_err(),
+        "an anonymous client must be refused at the TLS layer, not served an HTTP response"
+    );
+}
+
+/// ADR 000062 (b) end-to-end: `[listen.client_auth]` and `[resumption]` (shared STEK) together
+/// must fail the LOAD closed — a ticket minted before the peer authenticated must never let it
+/// skip authentication on another replica.
+#[tokio::test]
+async fn client_auth_with_shared_stek_fails_the_load_closed() {
+    let server = make_cert();
+    let identity = make_cert_for("plecto-client");
+    let (_stek_dir, stek_path) = make_stek(9);
+    let upstream = spawn_upstream().await;
+    let tls_block = format!(
+        "{}\n[resumption]\nstek_file = \"{stek_path}\"\n",
+        client_auth_block(&server, &identity)
+    );
+    match loaded_control(&manifest_toml(upstream, "{digest}", &tls_block)) {
+        Ok(_) => panic!("[listen.client_auth] + [resumption] must fail the load (ADR 000062 (b))"),
+        Err(plecto_control::ControlError::Stek { reason, .. }) => {
+            assert!(
+                reason.contains("client_auth"),
+                "the error should name the crossing rule, got: {reason}"
+            );
+        }
+        Err(e) => panic!("expected the Stek crossing error, got: {e}"),
+    }
+}
+
+/// Client-authenticated sessions still resume per-node (grill 確定 4): the ticket carries the
+/// verified identity, 0-RTT stays refused, and — the load-bearing part — an anonymous peer
+/// still cannot get a ticket to resume with in the first place.
+#[tokio::test]
+async fn client_authenticated_sessions_still_resume_within_a_node() {
+    let server = make_cert();
+    let identity = make_cert_for("plecto-client");
+    let upstream = spawn_upstream().await;
+    let control = loaded_control(&manifest_toml(
+        upstream,
+        "{digest}",
+        &client_auth_block(&server, &identity),
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let anon = resuming_client_config(server.cert_der.clone());
+    assert!(
+        try_https_get(proxy, anon, "/api/hello").await.is_err(),
+        "sanity: the listener really requires a client certificate"
+    );
+
+    let config = client_config_with_identity(server.cert_der.clone(), &identity);
+    let (status, first) = https_get_kind_ready(proxy, config.clone(), "/api/hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, HandshakeKind::Full);
+    let (status, second) = https_get_kind(proxy, config, "/api/hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        second,
+        HandshakeKind::Resumed,
+        "per-node resumption stays on for client-authenticated sessions (ADR 000078)"
+    );
 }

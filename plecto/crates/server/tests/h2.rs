@@ -19,7 +19,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
@@ -33,6 +33,7 @@ struct TestCert {
     cert_path: String,
     key_path: String,
     cert_der: CertificateDer<'static>,
+    key_der: PrivateKeyDer<'static>,
 }
 
 fn make_cert() -> TestCert {
@@ -44,6 +45,7 @@ fn make_cert() -> TestCert {
     std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
     TestCert {
         cert_der: generated.cert.der().clone(),
+        key_der: PrivateKeyDer::try_from(generated.key_pair.serialize_der()).unwrap(),
         cert_path: cert_path.to_str().unwrap().to_string(),
         key_path: key_path.to_str().unwrap().to_string(),
         _dir: dir,
@@ -383,4 +385,107 @@ key_path = "{key_path}"
     std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(bytes.as_ref()), &mut out)
         .unwrap();
     assert_eq!(out, big_text().as_bytes());
+}
+
+// ----- ADR 000078: downstream client-certificate verification on the h2 path -----
+
+/// Like [`drive_h2`], but over a caller-built `ClientConfig`, and reporting failure instead of
+/// panicking — an anonymous client against a client-auth listener is EXPECTED to fail, at the
+/// connect or on the first request (TLS 1.3 post-handshake alert), and both fold into `Err`.
+async fn try_h2_get(proxy: SocketAddr, config: Arc<ClientConfig>) -> Result<StatusCode, String> {
+    let connector = TlsConnector::from(config);
+    let tcp = TcpStream::connect(proxy).await.map_err(|e| e.to_string())?;
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/hello")
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
+    Ok(resp.status())
+}
+
+/// Downstream mTLS on the h2 path (ADR 000078): the SAME TCP acceptor + `ServerConfig` that
+/// terminate HTTP/1.1 enforce client auth for an h2-negotiating client — authenticated is
+/// served over h2, anonymous is refused at the TLS layer.
+#[tokio::test]
+async fn client_auth_listener_serves_h2_only_to_an_authenticated_client() {
+    let cert = make_cert();
+    let identity = make_cert_for_client();
+    let upstream = spawn_upstream().await;
+    let toml = format!(
+        "{}\n[listen.client_auth]\nca_path = \"{}\"\n",
+        manifest_toml(upstream, "{digest}", &cert),
+        identity.cert_path
+    );
+    let control = loaded_control(&toml);
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert_der.clone()).unwrap();
+    let mut authed = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots.clone())
+        .with_client_auth_cert(
+            vec![identity.cert_der.clone()],
+            identity.key_der.clone_key(),
+        )
+        .unwrap();
+    authed.alpn_protocols = vec![b"h2".to_vec()];
+    let authed = Arc::new(authed);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match try_h2_get(proxy, authed.clone()).await {
+                Ok(StatusCode::SERVICE_UNAVAILABLE) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("upstream never became healthy")
+    .expect("an authenticated h2 client must be served");
+    assert_eq!(status, StatusCode::OK, "authenticated h2 client gets 200");
+
+    let mut anon = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    anon.alpn_protocols = vec![b"h2".to_vec()];
+    assert!(
+        try_h2_get(proxy, Arc::new(anon)).await.is_err(),
+        "an anonymous h2 client must be refused at the TLS layer"
+    );
+}
+
+/// A client identity for the mTLS tests: [`make_cert`] shape, distinct hostname.
+fn make_cert_for_client() -> TestCert {
+    let generated = rcgen::generate_simple_self_signed(vec!["plecto-client".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+    std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+    TestCert {
+        cert_der: generated.cert.der().clone(),
+        key_der: PrivateKeyDer::try_from(generated.key_pair.serialize_der()).unwrap(),
+        cert_path: cert_path.to_str().unwrap().to_string(),
+        key_path: key_path.to_str().unwrap().to_string(),
+        _dir: dir,
+    }
 }

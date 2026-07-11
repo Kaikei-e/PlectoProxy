@@ -12,12 +12,26 @@ WASM フィルタを安全に実行する wasmtime 埋め込みホスト（`plec
 _Avoid_: plugin, middleware, extension（filter を指すとき）
 
 **Decision**:
-フィルタの型付き戻り値（WIT variant）。`continue`（次段へ）/ `modified`（書換えて継続）/
-`short-circuit`（停止し即時応答を合成、upstream に到達させない）。
+フィルタの型付き戻り値（WIT variant）。request 側は `continue`（次段へ）/ `modified`（書換えて継続）/
+`short-circuit`（停止し即時応答を合成、upstream に到達させない）。response 側は `continue` / `modified` /
+`replace`（届いた応答を合成応答で差し替える、ADR 000073）。
 _Avoid_: result, verdict, response（ここでは別物を指す）
 
 **Short-circuit**:
-チェーンを打ち切りその場で応答を合成する decision。認証失敗・rate limit 超過がこれ。
+チェーンを打ち切りその場で応答を合成する **request 側** decision。認証失敗・rate limit 超過がこれ。
+upstream には到達しない。
+
+**Replace**:
+届いた upstream 応答を合成応答で差し替える **response 側**の終端 decision（ADR 000073）。upstream ボディは
+読まれずに破棄される（zero-copy 不変則は無傷、ADR 000038）。チェーンの残段はスキップ（short-circuit と同じ終端形）。
+「何かを短絡する」のではないので short-circuit とは呼ばない（P12）。
+_Avoid_: short-circuit（response 側で）, override
+
+**As-forwarded request snapshot**:
+`on-response` の第 1 引数（`plecto:filter@0.3.0`、ADR 000073）。request チェーン適用後・ホストの egress 変換
+（hop-by-hop strip / path rewrite / traceparent 注入）前の header-only リクエスト。auth フィルタの stamp も
+無編集の `Origin` もここに残る。値渡しの読み取り専用ビューで、編集しても何も起きない。
+_Avoid_: original request（downstream 原形とは別物）, wire form
 
 **plecto:filter world**:
 fast path（host）と untrusted な WASM フィルタの間の型付き境界。`wasi:http` の request/response

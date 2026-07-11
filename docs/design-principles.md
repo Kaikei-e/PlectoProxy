@@ -100,11 +100,11 @@ Plecto Proxy's Rust workspace consists of three crates = three contexts, each wi
 
 Three relations: **Fast path → Extension plane** (drives the chain per request), **Control → Extension plane** (the manifest digest-pins filters and declares chain order and trust roots; reload swaps atomically), **Control → Fast path** (the manifest declares routes and targets; the fast path takes a per-request `ConfigSnapshot` to select routes). The contract `wit/` sits at the workspace root, belonging to no crate — the contract is shared property between contexts, owned by none of them.
 
-### 2.2 Contract architecture (`plecto:filter@0.2.0`)
+### 2.2 Contract architecture (`plecto:filter@0.3.0`)
 
-The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. Header values are `list<u8>` (ADR 000071); `0.1.0` remains loadable via a frozen tree + host adapter. The current contract's structure:
+The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. Header values are `list<u8>` (ADR 000071); `on-response` receives the as-forwarded request snapshot and `response-decision` carries a `replace` arm, so P3 (decisions as types) holds symmetrically on the response side (ADR 000073). `0.1.0` / `0.2.0` remain loadable via frozen trees + host adapters. The current contract's structure:
 
-- **types**: `http-request` / `http-response` (header values are raw bytes), `request-edit` / `response-edit` (rewrites expressed as diffs), and the three-way decision variants.
+- **types**: `http-request` / `http-response` (header values are raw bytes), `request-edit` / `response-edit` (rewrites expressed as diffs), and the typed decision variants — request-side `continue` / `modified` / `short-circuit`, response-side `continue` / `modified` / `replace` (ADR 000073).
 - **host-API (six capabilities; 1 interface = 1 capability)**: `host-log` / `host-clock` (wall-clock snapshot captured once at request start) / `host-kv` / `host-counter` / `host-ratelimit` (token bucket stays **host-native**) / `host-config` (read-only manifest `[filter.config]`, ADR 000066).
 - **Two worlds**: `filter` (header-only) and `filter-body` (+ `on-request-body`, buffer-then-decide, `list<u8>` in v1). The duplication instead of `include` is a deliberate workaround for WIT's `use`-propagation semantics, with the reason recorded in comments — **the contract file carrying its own design annotations is this repository's house style.**
 - **Experimental**: `plecto:filter-streaming` (`stream<u8>`, async) is quarantined behind the off-by-default `streaming-body` feature and stays out of the default build until `wasm32-wasip3` reaches Tier 2.

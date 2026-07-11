@@ -417,3 +417,133 @@ async fn h3_drain_window_cuts_requests_that_outlive_it() {
     drop(send_request);
     let _ = drive.await;
 }
+
+/// A repetitive, over-threshold body — compression is observable by size, not just headers
+/// (mirrors tests/compression.rs, which covers the full matrix over HTTP/1.1).
+fn big_text() -> String {
+    "All work and no play makes the fast path a dull proxy. ".repeat(100)
+}
+
+async fn compressible(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "text/html")
+        .body(Full::new(Bytes::from(big_text())))
+        .unwrap())
+}
+
+async fn spawn_compressible_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service_fn(compressible))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// One h3 GET with `Accept-Encoding: gzip`, returning status + response headers + the raw wire
+/// body (no decode).
+async fn drive_h3_gzip(
+    proxy: SocketAddr,
+    root: CertificateDer<'static>,
+) -> (u16, hyper::http::HeaderMap, Vec<u8>) {
+    let endpoint = h3_client_endpoint(root);
+    let connecting = endpoint.connect(proxy, "localhost").unwrap();
+    let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
+        .await
+        .expect("QUIC connect timed out (no h3 listener?)")
+        .expect("QUIC connect failed");
+
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let req = hyper::http::Request::builder()
+        .method("GET")
+        .uri("https://localhost/api/hello")
+        .header("accept-encoding", "gzip")
+        .body(())
+        .unwrap();
+    let mut stream = send_request.send_request(req).await.unwrap();
+    stream.finish().await.unwrap();
+
+    let resp = stream.recv_response().await.unwrap();
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+    }
+    drop(send_request);
+    let _ = drive.await;
+    endpoint.wait_idle().await;
+    (status, headers, body)
+}
+
+#[tokio::test]
+async fn h3_compresses_the_streamed_response_body() {
+    // Compression wraps the one `ResponseBody` inside `proxy_core` (ADR 000074) — this pins that
+    // the manual h3 frame loop (h3/request.rs) streams the compressed frames unchanged.
+    let cert = make_cert();
+    let upstream = spawn_compressible_upstream().await;
+    let toml = format!(
+        r#"
+[[upstream]]
+name = "echo"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+upstream = "echo"
+[route.match]
+path_prefix = "/api"
+[route.compression]
+
+[[tls]]
+cert_path = "{cert_path}"
+key_path = "{key_path}"
+"#,
+        cert_path = cert.cert_path,
+        key_path = cert.key_path,
+    );
+    let control = loaded_control(&toml);
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let (status, headers, body) = {
+        let mut result = None;
+        for _ in 0..100 {
+            let (status, headers, body) = drive_h3_gzip(proxy, cert.cert_der.clone()).await;
+            if status != 503 {
+                result = Some((status, headers, body));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        result.expect("upstream never became healthy within the readiness window")
+    };
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-encoding").map(|v| v.as_bytes()),
+        Some(b"gzip".as_slice()),
+        "the negotiated coding rides the h3 response head"
+    );
+    assert!(
+        body.len() < big_text().len(),
+        "the h3 data frames carry compressed bytes"
+    );
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(body.as_slice()), &mut out)
+        .unwrap();
+    assert_eq!(out, big_text().as_bytes());
+}

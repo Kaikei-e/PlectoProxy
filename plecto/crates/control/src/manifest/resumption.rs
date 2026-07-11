@@ -95,15 +95,15 @@ mod tests {
         );
     }
 
-    /// ADR 000062 (b) canary: shared STEK MUST be rejected on a listener with downstream
-    /// client-cert verification (the resumption-bypasses-mTLS class: nginx CVE-2025-23419,
-    /// Apache CVE-2025-23048, Cloudflare's mTLS resumption incident). No such listener config
-    /// exists yet, so the cross-rule cannot be written — this canary pins that fact. If it
-    /// fails: a client-auth field just entered the manifest schema; BEFORE shipping it, add the
-    /// fail-closed validation "[resumption] + client-cert listener → build error" with tests,
-    /// then teach this canary the new field.
+    /// ADR 000062 (b), follow-through of the pre-mTLS canary: the fail-closed crossing rule
+    /// (`[resumption]` shared STEK × `[listen.client_auth]` → build error) is now implemented —
+    /// pinned by `tls::tests::client_auth_with_shared_stek_fails_closed` and the load-level E2E
+    /// in `plecto-server/tests/tls.rs` (the resumption-bypasses-mTLS class: nginx
+    /// CVE-2025-23419, Apache CVE-2025-23048, Cloudflare's mTLS resumption incident). This test
+    /// keeps guarding the SCHEMA: any NEW client-auth flavoured field may only ship after its
+    /// shared-STEK crossing semantics are decided (ADR 000078), then join the sanctioned list.
     #[test]
-    fn no_downstream_client_auth_exists_to_cross_shared_stek_yet() {
+    fn client_auth_schema_fields_stay_sanctioned() {
         // Property NAMES only — doc comments (schema descriptions) may mention mTLS freely.
         fn property_names(value: &serde_json::Value, out: &mut Vec<String>) {
             if let Some(object) = value.as_object() {
@@ -119,17 +119,29 @@ mod tests {
                 }
             }
         }
+        // Each entry records WHY it is allowed to coexist with the schema's STEK fields.
+        let sanctioned = [
+            "client_auth",      // [listen.client_auth]: crossing rule enforced fail-closed
+            "client_cert_path", // [upstream.tls]: presented identity, no ticket interaction
+            "client_key_path",  // ditto
+        ];
         let schema: serde_json::Value =
             serde_json::from_str(&crate::manifest_json_schema()).unwrap();
         let mut names = Vec::new();
         property_names(&schema, &mut names);
-        for needle in ["client_ca", "client_auth", "client_cert", "mtls"] {
-            assert!(
-                !names.iter().any(|n| n.to_lowercase().contains(needle)),
-                "manifest schema now has a {needle:?} field — implement the ADR 000062 (b) \
-                 fail-closed crossing rule (shared STEK x downstream client-cert verification) \
-                 before this lands"
-            );
+        for name in &names {
+            let lower = name.to_lowercase();
+            if ["client_ca", "client_auth", "client_cert", "mtls"]
+                .iter()
+                .any(|needle| lower.contains(needle))
+            {
+                assert!(
+                    sanctioned.contains(&name.as_str()),
+                    "manifest schema grew an unsanctioned client-auth field {name:?} — decide \
+                     its shared-STEK crossing semantics (ADR 000062 (b) / 000078) and add it to \
+                     the sanctioned list"
+                );
+            }
         }
     }
 }

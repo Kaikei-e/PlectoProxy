@@ -89,7 +89,20 @@ pub(crate) fn build_server_configs(
     client_auth: Option<&ClientAuth>,
     base_dir: &Path,
 ) -> Result<Option<TlsConfigs>, ControlError> {
-    let _ = client_auth; // wired by the GREEN half of this slice (ADR 000078)
+    // ADR 000062 (b) / 000078: a shared-STEK ticket is minted before any peer authenticates and
+    // opens on every replica sharing the file — on a client-auth listener it would let a peer
+    // resume PAST client-certificate verification. Refuse the combination outright; per-node
+    // resumption stays available (that ticket carries the verified identity and never leaves
+    // this node's keys).
+    if let (Some(resumption), Some(_)) = (resumption, client_auth) {
+        return Err(ControlError::Stek {
+            path: resumption.stek_file.clone(),
+            reason: "[resumption] shared STEK cannot be combined with [listen.client_auth]: a \
+                     cross-replica ticket would resume past client-certificate verification \
+                     (ADR 000062 (b) / 000078) — drop [resumption] to keep per-node resumption"
+                .to_string(),
+        });
+    }
     if entries.is_empty() {
         // `[resumption]` without any `[[tls]]` is a config mistake, not a no-op: the operator
         // asked for cross-replica resumption on a proxy that terminates no TLS. Fail closed.
@@ -98,6 +111,16 @@ pub(crate) fn build_server_configs(
                 path: resumption.stek_file.clone(),
                 reason: "[resumption] requires at least one [[tls]] cert (ticket keys bind to \
                          the cert set, ADR 000062)"
+                    .to_string(),
+            });
+        }
+        // Same shape for `[listen.client_auth]`: there is no TLS handshake to authenticate a
+        // client on, so the section is a mistake, not a no-op.
+        if let Some(auth) = client_auth {
+            return Err(ControlError::ClientAuthCa {
+                path: auth.ca_path.clone(),
+                reason: "[listen.client_auth] requires at least one [[tls]] cert — a plain-HTTP \
+                         listener has no handshake to verify a client certificate in"
                     .to_string(),
             });
         }
@@ -142,12 +165,22 @@ pub(crate) fn build_server_configs(
         None => shared_ticketer()?,
     };
 
+    // Downstream client-certificate verification ([listen.client_auth], ADR 000078): one
+    // required-mode verifier for BOTH configs — the granularity is the listener, and TCP + QUIC
+    // are two wire faces of the same one. `None` = today's no-client-auth listener.
+    let client_verifier = client_auth
+        .map(|auth| build_client_verifier(auth, base_dir))
+        .transpose()?;
+
     // TCP: HTTP/1.1 + HTTP/2 via ALPN (h2 preferred, ADR 000015), TLS 1.2 + 1.3.
-    let mut tcp = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
+    let tcp_builder = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
         .with_safe_default_protocol_versions()
-        .map_err(provider_init_err)?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
+        .map_err(provider_init_err)?;
+    let mut tcp = match &client_verifier {
+        Some(verifier) => tcp_builder.with_client_cert_verifier(verifier.clone()),
+        None => tcp_builder.with_no_client_auth(),
+    }
+    .with_cert_resolver(resolver.clone());
     tcp.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     // QUIC: HTTP/3, ALPN `h3`, TLS 1.3 only (ADR 000016). 0-RTT stays disabled: `max_early_data_size`
@@ -156,11 +189,14 @@ pub(crate) fn build_server_configs(
     // outright is the only safe choice here. The stateless ticketer below refuses it a second way
     // (rustls only configures early data when the ticketer is DISabled) — but the invariant test
     // pins `max_early_data_size == 0` on its own, so a rustls behavior change cannot reopen 0-RTT.
-    let mut quic = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
+    let quic_builder = ServerConfig::builder_with_provider(Arc::new(provider::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(provider_init_err)?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .map_err(provider_init_err)?;
+    let mut quic = match &client_verifier {
+        Some(verifier) => quic_builder.with_client_cert_verifier(verifier.clone()),
+        None => quic_builder.with_no_client_auth(),
+    }
+    .with_cert_resolver(resolver);
     quic.alpn_protocols = vec![b"h3".to_vec()];
 
     // Stateless session resumption (ADR 000052), replacing the implicit rustls default (a
@@ -180,6 +216,42 @@ pub(crate) fn build_server_configs(
     }))
 }
 
+/// Build the required-mode client-certificate verifier from `[listen.client_auth]` (ADR 000078).
+/// `ca_path` holds trust ANCHORS only — a client's intermediates belong in the chain the client
+/// presents, per X.509 path building. Required mode is the only mode: a peer presenting no (or
+/// an untrusted) certificate fails the handshake, since "request but allow none" only pays off
+/// once verified identities propagate to filters — declared deferred by the ADR. Certificate
+/// revocation (CRL/OCSP) is likewise out of this slice: no CRLs are configured, matching that
+/// declared deferral.
+fn build_client_verifier(
+    auth: &ClientAuth,
+    base_dir: &Path,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, ControlError> {
+    let err = |reason: String| ControlError::ClientAuthCa {
+        path: auth.ca_path.clone(),
+        reason,
+    };
+    let bytes = std::fs::read(base_dir.join(&auth.ca_path))
+        .map_err(|e| err(format!("read failed: {e}")))?;
+    let certs = CertificateDer::pem_slice_iter(&bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| err(format!("bad CA PEM: {e}")))?;
+    if certs.is_empty() {
+        return Err(err("no certificates in CA PEM".to_string()));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(err("no usable trust anchor in CA PEM".to_string()));
+    }
+    rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(provider::default_provider()),
+    )
+    .build()
+    .map_err(|e| err(format!("client verifier: {e}")))
+}
+
 /// Build the rustls `ClientConfig` for one `[upstream.tls]` entry (ADR 000042): server
 /// certificate verification is ALWAYS on — against the manifest's CA bundle when `ca_path` is
 /// set (replacing, not extending, the webpki roots: an internal-CA deployment trusts exactly its
@@ -187,6 +259,9 @@ pub(crate) fn build_server_configs(
 /// path's HTTPS connector owns it (hyper-rustls rejects a pre-populated list) and advertises
 /// `[h2, http/1.1]` — the negotiation result, not manifest config, selects the upstream protocol.
 /// Built at load/reload like the server configs above, so a bad CA fails the build closed.
+/// When `client_cert_path`/`client_key_path` declare an identity (upstream mTLS, ADR 000078),
+/// every TLS leg to this upstream presents it — forwarded requests and health probes share the
+/// connector this config feeds.
 pub(crate) fn build_upstream_client_config(
     upstream_name: &str,
     tls: &crate::manifest::UpstreamTls,
@@ -217,13 +292,77 @@ pub(crate) fn build_upstream_client_config(
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
     }
-    let config =
+    let builder =
         rustls::ClientConfig::builder_with_provider(Arc::new(provider::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(provider_init_err)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+            .with_root_certificates(roots);
+    let config = match (&tls.client_cert_path, &tls.client_key_path) {
+        (None, None) => builder.with_no_client_auth(),
+        (Some(cert_path), Some(key_path)) => {
+            let cerr = |path: &str, reason: String| ControlError::UpstreamClientCert {
+                upstream: upstream_name.to_string(),
+                path: path.to_string(),
+                reason,
+            };
+            let cert_bytes = std::fs::read(base_dir.join(cert_path))
+                .map_err(|e| cerr(cert_path, format!("read failed: {e}")))?;
+            let chain = CertificateDer::pem_slice_iter(&cert_bytes)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| cerr(cert_path, format!("bad cert PEM: {e}")))?;
+            if chain.is_empty() {
+                return Err(cerr(
+                    cert_path,
+                    "no certificates in client cert PEM".to_string(),
+                ));
+            }
+            let key_file = base_dir.join(key_path);
+            owner_only(&key_file).map_err(|reason| cerr(key_path, reason))?;
+            let key_bytes = std::fs::read(&key_file)
+                .map_err(|e| cerr(key_path, format!("read failed: {e}")))?;
+            let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+                .map_err(|e| cerr(key_path, format!("bad key PEM: {e}")))?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| cerr(cert_path, format!("client cert/key rejected: {e}")))?
+        }
+        (Some(path), None) | (None, Some(path)) => {
+            return Err(ControlError::UpstreamClientCert {
+                upstream: upstream_name.to_string(),
+                path: path.clone(),
+                reason: "client_cert_path and client_key_path must be set together — half an \
+                         identity cannot be presented (fail-closed)"
+                    .to_string(),
+            });
+        }
+    };
     Ok(Arc::new(config))
+}
+
+/// The ADR 000062 (d) key-file discipline applied to this slice's new private keys: reject
+/// group/other readability outright (unix; other platforms have no mode bits to check). The
+/// pre-existing `[[tls]]` server keys are NOT checked — retrofitting would break running
+/// configs, a separate decision (ADR 000078 grill 確定 6).
+fn owner_only(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("read failed: {e}"))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "file mode {:o} is readable by group/other — chmod 600 (owner-only) required",
+                mode & 0o777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Parse one `[upstream.tls] sni` verification-name override into a rustls `ServerName` (ADR

@@ -21,6 +21,19 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Mutual TLS in both directions (ADR 000078). Downstream: `[listen.client_auth] ca_path`
+  makes a verified client certificate **required** on every TLS handshake the listener
+  terminates (HTTP/1.1, h2 and h3/QUIC alike — one verifier for both wire faces; required
+  mode only). Upstream: `[upstream.tls] client_cert_path` / `client_key_path` present a
+  client identity on every TLS leg to that upstream, health probes included (both-or-neither,
+  fail-closed). `[resumption]` shared STEK cannot be combined with `[listen.client_auth]`
+  (ADR 000062 (b): a cross-replica ticket would resume past client-certificate verification);
+  per-node resumption stays on, and its tickets carry the verified identity. The new private
+  keys must be owner-only on unix (group/other-readable fails the build closed). Revocation
+  (CRL/OCSP) and propagation of the verified identity to filters are declared deferred.
+
 ## [0.3.0] - 2026-07-11
 
 ### Added

@@ -66,7 +66,7 @@ fast path と extension plane は上下関係でも主従関係でもなく、**
 
 機能追加の駆動軸は「競合が持っているから」ではなく「L7/API-gateway という**役割**が要求するから」である（ADR 000029）。同 ADR は native/WASM の配置基準を固定し、以後の判断（native rate-limit の床は fast path へ、WAF は extension plane へ、分散状態は外へ）はこの基準から導出されている。
 
-やらないと決めたことは黙って放置せず、**declined として ADR に言語化する**。現に response caching・AI/LLM gateway の native 化（ADR 000043）、WAF の native 実装(ADR 000037)、native 分散状態（ADR 000053）、h2c（ADR 000015）、0-RTT（ADR 000052）が明示的 declined として記録されている。deferred（時機待ち）とは区別し、deferred には序列を付けて管理する（現行序列は ADR 000054 が mTLS を先頭に引き上げ、ADR 000056 が PROXY protocol v2 を直後に挿入）。
+やらないと決めたことは黙って放置せず、**declined として ADR に言語化する**。現に response caching・AI/LLM gateway の native 化（ADR 000043）、WAF の native 実装(ADR 000037)、native 分散状態（ADR 000053）、h2c（ADR 000015）、0-RTT（ADR 000052）が明示的 declined として記録されている。deferred（時機待ち）とは区別し、deferred には序列を付けて管理する（序列は ADR 000054 起点・ADR 000056 改訂。先頭だった mTLS は ADR 000078 で着地）。
 
 ### P9 — 測定は誠実に。リーダーボードではなく方法論
 
@@ -130,7 +130,7 @@ Plecto Proxy の Rust workspace は三つの crate = 三つの文脈から成り
 
 ### 2.5 TLS・暗号方針
 
-crypto provider は **aws-lc-rs に一本化**（ADR 000051。cmake declined の判断を実地検証に基づき撤回した経緯ごと記録）。post-quantum の X25519MLKEM768 鍵交換を既定で優先。TLS 1.3 の stateless session resumption はチケット鍵ローテーション付きで導入し、**0-RTT 拒否とチケット鍵のノードローカル性を不変条件**とする（ADR 000052——2025 年に相次いだ ticket-key 共有起因の脆弱性を教訓とした線引き）。証明書は宣言的 manifest の静的ファイル管理（ADR 000014）。mTLS は品質ターゲット再定義に伴い deferred 序列の先頭（ADR 000054）。
+crypto provider は **aws-lc-rs に一本化**（ADR 000051。cmake declined の判断を実地検証に基づき撤回した経緯ごと記録）。post-quantum の X25519MLKEM768 鍵交換を既定で優先。TLS 1.3 の stateless session resumption はチケット鍵ローテーション付きで導入し、**0-RTT 拒否とチケット鍵のノードローカル性を不変条件**とする（ADR 000052——2025 年に相次いだ ticket-key 共有起因の脆弱性を教訓とした線引き）。証明書は宣言的 manifest の静的ファイル管理（ADR 000014）。mTLS は両方向で導入済み（ADR 000078）: listener は検証済み client certificate を必須化でき（`[listen.client_auth]`、required のみ。shared STEK との併用は ADR 000062 (b) により fail-closed）、upstream レグは client identity を提示できる（`[upstream.tls] client_cert_path` / `client_key_path`、health probe も提示）。失効確認（CRL/OCSP）と検証済み identity の filter 伝搬は declared deferred のまま。
 
 ### 2.6 観測性方針: ホストが伝播し、ゲスト契約は汚さない
 
@@ -201,7 +201,7 @@ ADR は `docs/ADR/NNNNNN.md`、frontmatter + wikilink、テンプレは `templat
 | `wasm32-wasip3` が Rust Tier-2 到達・wit-bindgen async 成熟 | `streaming-body` feature の既定化に向けた昇格判断（`stream<u8>` 本実装、M3 の真のストリーミング増分） |
 | `wasi:http`（proxy / middleware）収斂ゲートの成立 | 型語彙の `wasi:http` 収斂実施（ADR 000020）と、`outbound-http` の既定ビルド入り判断 |
 | Go（`gc`）本体が wasip2/p3 で Tier 相当の Component Model 対応に到達 | Tier B（ADR 000063、2026-07-06 判断・2026-07-08 実装）が前提とする TinyGo 限定の再訪 |
-| mTLS スライス着手 | downstream / upstream の client cert 検証設計（deferred 序列の先頭、ADR 000054。現状は両向き `with_no_client_auth`） |
+| 着地済み mTLS floor に失効確認 / identity 伝搬の需要が現れる | mTLS スライス（ADR 000078、2026-07-12 着地）の declared deferred: CRL/OCSP の本番級配線、検証済み client identity の filter 伝搬 |
 | リモート filter-registry 取得（wkg 境界）の需要成立 | M4 の残余——現行はオフライン image-layout が意図された既定 |
 | crypto provider の代替（例: 第三者監査済み pure-Rust 実装）の成熟 | ADR 000051 の再訪。判断基準は同 ADR が確立した「実リンク検証 + ビルド DX + 保守状況」 |
 | opt-in 分散合意（foca / openraft）の実需 | M5 deferred 分の着手可否。single-node first（P7）は維持したまま opt-in レイヤとして |

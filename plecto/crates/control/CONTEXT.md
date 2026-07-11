@@ -74,6 +74,20 @@ _Avoid_: key distribution（Plecto が鍵を配る含意——配布機構は持
 CVE-2025-23419 / 23048 の越境形の構造的遮断）。
 _Avoid_: vhost isolation（設定による分離の含意——ここでは鍵導出そのものが分離する）
 
+**Client auth（downstream mTLS / `[listen.client_auth]`）**:
+listener が終端する全 TLS handshake（TCP と QUIC の両面）で、`ca_path` の trust anchor に連鎖する
+client certificate を**必須**にする検証（ADR 000078）。required のみ——「要求するが未提示も通す」
+optional は identity の filter 伝搬（declared deferred）とセットでなければ導入しない。共有 STEK との
+併用は fail-closed（ADR 000062 (b)）。失効確認（CRL/OCSP）は本スライス外。
+_Avoid_: mTLS listener 単体の呼称で optional 含み（Plecto の client auth は常に required）,
+network policy / ext-authz（認証の確立点が異なり certificate-bound identity の代替にならない）
+
+**Client identity（upstream mTLS / `[upstream.tls]` client_cert_path + client_key_path）**:
+Plecto が upstream へ接続するとき提示する自身の証明書チェーンと秘密鍵。転送リクエストと health probe は
+同一 connector を共有するので、宣言すれば両方が提示する（ADR 000078）。both-or-neither を validation で
+強制し、秘密鍵は owner-only ファイル権限を要求（ADR 000062 (d) の規律を新規鍵に適用）。
+_Avoid_: client cert（downstream で「検証する」側の語と紛れる——upstream 側は「提示する」identity）
+
 ## 分散（opt-in）
 
 **Distribution (opt-in)**:

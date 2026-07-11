@@ -66,7 +66,7 @@ Distribution is an opt-in layer, not the default (ADR 000008). Configuration is 
 
 The axis for adding features is not "a competitor has it" but "the **role** of an L7/API gateway demands it" (ADR 000029). That ADR fixed the native/WASM placement criteria, and subsequent decisions (native rate-limit floor to the fast path, WAF to the extension plane, distributed state pushed out) derive from it.
 
-What we decide not to do is not silently shelved but **recorded as declined in an ADR**. Already declined explicitly: native response caching and AI/LLM gateway (ADR 000043), native WAF (ADR 000037), native distributed state (ADR 000053), h2c (ADR 000015), 0-RTT (ADR 000052). Declined is distinguished from deferred (waiting on timing), and deferred items carry a managed ordering (currently headed by mTLS per ADR 000054, revised by ADR 000056).
+What we decide not to do is not silently shelved but **recorded as declined in an ADR**. Already declined explicitly: native response caching and AI/LLM gateway (ADR 000043), native WAF (ADR 000037), native distributed state (ADR 000053), h2c (ADR 000015), 0-RTT (ADR 000052). Declined is distinguished from deferred (waiting on timing), and deferred items carry a managed ordering (per ADR 000054, revised by ADR 000056; its former head, mTLS, landed via ADR 000078).
 
 ### P9 — Measure honestly: methodology, not a leaderboard
 
@@ -130,7 +130,7 @@ Runtime bounding is layered: epoch interruption (a CPU budget; chosen over fuel 
 
 ### 2.5 TLS and cryptography policy
 
-The crypto provider is **consolidated on aws-lc-rs** (ADR 000051 — recorded together with the retraction of the earlier cmake-declined decision after hands-on verification). Post-quantum X25519MLKEM768 key exchange is preferred by default. TLS 1.3 stateless session resumption ships with ticket-key rotation, holding **0-RTT rejection and node-locality of ticket keys as invariants** (ADR 000052 — a line drawn from the 2025 wave of shared-ticket-key vulnerabilities). Certificates are static files managed by the declarative manifest (ADR 000014). mTLS heads the deferred ordering after the quality-target redefinition (ADR 000054).
+The crypto provider is **consolidated on aws-lc-rs** (ADR 000051 — recorded together with the retraction of the earlier cmake-declined decision after hands-on verification). Post-quantum X25519MLKEM768 key exchange is preferred by default. TLS 1.3 stateless session resumption ships with ticket-key rotation, holding **0-RTT rejection and node-locality of ticket keys as invariants** (ADR 000052 — a line drawn from the 2025 wave of shared-ticket-key vulnerabilities). Certificates are static files managed by the declarative manifest (ADR 000014). Mutual TLS ships in both directions (ADR 000078): a listener can require verified client certificates (`[listen.client_auth]`, required mode only; combining it with shared STEK is refused outright per ADR 000062 (b)), and an upstream leg can present a client identity (`[upstream.tls] client_cert_path` / `client_key_path` — health probes included). Revocation (CRL/OCSP) and propagation of the verified identity to filters stay declared deferred.
 
 ### 2.6 Observability policy: the host propagates; the guest contract stays clean
 
@@ -201,7 +201,7 @@ The principles do not change, but the policies carry explicit external triggers 
 | `wasm32-wasip3` reaches Rust Tier 2, wit-bindgen async matures | Promotion of the `streaming-body` feature toward default (real `stream<u8>` implementation, M3's true-streaming increment) |
 | The `wasi:http` (proxy / middleware) convergence gate is met | Executing the `wasi:http` type convergence (ADR 000020) and the default-build decision for `outbound-http` |
 | Go (`gc`) reaches Tier-equivalent wasip2/p3 Component Model support | Revisit the TinyGo-only assumption behind Tier B (ADR 000063, decided 2026-07-06 and implemented 2026-07-08) |
-| The mTLS slice starts | Design of downstream/upstream client-cert verification (head of the deferred ordering, ADR 000054; both directions are currently `with_no_client_auth`) |
+| Revocation or identity-propagation demand appears on the landed mTLS floor | The declared deferreds of the mTLS slice (ADR 000078, landed 2026-07-12): CRL/OCSP wiring, and propagation of the verified client identity to filters |
 | Demand materialises for remote filter-registry fetch (the wkg boundary) | The M4 remainder — offline image-layout is the intended default today |
 | A credible alternative crypto provider matures (e.g. an audited pure-Rust implementation) | Revisiting ADR 000051, using the criteria that ADR established: actual-link verification + build DX + maintenance status |
 | Real demand for opt-in distributed consensus (foca / openraft) | Whether to start the deferred M5 portion — as an opt-in layer, keeping single-node first (P7) |

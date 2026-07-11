@@ -13,7 +13,7 @@ use std::sync::Arc;
 use plecto_host::{Header, LoadedFilter};
 
 use crate::error::ControlError;
-use crate::manifest::Route;
+use crate::manifest::{CompressionAlgorithm, Route, RouteCompression};
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 use crate::weighted::{self, WeightedBackends};
@@ -65,6 +65,8 @@ pub(crate) struct CompiledRoute {
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
     /// This route's Upgrade opt-in (ADR 000048), or `None` for deny-by-default (strip as today).
     pub(crate) upgrade: Option<Arc<UpgradeConfig>>,
+    /// This route's compression opt-in (ADR 000074), or `None` for never-transform (the default).
+    pub(crate) compression: Option<Arc<CompressionConfig>>,
 }
 
 // Manual `Debug`: `LoadedFilter` (behind `resolved_chain`'s `Arc`) doesn't implement it, so this
@@ -85,6 +87,7 @@ impl std::fmt::Debug for CompiledRoute {
             .field("strip_prefix", &self.strip_prefix)
             .field("rate_limit", &self.rate_limit)
             .field("upgrade", &self.upgrade)
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -125,6 +128,51 @@ impl UpgradeConfig {
     /// The established tunnel's idle timeout; `None` = the operator disabled it (`0`).
     pub fn idle_timeout(&self) -> Option<std::time::Duration> {
         self.idle_timeout
+    }
+}
+
+/// A route's compiled `[route.compression]` (ADR 000074): the offered codings in server-preference
+/// order, the min-length floor, and the content-type allowlist (lower-cased at build so the
+/// per-response check is an allocation-free case-insensitive scan over a short list).
+#[derive(Debug)]
+pub struct CompressionConfig {
+    algorithms: Vec<CompressionAlgorithm>,
+    min_length: u64,
+    content_types: Vec<String>,
+}
+
+impl CompressionConfig {
+    /// Compile a manifest `[route.compression]` block. Public because the fast-path server's
+    /// negotiation unit tests build configs directly, without a manifest parse.
+    pub fn new(rc: &RouteCompression) -> Self {
+        Self {
+            algorithms: rc.algorithms.clone(),
+            min_length: rc.min_length,
+            content_types: rc
+                .content_types
+                .iter()
+                .map(|ct| ct.trim().to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    /// The codings this route offers, in server-preference order (the qvalue tie-break).
+    pub fn algorithms(&self) -> &[CompressionAlgorithm] {
+        &self.algorithms
+    }
+
+    /// The declared-length floor: a response shorter than this is not worth a codec header.
+    pub fn min_length(&self) -> u64 {
+        self.min_length
+    }
+
+    /// Is this `Content-Type` essence (`type/subtype`, parameters already stripped) compressible
+    /// on this route? Case-insensitive scan — the list is ~a dozen entries, no per-request alloc.
+    pub fn content_type_eligible(&self, essence: &str) -> bool {
+        let essence = essence.trim();
+        self.content_types
+            .iter()
+            .any(|ct| ct.eq_ignore_ascii_case(essence))
     }
 }
 
@@ -223,6 +271,47 @@ pub(crate) fn validate_routes<'a>(
                 }
             }
         }
+        // Validate the compression opt-in (ADR 000074): an empty coding list or an empty /
+        // non-`type/subtype` allowlist entry is a config typo — fail closed at build, before a
+        // request ever negotiates against it.
+        if let Some(c) = &r.compression {
+            if c.algorithms.is_empty() {
+                return Err(ControlError::InvalidRoute {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    reason: "compression.algorithms must be non-empty".to_string(),
+                });
+            }
+            let mut seen = HashSet::new();
+            for a in &c.algorithms {
+                if !seen.insert(a) {
+                    return Err(ControlError::InvalidRoute {
+                        path_prefix: r.matcher.path_prefix.clone(),
+                        reason: format!("compression.algorithms lists `{}` twice", a.token()),
+                    });
+                }
+            }
+            if c.content_types.is_empty() {
+                return Err(ControlError::InvalidRoute {
+                    path_prefix: r.matcher.path_prefix.clone(),
+                    reason: "compression.content_types must be non-empty".to_string(),
+                });
+            }
+            for ct in &c.content_types {
+                let essence = ct.trim();
+                let well_formed = essence
+                    .split_once('/')
+                    .is_some_and(|(t, s)| !t.is_empty() && !s.is_empty())
+                    && !essence.contains([';', ',', ' ']);
+                if !well_formed {
+                    return Err(ControlError::InvalidRoute {
+                        path_prefix: r.matcher.path_prefix.clone(),
+                        reason: format!(
+                            "compression.content_types entry `{essence}` is not a type/subtype"
+                        ),
+                    });
+                }
+            }
+        }
         validated.push(ValidatedRoute { route: r, targets });
     }
     Ok(validated)
@@ -260,6 +349,9 @@ pub struct RouteInfo {
     /// This route's Upgrade opt-in (ADR 000048), or `None` for deny-by-default. The fast path
     /// tunnels only when the client's token is allowlisted here.
     pub upgrade: Option<Arc<UpgradeConfig>>,
+    /// This route's compression opt-in (ADR 000074), or `None` for never-transform. The fast path
+    /// negotiates and compresses AFTER the response chain, on the streamed body filters never see.
+    pub compression: Option<Arc<CompressionConfig>>,
 }
 
 impl RouteInfo {
@@ -570,6 +662,7 @@ mod tests {
             strip_prefix: None,
             rate_limit: None,
             upgrade: None,
+            compression: None,
         }
     }
 
@@ -612,6 +705,7 @@ mod tests {
             strip_prefix: None,
             rate_limit,
             upgrade: None,
+            compression: None,
         }
     }
 

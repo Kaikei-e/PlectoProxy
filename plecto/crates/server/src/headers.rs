@@ -201,9 +201,27 @@ pub(crate) fn headers_to_vec(map: &hyper::HeaderMap) -> Vec<Header> {
 /// Copy contract headers into a hyper `HeaderMap`, skipping hop-by-hop and any that fail hyper's
 /// validation (a malformed name/value is dropped, never panics — data-plane no-panic).
 pub(crate) fn copy_headers(dst: Option<&mut hyper::HeaderMap>, headers: &[Header]) {
+    copy_headers_filtered(dst, headers, false);
+}
+
+/// Like [`copy_headers`], but also drops `Content-Length` — for synthesised (buffered) responses
+/// where the host owns framing from `full(body)` and a guest-supplied length must not desync the
+/// wire (ADR 000073 review). `Transfer-Encoding` is already hop-by-hop.
+pub(crate) fn copy_headers_synth(dst: Option<&mut hyper::HeaderMap>, headers: &[Header]) {
+    copy_headers_filtered(dst, headers, true);
+}
+
+fn copy_headers_filtered(
+    dst: Option<&mut hyper::HeaderMap>,
+    headers: &[Header],
+    strip_content_length: bool,
+) {
     let Some(dst) = dst else { return };
     for h in headers {
         if is_hop_by_hop(&h.name) {
+            continue;
+        }
+        if strip_content_length && h.name.eq_ignore_ascii_case("content-length") {
             continue;
         }
         if let (Ok(name), Ok(value)) = (

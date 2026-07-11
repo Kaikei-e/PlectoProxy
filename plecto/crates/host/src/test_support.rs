@@ -73,6 +73,19 @@ pub fn filter_noop_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_NOOP_COMPONENT")).expect("read filter-noop component")
 }
 
+/// The compiled `filter-cors` component bytes — the CORS reference filter (ADR 000073 / the F2
+/// shelf, ADR 000068), built by this crate's `build.rs`.
+pub fn filter_cors_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_CORS_COMPONENT")).expect("read filter-cors component")
+}
+
+/// The compiled `filter-compat-v02` component bytes — the fixture pinned to the FROZEN
+/// `plecto:filter@0.2.0` contract, keeping the V02 adapter rail covered now that the in-tree
+/// default is 0.3.0 (ADR 000073). Built by this crate's `build.rs`.
+pub fn filter_compat_v02_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_COMPAT_V02_COMPONENT")).expect("read filter-compat-v02 component")
+}
+
 /// The compiled `filter-extauthz` component bytes — the outbound-HTTP example (an ext_authz-style
 /// gate), built by this crate's `build.rs` when the `outbound-http` feature is on (ADR 000036).
 #[cfg(feature = "outbound-http")]

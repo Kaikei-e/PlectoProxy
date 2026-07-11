@@ -73,7 +73,7 @@ fn signed_load(name: &str, bytes: &[u8], opts: LoadOptions) -> (Host, LoadedFilt
     };
     let filter = host
         .load(name, &artifact, opts)
-        .unwrap_or_else(|e| panic!("{name} must satisfy plecto:filter@0.1.0: {e}"));
+        .unwrap_or_else(|e| panic!("{name} must satisfy plecto:filter@0.3.0: {e}"));
     (host, filter)
 }
 
@@ -249,7 +249,9 @@ fn every_language_edits_the_response_only_when_asked() {
             headers: vec![],
             body: vec![],
         };
-        let (decision, _logs) = filter.on_response(&plain, &RequestTrace::root()).unwrap();
+        let (decision, _logs) = filter
+            .on_response(&request(&[]), &plain, &RequestTrace::root())
+            .unwrap();
         assert!(
             matches!(decision, ResponseDecision::Continue),
             "{name}: a plain response should continue"
@@ -263,7 +265,9 @@ fn every_language_edits_the_response_only_when_asked() {
             }],
             body: vec![],
         };
-        let (decision, _logs) = filter.on_response(&marked, &RequestTrace::root()).unwrap();
+        let (decision, _logs) = filter
+            .on_response(&request(&[]), &marked, &RequestTrace::root())
+            .unwrap();
         match decision {
             ResponseDecision::Modified(edit) => {
                 assert!(

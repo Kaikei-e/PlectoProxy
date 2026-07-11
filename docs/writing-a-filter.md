@@ -22,7 +22,23 @@ only when your filter actually reads the body.
 | `init` | both | once per instance (heavy setup) | — |
 | `on-request` | both | per request, on the headers | `continue` / `modified(edit)` / `short-circuit(response)` |
 | `on-request-body` | `filter-body` only | per request, on the buffered body | `continue(body)` / `short-circuit(response)` |
-| `on-response` | both | per response, on the headers | `continue` / `modified(edit)` |
+| `on-response` | both | per response, on the headers, with the as-forwarded request snapshot (ADR 000073) | `continue` / `modified(edit)` / `replace(response)` |
+
+### Response-side decisions and chain order
+
+The response chain runs the route's filters in **reverse** of the request order (request
+`[auth, cors]` → response `cors → auth`). A `replace` is **terminal**: remaining filters in that
+reverse walk are skipped and the synthesised response is sent to the client. So the filters most
+at risk of being skipped are the ones **early in the request-order list** (they run last on the
+response). A response filter that must always run — audit, security-header stamping — belongs
+**last in the request-order list**, so it runs **first** on the response, before any `replace`
+can end the walk. The trade-off is inherent to a terminal `replace`: a filter cannot both be
+guaranteed to run and be guaranteed to see the final (possibly replaced) response.
+
+`req` on `on-response` is the **as-forwarded** snapshot: the request as it left the request-side
+chain (filter stamps such as `x-authenticated-user` are visible), **before** host egress
+transforms (hop-by-hop strip, upstream path rewrite, `traceparent` injection). It is value-passed;
+editing it does nothing.
 
 A filter is **stateless**. Anything it must remember lives in host state, reached only through the
 capabilities the host explicitly lends it — **deny-by-default**:
@@ -406,7 +422,7 @@ registry = "ghcr.io"
 metadata = { oci = { registry = "ghcr.io", namespacePrefix = "kaikei-e/wit/" } }
 EOF
 
-wkg get plecto:filter@0.2.0 --config wkg-registry.toml -o wit/ --format wit
+wkg get plecto:filter@0.3.0 --config wkg-registry.toml -o wit/ --format wit
 ```
 
 That writes the plain-text WIT to `wit/`, ready for `wit_bindgen::generate!` (or any other
@@ -423,7 +439,7 @@ disappear without a major bump. Do not depend on it outside an explicit opt-in b
 ### Compatibility policy
 
 The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
-versioning policy already says so. `plecto:filter@0.2.0` and a `plecto` binary at `0.2.6` is the
+versioning policy already says so. `plecto:filter@0.3.0` and a `plecto` binary at `0.2.6` is the
 normal, expected state.
 
 - **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional

@@ -1,4 +1,4 @@
-//! E2E (tdd-workflow Phase 0) for **header byte-equivalence** (`plecto:filter@0.2.0`, ADR 000071).
+//! E2E (tdd-workflow Phase 0) for **header byte-equivalence** (byte-valued headers since `plecto:filter@0.2.0`, ADR 000071; current contract 0.3.0).
 //! The contract carries header values as `list<u8>`, so non-UTF-8 bytes survive the filter boundary
 //! on `continue`. A filterless route exercises the fast-path projection; a filter-hello route exercises
 //! the WASM boundary. The fake upstream reflects `x-blob` into its response body.

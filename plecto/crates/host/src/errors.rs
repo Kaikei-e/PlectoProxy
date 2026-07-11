@@ -29,18 +29,18 @@ pub enum RunError {
     /// re-init'ing every request (circuit-breaker, review f000003 #5). Fail-closed mapping: 503.
     #[error("filter is in trap-cooldown (circuit open)")]
     Unavailable,
-    /// The guest returned cleanly but its output violates the contract's byte-level header rules
-    /// (CRLF / CTL in a value, a non-tchar name, oversize — ADR 000071). Distinct from `Trap` so
-    /// operators can tell a misbehaving-but-alive filter from a crashing one; the fail-closed
-    /// mapping is the same 502.
-    #[error("filter returned an invalid header (malformed name/value)")]
+    /// The guest returned cleanly but its output violates contract rules (CRLF / CTL / non-tchar
+    /// header, oversize header, or oversize synthesised body — ADR 000071 / 000073). Distinct
+    /// from `Trap` so operators can tell a misbehaving-but-alive filter from a crashing one;
+    /// fail-closed mapping is 502.
+    #[error("filter returned invalid output (malformed header or oversize synthesised body)")]
     InvalidOutput,
 }
 
-/// Marker the runtime wraps in a `wasmtime::Error` when guest output fails header validation, so
+/// Marker the runtime wraps in a `wasmtime::Error` when guest output fails validation, so
 /// [`RunError::from_call`] can classify it as [`RunError::InvalidOutput`] instead of a trap.
 #[derive(Debug, thiserror::Error)]
-#[error("filter returned an invalid header (malformed name/value); failing closed")]
+#[error("filter returned invalid output; failing closed")]
 pub(crate) struct InvalidGuestOutput;
 
 impl RunError {
@@ -105,6 +105,13 @@ pub enum LoadError {
          (fail-closed; ADR 000006 / review f000003)"
     )]
     SbomNotBound,
+    /// The component's decoded imports name no recognised `plecto:filter@0.N` track (absent, or
+    /// a future version the host does not yet bind). Fail-closed at load — never guess V03.
+    #[error(
+        "component does not import a recognised plecto:filter contract version \
+         (need @0.1 / @0.2 / @0.3; fail-closed)"
+    )]
+    UnsupportedContractVersion,
     /// The eager trusted-instance build (`Host::load`'s `Isolation::Trusted` path) failed —
     /// carries the same error `RunError::Instantiate` would for a later rebuild.
     #[error("filter instantiation failed: {0}")]

@@ -210,12 +210,83 @@ fn response_chain_applies_edit() {
         }],
         body: vec![],
     };
-    let out = control.on_response(resp);
-    assert!(
-        out.headers
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case("x-plecto-respadded")),
-        "the response-side chain must apply the filter's response edit"
+    let out = control.on_response(&req(&[]), resp);
+    match out {
+        plecto_control::ResponseOutcome::Forward(edited) => assert!(
+            edited
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("x-plecto-respadded")),
+            "the response-side chain must apply the filter's response edit"
+        ),
+        plecto_control::ResponseOutcome::Respond(_) => {
+            panic!("a modified (not replace) response should forward")
+        }
+    }
+}
+
+#[test]
+fn replace_stops_the_response_chain_and_yields_the_synthesised_response() {
+    // ADR 000073: a response filter's `replace` is terminal — the remaining (reverse-order)
+    // filters are skipped, exactly like the request side's short-circuit and the general
+    // proxy-filter form (a local response skips the rest of the chain). The chain is the SAME
+    // filter twice; if the second one ran, the sink would show two response spans.
+    let sink = Arc::new(InMemorySink::new());
+    let (signer, artifact) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("fh", artifact);
+    let host = Host::new(signer.trust_policy().unwrap())
+        .unwrap()
+        .with_telemetry_sink(sink.clone());
+    let manifest = Manifest::from_toml(&manifest_toml(&digest, &["fh", "fh"])).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+
+    // The replace marker rides the REQUEST — reaching the replace arm at all also proves the
+    // as-forwarded snapshot flowed into the response phase.
+    let marked = req(&[("x-plecto-resp-replace", "1")]);
+    let out = control.on_response(
+        &marked,
+        HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        },
+    );
+    match out {
+        plecto_control::ResponseOutcome::Respond(resp) => {
+            assert_eq!(resp.status, 418);
+            assert_eq!(resp.body, b"replaced by filter-hello");
+            assert!(
+                resp.headers
+                    .iter()
+                    .any(|h| h.name == "x-plecto-replaced" && h.value == b"1")
+            );
+        }
+        plecto_control::ResponseOutcome::Forward(_) => {
+            panic!("a replace must yield the synthesised response")
+        }
+    }
+    assert_eq!(
+        sink.spans().len(),
+        1,
+        "replace is terminal: the second filter in the (reverse-order) chain must not run"
+    );
+
+    // Control: a modified edit does NOT stop the chain — both filters run.
+    let echoed = req(&[("x-plecto-resp-echo", "1")]);
+    let out = control.on_response(
+        &echoed,
+        HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        },
+    );
+    assert!(matches!(out, plecto_control::ResponseOutcome::Forward(_)));
+    assert_eq!(
+        sink.spans().len(),
+        3,
+        "modified continues: both chain entries emit a response span (1 replace + 2 echo)"
     );
 }
 
@@ -297,11 +368,14 @@ fn request_and_response_spans_share_one_trace_via_snapshot() {
 
     let snap = control.snapshot();
     let _ = snap.on_request(req(&[]));
-    let _ = snap.on_response(HttpResponse {
-        status: 200,
-        headers: vec![],
-        body: vec![],
-    });
+    let _ = snap.on_response(
+        &req(&[]),
+        HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        },
+    );
 
     let spans = sink.spans();
     assert_eq!(spans.len(), 2, "one request span + one response span");

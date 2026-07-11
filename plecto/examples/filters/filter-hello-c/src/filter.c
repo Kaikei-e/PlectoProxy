@@ -190,7 +190,11 @@ void exports_filter_body_on_request_body(
 }
 
 void exports_filter_body_on_response(
-    filter_body_http_response_t *resp, filter_body_response_decision_t *ret) {
+    filter_body_http_request_t *req, filter_body_http_response_t *resp,
+    filter_body_response_decision_t *ret) {
+    // The as-forwarded request snapshot (plecto:filter@0.3.0, ADR 000073) — unused by this
+    // conformance subset, but ownership is ours to release.
+    filter_body_http_request_free(req);
     if (find_header(&resp->headers, "x-plecto-respedit") != NULL) {
         ret->tag = PLECTO_FILTER_TYPES_RESPONSE_DECISION_MODIFIED;
         ret->val.modified.set_status.is_some = false;

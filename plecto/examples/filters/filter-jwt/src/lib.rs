@@ -563,7 +563,7 @@ impl Guest for FilterJwt {
         }
     }
 
-    fn on_response(_resp: HttpResponse) -> ResponseDecision {
+    fn on_response(_req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {
         ResponseDecision::Continue
     }
 }

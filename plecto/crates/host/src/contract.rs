@@ -1,4 +1,5 @@
-//! `plecto:filter` contract version detection and 0.1↔0.2 adapters (ADR 000071).
+//! `plecto:filter` contract version detection and 0.1/0.2 → 0.3 adapters
+//! (ADR 000071 / 000073).
 
 mod bindings_v01 {
     wasmtime::component::bindgen!({
@@ -8,11 +9,22 @@ mod bindings_v01 {
     });
 }
 
+mod bindings_v02 {
+    wasmtime::component::bindgen!({
+        path: "../../wit/v0.2.0",
+        world: "filter",
+        exports: { default: async },
+    });
+}
+
 pub(crate) use crate::bindings::{
-    Filter as FilterV02, FilterPre as FilterPreV02, plecto::filter::types as types_v02,
+    Filter as FilterV03, FilterPre as FilterPreV03, plecto::filter::types as types_v03,
 };
 pub(crate) use bindings_v01::{
     Filter as FilterV01, FilterPre as FilterPreV01, plecto::filter::types as types_v01,
+};
+pub(crate) use bindings_v02::{
+    Filter as FilterV02, FilterPre as FilterPreV02, plecto::filter::types as types_v02,
 };
 
 use crate::{
@@ -25,27 +37,39 @@ use crate::{
 pub enum ContractVersion {
     V01,
     V02,
+    V03,
 }
 
 /// Detect the contract version from the component's decoded import names (wasmtime's own
 /// validated type information, not a byte scan — a scan can false-positive on a string the
-/// guest embeds in a data segment). Keyed on ANY `plecto:filter/…@0.1.` import, not one
-/// specific interface: componentization prunes unused imports, so a 0.1 guest that never
-/// logs has no `host-log` import at all. A component importing neither version defaults to
-/// V02 and fails at `instantiate_pre` with wasmtime's own unknown-import error (fail-closed).
+/// guest embeds in a data segment). Keyed on ANY `plecto:filter/…@0.N.` import, not one
+/// specific interface: componentization prunes unused imports, so a guest that never
+/// logs has no `host-log` import at all.
+///
+/// Returns `None` (fail-closed at load) when the component imports no `plecto:filter/…`
+/// interface, or imports one at an unknown version (e.g. a future `@0.4.`). Only an explicit
+/// `@0.1.` / `@0.2.` / `@0.3.` match is accepted — never a silent default to the latest.
 pub(crate) fn detect_contract_version(
     component: &wasmtime::component::Component,
     engine: &wasmtime::Engine,
-) -> ContractVersion {
-    let is_v01 = component
-        .component_type()
-        .imports(engine)
-        .any(|(name, _)| name.starts_with("plecto:filter/") && name.contains("@0.1."));
-    if is_v01 {
-        ContractVersion::V01
-    } else {
-        ContractVersion::V02
+) -> Option<ContractVersion> {
+    for (name, _) in component.component_type().imports(engine) {
+        if !name.starts_with("plecto:filter/") {
+            continue;
+        }
+        if name.contains("@0.1.") {
+            return Some(ContractVersion::V01);
+        }
+        if name.contains("@0.2.") {
+            return Some(ContractVersion::V02);
+        }
+        if name.contains("@0.3.") {
+            return Some(ContractVersion::V03);
+        }
+        // A `plecto:filter/…` import at an unrecognised version — do not guess.
+        return None;
     }
+    None
 }
 
 pub(crate) fn request_to_v01(req: &HttpRequest) -> types_v01::HttpRequest {
@@ -80,6 +104,41 @@ pub(crate) fn response_to_v01(resp: &HttpResponse) -> types_v01::HttpResponse {
     }
 }
 
+/// Project the canonical (0.3-shaped) request into the frozen 0.2 record: the same
+/// byte-valued shape, so this is a mechanical per-field clone, not a lossy projection
+/// (unlike [`request_to_v01`]).
+pub(crate) fn request_to_v02(req: &HttpRequest) -> types_v02::HttpRequest {
+    types_v02::HttpRequest {
+        method: req.method.clone(),
+        path: req.path.clone(),
+        authority: req.authority.clone(),
+        scheme: req.scheme.clone(),
+        headers: req
+            .headers
+            .iter()
+            .map(|h| types_v02::Header {
+                name: h.name.clone(),
+                value: h.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn response_to_v02(resp: &HttpResponse) -> types_v02::HttpResponse {
+    types_v02::HttpResponse {
+        status: resp.status,
+        headers: resp
+            .headers
+            .iter()
+            .map(|h| types_v02::Header {
+                name: h.name.clone(),
+                value: h.value.clone(),
+            })
+            .collect(),
+        body: resp.body.clone(),
+    }
+}
+
 fn header_from_v01(h: types_v01::Header) -> Option<Header> {
     validate_and_header(&h.name, h.value.as_bytes())
 }
@@ -88,8 +147,15 @@ fn header_from_v02(h: types_v02::Header) -> Option<Header> {
     validate_and_header(&h.name, &h.value)
 }
 
+fn header_from_v03(h: types_v03::Header) -> Option<Header> {
+    validate_and_header(&h.name, &h.value)
+}
+
 const MAX_GUEST_HEADER_NAME_LEN: usize = 256;
 const MAX_GUEST_HEADER_VALUE_LEN: usize = 8192;
+/// Ceiling on a guest-synthesised response body (`short-circuit` / `replace`). Symmetric to the
+/// request-body buffer cap on the fast path: an unbounded guest body is a trivial host OOM.
+pub(crate) const MAX_GUEST_RESPONSE_BODY_LEN: usize = 1 << 20; // 1 MiB
 
 /// RFC 9110 §5.6.2 `tchar` — the exact set hyper's `HeaderName::from_bytes` accepts, so a name
 /// that passes here can never be silently dropped at the egress `copy_headers` conversion.
@@ -180,6 +246,38 @@ fn response_edit_from_v02(edit: types_v02::ResponseEdit) -> Option<ResponseEdit>
     })
 }
 
+fn request_edit_from_v03(edit: types_v03::RequestEdit) -> Option<RequestEdit> {
+    let set_headers = edit
+        .set_headers
+        .into_iter()
+        .map(header_from_v03)
+        .collect::<Option<Vec<_>>>()?;
+    Some(RequestEdit {
+        set_headers,
+        remove_headers: edit.remove_headers,
+    })
+}
+
+fn response_edit_from_v03(edit: types_v03::ResponseEdit) -> Option<ResponseEdit> {
+    let set_headers = edit
+        .set_headers
+        .into_iter()
+        .map(header_from_v03)
+        .collect::<Option<Vec<_>>>()?;
+    Some(ResponseEdit {
+        set_status: edit.set_status,
+        set_headers,
+        remove_headers: edit.remove_headers,
+    })
+}
+
+fn validated_guest_body(body: Vec<u8>) -> Option<Vec<u8>> {
+    if body.len() > MAX_GUEST_RESPONSE_BODY_LEN {
+        return None;
+    }
+    Some(body)
+}
+
 fn response_from_v01(resp: types_v01::HttpResponse) -> Option<HttpResponse> {
     let headers = resp
         .headers
@@ -189,7 +287,7 @@ fn response_from_v01(resp: types_v01::HttpResponse) -> Option<HttpResponse> {
     Some(HttpResponse {
         status: resp.status,
         headers,
-        body: resp.body,
+        body: validated_guest_body(resp.body)?,
     })
 }
 
@@ -202,7 +300,20 @@ fn response_from_v02(resp: types_v02::HttpResponse) -> Option<HttpResponse> {
     Some(HttpResponse {
         status: resp.status,
         headers,
-        body: resp.body,
+        body: validated_guest_body(resp.body)?,
+    })
+}
+
+fn response_from_v03(resp: types_v03::HttpResponse) -> Option<HttpResponse> {
+    let headers = resp
+        .headers
+        .into_iter()
+        .map(header_from_v03)
+        .collect::<Option<Vec<_>>>()?;
+    Some(HttpResponse {
+        status: resp.status,
+        headers,
+        body: validated_guest_body(resp.body)?,
     })
 }
 
@@ -279,6 +390,48 @@ pub(crate) fn request_body_decision_from_v02(
     }
 }
 
+pub(crate) fn request_decision_from_v03(
+    decision: types_v03::RequestDecision,
+) -> Option<RequestDecision> {
+    match decision {
+        types_v03::RequestDecision::Continue => Some(RequestDecision::Continue),
+        types_v03::RequestDecision::Modified(edit) => {
+            Some(RequestDecision::Modified(request_edit_from_v03(edit)?))
+        }
+        types_v03::RequestDecision::ShortCircuit(resp) => {
+            Some(RequestDecision::ShortCircuit(response_from_v03(resp)?))
+        }
+    }
+}
+
+/// Map a 0.3 guest response decision to the validated native one. `replace` output is
+/// untrusted guest data on its way to the client, so it passes the SAME fail-closed header
+/// validation as a request-side `short-circuit` (ADR 000073 decision 4).
+pub(crate) fn response_decision_from_v03(
+    decision: types_v03::ResponseDecision,
+) -> Option<ResponseDecision> {
+    match decision {
+        types_v03::ResponseDecision::Continue => Some(ResponseDecision::Continue),
+        types_v03::ResponseDecision::Modified(edit) => {
+            Some(ResponseDecision::Modified(response_edit_from_v03(edit)?))
+        }
+        types_v03::ResponseDecision::Replace(resp) => {
+            Some(ResponseDecision::Replace(response_from_v03(resp)?))
+        }
+    }
+}
+
+pub(crate) fn request_body_decision_from_v03(
+    decision: types_v03::RequestBodyDecision,
+) -> Option<RequestBodyDecision> {
+    match decision {
+        types_v03::RequestBodyDecision::Continue(body) => Some(RequestBodyDecision::Continue(body)),
+        types_v03::RequestBodyDecision::ShortCircuit(resp) => {
+            Some(RequestBodyDecision::ShortCircuit(response_from_v03(resp)?))
+        }
+    }
+}
+
 /// Build a canonical header (byte-valued) for callers and tests.
 pub fn header(name: impl Into<String>, value: impl AsRef<[u8]>) -> Header {
     Header {
@@ -293,9 +446,9 @@ mod v01_host {
     };
     use crate::LogLevel;
     use crate::bindings::plecto::filter::{
-        host_clock as host_clock_v02, host_config as host_config_v02,
-        host_counter as host_counter_v02, host_kv as host_kv_v02, host_log as host_log_v02,
-        host_ratelimit as host_ratelimit_v02,
+        host_clock as host_clock_v03, host_config as host_config_v03,
+        host_counter as host_counter_v03, host_kv as host_kv_v03, host_log as host_log_v03,
+        host_ratelimit as host_ratelimit_v03,
     };
     use crate::state::HostState;
 
@@ -313,40 +466,40 @@ mod v01_host {
 
     impl host_log::Host for HostState {
         fn log(&mut self, level: host_log::Level, message: String) {
-            host_log_v02::Host::log(self, log_level(level), message);
+            host_log_v03::Host::log(self, log_level(level), message);
         }
     }
 
     impl host_clock::Host for HostState {
         fn now_ms(&mut self) -> u64 {
-            host_clock_v02::Host::now_ms(self)
+            host_clock_v03::Host::now_ms(self)
         }
     }
 
     impl host_kv::Host for HostState {
         fn get(&mut self, key: String) -> Option<Vec<u8>> {
-            host_kv_v02::Host::get(self, key)
+            host_kv_v03::Host::get(self, key)
         }
         fn set(&mut self, key: String, value: Vec<u8>) {
-            host_kv_v02::Host::set(self, key, value);
+            host_kv_v03::Host::set(self, key, value);
         }
         fn delete(&mut self, key: String) {
-            host_kv_v02::Host::delete(self, key);
+            host_kv_v03::Host::delete(self, key);
         }
     }
 
     impl host_counter::Host for HostState {
         fn increment(&mut self, key: String, delta: i64) -> i64 {
-            host_counter_v02::Host::increment(self, key, delta)
+            host_counter_v03::Host::increment(self, key, delta)
         }
         fn get(&mut self, key: String) -> i64 {
-            host_counter_v02::Host::get(self, key)
+            host_counter_v03::Host::get(self, key)
         }
     }
 
     impl host_ratelimit::Host for HostState {
         fn try_acquire(&mut self, key: String, cost: u64) -> host_ratelimit::Acquire {
-            let out = host_ratelimit_v02::Host::try_acquire(self, key, cost);
+            let out = host_ratelimit_v03::Host::try_acquire(self, key, cost);
             host_ratelimit::Acquire {
                 allowed: out.allowed,
                 remaining: out.remaining,
@@ -357,7 +510,82 @@ mod v01_host {
 
     impl host_config::Host for HostState {
         fn get(&mut self, key: String) -> Option<String> {
-            host_config_v02::Host::get(self, key)
+            host_config_v03::Host::get(self, key)
+        }
+    }
+}
+
+mod v02_host {
+    use super::bindings_v02::plecto::filter::{
+        host_clock, host_config, host_counter, host_kv, host_log, host_ratelimit,
+    };
+    use crate::LogLevel;
+    use crate::bindings::plecto::filter::{
+        host_clock as host_clock_v03, host_config as host_config_v03,
+        host_counter as host_counter_v03, host_kv as host_kv_v03, host_log as host_log_v03,
+        host_ratelimit as host_ratelimit_v03,
+    };
+    use crate::state::HostState;
+
+    impl super::bindings_v02::plecto::filter::types::Host for HostState {}
+
+    fn log_level(level: host_log::Level) -> LogLevel {
+        match level {
+            host_log::Level::Trace => LogLevel::Trace,
+            host_log::Level::Debug => LogLevel::Debug,
+            host_log::Level::Info => LogLevel::Info,
+            host_log::Level::Warn => LogLevel::Warn,
+            host_log::Level::Error => LogLevel::Error,
+        }
+    }
+
+    impl host_log::Host for HostState {
+        fn log(&mut self, level: host_log::Level, message: String) {
+            host_log_v03::Host::log(self, log_level(level), message);
+        }
+    }
+
+    impl host_clock::Host for HostState {
+        fn now_ms(&mut self) -> u64 {
+            host_clock_v03::Host::now_ms(self)
+        }
+    }
+
+    impl host_kv::Host for HostState {
+        fn get(&mut self, key: String) -> Option<Vec<u8>> {
+            host_kv_v03::Host::get(self, key)
+        }
+        fn set(&mut self, key: String, value: Vec<u8>) {
+            host_kv_v03::Host::set(self, key, value);
+        }
+        fn delete(&mut self, key: String) {
+            host_kv_v03::Host::delete(self, key);
+        }
+    }
+
+    impl host_counter::Host for HostState {
+        fn increment(&mut self, key: String, delta: i64) -> i64 {
+            host_counter_v03::Host::increment(self, key, delta)
+        }
+        fn get(&mut self, key: String) -> i64 {
+            host_counter_v03::Host::get(self, key)
+        }
+    }
+
+    impl host_ratelimit::Host for HostState {
+        fn try_acquire(&mut self, key: String, cost: u64) -> host_ratelimit::Acquire {
+            let out = host_ratelimit_v03::Host::try_acquire(self, key, cost);
+            host_ratelimit::Acquire {
+                allowed: out.allowed,
+                remaining: out.remaining,
+                retry_after_ms: out.retry_after_ms,
+            }
+        }
+    }
+
+    impl host_config::Host for HostState {
+        fn get(&mut self, key: String) -> Option<String> {
+            host_config_v03::Host::get(self, key)
         }
     }
 }
@@ -468,27 +696,103 @@ mod tests {
     }
 
     #[test]
+    fn v03_replace_output_passes_the_same_fail_closed_validation_as_short_circuit() {
+        // ADR 000073 decision 4: `replace` output is untrusted guest data headed for the client,
+        // so it passes the SAME header validation as a request-side short-circuit. CRLF fails
+        // closed (the mapper returns None → RunError::InvalidOutput); clean bytes pass intact.
+        let bad = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+            status: 200,
+            headers: vec![types_v03::Header {
+                name: "x-evil".to_string(),
+                value: b"a\r\nx-smuggled: 1".to_vec(),
+            }],
+            body: b"payload".to_vec(),
+        });
+        assert!(
+            response_decision_from_v03(bad).is_none(),
+            "CRLF in a replace header fails closed"
+        );
+
+        let ok = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+            status: 418,
+            headers: vec![types_v03::Header {
+                name: "x-blob".to_string(),
+                value: vec![0xC3, 0x28, 0xFF],
+            }],
+            body: b"payload".to_vec(),
+        });
+        match response_decision_from_v03(ok) {
+            Some(ResponseDecision::Replace(resp)) => {
+                assert_eq!(resp.status, 418);
+                assert_eq!(resp.headers[0].value, vec![0xC3, 0x28, 0xFF]);
+                assert_eq!(resp.body, b"payload");
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v02_projection_is_byte_faithful() {
+        // The 0.2 projection is a mechanical clone (same byte-valued shape), NOT the 0.1
+        // lossy-UTF-8 form: non-UTF-8 header bytes survive verbatim.
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            authority: "a".to_string(),
+            scheme: "https".to_string(),
+            headers: vec![Header {
+                name: "x-blob".to_string(),
+                value: vec![0xC3, 0x28],
+            }],
+        };
+        let projected = request_to_v02(&req);
+        assert_eq!(projected.headers[0].value, vec![0xC3, 0x28]);
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![Header {
+                name: "x-blob".to_string(),
+                value: vec![0xFF],
+            }],
+            body: b"b".to_vec(),
+        };
+        assert_eq!(response_to_v02(&resp).headers[0].value, vec![0xFF]);
+    }
+
+    #[test]
     fn detects_version_from_decoded_imports_not_bytes() {
         // Real components prune unused imports (the MoonBit fixture has no host-kv/clock/config),
         // so detection must key on ANY plecto:filter interface — and must read the decoded type
-        // structure, not raw bytes.
+        // structure, not raw bytes. Unknown / absent versions fail closed (`None`) at load.
         let engine = wasmtime::Engine::default();
-        let cases: &[(&str, ContractVersion)] = &[
+        let cases: &[(&str, Option<ContractVersion>)] = &[
             (
                 r#"(component (import "plecto:filter/host-log@0.1.0" (instance)))"#,
-                ContractVersion::V01,
+                Some(ContractVersion::V01),
             ),
             // a 0.1 guest that never logs: host-log is pruned, another interface remains.
             (
                 r#"(component (import "plecto:filter/host-clock@0.1.0" (instance)))"#,
-                ContractVersion::V01,
+                Some(ContractVersion::V01),
             ),
             (
                 r#"(component (import "plecto:filter/host-log@0.2.0" (instance)))"#,
-                ContractVersion::V02,
+                Some(ContractVersion::V02),
             ),
-            // no plecto import at all: default V02; instantiate_pre rejects it later.
-            (r"(component)", ContractVersion::V02),
+            (
+                r#"(component (import "plecto:filter/host-log@0.3.0" (instance)))"#,
+                Some(ContractVersion::V03),
+            ),
+            (
+                r#"(component (import "plecto:filter/host-clock@0.2.0" (instance)))"#,
+                Some(ContractVersion::V02),
+            ),
+            // no plecto import at all: fail closed at load (do not guess V03).
+            (r"(component)", None),
+            // future / unknown track: fail closed (do not silently bind as V03).
+            (
+                r#"(component (import "plecto:filter/host-log@0.4.0" (instance)))"#,
+                None,
+            ),
         ];
         for (wat, want) in cases {
             let component =
@@ -499,5 +803,25 @@ mod tests {
                 "wat: {wat}"
             );
         }
+    }
+
+    #[test]
+    fn oversize_guest_response_body_fails_closed() {
+        let ok = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![0u8; MAX_GUEST_RESPONSE_BODY_LEN],
+        });
+        assert!(response_decision_from_v03(ok).is_some());
+
+        let over = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![0u8; MAX_GUEST_RESPONSE_BODY_LEN + 1],
+        });
+        assert!(
+            response_decision_from_v03(over).is_none(),
+            "a synthesised body over the cap must fail closed"
+        );
     }
 }

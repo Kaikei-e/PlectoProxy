@@ -13,7 +13,7 @@ use hyper::{Response, StatusCode};
 use plecto_control::otlp::SpanRecord;
 use plecto_control::{
     ChainOutcome, HashInput, HashKeySource, HttpResponse, RateLimitDecision, RequestBodyOutcome,
-    RequestTrace,
+    RequestTrace, ResponseOutcome,
 };
 
 use crate::body::{INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body};
@@ -23,8 +23,8 @@ use crate::headers::{
     copy_headers, copy_headers_direct, headers_to_vec, set_forwarded, to_http_request,
 };
 use crate::respond::{
-    fault, http_response, stream_response, stream_response_direct, synth, synth_retry_after,
-    with_error_code,
+    discard_upstream_body, fault, http_response, stream_response, stream_response_direct, synth,
+    synth_retry_after, with_error_code,
 };
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
 
@@ -438,13 +438,22 @@ async fn proxy_core_inner(
                 body: Vec::new(),
             };
             let snap_resp = snapshot.clone();
-            let edited =
-                tokio::task::spawn_blocking(move || snap_resp.dispatch_response(idx, http_resp))
-                    .await?;
-            if edited.status != StatusCode::SWITCHING_PROTOCOLS.as_u16() || !edited.body.is_empty()
-            {
-                // A response filter vetoed the switch (or trapped fail-closed): honour its
-                // response and never splice — the upstream connection drops with `upstream_on`.
+            // `forward` moves into the closure: this branch always returns, so the normal
+            // response path below (which also consumes it) is never reached after this.
+            let outcome = tokio::task::spawn_blocking(move || {
+                snap_resp.dispatch_response(idx, &forward, http_resp)
+            })
+            .await?;
+            let edited = match outcome {
+                // A response filter replaced the handshake (or trapped fail-closed): honour
+                // its response and never splice — the upstream connection drops with
+                // `upstream_on`.
+                ResponseOutcome::Respond(resp) => return Ok(http_response(resp)),
+                ResponseOutcome::Forward(edited) => edited,
+            };
+            if edited.status != StatusCode::SWITCHING_PROTOCOLS.as_u16() {
+                // A response filter vetoed the switch by demoting the status: honour that
+                // response (header-only) and never splice.
                 return Ok(http_response(edited));
             }
             copy_headers(builder.headers_mut(), &edited.headers);
@@ -496,17 +505,27 @@ async fn proxy_core_inner(
         headers: headers_to_vec(&uparts.headers),
         body: Vec::new(), // header-only: filters never see the streamed body
     };
+    // The response chain sees the AS-FORWARDED request snapshot (ADR 000073): `forward` is the
+    // request exactly as it left the request-side chain (filter edits applied, before the
+    // egress hop-by-hop strip / path rewrite / traceparent injection), moved here for free —
+    // no per-request copy is added to hold it.
     let snap_resp = snapshot.clone();
-    let edited =
-        tokio::task::spawn_blocking(move || snap_resp.dispatch_response(idx, http_resp)).await?;
+    let outcome =
+        tokio::task::spawn_blocking(move || snap_resp.dispatch_response(idx, &forward, http_resp))
+            .await?;
 
-    // A response filter that trapped fail-closed yields a synthetic 5xx WITH a body; only then is
-    // `body` non-empty (a normal response-edit can set status/headers but not a body). So: a
-    // non-empty body means "use the synthetic response, drop the upstream stream"; an empty body
-    // means "send the edited status + headers and stream the upstream body through".
-    if edited.body.is_empty() {
-        Ok(stream_response(edited.status, &edited.headers, ubody))
-    } else {
-        Ok(http_response(edited))
+    // The typed successor of the old in-band signal (ADR 000073): `Forward` sends the edited
+    // status + headers and streams the upstream body through; `Respond` is a synthesised
+    // response — a filter's `replace` or the chain's fail-closed 5xx. The upstream body is
+    // discarded without blocking the client (background drain up to a cap, else socket close)
+    // so a replace does not permanently poison the upstream connection pool.
+    match outcome {
+        ResponseOutcome::Forward(edited) => {
+            Ok(stream_response(edited.status, &edited.headers, ubody))
+        }
+        ResponseOutcome::Respond(resp) => {
+            discard_upstream_body(ubody);
+            Ok(http_response(resp))
+        }
     }
 }

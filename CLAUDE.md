@@ -4,7 +4,7 @@
 [docs/design-principles.md](docs/design-principles.md)（英語・正）/ [docs/design-principles.ja.md](docs/design-principles.ja.md)
 （日本語・同期）——原則（P1–P12）・アーキテクチャ方針・配置決定木・非目標・進化の条件を三層で定礎する。
 個別判断の一次記録は `docs/ADR/`（`amends` / `supersedes` による append-only グラフ。`scripts/check_adr_graph.py` が CI で検証）、
-**Tenet・設計原則は ADR から生成せず独立した規範層**（`design-principles.md` を直接更新）、契約の正文は `wit/`（現行 `plecto:filter@0.2.0`、0.1 は `wit/v0.1.0/` 凍結 + ロード時アダプタ、ADR 000071）。
+**Tenet・設計原則は ADR から生成せず独立した規範層**（`design-principles.md` を直接更新）、契約の正文は `wit/`（現行 `plecto:filter@0.3.0`、0.1 / 0.2 は `wit/v0.1.0/` / `wit/v0.2.0/` 凍結 + ロード時アダプタ、ADR 000071 / 000073）。
 
 ## Plecto Proxy とは
 
@@ -47,7 +47,7 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 **安全 × ポータビリティ × セルフホスト性 × 運用の単純さ** ＞ 機能網羅性 × 強い権限 × 分散デフォルト。
 
 - **deny-by-default capability** — フィルタはホストが明示的に貸した能力以外、何も触れない（sandbox 強制）。
-- **判断は型で** — フィルタの戻り値は `decision` variant（`continue` / `modified` / `short-circuit`）。`plecto:filter@0.2.0` ではヘッダ値は `list<u8>`（原文バイト、ADR 000071）。
+- **判断は型で** — フィルタの戻り値は `decision` variant（request 側 `continue` / `modified` / `short-circuit`、response 側 `continue` / `modified` / `replace`、ADR 000073）。ヘッダ値は `list<u8>`（原文バイト、ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取る。
 - **init と per-request を分離** — 高コスト初期化は init フックへ、ホット経路は軽く保つ。
 - **フィルタはステートレス** — 状態はホスト KV（redb）に置く。
 - **fail-closed** — フィルタ trap / deadline 超過で素通り（fail-open）させない。

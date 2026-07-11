@@ -132,7 +132,7 @@ pub fn on_request_body(body : FixedArray[Byte]) -> @types.RequestBodyDecision {
 }
 
 ///|
-pub fn on_response(resp : @types.HttpResponse) -> @types.ResponseDecision {
+pub fn on_response(_req : @types.HttpRequest, resp : @types.HttpResponse) -> @types.ResponseDecision {
   if find_header(resp.headers, "x-plecto-respedit") is Some(_) {
     return @types.ResponseDecision::Modified(@types.ResponseEdit::{
       set_status: None,

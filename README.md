@@ -23,7 +23,7 @@ Plecto Proxy pairs **two complementary halves** through a typed [WIT](https://co
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (**74** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.2.0` contract (byte-valued headers; `0.1.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.2.6`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (**74** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.2.6`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto Proxy?
 
@@ -135,7 +135,7 @@ The native fast path has matured well past "a proxy that works." A snapshot of w
 The heart of Plecto Proxy is the `plecto:filter` WIT world — a custom world that defines Plecto Proxy's own vocabulary (the typed `decision`, init/per-request hooks, the deny-by-default host-API) while reusing standard types for polyglot compatibility.
 
 ```wit
-package plecto:filter@0.2.0;
+package plecto:filter@0.3.0;
 
 interface types {
   // Header values are raw bytes (ADR 000071) — not lossy UTF-8 strings.
@@ -146,6 +146,14 @@ interface types {
     %continue,                       // pass unchanged to the next filter
     modified(request-edit),          // apply the edit, then continue
     short-circuit(http-response),    // stop the chain; synthesise a response now
+  }
+
+  // The response side (ADR 000073): `replace` supplants the upstream response with a
+  // synthesised one (the upstream body is dropped unread — zero-copy stays intact).
+  variant response-decision {
+    %continue,
+    modified(response-edit),
+    replace(http-response),
   }
 }
 
@@ -166,7 +174,9 @@ world filter {
   import host-ratelimit;  import host-config;
   export init: func();                                                // heavy, once per instance
   export on-request:  func(req: http-request)  -> request-decision;   // hot path (headers)
-  export on-response: func(resp: http-response) -> response-decision; // hot path (headers)
+  // `req` is the AS-FORWARDED request snapshot (ADR 000073): the request as it left the
+  // request-side chain — an auth filter's stamp and the untouched `Origin` both ride it.
+  export on-response: func(req: http-request, resp: http-response) -> response-decision;
 }
 
 // Body-reading contract: `filter` plus `on-request-body`. Its PRESENCE is what makes the host
@@ -177,11 +187,11 @@ world filter-body {
   export init: func();
   export on-request:      func(req: http-request)  -> request-decision;
   export on-request-body: func(body: list<u8>)     -> request-body-decision;  // buffered body hook
-  export on-response:     func(resp: http-response) -> response-decision;
+  export on-response:     func(req: http-request, resp: http-response) -> response-decision;
 }
 ```
 
-> Current contract is **`plecto:filter@0.2.0`** (byte-valued headers, [ADR 000071](docs/ADR/000071.md)); `0.1.0` remains loadable with a deprecation warning. The request-side **body hook** (`on-request-body`, buffered `list<u8>`, [ADR 000025](docs/ADR/000025.md)) runs end-to-end for filters targeting `filter-body`. An **experimental, feature-gated** `stream<u8>` body world ([ADR 000020](docs/ADR/000020.md)) and `wasi:http` type reuse are next, gated on the P3 guest toolchain.
+> Current contract is **`plecto:filter@0.3.0`** (byte-valued headers, [ADR 000071](docs/ADR/000071.md); response-side request context + the `replace` decision, [ADR 000073](docs/ADR/000073.md) — the pair that makes a CORS dynamic-origin-echo filter expressible, see `examples/filters/filter-cors`); `0.1.0` / `0.2.0` remain loadable with a deprecation warning. The request-side **body hook** (`on-request-body`, buffered `list<u8>`, [ADR 000025](docs/ADR/000025.md)) runs end-to-end for filters targeting `filter-body`. An **experimental, feature-gated** `stream<u8>` body world ([ADR 000020](docs/ADR/000020.md)) and `wasi:http` type reuse are next, gated on the P3 guest toolchain.
 
 ## Writing a filter
 
@@ -199,14 +209,14 @@ impl Guest for FilterQuickstart {
         RequestDecision::Continue
     }
 
-    fn on_response(_resp: HttpResponse) -> ResponseDecision {
+    fn on_response(_req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {
         // The one visible thing this filter does: stamp a header so `curl -i` shows a WASM filter
         // touched the response.
         ResponseDecision::Modified(ResponseEdit {
             set_status: None,
             set_headers: vec![Header {
                 name: "x-plecto".into(),
-                value: b"hello-from-wasm".to_vec(), // list<u8> header values (@0.2.0)
+                value: b"hello-from-wasm".to_vec(), // list<u8> header values (@0.3.0)
             }],
             remove_headers: vec![],
         })
@@ -271,7 +281,7 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 
 | Milestone | Status | Covers |
 | --- | --- | --- |
-| **M0** — Foundation | ✅ done | `plecto:filter@0.2.0` contract (0.1 frozen + load adapter), wasmtime host, capability boundary, CI |
+| **M0** — Foundation | ✅ done | `plecto:filter@0.3.0` contract (0.1 / 0.2 frozen + load adapters), wasmtime host, capability boundary, CI |
 | **M1** — Filter runtime hardening | ✅ landed | trusted pool / untrusted fresh-per-request, redb KV, host-native rate limiting, quotas |
 | **M2** — The data path (fast path) | 🚧 maturing | HTTP/1–3 + TLS, routing / LB / resilience, upstream TLS + periodic DNS re-resolve, WebSocket tunnelling |
 | **M3** — Async & bodies | 🚧 Stages 1–2 landed | wasmtime-46 async, header/body-world split, buffer-then-decide body hook; `stream<u8>` is experimental |

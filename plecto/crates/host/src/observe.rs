@@ -153,6 +153,8 @@ pub enum SpanOutcome {
     Continue,
     Modified,
     ShortCircuit,
+    /// A response filter replaced the upstream response with a synthesised one (ADR 000073).
+    Replace,
     Deadline,
     Trap,
     InstantiateError,
@@ -169,6 +171,7 @@ impl SpanOutcome {
             SpanOutcome::Continue => "continue",
             SpanOutcome::Modified => "modified",
             SpanOutcome::ShortCircuit => "short-circuit",
+            SpanOutcome::Replace => "replace",
             SpanOutcome::Deadline => "deadline",
             SpanOutcome::Trap => "trap",
             SpanOutcome::InstantiateError => "instantiate-error",
@@ -180,7 +183,10 @@ impl SpanOutcome {
     /// A filter that ran and returned a decision is `Ok`; a `RunError` fault is `Error`.
     pub fn status(self) -> Status {
         match self {
-            SpanOutcome::Continue | SpanOutcome::Modified | SpanOutcome::ShortCircuit => Status::Ok,
+            SpanOutcome::Continue
+            | SpanOutcome::Modified
+            | SpanOutcome::ShortCircuit
+            | SpanOutcome::Replace => Status::Ok,
             SpanOutcome::Deadline
             | SpanOutcome::Trap
             | SpanOutcome::InstantiateError
@@ -207,6 +213,7 @@ impl From<&ResponseDecision> for SpanOutcome {
         match d {
             ResponseDecision::Continue => SpanOutcome::Continue,
             ResponseDecision::Modified(_) => SpanOutcome::Modified,
+            ResponseDecision::Replace(_) => SpanOutcome::Replace,
         }
     }
 }
@@ -432,7 +439,10 @@ impl TelemetrySink for MetricsSink {
     fn export(&self, span: &FilterSpan) {
         self.total.fetch_add(1, Ordering::Relaxed);
         match span.outcome {
-            SpanOutcome::ShortCircuit => {
+            // Both are the "filter answered instead of the upstream" terminal decisions —
+            // request-side short-circuit and response-side replace (ADR 000073) — so the
+            // coarse counter tallies them together; the per-span outcome keeps them distinct.
+            SpanOutcome::ShortCircuit | SpanOutcome::Replace => {
                 self.short_circuits.fetch_add(1, Ordering::Relaxed);
             }
             SpanOutcome::Deadline

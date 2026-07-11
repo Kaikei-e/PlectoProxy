@@ -230,78 +230,127 @@ pub fn wasmExportOnRequestBodyPostReturn(p0 : Int) -> Unit {
 }
 
 #doc(hidden)
-pub fn wasmExportOnResponse(p0 : Int, p1 : Int, p2 : Int, p3 : Int, p4 : Int) -> Int {
+pub fn wasmExportOnResponse(p0 : Int, p1 : Int, p2 : Int, p3 : Int, p4 : Int, p5 : Int, p6 : Int, p7 : Int, p8 : Int, p9 : Int, p10 : Int, p11 : Int, p12 : Int, p13 : Int, p14 : Int) -> Int {
+
+      let result = mbt_ffi_ptr2str(p0, p1)
+
+      let result0 = mbt_ffi_ptr2str(p2, p3)
+
+      let result1 = mbt_ffi_ptr2str(p4, p5)
+
+      let result2 = mbt_ffi_ptr2str(p6, p7)
 
       let array : Array[@types.Header] = [];
-      for index = 0; index < (p2); index = index + 1 {
-            let iter_base = (p1) + (index * 16)
+      for index = 0; index < (p9); index = index + 1 {
+            let iter_base = (p8) + (index * 16)
 
-            let result = mbt_ffi_ptr2str(mbt_ffi_load32((iter_base) + 0), mbt_ffi_load32((iter_base) + 4))
+            let result3 = mbt_ffi_ptr2str(mbt_ffi_load32((iter_base) + 0), mbt_ffi_load32((iter_base) + 4))
 
-            let result0 = mbt_ffi_ptr2bytes(mbt_ffi_load32((iter_base) + 8), mbt_ffi_load32((iter_base) + 12))
+            let result4 = mbt_ffi_ptr2bytes(mbt_ffi_load32((iter_base) + 8), mbt_ffi_load32((iter_base) + 12))
 
-            array.push(@types.Header::{name : result, value : result0})
+            array.push(@types.Header::{name : result3, value : result4})
       }
-      mbt_ffi_free(p1)
+      mbt_ffi_free(p8)
 
-      let result1 = mbt_ffi_ptr2bytes(p3, p4)
+      let array7 : Array[@types.Header] = [];
+      for index8 = 0; index8 < (p12); index8 = index8 + 1 {
+            let iter_base = (p11) + (index8 * 16)
 
-      let (result2) : (@types.ResponseDecision) = on_response(@types.HttpResponse::{status : (p0.land(0xFFFF).reinterpret_as_uint()), headers : array, body : result1});
+            let result5 = mbt_ffi_ptr2str(mbt_ffi_load32((iter_base) + 0), mbt_ffi_load32((iter_base) + 4))
+
+            let result6 = mbt_ffi_ptr2bytes(mbt_ffi_load32((iter_base) + 8), mbt_ffi_load32((iter_base) + 12))
+
+            array7.push(@types.Header::{name : result5, value : result6})
+      }
+      mbt_ffi_free(p11)
+
+      let result9 = mbt_ffi_ptr2bytes(p13, p14)
+
+      let (result10) : (@types.ResponseDecision) = on_response(@types.HttpRequest::{method_ : result, path : result0, authority : result1, scheme : result2, headers : array}, @types.HttpResponse::{status : (p10.land(0xFFFF).reinterpret_as_uint()), headers : array7, body : result9});
       let return_area = mbt_ffi_malloc(24)
 
-      match result2 {
+      match result10 {
             Continue => {
                   mbt_ffi_store8((return_area) + 0, (0))
 
                   ()
             }
-            Modified(payload3) => {
+            Modified(payload11) => {
                   mbt_ffi_store8((return_area) + 0, (1))
 
-                  match ((payload3).set_status) {
+                  match ((payload11).set_status) {
                         None => {
                               mbt_ffi_store8((return_area) + 4, (0))
 
                               ()
                         }
-                        Some(payload5) => {
+                        Some(payload13) => {
                               mbt_ffi_store8((return_area) + 4, (1))
-                              mbt_ffi_store16((return_area) + 6, (payload5).reinterpret_as_int())
+                              mbt_ffi_store16((return_area) + 6, (payload13).reinterpret_as_int())
 
                               ()
                         }
                   }
 
-                  let address = mbt_ffi_malloc(((payload3).set_headers).length() * 16);
-                  for index7 = 0; index7 < ((payload3).set_headers).length(); index7 = index7 + 1 {
-                        let iter_elem : @types.Header = ((payload3).set_headers)[(index7)]
-                        let iter_base = address + (index7 * 16);
+                  let address = mbt_ffi_malloc(((payload11).set_headers).length() * 16);
+                  for index15 = 0; index15 < ((payload11).set_headers).length(); index15 = index15 + 1 {
+                        let iter_elem : @types.Header = ((payload11).set_headers)[(index15)]
+                        let iter_base = address + (index15 * 16);
 
                         let ptr = mbt_ffi_str2ptr((iter_elem).name)
                         mbt_ffi_store32((iter_base) + 4, (iter_elem).name.length())
                         mbt_ffi_store32((iter_base) + 0, ptr)
 
-                        let ptr6 = mbt_ffi_bytes2ptr((iter_elem).value)
+                        let ptr14 = mbt_ffi_bytes2ptr((iter_elem).value)
 
                         mbt_ffi_store32((iter_base) + 12, (iter_elem).value.length())
-                        mbt_ffi_store32((iter_base) + 8, ptr6)
+                        mbt_ffi_store32((iter_base) + 8, ptr14)
 
                   }
-                  mbt_ffi_store32((return_area) + 12, ((payload3).set_headers).length())
+                  mbt_ffi_store32((return_area) + 12, ((payload11).set_headers).length())
                   mbt_ffi_store32((return_area) + 8, address)
 
-                  let address9 = mbt_ffi_malloc(((payload3).remove_headers).length() * 8);
-                  for index10 = 0; index10 < ((payload3).remove_headers).length(); index10 = index10 + 1 {
-                        let iter_elem : String = ((payload3).remove_headers)[(index10)]
-                        let iter_base = address9 + (index10 * 8);
+                  let address17 = mbt_ffi_malloc(((payload11).remove_headers).length() * 8);
+                  for index18 = 0; index18 < ((payload11).remove_headers).length(); index18 = index18 + 1 {
+                        let iter_elem : String = ((payload11).remove_headers)[(index18)]
+                        let iter_base = address17 + (index18 * 8);
 
-                        let ptr8 = mbt_ffi_str2ptr(iter_elem)
+                        let ptr16 = mbt_ffi_str2ptr(iter_elem)
                         mbt_ffi_store32((iter_base) + 4, iter_elem.length())
-                        mbt_ffi_store32((iter_base) + 0, ptr8)
+                        mbt_ffi_store32((iter_base) + 0, ptr16)
 
                   }
-                  mbt_ffi_store32((return_area) + 20, ((payload3).remove_headers).length())
-                  mbt_ffi_store32((return_area) + 16, address9)
+                  mbt_ffi_store32((return_area) + 20, ((payload11).remove_headers).length())
+                  mbt_ffi_store32((return_area) + 16, address17)
+
+                  ()
+            }
+            Replace(payload19) => {
+                  mbt_ffi_store8((return_area) + 0, (2))
+                  mbt_ffi_store16((return_area) + 4, ((payload19).status).reinterpret_as_int())
+
+                  let address22 = mbt_ffi_malloc(((payload19).headers).length() * 16);
+                  for index23 = 0; index23 < ((payload19).headers).length(); index23 = index23 + 1 {
+                        let iter_elem : @types.Header = ((payload19).headers)[(index23)]
+                        let iter_base = address22 + (index23 * 16);
+
+                        let ptr20 = mbt_ffi_str2ptr((iter_elem).name)
+                        mbt_ffi_store32((iter_base) + 4, (iter_elem).name.length())
+                        mbt_ffi_store32((iter_base) + 0, ptr20)
+
+                        let ptr21 = mbt_ffi_bytes2ptr((iter_elem).value)
+
+                        mbt_ffi_store32((iter_base) + 12, (iter_elem).value.length())
+                        mbt_ffi_store32((iter_base) + 8, ptr21)
+
+                  }
+                  mbt_ffi_store32((return_area) + 12, ((payload19).headers).length())
+                  mbt_ffi_store32((return_area) + 8, address22)
+
+                  let ptr24 = mbt_ffi_bytes2ptr((payload19).body)
+
+                  mbt_ffi_store32((return_area) + 20, (payload19).body.length())
+                  mbt_ffi_store32((return_area) + 16, ptr24)
 
                   ()
             }
@@ -334,50 +383,30 @@ pub fn wasmExportOnResponsePostReturn(p0 : Int) -> Unit {
                   mbt_ffi_free(mbt_ffi_load32((p0) + 16))
 
             }
+            2 => {
+
+                  for index1 = 0; index1 < (mbt_ffi_load32((p0) + 12)); index1 = index1 + 1 {
+                        let iter_base = (mbt_ffi_load32((p0) + 8)) + (index1 * 16)
+                        mbt_ffi_free(mbt_ffi_load32((iter_base) + 0))
+                        mbt_ffi_free(mbt_ffi_load32((iter_base) + 8))
+
+                  }
+                  mbt_ffi_free(mbt_ffi_load32((p0) + 8))
+                  mbt_ffi_free(mbt_ffi_load32((p0) + 16))
+
+            }
             _ => panic()
       }
 
 }
 
 ///|
-#owned(bytes)
-extern "wasm" fn mbt_ffi_bytes2ptr(bytes : FixedArray[Byte]) -> Int =
-#|(func (param i32) (result i32) local.get 0)
-
-///|
-extern "wasm" fn mbt_ffi_free(position : Int) =
-#|(func (param i32) local.get 0 call $moonbit.decref)
-
-///|
-#owned(str)
-extern "wasm" fn mbt_ffi_str2ptr(str : String) -> Int =
-#|(func (param i32) (result i32) local.get 0)
-
-///|
-extern "wasm" fn mbt_ffi_store32(offset : Int, value : Int) =
-#|(func (param i32) (param i32) local.get 0 local.get 1 i32.store)
-
-///|
-extern "wasm" fn mbt_ffi_malloc(size : Int) -> Int =
-#|(func (param i32) (result i32) (local i32)
-#| local.get 0 i32.const 4 i32.add call $moonbit.gc.malloc
-#| local.tee 1 i32.const 0 call $moonbit.init_array8
-#| local.get 1)
-
-///|
-extern "wasm" fn mbt_ffi_load8_u(offset : Int) -> Int =
-#|(func (param i32) (result i32) local.get 0 i32.load8_u)
-
-///|
 extern "wasm" fn mbt_ffi_store8(offset : Int, value : Int) =
 #|(func (param i32) (param i32) local.get 0 local.get 1 i32.store8)
 
 ///|
-extern "wasm" fn mbt_ffi_ptr2bytes(ptr : Int, len : Int) -> FixedArray[Byte] =
-#|(func (param i32) (param i32) (result i32)
-#| local.get 0
-#| local.get 1 call $moonbit.init_array8
-#| local.get 0)
+extern "wasm" fn mbt_ffi_store32(offset : Int, value : Int) =
+#|(func (param i32) (param i32) local.get 0 local.get 1 i32.store)
 
 ///|
 extern "wasm" fn mbt_ffi_ptr2str(ptr : Int, len : Int) -> String =
@@ -387,10 +416,42 @@ extern "wasm" fn mbt_ffi_ptr2str(ptr : Int, len : Int) -> String =
 #| local.get 0)
 
 ///|
+#owned(str)
+extern "wasm" fn mbt_ffi_str2ptr(str : String) -> Int =
+#|(func (param i32) (result i32) local.get 0)
+
+///|
+#owned(bytes)
+extern "wasm" fn mbt_ffi_bytes2ptr(bytes : FixedArray[Byte]) -> Int =
+#|(func (param i32) (result i32) local.get 0)
+
+///|
 extern "wasm" fn mbt_ffi_load32(offset : Int) -> Int =
 #|(func (param i32) (result i32) local.get 0 i32.load)
 
 ///|
+extern "wasm" fn mbt_ffi_ptr2bytes(ptr : Int, len : Int) -> FixedArray[Byte] =
+#|(func (param i32) (param i32) (result i32)
+#| local.get 0
+#| local.get 1 call $moonbit.init_array8
+#| local.get 0)
+
+///|
+extern "wasm" fn mbt_ffi_malloc(size : Int) -> Int =
+#|(func (param i32) (result i32) (local i32)
+#| local.get 0 i32.const 4 i32.add call $moonbit.gc.malloc
+#| local.tee 1 i32.const 0 call $moonbit.init_array8
+#| local.get 1)
+
+///|
 extern "wasm" fn mbt_ffi_store16(offset : Int, value : Int) =
 #|(func (param i32) (param i32) local.get 0 local.get 1 i32.store16)
+
+///|
+extern "wasm" fn mbt_ffi_free(position : Int) =
+#|(func (param i32) local.get 0 call $moonbit.decref)
+
+///|
+extern "wasm" fn mbt_ffi_load8_u(offset : Int) -> Int =
+#|(func (param i32) (result i32) local.get 0 i32.load8_u)
 

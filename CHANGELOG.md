@@ -21,6 +21,27 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `plecto:filter@0.3.0` (ADR 000073): `on-response` now receives the **as-forwarded request
+  snapshot** (the request as it left the request-side chain — an auth filter's stamp and the
+  untouched `Origin` both ride it) as its first parameter, and `response-decision` gains a
+  **`replace(http-response)`** arm that supplants the upstream response with a synthesised one
+  (terminal — the remaining chain is skipped; the upstream body is dropped unread, keeping the
+  zero-copy invariant of ADR 000038). `replace` output passes the same fail-closed header
+  validation as a request-side `short-circuit`. The fast path's old in-band "non-empty body
+  means synthetic" signal is replaced by the typed `ResponseOutcome`. `0.2.0` is frozen at
+  `wit/v0.2.0/` and stays loadable through a thin adapter (the request-context parameter is
+  dropped) with a one-time deprecation warning, same rail as `0.1.0` (ADR 000071); a fixture
+  guest pinned to the frozen 0.2 contract keeps that rail covered in CI. In-tree examples —
+  Rust, MoonBit, JS, C — move to 0.3.0 (the TinyGo Tier-B fixture deliberately stays on 0.1.0
+  as the V01 adapter's living coverage), and `plecto new-filter` scaffolds 0.3.0.
+- `filter-cors` (ADR 000068 / F2 shelf): a CORS reference filter — the ADR 000073 motivating
+  case. Preflight `OPTIONS` short-circuits at the gateway; actual responses gain the
+  **dynamic origin echo** (`Access-Control-Allow-Origin` reflecting the request's `Origin`,
+  read from the as-forwarded snapshot), with operator-owned policy via `[filter.config]`
+  (`allowed-origins` / `allow-methods` / `allow-headers` / `allow-credentials` / `max-age`).
+
 ### Changed
 
 - Docs sync to current code (HRT): README / README.ja, design-principles, operations, hardening,

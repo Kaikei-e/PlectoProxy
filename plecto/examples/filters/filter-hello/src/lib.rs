@@ -13,7 +13,15 @@
 //!         empty (ADR 000005 / 000026);
 //!       * if `x-plecto-block` is present, short-circuit 403;
 //!       * otherwise continue.
-//!   - on-response: continue.
+//!   - on-response (0.3.0 contract, ADR 000073 — the markers ride the REQUEST, so they also
+//!     prove the as-forwarded snapshot reaches the response phase):
+//!       * if the request carried `x-plecto-resp-replace`, `replace` with a synthesised 418
+//!         (the upstream response is dropped);
+//!       * if the request carried `x-plecto-resp-echo`, `modified` echoing the request's path
+//!         (`x-plecto-req-path`) and, when present, its `Origin` (`x-plecto-echo-origin`);
+//!       * if the response carries `x-plecto-respedit`, `modified` stamping
+//!         `x-plecto-respadded` (the pre-0.3 response-edit exercise);
+//!       * otherwise continue.
 
 // wit-bindgen flattens records into many core-wasm ABI args, so generated FFI shims trip
 // clippy::too_many_arguments. This allow scopes ONLY to generated code.
@@ -177,7 +185,57 @@ impl Guest for FilterHello {
         }
     }
 
-    fn on_response(resp: HttpResponse) -> ResponseDecision {
+    fn on_response(req: HttpRequest, resp: HttpResponse) -> ResponseDecision {
+        // Opt-in replace (ADR 000073): the marker rides the REQUEST, so hitting this arm also
+        // proves the as-forwarded snapshot reached the response phase. The synthesised response
+        // supplants the upstream one (which is dropped unread).
+        if has_header(&req, "x-plecto-resp-replace") {
+            return ResponseDecision::Replace(HttpResponse {
+                status: 418,
+                headers: vec![Header {
+                    name: "x-plecto-replaced".to_string(),
+                    value: b"1".to_vec(),
+                }],
+                body: b"replaced by filter-hello".to_vec(),
+            });
+        }
+
+        // Opt-in request-context echo (ADR 000073): reflect data only the request knows —
+        // its path, Origin when present, a request-chain stamp (`x-plecto-added`), and whether
+        // a host-egress-only header (`traceparent` injected at forward time) is absent from the
+        // as-forwarded snapshot when the client did not send one.
+        if has_header(&req, "x-plecto-resp-echo") {
+            let mut set_headers = vec![Header {
+                name: "x-plecto-req-path".to_string(),
+                value: req.path.clone().into_bytes(),
+            }];
+            if let Some(origin) = header_value(&req, "origin") {
+                set_headers.push(Header {
+                    name: "x-plecto-echo-origin".to_string(),
+                    value: origin.as_bytes().to_vec(),
+                });
+            }
+            if has_header(&req, "x-plecto-added") {
+                set_headers.push(Header {
+                    name: "x-plecto-echo-stamp".to_string(),
+                    value: b"1".to_vec(),
+                });
+            }
+            set_headers.push(Header {
+                name: "x-plecto-echo-has-traceparent".to_string(),
+                value: if has_header(&req, "traceparent") {
+                    b"1".to_vec()
+                } else {
+                    b"0".to_vec()
+                },
+            });
+            return ResponseDecision::Modified(ResponseEdit {
+                set_status: None,
+                set_headers,
+                remove_headers: vec![],
+            });
+        }
+
         // Opt-in response rewrite (gated on a header so default responses still `continue`):
         // exercises the response-side chain dispatch + edit application (ADR 000007).
         if resp

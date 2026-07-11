@@ -14,7 +14,7 @@ use std::sync::Arc;
 use plecto_host::{HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
-use crate::chain::{self, ChainOutcome, RequestBodyOutcome};
+use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseOutcome};
 use crate::route::{self, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
@@ -45,9 +45,10 @@ impl ConfigSnapshot {
         chain::dispatch_request(&self.config.resolved_chain, request, &self.trace)
     }
 
-    /// Drive a response back through the default `[chain]` in reverse.
-    pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
-        chain::dispatch_response(&self.config.resolved_chain, response, &self.trace)
+    /// Drive a response back through the default `[chain]` in reverse. `request` is the
+    /// as-forwarded request snapshot every response hook sees (ADR 000073).
+    pub fn on_response(&self, request: &HttpRequest, response: HttpResponse) -> ResponseOutcome {
+        chain::dispatch_response(&self.config.resolved_chain, request, response, &self.trace)
     }
 
     /// Match a request to a route by its `[route.match]` dimensions — host, path prefix, method,
@@ -102,10 +103,17 @@ impl ConfigSnapshot {
 
     /// Drive a response back through a matched route's chain in reverse. Same `route` index as
     /// the request side, on the same (cloned) snapshot, so both halves run one route's chain.
-    pub fn dispatch_response(&self, route: usize, response: HttpResponse) -> HttpResponse {
+    /// `request` is the as-forwarded request snapshot (ADR 000073). A stale index forwards the
+    /// response unchanged (fail-soft, same as the other `dispatch_*`).
+    pub fn dispatch_response(
+        &self,
+        route: usize,
+        request: &HttpRequest,
+        response: HttpResponse,
+    ) -> ResponseOutcome {
         match self.config.routes.get(route) {
-            Some(r) => chain::dispatch_response(&r.resolved_chain, response, &self.trace),
-            None => response,
+            Some(r) => chain::dispatch_response(&r.resolved_chain, request, response, &self.trace),
+            None => ResponseOutcome::Forward(response),
         }
     }
 
@@ -146,9 +154,10 @@ impl crate::Control {
     }
 
     /// Drive a response back through the chain in reverse, applying response edits. A trapped
-    /// filter yields a fail-closed 5xx. See [`Control::snapshot`] for the transaction-pinned form.
-    pub fn on_response(&self, response: HttpResponse) -> HttpResponse {
-        self.snapshot().on_response(response)
+    /// filter yields a fail-closed 5xx; a `replace` yields the synthesised response (both as
+    /// [`ResponseOutcome::Respond`]). See [`Control::snapshot`] for the transaction-pinned form.
+    pub fn on_response(&self, request: &HttpRequest, response: HttpResponse) -> ResponseOutcome {
+        self.snapshot().on_response(request, response)
     }
 }
 

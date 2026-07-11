@@ -100,11 +100,11 @@ Plecto Proxy の Rust workspace は三つの crate = 三つの文脈から成り
 
 関係は三本: **Fast path → Extension plane**（per-request に chain を駆動）、**Control → Extension plane**（manifest が filter を digest pin し chain 順と trust root を宣言、reload が atomic に差し替え）、**Control → Fast path**（manifest が route と転送先を宣言し、fast path は per-request に `ConfigSnapshot` を取って route を選ぶ）。契約 `wit/` は workspace 直下に置かれ、どの crate にも属さない——契約は文脈間の共有財であって、どれかの所有物ではない。
 
-### 2.2 契約アーキテクチャ（`plecto:filter@0.2.0`）
+### 2.2 契約アーキテクチャ（`plecto:filter@0.3.0`）
 
-契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。ヘッダ値は `list<u8>`（ADR 000071）。`0.1.0` は凍結ツリー＋ホストアダプタでロード可能。現行契約の構造:
+契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。ヘッダ値は `list<u8>`（ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取り、`response-decision` は `replace` arm を持つ——P3（判断は型で）が response 側にも対称に成立する（ADR 000073）。`0.1.0` / `0.2.0` は凍結ツリー＋ホストアダプタでロード可能。現行契約の構造:
 
-- **types**: `http-request` / `http-response`（ヘッダ値は原文バイト）・`request-edit` / `response-edit`（書換は差分で表現）・三種の decision variant。
+- **types**: `http-request` / `http-response`（ヘッダ値は原文バイト）・`request-edit` / `response-edit`（書換は差分で表現）・型付き decision variant——request 側 `continue` / `modified` / `short-circuit`、response 側 `continue` / `modified` / `replace`（ADR 000073）。
 - **host-API（6能力・1 interface = 1 capability）**: `host-log` / `host-clock`（リクエスト開始時スナップショット）/ `host-kv` / `host-counter` / `host-ratelimit`（token bucket は **host-native**）/ `host-config`（manifest `[filter.config]` の読み取り専用、ADR 000066）。
 - **二つの world**: `filter`（header-only）と `filter-body`（+ `on-request-body`、buffer-then-decide、v1 は `list<u8>`）。`include` ではなく敢えて重複記述しているのは WIT の `use` 伝播仕様への対処であり、コメントで理由が明記される——**契約ファイル自身が設計判断の注釈を持つ**のがこのリポジトリの流儀である。
 - **実験系**: `plecto:filter-streaming`（`stream<u8>`・async）は off-by-default の `streaming-body` feature に隔離され、`wasm32-wasip3` の Tier-2 到達まで既定ビルドに入らない。

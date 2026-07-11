@@ -32,10 +32,11 @@ pub(all) enum RequestDecision {
       ShortCircuit(HttpResponse)
 } derive()
 ///|
-/// The typed outcome of a response-side filter.
+/// The typed outcome of a response-side filter (ADR 000073).
 pub(all) enum ResponseDecision {
       Continue
       Modified(ResponseEdit)
+      Replace(HttpResponse)
 } derive()
 ///|
 /// The typed outcome of a request-side BODY filter (buffer-then-decide, ADR 000025). v1 carries

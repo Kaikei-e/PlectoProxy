@@ -8,7 +8,7 @@ use plecto_control::{Header, HttpResponse};
 
 use crate::ResponseBody;
 use crate::body::full;
-use crate::headers::{copy_headers, copy_headers_direct};
+use crate::headers::{copy_headers, copy_headers_direct, copy_headers_synth};
 
 const X_PLECTO_FAULT: HeaderName = HeaderName::from_static("x-plecto-fault");
 const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
@@ -37,15 +37,43 @@ pub(crate) mod fault {
     pub(crate) static BAD_UPGRADE: HeaderValue = HeaderValue::from_static("bad-upgrade");
 }
 
-/// A synthesised response (short-circuit / fail-closed) → a hyper `Response` with a buffered body.
+/// A synthesised response (short-circuit / `replace` / fail-closed) → a hyper `Response` with a
+/// buffered body. Guest-supplied `Content-Length` / `Transfer-Encoding` are stripped — the host
+/// owns framing for a body it materialised (`full`), so a hostile filter cannot desync the wire
+/// length from the bytes we send (ADR 000073 review).
 pub(crate) fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
-    copy_headers(builder.headers_mut(), &resp.headers);
+    copy_headers_synth(builder.headers_mut(), &resp.headers);
     builder.body(full(resp.body)).unwrap_or_else(|_| {
         // builder only errors on an invalid status/header already guarded above; stay total.
         Response::new(full(b"response build error".to_vec()))
     })
+}
+
+/// Drop an upstream response body without blocking the client path. Small bodies are drained in
+/// the background so the pooled upstream connection can be reused; anything over the drain cap
+/// (or a drain error) drops the remainder and hyper closes the socket — correct for "we do not
+/// want these bytes" after a `replace` / fail-closed synthesised response (ADR 000073 review).
+pub(crate) fn discard_upstream_body(mut body: ResponseBody) {
+    /// Bytes we are willing to read just to return a connection to the pool. Larger leftovers
+    /// are not worth the bandwidth; dropping the body closes the socket instead.
+    const DRAIN_CAP: usize = 64 << 10; // 64 KiB
+    tokio::spawn(async move {
+        use http_body_util::BodyExt;
+        let mut drained = 0usize;
+        while drained < DRAIN_CAP {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        drained = drained.saturating_add(data.len());
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        // Over-cap or error: dropping `body` here closes the upstream socket (pool-safe).
+    });
 }
 
 /// A forwarded response: the chain-edited status + headers, with the upstream body streamed.
@@ -170,6 +198,22 @@ mod tests {
             !resp.headers().contains_key("x-evil"),
             "an invalid header value is dropped from a synthesised response"
         );
+    }
+
+    #[test]
+    fn http_response_strips_guest_content_length_so_host_framing_wins() {
+        // A hostile replace/short-circuit can claim Content-Length: 9999 while the body is
+        // five bytes. The host must strip the guest length and let `full(body)` frame the wire.
+        let resp = http_response(HttpResponse {
+            status: 200,
+            headers: vec![header("content-length", "9999"), header("x-ok", "1")],
+            body: b"hello".to_vec(),
+        });
+        assert!(
+            !resp.headers().contains_key("content-length"),
+            "guest Content-Length must not survive onto a synthesised response"
+        );
+        assert!(resp.headers().contains_key("x-ok"));
     }
 
     #[test]

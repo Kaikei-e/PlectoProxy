@@ -56,6 +56,7 @@ componentized by `crates/host/build.rs` (ADR 000010).
 | `filter-template` | Scaffold for your own filter. |
 | `filter-streaming` | Streaming `stream<u8>` body filter (feature-gated). |
 | `filter-extauthz` | ext_authz over the SSRF-guarded outbound capability (feature-gated, ADR 000036). |
+| `filter-cors` | CORS policy reference — preflight short-circuit + dynamic origin echo from the as-forwarded request snapshot (ADR 000073). |
 
 ## Not here: benchmarks
 

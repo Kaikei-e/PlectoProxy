@@ -1,0 +1,17 @@
+[package]
+name = "filter-cors"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# A reference `plecto:filter` guest: a CORS policy filter (ADR 000073 / F2 shelf, ADR 000068).
+# Built for wasm32-unknown-unknown and componentized by crates/host/build.rs via wit-component
+# (ADR 000010), exactly like filter-hello. Declares its own [workspace] so the native
+# plecto/ workspace never absorbs it into a host-target build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.59"
+
+[workspace]

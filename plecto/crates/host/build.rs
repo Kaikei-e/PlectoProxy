@@ -60,6 +60,15 @@ fn main() {
             "filter_quickstart",
             "FILTER_QUICKSTART_COMPONENT",
         );
+        // filter-cors is the CORS reference filter (ADR 000073 / F2 shelf) — the living proof of
+        // the 0.3.0 response-side contract (request context on on-response + preflight SC).
+        build_component(
+            &cargo,
+            &filters.join("filter-cors"),
+            &out_dir,
+            "filter_cors",
+            "FILTER_CORS_COMPONENT",
+        );
         // filter-compat-v02 is pinned to the FROZEN 0.2.0 contract (wit/v0.2.0/) — the V02
         // adapter rail's living fixture (ADR 000073). Test-only, so it lives under
         // crates/host/fixtures/, not examples/.

@@ -1,0 +1,15 @@
+---
+description: Prefer RFC/general algorithms over competitor names; write with HRT
+alwaysApply: true
+---
+
+# RFC-first, no competitor names, HRT
+
+When designing, reviewing, documenting, or justifying behaviour in this repo:
+
+1. **No competitor product names** in rationale, comments, ADRs, READMEs, or commit messages when the point is “how peers do X.” Cite **RFCs**, **IANA registries**, **language/spec algorithms**, or **generic industry practice** instead. Product names are fine only when the subject *is* that product (e.g. an interoperability bug report against a named peer).
+2. **General algorithms first** — prefer the standard selection/negotiation/validation algorithm (e.g. RFC 9110 §12.5.3 qvalue rules) over “copy what &lt;vendor&gt; does.”
+3. **HRT** (Humble, Respectful, Transparent):
+   - **Humble** — do not overclaim compliance; mark intentional deviations from the RFC and why.
+   - **Respectful** — critique designs and evidence, not authors; no dunking on other projects.
+   - **Transparent** — if a comment, ADR, or module doc promises behaviour the code cannot keep, fix the claim or the code in the same change.

@@ -254,3 +254,133 @@ async fn prefers_h2_when_client_offers_both() {
     );
     assert_eq!(r.status, StatusCode::OK);
 }
+
+/// A repetitive, over-threshold body — compression is observable by size, not just headers
+/// (mirrors tests/compression.rs, which covers the full matrix over HTTP/1.1).
+fn big_text() -> String {
+    "All work and no play makes the fast path a dull proxy. ".repeat(100)
+}
+
+async fn compressible(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "text/html")
+        .body(Full::new(Bytes::from(big_text())))
+        .unwrap())
+}
+
+async fn spawn_compressible_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service_fn(compressible))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// One h2 GET with `Accept-Encoding: gzip`, returning the raw parts + wire body (no decode).
+async fn drive_h2_gzip(
+    proxy: SocketAddr,
+    root: CertificateDer<'static>,
+) -> (hyper::http::response::Parts, Bytes) {
+    let mut roots = RootCertStore::empty();
+    roots.add(root).unwrap();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let tcp = TcpStream::connect(proxy).await.unwrap();
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/hello")
+        .header("host", "localhost")
+        .header("accept-encoding", "gzip")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    (parts, bytes)
+}
+
+#[tokio::test]
+async fn h2_compresses_the_streamed_response_body() {
+    // Compression wraps the one `ResponseBody` inside `proxy_core` (ADR 000074) — this pins that
+    // hyper's h2 DATA framing carries the compressed stream unchanged (no Content-Length games).
+    let cert = make_cert();
+    let upstream = spawn_compressible_upstream().await;
+    let toml = format!(
+        r#"
+[[upstream]]
+name = "echo"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+upstream = "echo"
+[route.match]
+path_prefix = "/api"
+[route.compression]
+
+[[tls]]
+cert_path = "{cert_path}"
+key_path = "{key_path}"
+"#,
+        cert_path = cert.cert_path,
+        key_path = cert.key_path,
+    );
+    let control = loaded_control(&toml);
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let (parts, bytes) = {
+        let mut result = None;
+        for _ in 0..100 {
+            let (parts, bytes) = drive_h2_gzip(proxy, cert.cert_der.clone()).await;
+            if parts.status != StatusCode::SERVICE_UNAVAILABLE {
+                result = Some((parts, bytes));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        result.expect("upstream never became healthy within the readiness window")
+    };
+
+    assert_eq!(parts.status, StatusCode::OK);
+    assert_eq!(
+        parts.headers.get("content-encoding").map(|v| v.as_bytes()),
+        Some(b"gzip".as_slice()),
+        "the negotiated coding rides h2 response HEADERS"
+    );
+    assert!(
+        bytes.len() < big_text().len(),
+        "the h2 DATA frames carry compressed bytes"
+    );
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(bytes.as_ref()), &mut out)
+        .unwrap();
+    assert_eq!(out, big_text().as_bytes());
+}

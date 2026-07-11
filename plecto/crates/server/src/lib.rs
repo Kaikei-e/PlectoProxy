@@ -37,6 +37,7 @@
 mod access_log;
 mod admin;
 mod body;
+mod compression;
 mod dispatch;
 mod dns;
 mod error;

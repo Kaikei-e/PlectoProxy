@@ -44,6 +44,14 @@ pub struct Route {
     /// deny-by-default (the Upgrade/Connection pair keeps being stripped as hop-by-hop).
     #[serde(default)]
     pub upgrade: Option<RouteUpgrade>,
+    /// Native response compression opt-in (ADR 000074 / 000075): negotiate a content coding against the
+    /// client's `Accept-Encoding` and compress eligible responses AFTER the response chain
+    /// (filters always see identity). Absent = never transform — deny-by-default, which is also
+    /// the per-route BREACH opt-out. Do **not** enable on routes that reflect secrets into the
+    /// response body (CSRF tokens, session nonces echoed from the request): compression + reflection
+    /// enables BREACH-class chosen-plaintext attacks against TLS. Leave those routes uncompressed.
+    #[serde(default)]
+    pub compression: Option<RouteCompression>,
 }
 
 /// A route's Upgrade declaration (`[route.upgrade]`, ADR 000048). The allowlist shape is the
@@ -65,6 +73,93 @@ pub struct RouteUpgrade {
 /// that an abandoned tunnel cannot hold a connection permit for hours.
 fn default_upgrade_idle_timeout_ms() -> u64 {
     300_000
+}
+
+/// A route's compression declaration (`[route.compression]`, ADR 000074). Every field has a safe
+/// default, so the bare block header is the whole opt-in; the fields exist to narrow it.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteCompression {
+    /// The codings this route offers, in SERVER-PREFERENCE order — the tie-break when the
+    /// client's qvalues don't decide (RFC 9110 §12.5.3 orders only by qvalue). Default
+    /// `["zstd", "br", "gzip"]`: best ratio-per-CPU first, universal fallback last.
+    #[serde(default = "default_compression_algorithms")]
+    pub algorithms: Vec<CompressionAlgorithm>,
+    /// Don't compress a response whose declared `Content-Length` is below this (bytes). Under
+    /// ~1 KiB the codec dictionary + trailer can exceed the saving (common practice defaults
+    /// cluster around tens of bytes to ~1 KiB; 1024 is the safe middle). A response with NO
+    /// declared length (streamed / chunked) is always eligible — its size is unknowable up front.
+    #[serde(default = "default_compression_min_length")]
+    pub min_length: u64,
+    /// The `type/subtype` allowlist (matched against the response `Content-Type` essence,
+    /// case-insensitive, parameters ignored). REPLACES the default when set. The default covers
+    /// the textual web types; already-compressed media (images, video, archives) and
+    /// `text/event-stream` (a compressor buffering an SSE stream stalls events) stay excluded.
+    #[serde(default = "default_compression_content_types")]
+    pub content_types: Vec<String>,
+}
+
+/// A content coding Plecto can produce (ADR 000074: gzip baseline + zstd / brotli). The serde
+/// spelling is the wire token (`Accept-Encoding` / `Content-Encoding`), so the manifest reads
+/// exactly like the negotiation it configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompressionAlgorithm {
+    /// RFC 8878 Zstandard. Encoded with window_log ≤ 23: RFC 9659 forbids frames over an 8 MiB
+    /// window for web content (browsers reject them).
+    Zstd,
+    /// RFC 7932 Brotli.
+    Br,
+    /// RFC 9110 §8.4.1.3 gzip — the universally-supported baseline.
+    Gzip,
+}
+
+impl CompressionAlgorithm {
+    /// The registered content-coding token (what goes on the wire in `Content-Encoding`).
+    pub fn token(self) -> &'static str {
+        match self {
+            CompressionAlgorithm::Zstd => "zstd",
+            CompressionAlgorithm::Br => "br",
+            CompressionAlgorithm::Gzip => "gzip",
+        }
+    }
+}
+
+fn default_compression_algorithms() -> Vec<CompressionAlgorithm> {
+    vec![
+        CompressionAlgorithm::Zstd,
+        CompressionAlgorithm::Br,
+        CompressionAlgorithm::Gzip,
+    ]
+}
+
+fn default_compression_min_length() -> u64 {
+    1024
+}
+
+/// The default compressible-content allowlist: the textual web types every major proxy ships
+/// (HTML/CSS/JS/JSON/XML feeds/SVG) plus `application/wasm` (components compress well and are
+/// Plecto's own distribution format). Notably ABSENT: `text/event-stream` and all
+/// already-compressed media.
+fn default_compression_content_types() -> Vec<String> {
+    [
+        "text/html",
+        "text/css",
+        "text/plain",
+        "text/xml",
+        "text/javascript",
+        "application/javascript",
+        "application/x-javascript",
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/rss+xml",
+        "application/atom+xml",
+        "image/svg+xml",
+        "application/wasm",
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 /// The match dimensions of a route (`[route.match]`, ADR 000034), modelled on Gateway-API v1.5.0

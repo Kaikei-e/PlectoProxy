@@ -70,15 +70,15 @@ pub use diagnostic::{
 };
 pub use error::ControlError;
 pub use manifest::{
-    Chain, CircuitBreaker, FilterEntry, HealthConfig, IsolationKind, Manifest, Observability,
-    OutlierDetection, ProxyProtocolTrust, RateLimitKeyKind, Route, RouteRateLimit, State,
-    StateBackendKind, TlsCert, Trust, Upstream,
+    Chain, CircuitBreaker, CompressionAlgorithm, FilterEntry, HealthConfig, IsolationKind,
+    Manifest, Observability, OutlierDetection, ProxyProtocolTrust, RateLimitKeyKind, Route,
+    RouteCompression, RouteRateLimit, State, StateBackendKind, TlsCert, Trust, Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
-pub use route::{RouteInfo, UpgradeConfig, normalize_path};
+pub use route::{CompressionConfig, RouteInfo, UpgradeConfig, normalize_path};
 /// The rustls TLS client config the fast path re-encrypts upstream forward legs with
 /// (ADR 000042), re-exported for the same reason as [`TlsServerConfig`].
 pub use rustls::ClientConfig as TlsClientConfig;
@@ -624,6 +624,11 @@ fn build_active(
                 .upgrade
                 .as_ref()
                 .map(|u| Arc::new(route::UpgradeConfig::new(&u.protocols, u.idle_timeout_ms))),
+            // Compile the compression opt-in (ADR 000074) — codings / allowlist validated above.
+            compression: r
+                .compression
+                .as_ref()
+                .map(|c| Arc::new(route::CompressionConfig::new(c))),
         });
     }
 

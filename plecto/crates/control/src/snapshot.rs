@@ -77,6 +77,7 @@ impl ConfigSnapshot {
             reads_body: r.reads_body,
             rate_limit: r.rate_limit.clone(),
             upgrade: r.upgrade.clone(),
+            compression: r.compression.clone(),
         })
     }
 

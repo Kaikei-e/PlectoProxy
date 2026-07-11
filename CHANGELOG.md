@@ -23,6 +23,18 @@ All notable changes to Plecto are documented here. The format follows
 
 ### Added
 
+- Native response compression (ADR 000074 / 000075): an opt-in `[route.compression]` block
+  negotiates `gzip` / `br` / `zstd` against the client's `Accept-Encoding` (RFC 9110 §12.5.3
+  qvalues; tie-break by the configured server-preference order, default zstd → br → gzip) and
+  compresses eligible responses **after** the response filter chain — filters always see the
+  identity representation, on every transport (HTTP/1.1, h2, h3). Safety defaults converge with
+  industry practice: content-type allowlist (textual web types + `application/wasm`;
+  `text/event-stream` excluded), 1 KiB min-length floor, skips for already-encoded /
+  `Cache-Control: no-transform` / 204 / 206 / 304 / HEAD, `Vary: Accept-Encoding` on eligible
+  responses, strong-ETag weakening, and per-frame flush so streamed bodies keep streaming.
+  zstd frames are pinned to an ≤ 8 MiB window (RFC 9659) and the encoder is compress-only.
+  No `[route.compression]` block = never transform (deny-by-default; also the per-route BREACH
+  opt-out).
 - `plecto:filter@0.3.0` (ADR 000073): `on-response` now receives the **as-forwarded request
   snapshot** (the request as it left the request-side chain — an auth filter's stamp and the
   untouched `Origin` both ride it) as its first parameter, and `response-decision` gains a

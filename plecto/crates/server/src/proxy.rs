@@ -494,11 +494,8 @@ async fn proxy_core_inner(
     if !route.has_filters {
         // No chain to run: skip the blocking-pool hop and the contract projection; the hop-by-hop
         // strip still applies, directly on the original header bytes.
-        return Ok(stream_response_direct(
-            uparts.status,
-            &uparts.headers,
-            ubody,
-        ));
+        let resp = stream_response_direct(uparts.status, &uparts.headers, ubody);
+        return Ok(crate::compression::apply(resp, &route, &parts));
     }
     let http_resp = HttpResponse {
         status: uparts.status.as_u16(),
@@ -521,7 +518,11 @@ async fn proxy_core_inner(
     // so a replace does not permanently poison the upstream connection pool.
     match outcome {
         ResponseOutcome::Forward(edited) => {
-            Ok(stream_response(edited.status, &edited.headers, ubody))
+            // Compression runs LAST — after the chain's header edits, on the streamed body the
+            // chain never sees (ADR 000074: filters always see identity). A `Respond` below is
+            // host-framed synthesis (small, buffered), deliberately never compressed.
+            let resp = stream_response(edited.status, &edited.headers, ubody);
+            Ok(crate::compression::apply(resp, &route, &parts))
         }
         ResponseOutcome::Respond(resp) => {
             discard_upstream_body(ubody);

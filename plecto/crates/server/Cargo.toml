@@ -154,6 +154,16 @@ toml_edit = "0.22"
 # the same `ComponentEncoder` recipe `crates/host/build.rs` already uses at BUILD time (ADR
 # 000010), needed here because `plecto dev` componentizes on every file-watch trigger, not once.
 wit-component = "0.252"
+# --- Response compression codecs (ADR 000074): gzip baseline + zstd / brotli. ---
+# flate2 (miniz_oxide backend) and brotli are pure Rust. zstd is this workspace's one C-bindings
+# codec (bundled libzstd, BSD-3-Clause): production-grade pure-Rust zstd ENCODERs are not yet
+# mature (ruzstd self-reports below libzstd on ratio/speed/configurability; c2rust-derived ports
+# still carry substantial unsafe) — COMPRESS-ONLY here (the decompress API is never touched),
+# minimal features, window_log ≤ 23 (RFC 9659).
+# Re-examine when a pure-Rust encoder stabilises or upstream stops tracking libzstd releases.
+flate2 = "1"
+brotli = "8"
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for E2E fixtures,
@@ -174,6 +184,11 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # tikv-jemallocator: the jemalloc build variant of the bench-server harness (feature `jemalloc`),
 # for the memory matrix's allocator sweep. Dev-only — never in a production build.
 tikv-jemallocator = "0.6"
+# flate2 / brotli / zstd: the DECODE oracles for the response-compression E2E — each test
+# decompresses the wire bytes with the reference decoder to prove the roundtrip.
+flate2 = "1"
+brotli = "8"
+zstd = "0.13"
 # sha1 + base64: the RFC 6455 `Sec-WebSocket-Accept` handshake for bench-server's `/ws` mock
 # upstream (ADR 000048's WS benchmark). Both are already transitive dependencies of this workspace
 # (rustls / cosign stack) — no new supply-chain surface, just promoted to direct dev-deps.

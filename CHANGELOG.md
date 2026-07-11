@@ -29,7 +29,8 @@ All notable changes to Plecto are documented here. The format follows
   mode only). Upstream: `[upstream.tls] client_cert_path` / `client_key_path` present a
   client identity on every TLS leg to that upstream, health probes included (both-or-neither,
   fail-closed). `[resumption]` shared STEK cannot be combined with `[listen.client_auth]`
-  (ADR 000062 (b): a cross-replica ticket would resume past client-certificate verification);
+  (ADR 000062 (b): resumption accepts a ticket without re-running client-certificate
+  verification, and a shared key would let that ticket open on every replica);
   per-node resumption stays on, and its tickets carry the verified identity. The new private
   keys must be owner-only on unix (group/other-readable fails the build closed). Revocation
   (CRL/OCSP) and propagation of the verified identity to filters are declared deferred.

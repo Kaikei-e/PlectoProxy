@@ -98,9 +98,9 @@ mod tests {
     /// ADR 000062 (b), follow-through of the pre-mTLS canary: the fail-closed crossing rule
     /// (`[resumption]` shared STEK × `[listen.client_auth]` → build error) is now implemented —
     /// pinned by `tls::tests::client_auth_with_shared_stek_fails_closed` and the load-level E2E
-    /// in `plecto-server/tests/tls.rs` (the resumption-bypasses-mTLS class: nginx
-    /// CVE-2025-23419, Apache CVE-2025-23048, Cloudflare's mTLS resumption incident). This test
-    /// keeps guarding the SCHEMA: any NEW client-auth flavoured field may only ship after its
+    /// in `plecto-server/tests/tls.rs` (resume-without-reverify amplified across replicas:
+    /// nginx CVE-2025-23419, Apache CVE-2025-23048, Cloudflare's mTLS resumption incident). This
+    /// test keeps guarding the SCHEMA: any NEW client-auth flavoured field may only ship after its
     /// shared-STEK crossing semantics are decided (ADR 000078), then join the sanctioned list.
     #[test]
     fn client_auth_schema_fields_stay_sanctioned() {

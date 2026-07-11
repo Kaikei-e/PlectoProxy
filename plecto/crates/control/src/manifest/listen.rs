@@ -45,8 +45,9 @@ pub struct Listen {
 /// `[listen.client_auth]` (ADR 000078): downstream client-certificate verification. Granularity
 /// is the listener — which today is the whole data plane (one `[listen]`), and generalises
 /// per-listener if Plecto ever grows more. Mutually exclusive with `[resumption]` shared STEK
-/// (ADR 000062 (b)): a resumption ticket minted before a peer was authenticated must never let
-/// it skip authentication on another replica, so the combination fails the build closed.
+/// (ADR 000062 (b)): resumption accepts a ticket without re-running client-certificate
+/// verification, and a shared key would let that ticket open on every replica, so the
+/// combination fails the build closed.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuth {

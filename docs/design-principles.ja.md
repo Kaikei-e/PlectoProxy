@@ -130,7 +130,7 @@ Plecto Proxy の Rust workspace は三つの crate = 三つの文脈から成り
 
 ### 2.5 TLS・暗号方針
 
-crypto provider は **aws-lc-rs に一本化**（ADR 000051。cmake declined の判断を実地検証に基づき撤回した経緯ごと記録）。post-quantum の X25519MLKEM768 鍵交換を既定で優先。TLS 1.3 の stateless session resumption はチケット鍵ローテーション付きで導入し、**0-RTT 拒否とチケット鍵のノードローカル性を不変条件**とする（ADR 000052——2025 年に相次いだ ticket-key 共有起因の脆弱性を教訓とした線引き）。証明書は宣言的 manifest の静的ファイル管理（ADR 000014）。mTLS は両方向で導入済み（ADR 000078）: listener は検証済み client certificate を必須化でき（`[listen.client_auth]`、required のみ。shared STEK との併用は ADR 000062 (b) により fail-closed）、upstream レグは client identity を提示できる（`[upstream.tls] client_cert_path` / `client_key_path`、health probe も提示）。失効確認（CRL/OCSP）と検証済み identity の filter 伝搬は declared deferred のまま。
+crypto provider は **aws-lc-rs に一本化**（ADR 000051。cmake declined の判断を実地検証に基づき撤回した経緯ごと記録）。post-quantum の X25519MLKEM768 鍵交換を既定で優先。TLS 1.3 の stateless session resumption はチケット鍵ローテーション付きで導入し、**0-RTT 拒否とチケット鍵のノードローカル性を不変条件**とする（ADR 000052——2025 年に相次いだ ticket-key 共有起因の脆弱性を教訓とした線引き）。証明書は宣言的 manifest の静的ファイル管理（ADR 000014）。mTLS は両方向で導入済み（ADR 000078）: listener は検証済み client certificate を必須化でき（`[listen.client_auth]`、required のみ。shared STEK との併用は ADR 000062 (b) により fail-closed）、upstream レグは client identity を提示できる（`[upstream.tls] client_cert_path` / `client_key_path`、health probe も提示）。client auth 下でも per-node resumption は維持する（ticket が検証済み chain を復元し、CertificateRequest は再送されない）ため、**ticket 有効期間内は証明書の期限・失効の再検証が走らない**——shared STEK 禁止では閉じない Honest gap。失効確認（CRL/OCSP）と検証済み identity の filter 伝搬は declared deferred のまま。
 
 ### 2.6 観測性方針: ホストが伝播し、ゲスト契約は汚さない
 

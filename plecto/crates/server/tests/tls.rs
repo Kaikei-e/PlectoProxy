@@ -659,8 +659,8 @@ async fn client_auth_listener_serves_an_authenticated_client_and_refuses_an_anon
 }
 
 /// ADR 000062 (b) end-to-end: `[listen.client_auth]` and `[resumption]` (shared STEK) together
-/// must fail the LOAD closed — a ticket minted before the peer authenticated must never let it
-/// skip authentication on another replica.
+/// must fail the LOAD closed — resumption accepts a ticket without re-running client-certificate
+/// verification, and a shared key would let that ticket open on every replica.
 #[tokio::test]
 async fn client_auth_with_shared_stek_fails_the_load_closed() {
     let server = make_cert();
@@ -683,9 +683,42 @@ async fn client_auth_with_shared_stek_fails_the_load_closed() {
     }
 }
 
-/// Client-authenticated sessions still resume per-node (grill 確定 4): the ticket carries the
-/// verified identity, 0-RTT stays refused, and — the load-bearing part — an anonymous peer
-/// still cannot get a ticket to resume with in the first place.
+/// Required mode refuses a presented certificate that does not chain to `ca_path` — not only
+/// anonymous peers. Pins the untrusted-presentation path the happy-path tests leave uncovered.
+#[tokio::test]
+async fn client_auth_listener_refuses_an_untrusted_client_certificate() {
+    let server = make_cert();
+    let trusted = make_cert_for("plecto-client");
+    let untrusted = make_cert_for("imposter");
+    let upstream = spawn_upstream().await;
+    let control = loaded_control(&manifest_toml(
+        upstream,
+        "{digest}",
+        &client_auth_block(&server, &trusted),
+    ))
+    .unwrap();
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    let bad = client_config_with_identity(server.cert_der.clone(), &untrusted);
+    assert!(
+        try_https_get(proxy, bad, "/api/hello").await.is_err(),
+        "a client certificate that does not chain to ca_path must be refused at the TLS layer"
+    );
+
+    let good = client_config_with_identity(server.cert_der, &trusted);
+    let (status, _) = https_get_kind_ready(proxy, good, "/api/hello").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sanity: a trusted identity is still served on the same listener"
+    );
+}
+
+/// Client-authenticated sessions still resume per-node (grill 確定 4): 0-RTT stays refused, an
+/// anonymous peer still cannot get a ticket, and the ticket-restored `peer_certificates` identity
+/// is pinned by `plecto-control`'s
+/// `client_auth_peer_certificates_survive_per_node_resumption` (HTTP E2E cannot see server-side
+/// peer certs while identity propagation stays deferred).
 #[tokio::test]
 async fn client_authenticated_sessions_still_resume_within_a_node() {
     let server = make_cert();

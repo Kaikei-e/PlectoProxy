@@ -89,17 +89,19 @@ pub(crate) fn build_server_configs(
     client_auth: Option<&ClientAuth>,
     base_dir: &Path,
 ) -> Result<Option<TlsConfigs>, ControlError> {
-    // ADR 000062 (b) / 000078: a shared-STEK ticket is minted before any peer authenticates and
-    // opens on every replica sharing the file — on a client-auth listener it would let a peer
-    // resume PAST client-certificate verification. Refuse the combination outright; per-node
-    // resumption stays available (that ticket carries the verified identity and never leaves
-    // this node's keys).
+    // ADR 000062 (b) / 000078: TLS 1.3 resumption accepts a ticket without re-running
+    // client-certificate verification (CertificateRequest is omitted under a resumption PSK;
+    // rustls restores the chain from the ticket instead). A shared STEK lets that ticket open
+    // on every replica — amplifying stolen-ticket blast radius and the CVE-2025-23419-class
+    // cross-context risk — so refuse the combination. Per-node resumption stays available:
+    // the ticket still carries the verified identity, and its keys never leave this node.
     if let (Some(resumption), Some(_)) = (resumption, client_auth) {
         return Err(ControlError::Stek {
             path: resumption.stek_file.clone(),
             reason: "[resumption] shared STEK cannot be combined with [listen.client_auth]: a \
-                     cross-replica ticket would resume past client-certificate verification \
-                     (ADR 000062 (b) / 000078) — drop [resumption] to keep per-node resumption"
+                     cross-replica ticket would resume without re-running client-certificate \
+                     verification (ADR 000062 (b) / 000078) — drop [resumption] to keep \
+                     per-node resumption"
                 .to_string(),
         });
     }
@@ -866,8 +868,8 @@ mod tests {
 
     #[test]
     fn client_auth_with_shared_stek_fails_closed() {
-        // ADR 000062 (b) / 000078: a resumption ticket minted before the peer authenticated must
-        // never let it skip authentication on another replica — the combination is refused.
+        // ADR 000062 (b) / 000078: shared STEK × client auth amplifies resume-without-reverify
+        // across replicas — the combination is refused.
         let (dir, entry) = default_cert_entry();
         let resumption = resumption_entry(dir.path(), 7);
         let auth = client_auth_entry(dir.path(), &some_ca_pem());
@@ -878,6 +880,125 @@ mod tests {
             }
         };
         assert!(matches!(err, ControlError::Stek { .. }));
+    }
+
+    /// Pump TLS records between a client and server until neither side wants I/O.
+    fn pump_tls(client: &mut rustls::ClientConnection, server: &mut rustls::ServerConnection) {
+        loop {
+            let mut progressed = false;
+            while client.wants_write() {
+                let mut buf = Vec::new();
+                let n = client.write_tls(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                server.read_tls(&mut &buf[..]).unwrap();
+                server.process_new_packets().unwrap();
+                progressed = true;
+            }
+            while server.wants_write() {
+                let mut buf = Vec::new();
+                let n = server.write_tls(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                client.read_tls(&mut &buf[..]).unwrap();
+                client.process_new_packets().unwrap();
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// Grill 確定 4 load-bearing claim: with OUR `ServerConfig` (required client auth + per-node
+    /// ticketer), a resumed handshake restores `peer_certificates` from the ticket — identity is
+    /// preserved even though CertificateRequest is not re-sent (RFC 8446 / 9846 under PSK).
+    #[test]
+    fn client_auth_peer_certificates_survive_per_node_resumption() {
+        let (dir, entry) = default_cert_entry();
+        let client_id =
+            rcgen::generate_simple_self_signed(vec!["plecto-client".to_string()]).unwrap();
+        let auth = client_auth_entry(dir.path(), client_id.cert.pem().as_bytes());
+        let configs =
+            build_server_configs(std::slice::from_ref(&entry), None, Some(&auth), dir.path())
+                .unwrap()
+                .expect("client-auth listener yields TCP + QUIC configs");
+
+        let server_pem = std::fs::read(&entry.cert_path).unwrap();
+        let server_certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(&server_pem)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_certs[0].clone()).unwrap();
+
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(client_id.cert.der().to_vec())],
+                    PrivateKeyDer::try_from(client_id.key_pair.serialize_der()).unwrap(),
+                )
+                .unwrap(),
+        );
+
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut client =
+            rustls::ClientConnection::new(client_config.clone(), server_name.clone()).unwrap();
+        let mut server = rustls::ServerConnection::new(configs.tcp.clone()).unwrap();
+        for _ in 0..64 {
+            pump_tls(&mut client, &mut server);
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "full handshake must complete"
+        );
+        // Drain NewSessionTicket into the client's session cache.
+        for _ in 0..16 {
+            pump_tls(&mut client, &mut server);
+        }
+        let full_chain = server
+            .peer_certificates()
+            .expect("full handshake must expose the verified client chain")
+            .to_vec();
+        assert!(
+            !full_chain.is_empty(),
+            "verified client chain must be non-empty"
+        );
+        assert_eq!(
+            client.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "first connection is a full handshake"
+        );
+
+        let mut client2 = rustls::ClientConnection::new(client_config, server_name).unwrap();
+        let mut server2 = rustls::ServerConnection::new(configs.tcp).unwrap();
+        for _ in 0..64 {
+            pump_tls(&mut client2, &mut server2);
+            if !client2.is_handshaking() && !server2.is_handshaking() {
+                break;
+            }
+        }
+        assert_eq!(
+            client2.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed),
+            "second connection must resume with the per-node ticket"
+        );
+        let resumed_chain = server2
+            .peer_certificates()
+            .expect("resumed handshake must restore peer_certificates from the ticket")
+            .to_vec();
+        assert_eq!(
+            resumed_chain, full_chain,
+            "ticket-restored identity must match the originally verified chain"
+        );
     }
 
     #[test]

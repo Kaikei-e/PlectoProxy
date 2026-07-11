@@ -56,7 +56,9 @@ fn version_flag_names_the_compiled_capability_profile() {
     assert!(out.status.success(), "--version exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     // This integration test compiles with the same features as the binary, so cfg! sees the
-    // profile under test. Partial feature sets are not a named release profile and out of scope.
+    // profile under test. CI also runs this suite under `--features capabilities` so the
+    // named capabilities self-report path is exercised, not only the default minimal build.
+    // Partial feature sets report as `custom (...)` and are not a named release profile.
     let expected = if cfg!(feature = "capabilities") {
         "profile: capabilities (outbound-http, outbound-tcp, fat-guest)"
     } else {

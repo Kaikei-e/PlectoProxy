@@ -130,15 +130,19 @@ jobs:
       # must not be discovered broken at tag time. A dev-profile `cargo check` catches the
       # feature-wiring class (cfg misses, forwarding-chain typos, unused optional deps) in
       # seconds — Cargo keys build artifacts on the enabled feature set, so this reuses the
-      # warm cache instead of thrashing it. Only link/codegen-time breakage escapes a check
-      # (RFC 3477); the main-only release build below still catches that before any tag exists.
-      # Its own cargo invocation, never folded into a workspace build: feature unification
-      # would leak the capability deps into the minimal artifact's graph.
+      # warm cache instead of thrashing it. Link/codegen-time breakage can still escape a check;
+      # the main-only release build below catches that on every merge to main. Its own cargo
+      # invocation, never folded into a workspace build: feature unification would leak the
+      # capability deps into the minimal artifact's graph (Cargo Book resolver).
       - run: cargo check --locked -p plecto-server --features capabilities
-      # The real release-profile capabilities build runs on main pushes only, so PR wall-time
-      # stays flat while every commit a tag can point at has built the shipped feature set in
-      # the shipped profile (release.yml's gate requires the tagged commit's CI run — i.e. this
-      # one — to be green). The wasmtime-CI-style "PRs light, merge-time heavy" split.
+      # Exercise the capabilities branch of `plecto --version` (ADR 000079 Decision 6). The
+      # default `cargo test --all` above only builds the binary with default features, so the
+      # named-profile self-report path would otherwise never run in CI.
+      - run: cargo test -p plecto-server --features capabilities --test cli --locked
+      # The real release-profile capabilities build runs on main pushes only (wasmtime-CI-style
+      # "PRs light, merge-time heavy"). release.yml's gate requires a green ci.yml run for the
+      # tagged SHA on the default branch — so a tag can only point at a commit that has already
+      # passed this step on main; PR-only green is not enough to ship.
       - name: Release parity for the capabilities profile (main only)
         if: github.ref == 'refs/heads/main'
         run: cargo build --release --locked -p plecto-server --features capabilities

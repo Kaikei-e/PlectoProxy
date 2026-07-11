@@ -23,6 +23,17 @@ All notable changes to Plecto are documented here. The format follows
 
 ### Added
 
+- Reference filters as signed OCI artifacts (ADR 000080). Every release now publishes the
+  reference filter components — `filters/jwt`, `filters/cors`, `filters/apikey`,
+  `filters/extauthz` — as individual CNCF Wasm OCI Artifacts under
+  `ghcr.io/kaikei-e/plecto/filters/<name>:<filter-version>`, each cosign-signed (keyless, by
+  digest) with an SPDX SBOM attestation of the shipped component bytes. Filters version
+  independently of the runtime (immutable tags — content mismatch fails closed); digests and
+  the required runtime capability profile land in the release notes, and
+  `docs/reference-filters.md` carries the filter × profile compatibility matrix plus the
+  verify-then-load recipe. CI builds the shelf with the same script release uses. Test-fixture
+  builds no longer count as shipping; the Redis rate-limit reference stays off the shelf until
+  its secure path lands (ADR 000081).
 - Named runtime capability profiles in the release artifacts (ADR 000079). Every release now
   ships **two** profiles of the binary and the container image: **minimal** (unsuffixed — the
   former single artifact, default features, smallest attack surface) and **capabilities**

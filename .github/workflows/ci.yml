@@ -114,6 +114,8 @@ jobs:
             plecto/examples/filters/filter-streaming
             plecto/examples/filters/filter-extauthz
             plecto/examples/filters/filter-jwt
+            plecto/examples/filters/filter-cors
+            plecto/examples/filters/filter-apikey
             plecto/examples/filters/filter-tcp-gate
             plecto/examples/filters/filter-ratelimit-redis
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -162,6 +164,14 @@ jobs:
           echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "${{ runner.temp }}/wit-bindgen-0.59.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "WASI_SDK_PATH=${{ runner.temp }}/wasi-sdk-33.0-x86_64-linux" >> "$GITHUB_ENV"
+      # ADR 000080: build the shelf with the exact encode path release.yml publishes
+      # (scripts/build-reference-filters.sh). Host fixture builds (build.rs) still exercise
+      # behaviour; this step is the release-parity encode + import-floor gate so CI green means
+      # the bytes we would ship are buildable and match the compatibility matrix's import claims.
+      # working-directory: . — the script lives at repo root; this job's default is plecto/.
+      - name: Reference filter release-parity build (ADR 000080)
+        working-directory: .
+        run: ./scripts/build-reference-filters.sh "${{ runner.temp }}/shelf"
       - name: Install MoonBit
         run: |
           set -euo pipefail

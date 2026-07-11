@@ -431,6 +431,11 @@ verify the pulled contract against the digest recorded in that tag's [GitHub
 Release](https://github.com/Kaikei-e/PlectoProxy/releases) notes before you build against it, the
 same fail-closed instinct §5's digest-pinned filter loading already asks of you.
 
+The reference filter **components** are distributed the same way, as individually cosign-signed
+CNCF Wasm OCI Artifacts under `ghcr.io/kaikei-e/plecto/filters/<name>` (ADR 000080) —
+[reference-filters.md](reference-filters.md) has the shelf, the filter × runtime-profile
+compatibility matrix, and the verify-then-package recipe that feeds §5's load path.
+
 The experimental streaming contract publishes the same way, one package over: `plecto:filter-streaming@0.1.0`.
 It carries **no compatibility guarantee** — it is the off-by-default `streaming-body` feature's
 contract (§3's `filter`/`filter-body` split has no third `streaming` world yet) and may change or

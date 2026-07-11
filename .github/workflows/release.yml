@@ -25,6 +25,12 @@
 #   - ghcr.io/kaikei-e/wit/plecto/*        plecto:filter (+ experimental plecto:filter-streaming)
 #                                          WIT contract, CNCF Wasm OCI Artifact layout (ADR 000064);
 #                                          digest recorded in this tag's release notes
+#   - ghcr.io/kaikei-e/plecto/filters/*    reference filter components (jwt / cors / apikey /
+#                                          extauthz), each its own CNCF Wasm OCI Artifact,
+#                                          cosign-signed by digest with an SPDX SBOM attestation
+#                                          (ADR 000080); digest + required runtime profile recorded
+#                                          in this tag's release notes, the full compatibility
+#                                          matrix in docs/reference-filters.md
 #
 # Verify a binary (minimal = unsuffixed; capabilities = insert "-capabilities" before .tar.gz):
 #   cosign verify-blob --bundle plecto-<tag>-<target>.tar.gz.sigstore.json \
@@ -38,6 +44,9 @@
 # Verify an image (same flags; pin the profile's index digest from the release notes):
 #   cosign verify ghcr.io/<owner>/plecto@<minimal-digest>
 #   cosign verify ghcr.io/<owner>/plecto@<capabilities-digest>
+# Verify a reference filter and its SBOM attestation (same flags; pin the digest from the notes):
+#   cosign verify ghcr.io/kaikei-e/plecto/filters/<name>@<digest>
+#   cosign verify-attestation --type spdxjson ghcr.io/kaikei-e/plecto/filters/<name>@<digest>
 
 name: release
 
@@ -393,13 +402,143 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Single writer for the draft release body (ADR 000079): container-merge and wit-publish each
-  # upload a digest fragment; this job overwrites the notes once. Avoids the lost-update race of
-  # parallel `gh release view` → append → `gh release edit`. `binaries` may have created the
-  # draft earlier with a placeholder body — that is fine; we replace it here.
+  # Publishes the reference filter components — jwt, cors, apikey, extauthz — as individually
+  # cosign-signed CNCF Wasm OCI Artifacts with SPDX SBOM attestations (ADR 000080): the third
+  # artifact class next to the host binaries/images (ADR 000047 / 000079) and the WIT contract
+  # (ADR 000064). The test-fixture builds in crates/host/build.rs do not count as shipping
+  # (ADR 000080 Decision 3); only these signed artifacts do. Like wit-publish, independent of
+  # binaries/container-build — a filter-publish hiccup must not block the binaries, and vice
+  # versa — `needs: gate` only.
+  #
+  # Build path is shared with ci.yml via scripts/build-reference-filters.sh (same
+  # wasm-tools / wasip2 encode, same import-floor asserts). Filters version independently of
+  # the runtime (each guest's Cargo.toml): we always rebuild; if <name>:<version> already
+  # exists we compare the pulled component's sha256 to the local build and fail closed on
+  # mismatch (bump the filter version — tags are immutable). Matching digests skip push.
+  # verify-before-sign re-signs / re-attests only a digest that lacks a valid signature or
+  # SBOM attestation — self-healing after a partial earlier run without piling signatures.
+  #
+  # SBOM: syft scans the component .wasm bytes (not the source tree), then cosign attest
+  # binds that SPDX predicate to the OCI manifest digest. That is OCI-digest-bound attestation
+  # of the shipped component; the host's keyed load path still re-binds under the operator's
+  # [trust] key (ADR 000006 / Decision 5).
+  #
+  # ghcr quirk (same as ADR 000064's WIT packages): the first push of each filters/<name>
+  # package lands PRIVATE; flipping it Public is a one-time manual step in the package settings.
+  filter-publish:
+    name: reference filters (OCI publish + sign)
+    needs: gate
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    # Job-level permissions REPLACE the workflow-level default (deny-by-default): unlike
+    # wit-publish this job cosign-signs, so it needs `id-token`, but it still neither reads CI
+    # status nor writes the release — digests go to an artifact for the single release-notes
+    # writer.
+    permissions:
+      packages: write # push the filter OCI artifacts to ghcr.io
+      id-token: write # cosign keyless signing + SBOM attestation (Fulcio OIDC)
+    env:
+      FILTERS_NS: ghcr.io/kaikei-e/plecto/filters
+      CERT_ID_REGEXP: https://github.com/Kaikei-e/PlectoProxy/\.github/workflows/release\.yml@.*
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      # Same toolchain shape as ci.yml's build job: rust-toolchain.toml pins the channel and
+      # wasm32-unknown-unknown; wasm32-wasip2 (the outbound guests' target) is added here.
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip2
+      - name: Install wasm-tools + wkg (sha256-pinned, same pins as ci.yml)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
+          echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
+          tar xzf wasm-tools.tar.gz
+          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
+          echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
+          chmod +x wkg
+          mkdir -p wkg-bin && mv wkg wkg-bin/
+          echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wkg-bin" >> "$GITHUB_PATH"
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+          # wkg has no OCI-auth flag of its own — it falls back to this docker credential store.
+      - name: Build shelf (shared script — same as CI release-parity)
+        run: ./scripts/build-reference-filters.sh "${RUNNER_TEMP}/shelf"
+      - name: Push, sign, and attest each reference filter
+        run: |
+          set -euo pipefail
+          : > /tmp/filter-digests.md
+          while IFS=$'\t' read -r short _kind profile local_sha component; do
+            case "${short}" in
+              jwt) guest="plecto/examples/filters/filter-jwt" ;;
+              cors) guest="plecto/examples/filters/filter-cors" ;;
+              apikey) guest="plecto/examples/filters/filter-apikey" ;;
+              extauthz) guest="plecto/examples/filters/filter-extauthz" ;;
+              *) echo "error: unknown shelf short name '${short}'" >&2; exit 1 ;;
+            esac
+            version=$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' "${guest}/Cargo.toml" | head -n1)
+            : "${version:?could not parse a version from ${guest}/Cargo.toml}"
+            repo="${FILTERS_NS}/${short}"
+            ref="${repo}:${version}"
+
+            if docker buildx imagetools inspect "${ref}" >/dev/null 2>&1; then
+              remote="${RUNNER_TEMP}/${short}.remote.wasm"
+              wkg oci pull "${ref}" -o "${remote}"
+              # Same strip-then-hash as scripts/build-reference-filters.sh (content_sha).
+              remote_stripped="${RUNNER_TEMP}/${short}.remote.stripped.wasm"
+              wasm-tools strip "${remote}" -o "${remote_stripped}"
+              remote_sha="$(sha256sum "${remote_stripped}" | awk '{print $1}')"
+              if [ "${local_sha}" != "${remote_sha}" ]; then
+                echo "error: ${short}@${version} already at ${ref} but content differs from this commit" >&2
+                echo "  published content-sha256:${remote_sha}" >&2
+                echo "  this commit content-sha256:${local_sha}" >&2
+                echo "Bump ${guest}/Cargo.toml version (ADR 000080 — filter tags are immutable)." >&2
+                exit 1
+              fi
+              echo "${short}@${version} content matches ${ref} — skip push"
+            else
+              wkg oci push "${ref}" "${component}" \
+                --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            fi
+
+            digest=$(docker buildx imagetools inspect "${ref}" --format "{{json .Manifest}}" | jq -r '.digest')
+            if ! cosign verify --certificate-identity-regexp "${CERT_ID_REGEXP}" \
+                --certificate-oidc-issuer "${OIDC_ISSUER}" "${repo}@${digest}" >/dev/null 2>&1; then
+              cosign sign --yes "${repo}@${digest}"
+            fi
+            if ! cosign verify-attestation --type spdxjson \
+                --certificate-identity-regexp "${CERT_ID_REGEXP}" \
+                --certificate-oidc-issuer "${OIDC_ISSUER}" "${repo}@${digest}" >/dev/null 2>&1; then
+              # Scan the component bytes we are shipping — not the source tree (ADR 000080).
+              syft scan "file:${component}" -o "spdx-json=${RUNNER_TEMP}/${short}.spdx.json"
+              cosign attest --yes --type spdxjson \
+                --predicate "${RUNNER_TEMP}/${short}.spdx.json" "${repo}@${digest}"
+            fi
+            echo "- ${short} ${version}: \`${repo}@${digest}\` (runtime profile: ${profile})" >>/tmp/filter-digests.md
+          done < "${RUNNER_TEMP}/shelf/manifest.tsv"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes-filters
+          path: /tmp/filter-digests.md
+          if-no-files-found: error
+          retention-days: 1
+
+  # Single writer for the draft release body (ADR 000079): container-merge, wit-publish, and
+  # filter-publish each upload a digest fragment; this job overwrites the notes once. Avoids the
+  # lost-update race of parallel `gh release view` → append → `gh release edit`. `binaries` may
+  # have created the draft earlier with a placeholder body — that is fine; we replace it here.
   release-notes:
-    name: draft release notes (images + WIT)
-    needs: [binaries, container-merge, wit-publish]
+    name: draft release notes (images + WIT + filters)
+    needs: [binaries, container-merge, wit-publish, filter-publish]
     timeout-minutes: 5
     runs-on: ubuntu-24.04
     permissions:
@@ -424,5 +563,8 @@ jobs:
             echo
             echo "WIT contract (ADR 000064):"
             cat /tmp/notes/release-notes-wit/wit-digests.md
+            echo
+            echo "Reference filters (ADR 000080; compatibility matrix: docs/reference-filters.md):"
+            cat /tmp/notes/release-notes-filters/filter-digests.md
           } >/tmp/release-notes.md
           gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/release-notes.md

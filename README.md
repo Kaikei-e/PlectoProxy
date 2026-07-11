@@ -273,6 +273,13 @@ keyless signature, and per-profile image digests recorded in the release notes
 ([ADR 000047](docs/ADR/000047.md)); the verification commands are in each release's notes and
 in [`release.yml`](.github/workflows/release.yml)'s header comment.
 
+The **reference filters** ship the same way, as separate artifacts: each release publishes
+`filters/jwt`, `filters/cors`, `filters/apikey`, and `filters/extauthz` as individually
+cosign-signed CNCF Wasm OCI Artifacts with SPDX SBOM attestations under
+`ghcr.io/kaikei-e/plecto/filters/<name>` ([ADR 000080](docs/ADR/000080.md)). Which filter needs
+which runtime profile — and the verify-then-load recipe — is in
+[docs/reference-filters.md](docs/reference-filters.md).
+
 ### Run the demos
 
 Nine self-contained demos live under `examples/<name>/`, each wiring the **production load path** (sign + offline OCI layout + verify + load, fail-closed) and printing copy-paste `curl` commands on startup. [`examples/README.md`](plecto/examples/README.md) is the guided learning path with the full write-up of each; here's the quick map:

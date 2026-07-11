@@ -7,11 +7,14 @@
 # suite is a LOCAL harness (bench/perf/run-perf.sh): hosted-runner macro numbers would be noisy and
 # low-value, so it is deliberately not run here.
 #
-# This is a CORRECTNESS gate (the benches must compile and run without panicking) and an
-# INFORMATIONAL perf signal (it prints the numbers). It does NOT hard-fail on small deltas: hosted
-# VMs are noisy neighbours (~2–3% CV), so a tight threshold would false-fail (~1-in-2 at a 2% gate).
-# Read the printed numbers for direction; run locally with `--save-baseline`/`--baseline` for a real
-# comparison (performance/README.md → Reproducing).
+# Two jobs, two verdict policies (bench/methodology.md § Measurement tiers):
+# - `micro` (criterion, wall-clock): a CORRECTNESS gate (benches compile and run) and an
+#   INFORMATIONAL perf signal. It does NOT hard-fail on small deltas: hosted VMs are noisy
+#   neighbours (~2–3% CV), so a tight wall-clock threshold would false-fail (~1-in-2 at a 2% gate).
+# - `instruction` (gungraun/callgrind, instruction counts): the JUDGED perf gate. Instruction
+#   counts are invariant to the runner's frequency/thermal/neighbour noise, so a soft limit
+#   (ir=5%) against the baseline saved from main is meaningful even on shared runners. Main
+#   pushes refresh the baseline (actions/cache); PRs compare and fail past the limit.
 #
 # Actions are SHA-pinned (supply-chain stance, ADR 000006 / OWASP A08), matching ci.yml.
 
@@ -64,6 +67,68 @@ jobs:
       # `[lib] bench = false` on both crates makes `cargo bench` run ONLY the criterion targets, so
       # `--warm-up-time` / `--measurement-time` reach them (the libtest harness would reject them).
       # Quick settings keep this to seconds: the goal is "the benches build + run" plus a direction
-      # signal, not a publication-grade measurement.
+      # signal, not a publication-grade measurement. The gungraun bench targets are skipped here
+      # automatically (required-features = ["instruction-bench"]).
       - name: criterion micro-benchmarks (informational)
         run: cargo bench -p plecto-control -p plecto-host -- --warm-up-time 1 --measurement-time 3
+
+  instruction:
+    name: gungraun instruction-count gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Free disk space for the wasmtime/cranelift build
+        if: runner.environment == 'github-hosted'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: plecto-instruction
+          cache-on-failure: true
+      # The instruction-count baseline: written by main pushes, read (restore-keys) by PRs.
+      # rust-cache prunes workspace artifacts from ./target, so the gungraun results need their
+      # own cache. restore is unconditional; save is main-only, so a PR can never become the
+      # baseline another PR is judged against.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: plecto/target/gungraun
+          key: gungraun-baseline-main-${{ github.sha }}
+          restore-keys: gungraun-baseline-main-
+      - name: Install valgrind
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends valgrind
+      # The runner binary must version-match the `gungraun` dev-dependency; read the version from
+      # the lockfile rather than restating it here. crates.io source build (supply-chain stance —
+      # no prebuilt third-party binaries), cached by rust-cache after the first run.
+      - name: Install gungraun-runner (version-locked to Cargo.lock)
+        run: |
+          VER="$(grep -A1 '^name = "gungraun"$' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')"
+          if command -v gungraun-runner >/dev/null 2>&1 && gungraun-runner --version | grep -qF "$VER"; then
+            echo "gungraun-runner $VER already present"
+          else
+            cargo install gungraun-runner --version "$VER" --locked
+          fi
+      # Main: refresh the named baseline. PR with a restored baseline: judge against it with a
+      # soft instruction-count limit — past ir=5% the job FAILS (this project's first CI-judged
+      # performance gate; wall-clock stays informational in `micro` above). No baseline yet
+      # (first run, or cache eviction): run informational, main will re-seed.
+      - name: instruction-count benchmarks
+        run: |
+          # NB: the value must be attached with `=` — a space-separated value is parsed as a
+          # positional benchmark FILTER and silently filters every bench out.
+          ARGS=()
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            ARGS=(--save-baseline=main)
+          elif [ -d target/gungraun ]; then
+            ARGS=(--baseline=main --callgrind-limits=ir=5%)
+          else
+            echo "no baseline restored — informational pass (main re-seeds the cache)"
+          fi
+          cargo bench -p plecto-host    --features instruction-bench --bench wasm_inst     -- "${ARGS[@]}"
+          cargo bench -p plecto-control --features instruction-bench --bench fastpath_inst -- "${ARGS[@]}"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: plecto/target/gungraun
+          key: gungraun-baseline-main-${{ github.sha }}

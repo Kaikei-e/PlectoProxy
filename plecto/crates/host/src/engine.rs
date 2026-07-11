@@ -52,7 +52,16 @@ pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
         // pool below this; the manifest registry (ADR 000007) will apportion the budget across
         // filters when the fast-path server lands. Exhaustion is a hard error (no internal
         // queue), surfaced as a fail-closed `RunError::Instantiate`.
+        // The instruction-count bench (benches/wasm_inst.rs) runs under callgrind, which cannot
+        // reserve the production pool's ~1 TiB of virtual address space (256 slots x (64 MiB +
+        // guard)). Shrink the SLOT COUNT only: per-slot sizing (memory size, guard) stays
+        // production-shaped, so the JIT'd guest code (guard-based bounds-check elision) and the
+        // per-request dispatch path are unchanged — a single-instance bench never sees the
+        // difference in how many instances could run concurrently.
+        #[cfg(not(feature = "instruction-bench"))]
         let slots = TRUSTED_POOL_SLOTS as u32;
+        #[cfg(feature = "instruction-bench")]
+        let slots = 4u32;
         pool.total_memories(slots);
         pool.total_tables(slots);
         pool.total_core_instances(slots);

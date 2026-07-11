@@ -11,7 +11,8 @@
 //!   cargo install gungraun-runner   # once, version-matched to the dev-dependency
 //!   cargo bench -p plecto-host --features instruction-bench --bench wasm_inst
 //!   # judge against a named baseline, mirroring the criterion flow:
-//!   ... --bench wasm_inst -- --save-baseline main   /   -- --baseline main
+//!   ... --bench wasm_inst -- --save-baseline=main   /   -- --baseline=main
+//!   (values must be `=`-attached: a space-separated value is parsed as a benchmark filter)
 
 use std::hint::black_box;
 

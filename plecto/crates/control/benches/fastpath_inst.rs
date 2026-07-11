@@ -9,7 +9,8 @@
 //!
 //!   cargo bench -p plecto-control --features instruction-bench --bench fastpath_inst
 //!   # judge against a named baseline, mirroring the criterion flow:
-//!   ... --bench fastpath_inst -- --save-baseline main   /   -- --baseline main
+//!   ... --bench fastpath_inst -- --save-baseline=main   /   -- --baseline=main
+//!   (values must be `=`-attached: a space-separated value is parsed as a benchmark filter)
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};

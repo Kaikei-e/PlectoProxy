@@ -41,6 +41,10 @@ mkdir -p "$DATA"
 # and what remains is slow host drift (clock/thermal/neighbours) — which interleaved repetition
 # cancels out of adjacent deltas and a longer single window cannot (it just watches the same host
 # state for longer). `quick` bypasses this table. ROUNDS = interleave rounds for `gate`'s ladder.
+# NOTE for the first post-restructure `all` snapshot: these report windows are SHORTER than the
+# pre-2026-07-11 suite (sweep/wasm 60->30 s etc), so absolute figures will step vs older history.
+# That snapshot's measurement-history entry must say "window lengths changed here — absolutes are
+# not comparable across the restructure; invariants are". One-time event, one-time note.
 TIER="${TIER:-report}"; [[ "${1:-all}" == "gate" ]] && TIER=gate
 case "$TIER" in
   gate)   D_CEIL=10; D_SWEEP=10; D_WASM=10; D_TAIL=15; D_TLS=10; D_RL=10; D_ENF=10; D_BODY=10; D_MIX=30; ROUNDS=3;;

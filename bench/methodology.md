@@ -111,6 +111,13 @@ criterion（wall-clock）は governor 非固定方針の下で日跨ぎ ±10–2
 **命令数**で行う（周波数・温度・隣接負荷に不変。`--save-baseline` / `--baseline` の named
 baseline と `--callgrind-limits 'ir=5%'` のソフトリミットを持つ）。wall-clock criterion は
 「実時間でどうか」の参考として並設を維持する——IPC 劣化は命令数に出ないため、両方要る。
+命令数層に**見えないもの**も明記しておく: (a) `spawn_blocking` ハンドオフ等のスケジューリング項
+（命令ではなく待ち時間）、(b) mmap_lock 競合 / TLB shootdown のような並行時 knee（callgrind 下は
+逐次実行）。criterion が既に開示している逐次実行の非対称性をそのまま継承するので、命令数の
+不変＝実時間の不変ではない。
+CI（`bench.yml`）はこの二本立てをそのまま反映する: criterion ジョブは informational のまま、
+gungraun の instruction ジョブが **main push で baseline を保存し、PR を `ir=5%` ソフトリミットで
+機械判定**する（命令数は shared runner のノイズを受けないため、hosted CI でも判定が成立する）。
 criterion を CI の閾値判定に使わない方針は criterion 公式 FAQ の推奨どおり。
 （[gungraun](https://github.com/gungraun/gungraun), Tier S;
 [criterion FAQ](https://bheisler.github.io/criterion.rs/book/faq.html), Tier S）

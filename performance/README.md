@@ -838,10 +838,13 @@ what that setup buys.)
   invariants this report tracks (interleaved for a confidence half-width) and machine-checks them
   against `bench/perf/gate_tolerances.toml` — the bands are tracked in-repo, so a deliberate
   performance change is reviewed as a diff. `all` stays the human-read release snapshot.
-- **CI regression gate (opt-in).** Per-PR runs only the light criterion micro-benchmarks
-  (`cargo bench -- --baseline main`, seconds); the heavy k6/oha macro suite runs on manual dispatch /
-  nightly. Hosted-runner numbers are treated as *relative* (regression direction), never absolute — CI
-  VMs are noisy neighbours.
+- **CI regression gate.** Per-PR, two layers with different verdict policies (`bench.yml`): the
+  criterion micro-benchmarks stay *informational* (hosted-runner wall-clock is noisy-neighbour
+  bound, ~2–3 % CV, so a tight threshold would false-fail), while the gungraun instruction-count
+  benches are *judged* — a soft limit (`ir=5%`) against the baseline saved from main pushes.
+  Instruction counts don't inherit the runner's frequency/thermal noise, which is what makes a
+  machine verdict meaningful on shared VMs. The heavy k6/oha macro suite never runs in CI — the
+  local T1 `gate` covers per-change macro invariants.
 - **Prior art.** Disclosing open- vs closed-loop and corrected latency is standard in tools such as
   `wrk2` and k6. This report follows that spirit using only its own measurements.
 
@@ -879,10 +882,13 @@ cargo bench -p plecto-control -p plecto-host -- --baseline main        # on a ch
 # 2) instruction counts (gungraun/callgrind; frequency/thermal-invariant — the deterministic
 #    judge for "did the contract surface get more expensive?"). Needs valgrind + a
 #    version-matched `cargo install gungraun-runner`; feature-gated so plain `cargo bench` skips it:
-cargo bench -p plecto-host    --features instruction-bench --bench wasm_inst     -- --save-baseline main
-cargo bench -p plecto-control --features instruction-bench --bench fastpath_inst -- --save-baseline main
-#    ...then on a change: the same commands with `-- --baseline main` (soft limits are also
-#    available, e.g. `-- --callgrind-limits 'ir=5%'`).
+#    NB: gungraun needs `=`-attached values — a space-separated `--save-baseline main` is parsed
+#    as a positional benchmark filter and silently runs nothing — and baseline names allow only
+#    [A-Za-z0-9_] (use `pre_adr73`, not `pre-adr73`).
+cargo bench -p plecto-host    --features instruction-bench --bench wasm_inst     -- --save-baseline=main
+cargo bench -p plecto-control --features instruction-bench --bench fastpath_inst -- --save-baseline=main
+#    ...then on a change: the same commands with `-- --baseline=main` (soft limits are also
+#    available, e.g. `-- --callgrind-limits=ir=5%`).
 
 # Optional live dashboard (images are a one-time setup pull; the load stays on loopback):
 INFLUX=1 bash bench/perf/run-perf.sh all     # http://localhost:3000/d/plecto-lb-k6

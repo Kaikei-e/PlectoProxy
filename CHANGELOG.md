@@ -21,6 +21,8 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-11
+
 ### Added
 
 - Native response compression (ADR 000074 / 000075): an opt-in `[route.compression]` block
@@ -69,7 +71,12 @@ All notable changes to Plecto are documented here. The format follows
   `OPENLOOP_GEN=k6`.
 - Performance snapshot refreshed (2026-07-11 full `run-perf.sh all`): `performance/README.md`
   numbers and `performance/img/*.webp` charts regenerated; open-loop publishes the auto
-  70 %-of-peak schedule-latency figure (0 dropped) instead of the old k6-pinned 60k/s path.
+  70 %-of-peak schedule-latency figure (0 dropped) instead of the old k6-pinned 60k/s path. A
+  second full refresh (plus a fresh `cargo bench` criterion pass) the same day, ahead of the
+  v0.3.0 release, confirms every fixed-rate/tail regression invariant this report tracks (the
+  pooled WASM dispatch floor, the apikey filter's own cost, rate-limit enforcement, round-robin
+  exactness) reproduces number-for-number after landing response compression (ADR 000074 / ADR
+  000075) — expected, since compression is opt-in and off by default on every measured route.
 
 ### Fixed
 

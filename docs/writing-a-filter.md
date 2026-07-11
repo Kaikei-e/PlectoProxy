@@ -439,7 +439,7 @@ disappear without a major bump. Do not depend on it outside an explicit opt-in b
 ### Compatibility policy
 
 The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
-versioning policy already says so. `plecto:filter@0.3.0` and a `plecto` binary at `0.2.6` is the
+versioning policy already says so. `plecto:filter@0.3.0` and a `plecto` binary at `0.3.0` is the
 normal, expected state.
 
 - **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional

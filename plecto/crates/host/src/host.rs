@@ -9,7 +9,8 @@ use wasmtime::Engine;
 use wasmtime::component::{Component, HasSelf, Linker};
 
 use crate::contract::{
-    ContractVersion, FilterPreV01, FilterPreV02, FilterV01, FilterV02, detect_contract_version,
+    ContractVersion, FilterPreV01, FilterPreV02, FilterPreV03, FilterV01, FilterV02, FilterV03,
+    detect_contract_version,
 };
 use crate::engine::{Allocation, EpochTicker, TRUSTED_POOL_MAX, build_engine};
 use crate::errors::{LoadError, sbom_binds_component};
@@ -188,25 +189,48 @@ impl Host {
             Isolation::Untrusted => &self.untrusted_engine,
         };
         let component = Component::from_binary(engine, component_bytes)?;
-        let version = detect_contract_version(&component, engine);
-        if version == ContractVersion::V01 {
-            // Once per process, not per load (ADR 000071): the operator needs the nudge, not a
-            // log line per hot-reload of the same fleet of legacy filters.
-            static V01_WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !V01_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    filter = %filter_id,
-                    "plecto:filter@0.1.0 is deprecated; rebuild filters for 0.2.0 (byte-valued headers)"
-                );
+        let version = detect_contract_version(&component, engine)
+            .ok_or(LoadError::UnsupportedContractVersion)?;
+        match version {
+            ContractVersion::V01 => {
+                // Once per process, not per load (ADR 000071): the operator needs the nudge, not
+                // a log line per hot-reload of the same fleet of legacy filters.
+                static V01_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !V01_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        filter = %filter_id,
+                        "plecto:filter@0.1.0 is deprecated; rebuild filters for 0.3.0 \
+                         (byte-valued headers + response request-context/replace)"
+                    );
+                }
             }
+            ContractVersion::V02 => {
+                // Same once-per-process nudge for the 0.2 track (ADR 000073).
+                static V02_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !V02_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        filter = %filter_id,
+                        "plecto:filter@0.2.0 is deprecated; rebuild filters for 0.3.0 \
+                         (response request-context + replace decision)"
+                    );
+                }
+            }
+            ContractVersion::V03 => {}
         }
         let mut linker = Linker::<HostState>::new(engine);
         // deny-by-default: lend ONLY the plecto host-API (every basic capability in one call),
-        // at the interface version this component targets — 0.1 and 0.2 instance names are
+        // at the interface version this component targets — 0.1 / 0.2 / 0.3 instance names are
         // distinct semver tracks and never cross-resolve. No WASI is added — unless this filter
         // has an outbound policy (below).
         match version {
+            ContractVersion::V03 => {
+                FilterV03::add_to_linker::<_, HasSelf<HostState>>(
+                    &mut linker,
+                    |s: &mut HostState| s,
+                )?;
+            }
             ContractVersion::V02 => {
                 FilterV02::add_to_linker::<_, HasSelf<HostState>>(
                     &mut linker,
@@ -316,6 +340,9 @@ impl Host {
         }
 
         let pre = match version {
+            ContractVersion::V03 => {
+                FilterPreBinding::V03(FilterPreV03::new(linker.instantiate_pre(&component)?)?)
+            }
             ContractVersion::V02 => {
                 FilterPreBinding::V02(FilterPreV02::new(linker.instantiate_pre(&component)?)?)
             }

@@ -1,6 +1,6 @@
 //! WIT-conformance (tdd-workflow Phase 1) + the ADR 000006 provenance gate.
 //!
-//! Loading a component type-checks it against the `plecto:filter@0.1.0` world (`InstancePre`
+//! Loading a component type-checks it against the `plecto:filter@0.3.0` world (`InstancePre`
 //! resolves every import/export) — Plecto's consumer-driven contract test. ADR 000006 now
 //! ALSO requires, before instantiation, a verified keyed cosign signature over the component
 //! plus a signed SBOM: `Host::load` is fail-closed. These tests pin both the contract and the
@@ -10,8 +10,8 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_quickstart_component};
 use plecto_host::{
-    Host, HttpResponse, Isolation, LoadError, LoadOptions, RequestBodyDecision, RequestTrace,
-    ResponseDecision, SignedArtifact, TrustPolicy,
+    Host, HttpRequest, HttpResponse, Isolation, LoadError, LoadOptions, RequestBodyDecision,
+    RequestTrace, ResponseDecision, SignedArtifact, TrustPolicy,
 };
 
 fn component_bytes() -> Vec<u8> {
@@ -67,7 +67,7 @@ fn component_satisfies_plecto_filter_world() {
     let fx = fixture();
     fx.host()
         .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
-        .expect("filter-hello must satisfy plecto:filter@0.1.0 and pass the provenance gate");
+        .expect("filter-hello must satisfy plecto:filter@0.3.0 and pass the provenance gate");
 }
 
 #[test]
@@ -100,7 +100,16 @@ fn response_hook_is_honoured() {
         headers: vec![],
         body: vec![],
     };
-    let (decision, _logs) = filter.on_response(&resp, &RequestTrace::root()).unwrap();
+    let req = HttpRequest {
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        authority: "example.test".to_string(),
+        scheme: "https".to_string(),
+        headers: vec![],
+    };
+    let (decision, _logs) = filter
+        .on_response(&req, &resp, &RequestTrace::root())
+        .unwrap();
     assert!(matches!(decision, ResponseDecision::Continue));
 }
 

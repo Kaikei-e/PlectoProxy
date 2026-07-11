@@ -150,17 +150,21 @@ impl LoadedFilter {
     }
 
     /// Run the response-side hook for one response. Same fail-closed contract as `on_request`.
+    /// `req` is the as-forwarded request snapshot (ADR 000073) — the request as it left the
+    /// request-side chain — passed to a 0.3 guest as `on-response`'s first parameter and
+    /// dropped by the 0.1 / 0.2 adapters.
     pub fn on_response(
         &self,
+        req: &HttpRequest,
         resp: &HttpResponse,
         trace: &RequestTrace,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
         if !self.inner.sink.enabled() {
-            return self.run_on_response(resp).map_err(|(err, _)| err);
+            return self.run_on_response(req, resp).map_err(|(err, _)| err);
         }
         let start = SystemTime::now();
         let elapsed = Instant::now();
-        let result = self.run_on_response(resp);
+        let result = self.run_on_response(req, resp);
         let outcome = match &result {
             Ok((decision, _)) => SpanOutcome::from(decision),
             Err((err, _)) => SpanOutcome::from(err),
@@ -176,9 +180,13 @@ impl LoadedFilter {
         result.map_err(|(err, _)| err)
     }
 
-    fn run_on_response(&self, resp: &HttpResponse) -> HookResult<ResponseDecision> {
+    fn run_on_response(
+        &self,
+        req: &HttpRequest,
+        resp: &HttpResponse,
+    ) -> HookResult<ResponseDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
-            self.inner.runtime.call_on_response(inst, resp)
+            self.inner.runtime.call_on_response(inst, req, resp)
         })
     }
 }

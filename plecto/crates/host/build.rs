@@ -60,6 +60,16 @@ fn main() {
             "filter_quickstart",
             "FILTER_QUICKSTART_COMPONENT",
         );
+        // filter-compat-v02 is pinned to the FROZEN 0.2.0 contract (wit/v0.2.0/) — the V02
+        // adapter rail's living fixture (ADR 000073). Test-only, so it lives under
+        // crates/host/fixtures/, not examples/.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-compat-v02"),
+            &out_dir,
+            "filter_compat_v02",
+            "FILTER_COMPAT_V02_COMPONENT",
+        );
         // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API
         // calls). It is benchmark-only, so it lives under bench/filters/, not examples/.
         build_component(

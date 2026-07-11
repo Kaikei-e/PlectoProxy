@@ -51,7 +51,7 @@ impl Guest for MyFilter {
     // `filter-body` in the `generate!` above and add `fn on_request_body(body: Vec<u8>) ->
     // RequestBodyDecision` — its presence is what makes the host buffer the body (ADR 000038).
 
-    fn on_response(_resp: HttpResponse) -> ResponseDecision {
+    fn on_response(_req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {
         ResponseDecision::Continue
     }
 }

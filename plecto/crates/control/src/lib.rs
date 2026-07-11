@@ -63,7 +63,7 @@ use arc_swap::ArcSwap;
 use plecto_host::{LoadedFilter, SignedArtifact};
 
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
-pub use chain::{ChainOutcome, RequestBodyOutcome};
+pub use chain::{ChainOutcome, RequestBodyOutcome, ResponseOutcome};
 pub use diagnostic::{
     DEV_KEY_IN_TRUST, Diagnostic, PATH_NORMALIZATION_REJECTED, QUOTA_EXCEEDED,
     SIGNATURE_VERIFICATION_FAILED, diagnose, diagnosed_message,

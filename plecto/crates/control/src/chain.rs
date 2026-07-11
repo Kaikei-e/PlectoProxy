@@ -28,6 +28,17 @@ pub enum RequestBodyOutcome {
     Forward(Vec<u8>),
 }
 
+/// The result of driving a response back through the chain (ADR 000073): the typed successor
+/// of the old in-band "non-empty body means synthetic" signal.
+pub enum ResponseOutcome {
+    /// The chain passed: send the (possibly edited) status + headers and stream the upstream
+    /// body through (its `body` is empty — header-only, ADR 000038).
+    Forward(HttpResponse),
+    /// Send this SYNTHESISED response instead of the upstream one (a filter's `replace`, or
+    /// the chain failed closed on a trap / deadline) — the upstream stream is dropped unread.
+    Respond(HttpResponse),
+}
+
 pub(crate) fn dispatch_request(
     chain: &[Arc<LoadedFilter>],
     mut request: HttpRequest,
@@ -73,22 +84,29 @@ pub(crate) fn dispatch_request_body(
 
 pub(crate) fn dispatch_response(
     chain: &[Arc<LoadedFilter>],
+    request: &HttpRequest,
     mut response: HttpResponse,
     trace: &RequestTrace,
-) -> HttpResponse {
+) -> ResponseOutcome {
     // The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
-    // `response-decision` has no short-circuit, so the chain only continues or rewrites. The
-    // same `trace` as the request side, so request + response spans share one trace (ADR 000009).
+    // `request` is the as-forwarded snapshot every hook sees (ADR 000073). A `replace` stops
+    // the chain and answers with the synthesised response — same terminal shape as the request
+    // side's short-circuit and the fail-closed arm (and the general proxy-filter form: a local
+    // response skips the remaining filters). The same `trace` as the request side, so request +
+    // response spans share one trace (ADR 000009).
     for filter in chain.iter().rev() {
-        match filter.on_response(&response, trace) {
+        match filter.on_response(request, &response, trace) {
             Ok((ResponseDecision::Continue, _logs)) => {}
             Ok((ResponseDecision::Modified(edit), _logs)) => {
                 apply_response_edit(&mut response, edit)
             }
-            Err(err) => return err.fail_closed_response(),
+            Ok((ResponseDecision::Replace(replacement), _logs)) => {
+                return ResponseOutcome::Respond(replacement);
+            }
+            Err(err) => return ResponseOutcome::Respond(err.fail_closed_response()),
         }
     }
-    response
+    ResponseOutcome::Forward(response)
 }
 
 /// Apply a request rewrite: remove the named headers, then set (replace-or-add) the given

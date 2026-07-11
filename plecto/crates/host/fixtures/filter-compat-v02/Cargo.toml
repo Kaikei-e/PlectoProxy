@@ -1,0 +1,18 @@
+[package]
+name = "filter-compat-v02"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Test fixture pinned to the FROZEN plecto:filter@0.2.0 contract (wit/v0.2.0/) — the living
+# guest that keeps the host's V02 adapter rail (ADR 000073) covered in CI now that every
+# in-tree example targets 0.3.0. Built for wasm32-unknown-unknown and componentized by
+# crates/host/build.rs, exactly like the example guests. Declares its own [workspace] so the
+# native plecto/ workspace never absorbs it into a host-target build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.59"
+
+[workspace]

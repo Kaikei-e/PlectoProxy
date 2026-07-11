@@ -39,28 +39,8 @@ extern "wasm" fn mbt_ffi_free(position : Int) =
 #|(func (param i32) local.get 0 call $moonbit.decref)
 
 #doc(hidden)
-pub fn wasmExportOnResponse(p0 : Int, p1 : Int, p2 : Int, p3 : Int, p4 : Int) -> Int {
-      @filterBody.wasmExportOnResponse(p0, p1, p2, p3, p4)
-}
-
-#doc(hidden)
-pub fn wasmExportOnResponsePostReturn(p0 : Int) -> Unit {
-      @filterBody.wasmExportOnResponsePostReturn(p0)
-}
-
-#doc(hidden)
-pub fn wasmExportOnRequestBody(p0 : Int, p1 : Int) -> Int {
-      @filterBody.wasmExportOnRequestBody(p0, p1)
-}
-
-#doc(hidden)
-pub fn wasmExportOnRequest(p0 : Int, p1 : Int, p2 : Int, p3 : Int, p4 : Int, p5 : Int, p6 : Int, p7 : Int, p8 : Int, p9 : Int) -> Int {
-      @filterBody.wasmExportOnRequest(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9)
-}
-
-#doc(hidden)
-pub fn wasmExportOnRequestPostReturn(p0 : Int) -> Unit {
-      @filterBody.wasmExportOnRequestPostReturn(p0)
+pub fn wasmExportInit() -> Unit {
+      @filterBody.wasmExportInit()
 }
 
 #doc(hidden)
@@ -69,7 +49,27 @@ pub fn wasmExportOnRequestBodyPostReturn(p0 : Int) -> Unit {
 }
 
 #doc(hidden)
-pub fn wasmExportInit() -> Unit {
-      @filterBody.wasmExportInit()
+pub fn wasmExportOnResponse(p0 : Int, p1 : Int, p2 : Int, p3 : Int, p4 : Int, p5 : Int, p6 : Int, p7 : Int, p8 : Int, p9 : Int, p10 : Int, p11 : Int, p12 : Int, p13 : Int, p14 : Int) -> Int {
+      @filterBody.wasmExportOnResponse(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14)
+}
+
+#doc(hidden)
+pub fn wasmExportOnRequestPostReturn(p0 : Int) -> Unit {
+      @filterBody.wasmExportOnRequestPostReturn(p0)
+}
+
+#doc(hidden)
+pub fn wasmExportOnRequest(p0 : Int, p1 : Int, p2 : Int, p3 : Int, p4 : Int, p5 : Int, p6 : Int, p7 : Int, p8 : Int, p9 : Int) -> Int {
+      @filterBody.wasmExportOnRequest(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9)
+}
+
+#doc(hidden)
+pub fn wasmExportOnRequestBody(p0 : Int, p1 : Int) -> Int {
+      @filterBody.wasmExportOnRequestBody(p0, p1)
+}
+
+#doc(hidden)
+pub fn wasmExportOnResponsePostReturn(p0 : Int) -> Unit {
+      @filterBody.wasmExportOnResponsePostReturn(p0)
 }
 

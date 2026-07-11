@@ -6,5 +6,5 @@ declare pub fn on_request(req : @types.HttpRequest) -> @types.RequestDecision
 ///|
 declare pub fn on_request_body(body : FixedArray[Byte]) -> @types.RequestBodyDecision
 ///|
-declare pub fn on_response(resp : @types.HttpResponse) -> @types.ResponseDecision
+declare pub fn on_response(req : @types.HttpRequest, resp : @types.HttpResponse) -> @types.ResponseDecision
 

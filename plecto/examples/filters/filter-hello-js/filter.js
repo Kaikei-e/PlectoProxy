@@ -6,9 +6,9 @@
 // Consequence: Date.now() / Math.random() are unavailable in here by design — time
 // comes from host-clock, exactly as the contract intends.
 
-import { log } from 'plecto:filter/host-log@0.2.0';
-import { increment, get as counterGet } from 'plecto:filter/host-counter@0.2.0';
-import { tryAcquire } from 'plecto:filter/host-ratelimit@0.2.0';
+import { log } from 'plecto:filter/host-log@0.3.0';
+import { increment, get as counterGet } from 'plecto:filter/host-counter@0.3.0';
+import { tryAcquire } from 'plecto:filter/host-ratelimit@0.3.0';
 
 function findHeader(headers, name) {
   return headers.find((h) => h.name.toLowerCase() === name);
@@ -101,7 +101,7 @@ export function onRequestBody(body) {
   return { tag: 'continue', val: upper };
 }
 
-export function onResponse(resp) {
+export function onResponse(_req, resp) {
   if (findHeader(resp.headers, 'x-plecto-respedit')) {
     return {
       tag: 'modified',

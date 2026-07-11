@@ -46,6 +46,29 @@ fn version_flag_prints_the_package_version_and_exits_zero() {
 }
 
 #[test]
+fn version_flag_names_the_compiled_capability_profile() {
+    // ADR 000079: compile-time inclusion ≠ runtime grant. The binary self-reports which named
+    // runtime capability profile it was compiled as, so an operator can tell a minimal binary
+    // from a capabilities one on the spot — without digest bookkeeping or reading the
+    // cargo-auditable dependency list out of the executable.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["--version"], dir.path());
+    assert!(out.status.success(), "--version exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // This integration test compiles with the same features as the binary, so cfg! sees the
+    // profile under test. Partial feature sets are not a named release profile and out of scope.
+    let expected = if cfg!(feature = "capabilities") {
+        "profile: capabilities (outbound-http, outbound-tcp, fat-guest)"
+    } else {
+        "profile: minimal"
+    };
+    assert!(
+        stdout.contains(expected),
+        "--version names the compiled profile, want {expected:?}, got: {stdout:?}"
+    );
+}
+
+#[test]
 fn schema_emits_a_draft07_json_schema_describing_the_manifest() {
     // `plecto schema` (ADR 000049): the manifest's JSON Schema on stdout, derived from the same
     // serde model `from_toml` parses with. draft-07 is the level taplo / Even Better TOML

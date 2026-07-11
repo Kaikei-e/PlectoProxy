@@ -1,0 +1,18 @@
+[package]
+name = "filter-resp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# ADR 000073 response-side cost ladder rungs: reads the as-forwarded request snapshot on
+# `on-response`, and optionally `replace`s. No host-API calls — isolates response-context /
+# replace from the request-side work filter-hello pays. Built for wasm32-unknown-unknown and
+# componentized by crates/host/build.rs (ADR 000010). Own [workspace] so the native plecto/
+# workspace never absorbs it.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.59"
+
+[workspace]

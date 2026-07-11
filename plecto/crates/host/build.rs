@@ -88,6 +88,14 @@ fn main() {
             "filter_noop",
             "FILTER_NOOP_COMPONENT",
         );
+        // filter-resp: ADR 000073 response-context read + optional `replace` rungs (no host-API).
+        build_component(
+            &cargo,
+            &bench_filters.join("filter-resp"),
+            &out_dir,
+            "filter_resp",
+            "FILTER_RESP_COMPONENT",
+        );
     }
 
     // Experimental streaming body filter (feature `streaming-body`, OFF by default): build the

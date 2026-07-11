@@ -16,8 +16,12 @@
 # / `churn` split each ran their own copy of this — see performance/README.md's consolidation note).
 #
 #   bash bench/perf/run-perf.sh <phase>
-#   phase ∈ quick ceiling sweep openloop rr ejection swap wasm tls h3 ws footprint ratelimit body mix
-#           industry all
+#   phase ∈ quick gate ceiling sweep openloop rr ejection swap wasm v03 tls h3 ws footprint ratelimit
+#           body mix industry all
+#
+# Tiers (bench/methodology.md § Measurement tiers): `quick` = T0 smoke, `gate` = T1 per-change
+# regression gate (interleaved invariant deltas, banded verdict, exit code), `all` = T2 release
+# report (TIER=report windows), opt-in phases (`v03`, manual tls modes, mem_matrix.py) = T3 deep.
 #
 # Default ports avoid colliding with other local services (override with *_ADDR env).
 # Offline: load traffic stays on loopback. Set REQUIRE_OFFLINE=1 to refuse a default IPv4 route
@@ -30,6 +34,19 @@ ROOT="$(cd "$BENCH/.." && pwd)"
 WS="$ROOT/plecto"
 DATA="$ROOT/performance/data"
 mkdir -p "$DATA"
+
+# ---- tier-scaled measurement windows (seconds) — the single place window lengths live.
+# T2 `report` (default) sizes windows for the full-suite snapshot. T1 `gate` trades window length
+# for repetition: with warm-up excluded, loopback steady-state percentiles converge within ~10 s,
+# and what remains is slow host drift (clock/thermal/neighbours) — which interleaved repetition
+# cancels out of adjacent deltas and a longer single window cannot (it just watches the same host
+# state for longer). `quick` bypasses this table. ROUNDS = interleave rounds for `gate`'s ladder.
+TIER="${TIER:-report}"; [[ "${1:-all}" == "gate" ]] && TIER=gate
+case "$TIER" in
+  gate)   D_CEIL=10; D_SWEEP=10; D_WASM=10; D_TAIL=15; D_TLS=10; D_RL=10; D_ENF=10; D_BODY=10; D_MIX=30; ROUNDS=3;;
+  report) D_CEIL=20; D_SWEEP=30; D_WASM=30; D_TAIL=20; D_TLS=20; D_RL=20; D_ENF=30; D_BODY=15; D_MIX=60; ROUNDS=1;;
+  *) echo "unknown TIER: $TIER (expected gate|report)"; exit 2;;
+esac
 
 OHA="${OHA:-$HOME/.cargo/bin/oha}"
 K6="${K6:-$(command -v k6)}"
@@ -96,13 +113,26 @@ if [[ "${INFLUX:-}" == "1" ]]; then
 fi
 
 PROXY_PID=""
+PROXY_KEY=""
 BLOG=""
-stop_proxy(){ [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; PROXY_PID=""; }
+stop_proxy(){ [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; PROXY_PID=""; PROXY_KEY=""; }
+# End-of-phase stop. Under SHARE_PROXY=1 (the `all` runner) the proxy is left running so the next
+# phase's launch() can reuse it when the spec matches — the BACKEND_LATENCY_MS=0 bench-server
+# family (footprint/ceiling/ws/wasm) is identical and used to pay 4 launches + health + warm.
+release_proxy(){ [[ "${SHARE_PROXY:-}" == "1" ]] || stop_proxy; }
 trap 'stop_proxy; influx_down' EXIT
 
 # launch <example> <addr> <health_url|""> [env KEY=VAL ...]
 # health_url empty => skip the http health loop (caller probes itself, e.g. TLS over https).
+# Memoized: if the same example+addr+env is already running (a release_proxy'd share), reuse it;
+# any mismatch stops the old proxy first, so callers never need to stop before a re-launch.
 launch(){
+  local key="$*"
+  if [[ -n "$PROXY_PID" && "$key" == "$PROXY_KEY" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "reusing $1 on $2 (pid $PROXY_PID, still pinned $PROXY_CPUS)"
+    return 0
+  fi
+  stop_proxy
   local ex="$1" addr="$2" health="$3"; shift 3
   BLOG="$(mktemp)"
   env PLECTO_PROXY_ADDR="$addr" RUST_LOG=warn "$@" "$WS/target/release/examples/$ex" >"$BLOG" 2>&1 &
@@ -110,11 +140,19 @@ launch(){
   taskset -cp "$PROXY_CPUS" "$PROXY_PID" >/dev/null 2>&1
   if [[ -n "$health" ]]; then
     local ok=""
-    for _ in $(seq 80); do curl -fsS "$health" >/dev/null 2>&1 && { ok=1; break; }; sleep 0.25; done
+    for _ in $(seq 80); do
+      # A health 200 alone is not proof of THIS proxy: if the fresh process died (bind failure,
+      # crash) while something else still answers on the port, the phase would silently measure
+      # the wrong config. Require the launched pid to be alive too.
+      kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy $ex exited during startup"; cat "$BLOG"; return 1; }
+      curl -fsS "$health" >/dev/null 2>&1 && { ok=1; break; }
+      sleep 0.25
+    done
     [[ -n "$ok" ]] || { echo "proxy $ex did not become healthy"; cat "$BLOG"; return 1; }
   else
     sleep 2
   fi
+  PROXY_KEY="$key"
   echo "launched $ex on $addr (pid $PROXY_PID, pinned $PROXY_CPUS)"
 }
 
@@ -156,16 +194,16 @@ phase_ceiling(){
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
   local tmp; tmp="$(mktemp -d)"
   warm_oha -c 50 "http://$BENCH_ADDR/baseline/x"
-  gen "$OHA" -z 30s -c 50 --no-tui --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/ka.json" 2>/dev/null
+  gen "$OHA" -z "${D_CEIL}s" -c 50 --no-tui --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/ka.json" 2>/dev/null
   echo "  keep-alive        -> $(oha_row "$tmp/ka.json")"
   # Cold-connection churn leaves the client side with one TIME_WAIT socket per request; 30 s at
   # tens of k rps can brush the ephemeral-port range (net.ipv4.ip_local_port_range). Failures from
   # port exhaustion would show as errors here, not latency — check the error count if cold rps
   # collapses versus keep-alive by more than the handshake cost.
   warm_oha -c 50 --disable-keepalive "http://$BENCH_ADDR/baseline/x"
-  gen "$OHA" -z 30s -c 50 --no-tui --disable-keepalive --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/cold.json" 2>/dev/null
+  gen "$OHA" -z "${D_CEIL}s" -c 50 --no-tui --disable-keepalive --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/cold.json" 2>/dev/null
   echo "  cold (TCP/req)    -> $(oha_row "$tmp/cold.json")"
-  stop_proxy
+  release_proxy
   { echo "variant,kpi,rps,p50,p90,p95,p99"
     add(){ read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$3")"; echo "$1,$2,$rps,$p50,$p90,$p95,$p99"; }
     # RR = Request/Response on a persistent connection; CRR = Connect/Request/Response (RFC 9411 §7.2/7.3 shape).
@@ -182,7 +220,7 @@ phase_sweep(){
   for vus in 50 100 200 400 800; do
     log "  VU=$vus"
     gen "$K6" run -q "${INFLUX_OUT[@]}" \
-      -e TARGET="http://$LB_ADDR/" -e VUS=$vus -e DUR=60s -e OUT="$tmp/vu$vus.json" \
+      -e TARGET="http://$LB_ADDR/" -e VUS=$vus -e DUR="${D_SWEEP}s" -e OUT="$tmp/vu$vus.json" \
       "$BENCH/k6/lb-sweep-step.js" 2>&1 | tail -1
   done
   stop_proxy
@@ -220,7 +258,8 @@ phase_openloop(){
       ;;
     loadgen|*)
       loadgen openloop --target "http://$LB_ADDR/" --rate "$rate" --duration 90 --warmup 5 \
-        --workers "${OPENLOOP_WORKERS:-64}" --out "$DATA/openloop.json"
+        --workers "${OPENLOOP_WORKERS:-64}" --out "$DATA/openloop.json" \
+        --hist-out "$DATA/openloop_hist.csv"
       ;;
   esac
   stop_proxy
@@ -335,7 +374,7 @@ phase_wasm(){
   for r in "${ladder[@]}"; do
     local hdr=(); [[ "$r" == trusted || "$r" == ondemand ]] && hdr=(-H "x-api-key: alice-secret")
     warm_oha -c 50 "${hdr[@]}" "http://$BENCH_ADDR/$r/x"
-    gen "$OHA" -z 60s -c 50 --no-tui --output-format json "${hdr[@]}" \
+    gen "$OHA" -z "${D_WASM}s" -c 50 --no-tui --output-format json "${hdr[@]}" \
       "http://$BENCH_ADDR/$r/x" > "$tmp/$r.json" 2>/dev/null
     echo "  /$r -> $(oha_row "$tmp/$r.json")"
   done
@@ -357,11 +396,12 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
   { echo "route,rate,rps,p50,p90,p95,p99"
     for r in baseline "${ladder[@]}"; do
       local hdr=(); [[ "$r" == trusted || "$r" == ondemand ]] && hdr=(-H "x-api-key: alice-secret")
-      gen "$OHA" -z 30s -c 50 -q "$qlat" --latency-correction --no-tui --output-format json "${hdr[@]}" \
+      gen "$OHA" -z "${D_TAIL}s" -c 50 -q "$qlat" --latency-correction --no-tui --output-format json "${hdr[@]}" \
         "http://$BENCH_ADDR/$r/x" > "$tmp/tail_$r.json" 2>/dev/null
       read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/tail_$r.json")"
       echo "$r,$qlat,$rps,$p50,$p90,$p95,$p99"
     done; } > "$DATA/wasm_overhead_tail.csv"
+  # Not release_proxy: 3.3 needs a different backend env anyway (BACKEND_LATENCY_MS=15).
   stop_proxy
   { echo "route,rps,p50,p90,p95,p99"
     echo "baseline,$base_rps,$base_p50,$base_p90,$base_p95,$base_p99"
@@ -390,6 +430,199 @@ print("wrote wasm_mixed.csv")
   cat "$DATA/wasm_mixed.csv"
 }
 
+# ---------------------------------------------------------------- Phase 3b v0.3.0 response ladder + compression
+# Targeted add-on (not part of `all`): ADR 000073 response-context / replace + ADR 000074/075
+# compression opt-in. Keeps the heavy full suite off the critical path while filling the
+# previously-unmeasured v0.3.0 feature costs (see docs/plans/performance_feed_back_01.md).
+phase_v03(){
+  log "Phase 3b — v0.3.0 response ladder + compression (oha) -> v03_*.csv"
+  # Response-side rungs share the default tiny backend (16 B): isolate guest/host work, not codec
+  # CPU. Compression needs RESP_BYTES ≥ min_length (1024) + Accept-Encoding — separate launch.
+  launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
+  local tmp; tmp="$(mktemp -d)"
+  # Adjacent deltas (same backend):
+  #   noop-pooled → resp-ctx      = reading the as-forwarded request snapshot on on-response
+  #   resp-ctx    → resp-replace  = synthesising a replace response (status+body)
+  # noop-pooled is re-measured here so the delta is same-process / same-session (not borrowed
+  # from an earlier wasm phase that may not have run).
+  local ladder=(noop-pooled resp-ctx resp-replace)
+  for r in "${ladder[@]}"; do
+    local hdr=()
+    [[ "$r" == resp-replace ]] && hdr=(-H "x-plecto-resp-replace: 1")
+    warm_oha -c 50 "${hdr[@]}" "http://$BENCH_ADDR/$r/x"
+    gen "$OHA" -z "${D_WASM}s" -c 50 --no-tui --output-format json "${hdr[@]}" \
+      "http://$BENCH_ADDR/$r/x" > "$tmp/$r.json" 2>/dev/null
+    echo "  /$r -> $(oha_row "$tmp/$r.json")"
+  done
+  local floor qlat
+  floor="$(python3 -c '
+import json,sys
+print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[1:])))
+' "$tmp/noop-pooled.json" "$tmp/resp-ctx.json" "$tmp/resp-replace.json")"
+  qlat="${V03_QLAT:-$(( floor * 60 / 100 ))}"
+  log "  response-ladder tails at fixed ${qlat} rps (oha -q --latency-correction)"
+  { echo "route,rate,rps,p50,p90,p95,p99"
+    for r in "${ladder[@]}"; do
+      local hdr=()
+      [[ "$r" == resp-replace ]] && hdr=(-H "x-plecto-resp-replace: 1")
+      gen "$OHA" -z "${D_TAIL}s" -c 50 -q "$qlat" --latency-correction --no-tui --output-format json "${hdr[@]}" \
+        "http://$BENCH_ADDR/$r/x" > "$tmp/tail_$r.json" 2>/dev/null
+      read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/tail_$r.json")"
+      echo "$r,$qlat,$rps,$p50,$p90,$p95,$p99"
+    done; } > "$DATA/v03_response_tail.csv"
+  stop_proxy
+  { echo "route,rps,p50,p90,p95,p99"
+    for r in "${ladder[@]}"; do
+      read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/$r.json")"
+      echo "$r,$rps,$p50,$p90,$p95,$p99"
+    done; } > "$DATA/v03_response.csv"
+  cat "$DATA/v03_response.csv"
+  echo "--- tails at ${qlat} rps ---"
+  cat "$DATA/v03_response_tail.csv"
+
+  # Compression: 4 KiB text/plain upstream (≥1024 min_length), gzip pinned on /compress.
+  # Control = /baseline with the same Accept-Encoding (no [route.compression] → identity).
+  # Method: RFC 9411 §7.3 HTTP throughput at one object size; closed-loop ceiling + CO-safe
+  # fixed-rate tails (oha -q --latency-correction), same pattern as the WASM ladder.
+  log "  compression opt-in (RESP_BYTES=4096, Accept-Encoding: gzip) -> v03_compression.csv"
+  launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" \
+    BACKEND_LATENCY_MS=0 RESP_BYTES=4096 || return 1
+  local ae=(-H "Accept-Encoding: gzip")
+  for r in baseline compress; do
+    warm_oha -c 50 "${ae[@]}" "http://$BENCH_ADDR/$r/x"
+    gen "$OHA" -z "${D_WASM}s" -c 50 --no-tui --output-format json "${ae[@]}" \
+      "http://$BENCH_ADDR/$r/x" > "$tmp/c_$r.json" 2>/dev/null
+    echo "  /$r (gzip AE) -> $(oha_row "$tmp/c_$r.json")"
+  done
+  floor="$(python3 -c '
+import json,sys
+print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[1:])))
+' "$tmp/c_baseline.json" "$tmp/c_compress.json")"
+  qlat="${V03_COMPRESS_QLAT:-$(( floor * 60 / 100 ))}"
+  { echo "route,rate,rps,p50,p90,p95,p99"
+    for r in baseline compress; do
+      gen "$OHA" -z "${D_TAIL}s" -c 50 -q "$qlat" --latency-correction --no-tui --output-format json "${ae[@]}" \
+        "http://$BENCH_ADDR/$r/x" > "$tmp/ctail_$r.json" 2>/dev/null
+      read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/ctail_$r.json")"
+      echo "$r,$qlat,$rps,$p50,$p90,$p95,$p99"
+    done; } > "$DATA/v03_compression_tail.csv"
+  stop_proxy
+  { echo "route,rps,p50,p90,p95,p99"
+    for r in baseline compress; do
+      read -r rps p50 p90 p95 p99 _ <<<"$(oha_row "$tmp/c_$r.json")"
+      echo "$r,$rps,$p50,$p90,$p95,$p99"
+    done; } > "$DATA/v03_compression.csv"
+  cat "$DATA/v03_compression.csv"
+  echo "--- compression tails at ${qlat} rps ---"
+  cat "$DATA/v03_compression_tail.csv"
+}
+
+# ---------------------------------------------------------------- T1 gate — per-change regression verdict
+# Measures ONLY the invariants performance/README.md tracks across snapshots, then checks each
+# against the bands in gate_tolerances.toml (tracked in-repo, so changing a performance expectation
+# is a reviewable diff like any other contract change). Exit 0 = every invariant in band.
+#
+# Method (bench/methodology.md § Measurement tiers): the ladder rungs are measured as an A/B/C
+# INTERLEAVE over ROUNDS short windows instead of one long window — slow host drift (clock,
+# thermal, neighbours) lands inside a round and cancels out of the adjacent deltas, and the
+# per-round spread gives a confidence half-width a single window cannot. Fixed-rate tails use a
+# CONSTANT 2000 rps rather than the report tier's auto-derived 60%-of-floor: the gate never
+# measures the fresh rungs, so there is no knee to dodge, and a constant offered rate keeps every
+# snapshot comparable across rung-set changes.
+phase_gate(){
+  log "Gate — invariant deltas, interleaved x${ROUNDS}, banded verdict -> gate.csv"
+  local ex
+  for ex in bench-server load-balancing; do
+    [[ -x "$WS/target/release/examples/$ex" ]] || {
+      echo "gate: missing release example '$ex' — build first (see bench/plan.md):"
+      echo "  cd plecto && cargo build --release -p plecto-server --features bench-harnesses \\"
+      echo "    --example load-balancing --example bench-server --example tls-http --example swap-bench"
+      return 1
+    }
+  done
+  local tmp round r hdr
+  tmp="$(mktemp -d)"
+  local ladder=(baseline noop-pooled trusted)
+
+  # -- 1. WASM dispatch floor + filter cost: interleaved closed-loop ladder --
+  launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
+  for round in $(seq "$ROUNDS"); do
+    for r in "${ladder[@]}"; do
+      hdr=(); [[ "$r" == trusted ]] && hdr=(-H "x-api-key: alice-secret")
+      [[ "$round" == 1 ]] && warm_oha -c 50 "${hdr[@]}" "http://$BENCH_ADDR/$r/x"
+      gen "$OHA" -z "${D_WASM}s" -c 50 --no-tui --output-format json "${hdr[@]}" \
+        "http://$BENCH_ADDR/$r/x" > "$tmp/r${round}_$r.json" 2>/dev/null
+      echo "  round $round /$r -> $(oha_row "$tmp/r${round}_$r.json")"
+    done
+  done
+
+  # -- 2. pooled tail floor at the constant gate rate (+ /resp-ctx, the ADR 000073 read rung) --
+  local qlat="${GATE_QLAT:-2000}"
+  log "  fixed-rate tails at ${qlat} rps (oha -q --latency-correction)"
+  for r in "${ladder[@]}" resp-ctx; do
+    hdr=(); [[ "$r" == trusted ]] && hdr=(-H "x-api-key: alice-secret")
+    gen "$OHA" -z "${D_TAIL}s" -c 50 -q "$qlat" --latency-correction --no-tui --output-format json \
+      "${hdr[@]}" "http://$BENCH_ADDR/$r/x" > "$tmp/tail_$r.json" 2>/dev/null
+    echo "  tail /$r -> $(oha_row "$tmp/tail_$r.json")"
+  done
+  stop_proxy
+
+  # -- 3. rate-limit tax (interleaved pair) + enforcement convergence (bucket maths converge in
+  #       2-3 s, so D_ENF=10 s is plenty — the 30 s report window buys nothing here) --
+  if command -v k6 >/dev/null 2>&1 || [[ -n "${K6:-}" && -x "${K6}" ]]; then
+    launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" || return 1
+    for round in 1 2; do
+      for r in baseline ratelimit; do
+        gen "$K6" run -q -e BASE="http://$BENCH_ADDR" -e ROUTE_PATH="/$r" \
+          -e KEYS=1000 -e VUS=50 -e DUR="${D_RL}s" -e OUT="$tmp/rl_r${round}_$r.json" \
+          "$BENCH/k6-wasm/ratelimit-overhead.js" 2>&1 | tail -1
+      done
+    done
+    stop_proxy
+    launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" \
+      RL_CAPACITY=2000 RL_REFILL_TOKENS=1000 RL_REFILL_INTERVAL_MS=1000 || return 1
+    gen "$K6" run -q -e BASE="http://$BENCH_ADDR" -e RATE=5000 -e DUR="${D_ENF}s" \
+      -e OUT="$tmp/enforce.json" "$BENCH/k6-wasm/ratelimit-enforce.js" 2>&1 | tail -1
+    stop_proxy
+  else
+    echo "  gate: k6 not found — rate-limit invariants will report verdict=skipped"
+  fi
+
+  # -- 4. round-robin exactness + compressed ejection timeline. The resilience time-constants are
+  #       ~1 s, so a 40 s timeline (eject@10 / rejoin@18 / eject-all@26 / restore@32) bounds them
+  #       as well as the report tier's 75 s one --
+  launch load-balancing "$LB_ADDR" "http://$LB_ADDR/" || return 1
+  loadgen rr --target "http://$LB_ADDR/" --total 120000 --workers 48 --out "$tmp/rr.csv" || return 1
+  local be; be=($(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$BLOG" | head -3))
+  [[ "${#be[@]}" -eq 3 ]] || { echo "expected 3 backends, got ${be[*]:-none}"; stop_proxy; return 1; }
+  loadgen ejection --target "http://$LB_ADDR/" --rate 4000 --duration 40 --warmup 5 --workers 64 \
+    --toggle "a=${be[0]}/toggle" "b=${be[1]}/toggle" "c=${be[2]}/toggle" \
+    --toggle-at "10=b:eject b" --toggle-at "18=b:rejoin b" \
+    --toggle-at "26=a,b,c:eject all" --toggle-at "32=a,b,c:restore all" \
+    --out "$tmp/ej_timeline.csv" --events-out "$tmp/ej_events.csv" || { stop_proxy; return 1; }
+  stop_proxy
+
+  # -- verdict --
+  local rc=0
+  python3 "$HERE/gate_verdict.py" "$tmp" "$HERE/gate_tolerances.toml" > "$DATA/gate.csv" || rc=1
+  cat "$DATA/gate.csv"
+  if [[ "$rc" == 0 ]]; then log "gate: PASS (every invariant in band)"
+  else log "gate: FAIL — an invariant left its band (bands: bench/perf/gate_tolerances.toml)"; fi
+
+  # -- 5. micro layer (informational): criterion vs a saved `main` baseline when one exists.
+  #       The deterministic pass/fail judgement for contract-surface cost lives in the
+  #       instruction-count benches (see performance/README.md → Reproducing). GATE_MICRO=0 skips.
+  if [[ "${GATE_MICRO:-1}" == "1" ]]; then
+    if find "$WS/target/criterion" -maxdepth 4 -type d -name main 2>/dev/null | grep -q .; then
+      (cd "$WS" && cargo bench -p plecto-control -p plecto-host -- --baseline main) || true
+    else
+      echo "  no saved criterion baseline 'main' — informational micro layer skipped. Save one on"
+      echo "  the base branch: (cd plecto && cargo bench -p plecto-control -p plecto-host -- --save-baseline main)"
+    fi
+  fi
+  return "$rc"
+}
+
 # ---------------------------------------------------------------- Phase 4 TLS
 phase_tls(){
   [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling
@@ -404,13 +637,13 @@ phase_tls(){
   # health over https (self-signed): tolerant probe before measuring.
   for _ in $(seq 40); do gen "$OHA" -n 1 --insecure --no-tui "https://$TLS_ADDR/api/hello" >/dev/null 2>&1 && break; sleep 0.25; done
   warm_oha -c 50 --insecure "https://$TLS_ADDR/api/hello"
-  gen "$OHA" -z 30s -c 50 --no-tui --insecure --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h1_ka.json" 2>/dev/null
+  gen "$OHA" -z "${D_TLS}s" -c 50 --no-tui --insecure --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h1_ka.json" 2>/dev/null
   echo "  tls h1 keepalive  -> $(oha_row "$tmp/tls_h1_ka.json")"
   warm_oha -c 50 --insecure --disable-keepalive "https://$TLS_ADDR/api/hello"
-  gen "$OHA" -z 30s -c 50 --no-tui --insecure --disable-keepalive --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h1_hs.json" 2>/dev/null
+  gen "$OHA" -z "${D_TLS}s" -c 50 --no-tui --insecure --disable-keepalive --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h1_hs.json" 2>/dev/null
   echo "  tls h1 handshake  -> $(oha_row "$tmp/tls_h1_hs.json")"
   warm_oha -c 50 --insecure --http2 "https://$TLS_ADDR/api/hello"
-  gen "$OHA" -z 30s -c 50 --no-tui --insecure --http2 --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h2.json" 2>/dev/null
+  gen "$OHA" -z "${D_TLS}s" -c 50 --no-tui --insecure --http2 --output-format json "https://$TLS_ADDR/api/hello" > "$tmp/tls_h2.json" 2>/dev/null
   echo "  tls (h2)          -> $(oha_row "$tmp/tls_h2.json")"
   stop_proxy
   { echo "variant,rps,p50,p99"
@@ -437,7 +670,7 @@ phase_footprint(){
   wait $HOLD 2>/dev/null
   echo "RSS with ~1000 conns: ${busy} kB" | tee -a "$DATA/footprint.txt"
   python3 -c "print(f'bytes/conn ≈ {($busy-$idle)*1024/1000:.0f}')" | tee -a "$DATA/footprint.txt"
-  stop_proxy
+  release_proxy
 }
 
 # ---------------------------------------------------------------- Phase 6 rate limit (ADR 000026)
@@ -449,7 +682,7 @@ phase_ratelimit(){
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" || return 1
   for rt in baseline ratelimit; do
     gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$BENCH_ADDR" -e ROUTE_PATH="/$rt" \
-      -e KEYS=1000 -e VUS=50 -e DUR=30s -e OUT="$tmp/ov_$rt.json" \
+      -e KEYS=1000 -e VUS=50 -e DUR="${D_RL}s" -e OUT="$tmp/ov_$rt.json" \
       "$BENCH/k6-wasm/ratelimit-overhead.js" 2>&1 | tail -1
   done
   stop_proxy
@@ -468,10 +701,10 @@ with open(sys.argv[3],"w",newline="") as o:
   log "Phase 6.2 — enforcement + fairness (tight bucket, refill 1000/s) -> ratelimit_{enforce,fairness}.csv"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" \
     RL_CAPACITY=2000 RL_REFILL_TOKENS=1000 RL_REFILL_INTERVAL_MS=1000 || return 1
-  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$BENCH_ADDR" -e RATE=5000 -e DUR=30s \
+  gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$BENCH_ADDR" -e RATE=5000 -e DUR="${D_ENF}s" \
     -e OUT="$tmp/enforce.json" "$BENCH/k6-wasm/ratelimit-enforce.js" 2>&1 | tail -1
   gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$BENCH_ADDR" -e HOT_RATE=4000 -e LIGHT_RATE=500 \
-    -e DUR=30s -e OUT="$tmp/fairness.json" "$BENCH/k6-wasm/ratelimit-fairness.js" 2>&1 | tail -1
+    -e DUR="${D_ENF}s" -e OUT="$tmp/fairness.json" "$BENCH/k6-wasm/ratelimit-fairness.js" 2>&1 | tail -1
   stop_proxy
   python3 -c '
 import json,sys
@@ -506,7 +739,7 @@ phase_body(){
     for size in 1024 102400 1048576; do
       for rt in baseline body body-headeronly; do
         gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$BENCH_ADDR" -e ROUTE_PATH="/$rt" \
-          -e SIZE=$size -e VUS=50 -e DUR=20s -e OUT="$tmp/b_${size}_$rt.json" \
+          -e SIZE=$size -e VUS=50 -e DUR="${D_BODY}s" -e OUT="$tmp/b_${size}_$rt.json" \
           "$BENCH/k6-wasm/body-transform.js" >/dev/null 2>&1
         python3 -c '
 import json,sys
@@ -562,7 +795,7 @@ phase_mix(){
   # proxy: the per-class deltas are attributable to the traffic blend, not the offered load.
   for prof in read-only mix; do
     gen "$K6" run -q "${INFLUX_OUT[@]}" -e BASE="http://$BENCH_ADDR" -e RATE="${MIX_RATE:-20000}" \
-      -e DUR=60s -e PROFILE="$prof" -e OUT="$tmp/mix_$prof.json" \
+      -e DUR="${D_MIX}s" -e PROFILE="$prof" -e OUT="$tmp/mix_$prof.json" \
       "$BENCH/k6/weighted-mix.js" 2>&1 | tail -2
   done
   stop_proxy
@@ -614,17 +847,29 @@ phase_ws(){
       --out "$tmp/ws_echo_$size.csv"
     tail -1 "$tmp/ws_echo_$size.csv" >> "$DATA/ws_echo.csv"
   done
-  stop_proxy
+  release_proxy
   cat "$DATA/ws_echo.csv"
 }
 
+rc=0
 case "${1:-all}" in
-  quick) phase_quick;; ceiling) phase_ceiling;;
+  quick) phase_quick;; gate) phase_gate || rc=1;; ceiling) phase_ceiling;;
   sweep) phase_sweep;; openloop) phase_openloop;; rr) phase_rr;; ejection) phase_ejection;; swap) phase_swap;;
-  wasm) phase_wasm;; tls) phase_tls;; h3) phase_h3;; ws) phase_ws;; footprint) phase_footprint;;
+  wasm) phase_wasm;; v03) phase_v03;; tls) phase_tls;; h3) phase_h3;; ws) phase_ws;; footprint) phase_footprint;;
   ratelimit) phase_ratelimit;; body) phase_body;; mix) phase_mix;; industry) phase_industry;;
-  all) phase_ceiling; phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_swap; phase_wasm; \
-       phase_tls; phase_h3; phase_ws; phase_ratelimit; phase_body; phase_mix; phase_footprint;;
+  all)
+    # The four BACKEND_LATENCY_MS=0 bench-server phases share ONE launch (SHARE_PROXY +
+    # memoized launch): footprint runs first because its idle-RSS read must precede any load
+    # (ws's own footprint row is a held-tunnel DELTA, so it tolerates the shared warm proxy).
+    SHARE_PROXY=1
+    phase_footprint; phase_ceiling; phase_ws; phase_wasm
+    SHARE_PROXY=0; stop_proxy
+    phase_tls; phase_h3; phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_swap
+    phase_ratelimit; phase_body; phase_mix
+    ;;
+  # note: `v03` is opt-in (not in `all`) — run `bash bench/perf/run-perf.sh v03` after landing
+  # ADR 000073/074/075 response features; see performance/README.md § v0.3.0 response ladder.
   *) echo "unknown phase: $1"; exit 2;;
 esac
 log "done: $1"
+exit "$rc"

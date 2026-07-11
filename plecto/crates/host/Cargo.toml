@@ -85,6 +85,11 @@ fat-guest = [
 # so it is never linked into a production build. Run: `cargo run -p plecto-host --example mem-probe
 # --features dhat-heap`.
 dhat-heap = []
+# Marker for the instruction-count bench target (benches/wasm_inst.rs): running it needs valgrind
+# plus a version-matched gungraun-runner on PATH, so the target is skipped by a plain `cargo bench`
+# (CI included) and opted into explicitly:
+#   cargo bench -p plecto-host --features instruction-bench --bench wasm_inst
+instruction-bench = []
 
 [dependencies]
 wasmtime = { workspace = true }
@@ -150,6 +155,12 @@ tempfile = "3"
 # criterion: in-process WASM micro-benchmarks (cold load, per-request pooled vs fresh instance).
 # default-features = false drops plotters/rayon — we only need the harness + baseline comparison.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# gungraun (the renamed iai-callgrind): callgrind-based instruction counts for the SAME hot calls
+# criterion times above (benches/wasm_inst.rs). Instruction counts are invariant to CPU frequency
+# / thermal / neighbour load, so the "did the contract surface get more expensive?" judgement is
+# deterministic where wall-clock drifts double digits on an unpinned host. Dev-only + feature-gated
+# (`instruction-bench`), so neither production builds nor a valgrind-less `cargo bench` see it.
+gungraun = "0.19"
 # dhat: host-heap profiler for the `mem-probe` example (feature `dhat-heap`). Dev-only, so it is
 # never linked into a production build of the lib.
 dhat = "0.3"
@@ -171,6 +182,13 @@ base64 = "0.22"
 [[bench]]
 name = "wasm"
 harness = false
+
+# Instruction-count twin of the `wasm` bench (wall-clock criterion stays authoritative for "how
+# long", this one for "how much work"). required-features keeps it out of a plain `cargo bench`.
+[[bench]]
+name = "wasm_inst"
+harness = false
+required-features = ["instruction-bench"]
 
 # mem-probe: Stage 1 mechanistic probe for the body-tax memory investigation
 # (docs/plans/performance_evolution_001.md). Drives the host's on-request-body hook directly (no

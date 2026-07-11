@@ -73,6 +73,12 @@ pub fn filter_noop_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_NOOP_COMPONENT")).expect("read filter-noop component")
 }
 
+/// The compiled `filter-resp` component bytes — ADR 000073 response-context / `replace` ladder
+/// rungs (no host-API calls), built by this crate's `build.rs`.
+pub fn filter_resp_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_RESP_COMPONENT")).expect("read filter-resp component")
+}
+
 /// The compiled `filter-cors` component bytes — the CORS reference filter (ADR 000073 / the F2
 /// shelf, ADR 000068), built by this crate's `build.rs`.
 pub fn filter_cors_component() -> Vec<u8> {

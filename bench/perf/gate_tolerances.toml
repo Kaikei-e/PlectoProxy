@@ -1,0 +1,75 @@
+# Gate bands — the machine-checked expectation for every invariant `run-perf.sh gate` measures.
+# Tracked in-repo ON PURPOSE: a deliberate performance change must widen/move its band in the same
+# PR, so the perf expectation is code-reviewed like any other contract change.
+#
+# Bands are host-relative (loopback, no governor pinning): these initial values are calibrated
+# from the 2026-07-11 report snapshots on the reference host. On a new host, run the gate 2-3
+# times, read gate.csv's value/ci_half columns, and re-centre lo/hi around them (half-width
+# guidance: >= 3x the observed interleave half-range). Prefer DELTAS (µs/req, ms) over absolute
+# throughput — they survive host drift far better; see bench/methodology.md § Measurement tiers.
+
+# noop-pooled − baseline, closed-loop µs/req (interleaved mean): the WASM dispatch floor.
+# 2026-07-11 report snapshots put the CROSS-PHASE delta at 3.74 / 3.9 µs; the gate's same-session
+# interleave measured 2.45 ± 0.16 µs on 2026-07-11 (different host state, and baseline measured
+# in-session rather than borrowed from ceiling.csv). Band spans both until 2-3 more gate runs
+# tighten it — PROVISIONAL.
+[dispatch_floor_us]
+lo = 2.0
+hi = 4.6
+
+# trusted − noop-pooled, closed-loop µs/req: the apikey filter's own per-request work.
+# 2026-07-06 interleaved A/B: 0.6 ± 0.2 µs; 2026-07-11 single-window: 0.86 µs.
+[apikey_cost_us]
+lo = 0.3
+hi = 1.2
+
+# Fixed-rate (2000 rps) p50 deltas, ms — the honest tail floor invariants.
+# noop-pooled − baseline: +0.11 ms across the last two snapshots.
+[pooled_tail_p50_ms]
+lo = 0.04
+hi = 0.20
+
+# trusted − noop-pooled: +0.055 ms on 2026-07-11.
+[apikey_tail_p50_ms]
+lo = -0.02
+hi = 0.15
+
+# resp-ctx − noop-pooled (ADR 000073 as-forwarded snapshot read on on-response).
+# PROVISIONAL: no prior 2000 rps measurement exists (the v03 tail ran at 67k rps) — calibrate
+# after the first 2-3 gate runs, then tighten.
+[respctx_tail_p50_ms]
+lo = -0.05
+hi = 0.25
+
+# ratelimit − baseline, closed-loop µs/req (k6, generous bucket, 1000 keys).
+# 2026-07-11: 3.24 µs.
+[ratelimit_tax_us]
+lo = 2.2
+hi = 4.2
+
+# Enforcement convergence: allowed_rps / (refill + capacity/window). The initial burst drains the
+# full bucket into the window, so the expectation depends on the window length — the params here
+# MUST match phase_gate's launch env and D_ENF.
+[enforce_allowed_ratio]
+refill_per_s = 1000
+capacity = 2000
+window_s = 10
+lo = 0.90
+hi = 1.10
+
+# Round-robin exactness: max(count) − min(count) over the three instances, in requests.
+[rr_spread_req]
+lo = 0
+hi = 0
+
+# Slowest event -> steady-state transition on the compressed ejection timeline, in 1 s buckets.
+# Historical timelines settle in 1-2 buckets (health probes: 500 ms interval, threshold 2).
+[ejection_transition_s]
+lo = 0
+hi = 2
+
+# Failed/503 responses OUTSIDE the eject-all fail-closed window (and outside a 2 s grace after
+# each event). Single-instance ejection must not fail requests: peers absorb the load.
+[ejection_stray_failed]
+lo = 0
+hi = 0

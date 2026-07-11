@@ -17,7 +17,8 @@
 //!
 //! `rr` fires N keep-alive GETs and tallies the `X-Instance` header (round-robin split to
 //! single-request precision). `ejection` holds a fixed open-loop arrival rate while a controller
-//! drives the fault timeline (15 s eject b / 30 rejoin b / 45 eject all / 60 restore all / 75 end)
+//! drives the fault timeline (default: 15 s eject b / 30 rejoin b / 45 eject all / 60 restore all
+//! / 75 end; `--toggle-at SEC=keys[:label]` replaces it — the gate tier runs a compressed 40 s one)
 //! and buckets per-second per-instance served counts plus the 503/error rate; `--warmup` seconds
 //! of unrecorded load precede t=0 so the timeline starts at steady state. `hold` opens N idle
 //! keep-alive connections for the footprint phase's RSS read. `swap` is `ejection`'s open-loop
@@ -213,8 +214,33 @@ struct EjectionArgs {
     warmup: u64,
     workers: u64,
     toggles: HashMap<String, String>,
+    plan: Vec<ToggleEvent>,
     out: String,
     events_out: String,
+}
+
+/// One controller action: at `at` seconds (post-warmup) hit the `/toggle` of every key in `keys`,
+/// then record `label` in the events CSV.
+struct ToggleEvent {
+    at: u64,
+    keys: Vec<String>,
+    label: String,
+}
+
+/// The classic 75 s fault timeline, kept as the default so existing invocations are unchanged.
+/// `--toggle-at` replaces it wholesale (the gate tier runs a compressed 40 s variant).
+fn default_ejection_plan() -> Vec<ToggleEvent> {
+    let ev = |at: u64, keys: &[&str], label: &str| ToggleEvent {
+        at,
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+        label: label.to_string(),
+    };
+    vec![
+        ev(15, &["b"], "eject b"),
+        ev(30, &["b"], "rejoin b"),
+        ev(45, &["a", "b", "c"], "eject all"),
+        ev(60, &["a", "b", "c"], "restore all"),
+    ]
 }
 
 async fn ejection_worker(
@@ -274,24 +300,19 @@ async fn toggle(url: &str) {
 
 async fn controller(
     toggles: HashMap<String, String>,
+    plan: Vec<ToggleEvent>,
     start: Instant,
     warmup: u64,
 ) -> Vec<(u64, String)> {
-    let plan: [(u64, &[&str], &str); 4] = [
-        (15, &["b"], "eject b"),
-        (30, &["b"], "rejoin b"),
-        (45, &["a", "b", "c"], "eject all"),
-        (60, &["a", "b", "c"], "restore all"),
-    ];
     let mut events = Vec::new();
-    for (delay, keys, label) in plan {
-        tokio::time::sleep_until(start + Duration::from_secs(warmup + delay)).await;
-        for k in keys {
-            if let Some(url) = toggles.get(*k) {
+    for ev in plan {
+        tokio::time::sleep_until(start + Duration::from_secs(warmup + ev.at)).await;
+        for k in &ev.keys {
+            if let Some(url) = toggles.get(k) {
                 toggle(url).await;
             }
         }
-        events.push((delay, label.to_string()));
+        events.push((ev.at, ev.label));
     }
     events
 }
@@ -313,7 +334,7 @@ async fn run_ejection(a: EjectionArgs) -> Result<(), BoxError> {
             ))
         })
         .collect();
-    let ctl = tokio::spawn(controller(a.toggles.clone(), start, a.warmup));
+    let ctl = tokio::spawn(controller(a.toggles.clone(), a.plan, start, a.warmup));
 
     // Pace arrivals open-loop: every 10 ms credit rate/100 tokens on a monotonic schedule.
     // Backlog is capped at 3 s of tokens; credits beyond the cap are dropped (open-loop: a slow
@@ -953,8 +974,9 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  plecto-loadgen rr --target URL [--total N] [--workers W] [--out FILE]\n  \
          plecto-loadgen openloop --target URL --rate R [--duration S] [--warmup S] \
-         [--workers W] [--backlog-secs S] [--out FILE]\n  \
+         [--workers W] [--backlog-secs S] [--out FILE] [--hist-out FILE]\n  \
          plecto-loadgen ejection --target URL --toggle a=URL b=URL c=URL \
+         [--toggle-at SEC=key[,key...][:label] ...] \
          [--rate R] [--duration S] [--warmup S] [--workers W] [--out FILE] [--events-out FILE]\n  \
          plecto-loadgen swap --target URL --exec-at SEC=CMD [--exec-at SEC=CMD ...] \
          [--rate R] [--duration S] [--warmup S] [--workers W] [--out FILE] [--events-out FILE]\n  \
@@ -977,6 +999,7 @@ fn parse_openloop(rest: &[String]) -> openloop::OpenloopArgs {
         workers: 64,
         backlog_secs: 3,
         out: "openloop.json".to_string(),
+        hist_out: None,
     };
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
@@ -988,6 +1011,7 @@ fn parse_openloop(rest: &[String]) -> openloop::OpenloopArgs {
             "--workers" => a.workers = take_num(&mut it, flag).max(1),
             "--backlog-secs" => a.backlog_secs = take_num(&mut it, flag).max(1),
             "--out" => a.out = take(&mut it, flag),
+            "--hist-out" => a.hist_out = Some(take(&mut it, flag)),
             _ => usage(),
         }
     }
@@ -1043,6 +1067,7 @@ fn parse_ejection(rest: &[String]) -> EjectionArgs {
         warmup: 5,
         workers: 64,
         toggles: HashMap::new(),
+        plan: Vec::new(),
         out: "ejection_timeline.csv".to_string(),
         events_out: "ejection_events.csv".to_string(),
     };
@@ -1065,8 +1090,27 @@ fn parse_ejection(rest: &[String]) -> EjectionArgs {
                     a.toggles.insert(k.to_string(), v.to_string());
                 }
             }
+            // "SEC=key[,key...][:label]" — giving any --toggle-at replaces the default plan
+            // wholesale, so a caller owns the whole timeline or none of it.
+            "--toggle-at" => {
+                let spec = take(&mut it, flag);
+                let Some((at, tail)) = spec.split_once('=') else { usage() };
+                let Ok(at) = at.parse::<u64>() else { usage() };
+                let (keys, label) = match tail.split_once(':') {
+                    Some((k, l)) => (k, l.to_string()),
+                    None => (tail, format!("toggle {tail}")),
+                };
+                a.plan.push(ToggleEvent {
+                    at,
+                    keys: keys.split(',').map(str::to_string).collect(),
+                    label,
+                });
+            }
             _ => usage(),
         }
+    }
+    if a.plan.is_empty() {
+        a.plan = default_ejection_plan();
     }
     if !["a", "b", "c"].iter().all(|k| a.toggles.contains_key(*k)) {
         eprintln!("--toggle must provide a=URL b=URL c=URL");

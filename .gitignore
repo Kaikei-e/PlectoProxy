@@ -12,6 +12,8 @@ plecto/examples/filters/filter-jwt/target
 plecto/examples/filters/filter-cors/target
 plecto/crates/host/fixtures/filter-compat-v02/target
 bench/filters/filter-noop/target
+bench/filters/filter-resp/target
+bench/loadgen/target
 plecto/spike/streaming-async/guest/target
 plecto/spike/streaming-async/host/target
 docs/feedback

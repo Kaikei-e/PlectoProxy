@@ -53,41 +53,24 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 ## TL;DR
 
-> **Measurement history** (newest first). **2026-07-11 (release confirmation)** — a second full
+> **Measurement history** (newest first). **2026-07-11 (v0.3.0 feature costs)** — targeted
+> `bash bench/perf/run-perf.sh v03` (not a full `all` refresh): fills the previously-unmeasured
+> ADR 000073 response-context / `replace` rungs and the ADR 000074/075 compression opt-in row.
+> Method: same adjacent-delta ladder + oha fixed-rate CO-safe tails as the WASM plane; see
+> [`bench/methodology.md`](../bench/methodology.md) § v0.3.0 response / compression. Track
+> **µs/req** (and fixed-rate p50), not %-of-baseline. **2026-07-11 (release confirmation)** — a second full
 > `bash bench/perf/run-perf.sh all` refresh (plus a fresh `cargo bench` criterion pass) ahead of
 > the **v0.3.0** release, after landing native response compression
 > ([ADR 000074](../docs/ADR/000074.md) / [ADR 000075](../docs/ADR/000075.md)) and the
 > `plecto:filter@0.3.0` response-context / `replace` contract ([ADR 000073](../docs/ADR/000073.md)).
 > Compression is opt-in (`[route.compression]`) and off by default, so it touches none of the
-> routes this report measures — the point of this pass is to confirm exactly that: every
-> fixed-rate/tail invariant this report tracks for regressions (the pooled WASM dispatch floor
-> **+0.11 ms p50 / +0.26 ms p99**, the apikey filter's own cost **≈0.86 µs / −9.8 %**, rate-limit
-> enforcement converging to **1,033/s at 79.3 % shed**, round-robin **exact to one request**)
-> reproduces the earlier same-day pass number-for-number — a clean regression check. Full-throttle
-> *absolute* figures this pass are cleanly ordered for once (`baseline` > every WASM/rate-limit
-> rung, no under-read artifact), so this snapshot's tables read directly without the "adjacent
-> deltas only" caveat earlier snapshots needed — but per the methodology, still treat them as this
-> host's noise band, not a capacity claim. Charts regenerated with `python3 performance/plot.py`.
-> **2026-07-11 (earlier same day)** — first full refresh after the industry-methodology pass
-> ([`bench/methodology.md`](../bench/methodology.md)): authoritative open-loop is now
-> **`plecto-loadgen openloop`** (wrk2 schedule-latency), so the auto 70 %-of-peak target achieved
-> **0 dropped** — the earlier k6-pinned `OPENLOOP_RATE=60000` workaround is no longer needed for
-> the published figure. Ceiling CSV carries **RR/CRR** KPI labels. **2026-07-09** — re-measured after KvQuota striping, PROXY protocol v2, body-retry,
-> H3 GOAWAY, outbound-TCP, two-tier rate-limit, shared ticket keys, and fat-guest (unmeasured in
-> the default build). Open-loop still needed a pinned 60k/s under k6. **2026-07-05** — re-measured after ADR 000052 (stateless
-> TLS 1.3 session resumption) plus three hot-path fixes landed alongside it: a control-plane
-> outlier-ejection race fix that also cut a per-request **route-lookup** allocation and the chain's
-> per-filter HashMap re-resolution (the LB *pick* path is untouched), a host quota-accounting
-> race fix + new untrusted-instance breaker, and fail-closed handling for a buffer-permit error. This
-> run fills the [TLS section](#tls-termination)'s previously-pending resumption gap with a clean
-> `plecto-loadgen tls --mode full|resumed` measurement, which confirms oha's `handshake/req` row was
-> already silently resumption-contaminated. **2026-07-04** — re-measured post ADR 000050/000051 (TLS
-> crypto provider moved to **aws-lc-rs**, a new baseline, not a `ring` delta); `wasm-bench` /
-> `edge-bench` consolidated into one `bench-server` harness so the plain-HTTP/1.1 ceiling is measured
-> once and every other section reads it; added endpoint-set-swap (ADR 000044) and WebSocket
-> (ADR 000048) scenarios. **2026-07-02** — harness rebuilt onto `plecto-loadgen` (Rust), warm-up
-> excluded from every window. Every figure below is refreshed; the **µs/req deltas are what to track
-> across snapshots**, not raw throughput.
+> routes the `all` suite measures — that pass confirmed the regression invariants with the features
+> *present but unused* (pooled WASM floor **+0.11 ms p50 / +0.26 ms p99**, apikey **≈0.86 µs /
+> −9.8 %**, rate-limit **1,033/s at 79.3 % shed**, round-robin exact). Charts from that pass:
+> `python3 performance/plot.py`. **Older generations** (2026-07-11 industry pass … 07-02) live in
+> [`HISTORY.md`](HISTORY.md) — this TL;DR keeps only the newest two. **µs/req deltas are what to
+> track across snapshots**, not raw throughput — and the tracked invariant set is now machine-checked
+> by the T1 gate (`bash bench/perf/run-perf.sh gate`, bands in `bench/perf/gate_tolerances.toml`).
 
 **Load-balancing fast path** (plaintext HTTP/1.1, 3 upstreams, trivial 0 ms backend; k6 / loadgen / oha):
 
@@ -129,6 +112,10 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   [the ladder's tail note](#the-same-ladder-at-one-fixed-rate--honest-tails)).
 - These macro deltas **reconcile with the criterion [micro-benchmarks](#0-micro-benchmarks-in-process-criterion)**
   in direction and order of magnitude — both freshly re-run this pass.
+- **v0.3.0 response / compression (opt-in `v03` phase, 2026-07-11):** reading the as-forwarded
+  request snapshot on `on-response` costs **≈ +0.90 µs/req** over pooled no-op; gzip on a 4 KiB
+  compressible body costs **≈ −32 % ceiling / +2.1 µs/req** vs the same body uncompressed. See
+  [v0.3.0 response ladder + compression](#v030-response-ladder--compression).
 - A rejected request (**HTTP 401 short-circuit**) is decided in **~0.30 ms and never reaches the
   backend** — bad traffic is shed **~55× faster** than good traffic is forwarded through a 15 ms backend.
 
@@ -527,6 +514,72 @@ requests are decided **at the edge in ~0.30 ms** and never reach the upstream: b
 hit. (Filter faults or deadline overruns **fail closed** — 502/504 — exercised by the test suite,
 not this benchmark.)
 
+## v0.3.0 response ladder + compression
+
+The release-confirmation `all` pass measured every route with ADR 000073/074/075 **present but
+unused**. This section fills the gap: what those features cost **when exercised**. Opt-in phase
+(`bash bench/perf/run-perf.sh v03`) — not part of `all`, so a full refresh stays heavy while this
+row can be re-run alone. Same generators and CO-safe tail pattern as
+[the WASM cost ladder](#the-wasm-cost-ladder--isolating-each-cost).
+
+### Response-context read vs `replace` (ADR 000073)
+
+> R1 — fixed 50 connections, 0 ms backend, tiny response (oha). Lean `filter-resp` (no host-API
+> calls): `/resp-ctx` always *reads* the as-forwarded request snapshot then `continue`;
+> `/resp-replace` does the same read then `replace`s with a synthesised **418** (marker header
+> `x-plecto-resp-replace`). Control is same-session `/noop-pooled` (ignores the snapshot).
+
+| Route | Decision path | req/s | p50 | p99 | µs/req |
+| --- | --- | --- | --- | --- | --- |
+| `/noop-pooled` | on-response unused params → continue | 124,233 | 0.39 ms | 0.74 ms | 8.05 |
+| `/resp-ctx` | read as-forwarded snapshot → continue | 111,715 | 0.40 ms | 1.23 ms | 8.95 |
+| `/resp-replace` | read + `replace` (418, 23 B body) | 120,467 | 0.39 ms | 0.78 ms | 8.30 |
+
+*(Measured 2026-07-11 via `v03`. Same-process adjacent deltas — do not splice onto an older
+`wasm` CSV's noop row.)*
+
+- **noop-pooled → resp-ctx ≈ +0.90 µs/req** — the cost of *using* the ADR 000073 request
+  snapshot on `on-response` (path length + header scan), with the same continue/forward path.
+  Track this µs delta for regressions; the −10 % ceiling is the same signal with a moving
+  denominator.
+- **noop-pooled → resp-replace ≈ +0.25 µs/req** net at full throttle — `replace` synthesises a
+  tiny body and **drops** the upstream payload on the wire (verified: `Content-Encoding` N/A,
+  23-byte 418). That wire-shape change can *under-read* replace's guest/host work relative to
+  resp-ctx; do **not** read "replace is cheaper than a context read" as a pure CPU claim. The
+  regression signal for replace is "still within ~1 µs of the pooled no-op on this host," not
+  a %-of-baseline.
+- Fixed-rate tails at **67 029/s** (60 % of this ladder's slowest ceiling; oha `-q`
+  `--latency-correction`): all three rungs hold the offered rate; **p50 stays ~0.93 ms**. p99
+  at this rate is host-noise-dominated on this session (43–130 ms) — same caveat as other
+  high-rate fixed runs near a host knee; prefer µs/req + p50 for this row.
+
+### Native response compression (ADR 000074 / 000075)
+
+> R2 — same oha shape; backend **4 096 B** repeating `text/plain` (above the 1024-byte
+> `min_length` default). Both routes send `Accept-Encoding: gzip`. `/baseline` has no
+> `[route.compression]` → identity; `/compress` pins `algorithms = ["gzip"]`. Wire check:
+> identity 4096 B vs gzip **45 B** + `Content-Encoding: gzip` + `Vary: accept-encoding`.
+
+| Route | Transform | req/s | p50 | p99 | µs/req |
+| --- | --- | --- | --- | --- | --- |
+| `/baseline` | identity (AE advertised, opt-in off) | 228,621 | 0.20 ms | 0.55 ms | 4.37 |
+| `/compress` | gzip (level 5, ADR 000075 defaults) | 154,322 | 0.31 ms | 0.55 ms | 6.48 |
+
+- **baseline → compress ≈ −32.5 % ceiling / +2.11 µs/req** for this highly compressible 4 KiB
+  filler. Real HTML/JSON ratios and CPU will differ; this row is a **regression floor** for the
+  opt-in path, not a capacity guide for production payloads. RFC 9411 §7.3-style: one object
+  size, sustainable throughput, method disclosed.
+- Fixed-rate at **92 592/s** (60 % of compress ceiling): both hold the rate; p50 ≈ 1.0 ms;
+  p99 again host-noise-band at this offered load — µs/req from the ceiling table is the
+  durable signal.
+
+**Criterion note (not re-run here).** Day-to-day criterion absolute drift (±10–20 %) is expected
+without a locked governor. To attribute ADR 000073 contract-surface cost in-process, use a
+same-host baseline pair — `cargo bench -p plecto-host -- --save-baseline pre-adr73` on the
+pre-landing commit, then `--baseline pre-adr73` after — per
+[criterion baselines](https://bheisler.github.io/criterion.rs/book/user_guide/command_line_options.html)
+([`bench/methodology.md`](../bench/methodology.md)).
+
 ## Outbound ext_authz (ADR 000036)
 
 A filter can call an external authorization service per request over the lent, SSRF-guarded outbound
@@ -777,7 +830,14 @@ what that setup buys.)
 - **Two layers that must agree.** In-process criterion micro-benchmarks isolate per-function cost
   deterministically; the open-loop macro scenarios measure it end-to-end. Micro-cost × calls-per-request
   should explain the macro delta — the WASM ladder is the worked example — so a divergence between the
-  layers is a bug in one of them, not noise.
+  layers is a bug in one of them, not noise. The micro layer itself is split in two: criterion for
+  wall-clock direction, and instruction counts (gungraun/callgrind, feature `instruction-bench`) as
+  the frequency-invariant judge for "did the contract surface get more expensive?" — see
+  [Reproducing](#reproducing) and `bench/methodology.md` § Measurement tiers.
+- **The local per-change gate.** `bash bench/perf/run-perf.sh gate` re-measures exactly the
+  invariants this report tracks (interleaved for a confidence half-width) and machine-checks them
+  against `bench/perf/gate_tolerances.toml` — the bands are tracked in-repo, so a deliberate
+  performance change is reviewed as a diff. `all` stays the human-read release snapshot.
 - **CI regression gate (opt-in).** Per-PR runs only the light criterion micro-benchmarks
   (`cargo bench -- --baseline main`, seconds); the heavy k6/oha macro suite runs on manual dispatch /
   nightly. Hosted-runner numbers are treated as *relative* (regression direction), never absolute — CI
@@ -795,17 +855,34 @@ The tracked, in-repo subjects and the runbook that produces every CSV here:
 cargo build --release -p plecto-server --features bench-harnesses \
   --example load-balancing --example bench-server --example tls-http --example swap-bench
 
-# One phase, or `all`. Pins the proxy to a core set and generators to a disjoint set; writes
-# performance/data/*.csv. Phases:
-#   quick ceiling sweep openloop rr ejection swap wasm tls h3 ws footprint ratelimit body mix all
-bash bench/perf/run-perf.sh all
+# T1 — the per-change regression gate (~6-7 min): interleaved invariant deltas judged against
+# bench/perf/gate_tolerances.toml, written to performance/data/gate.csv. Exit 0 = in band.
+bash bench/perf/run-perf.sh gate          # or: just gate
 
-# Or just a fast local sanity check (~1 min, oha only, no k6/Docker, no tracked CSV):
+# T2 — the full release-snapshot suite (~22 min at the report-tier windows). Phases:
+#   quick gate ceiling sweep openloop rr ejection swap wasm v03 tls h3 ws footprint ratelimit body mix all
+bash bench/perf/run-perf.sh all           # or: just report
+
+# T3 — opt-in deep phases (not part of `all`): v0.3.0 response-context / replace + compression:
+bash bench/perf/run-perf.sh v03           # or: just deep v03
+
+# T0 — a fast local sanity check (~1 min, oha only, no k6/Docker, no tracked CSV):
 bash bench/perf/run-perf.sh quick
 
-# In-process micro-benchmarks (deterministic; the CI regression gate). Save a baseline, then compare:
+# In-process micro-benchmarks, two layers (see bench/methodology.md § Measurement tiers):
+# 1) criterion (wall-clock; drifts with the unpinned governor — read direction, not absolutes).
+#    For ADR-sized contract changes, prefer a named baseline on the pre-change commit:
+#      git checkout <pre-adr73> && cargo bench -p plecto-host -- --save-baseline pre-adr73
+#      git checkout <post>      && cargo bench -p plecto-host -- --baseline pre-adr73
 cargo bench -p plecto-control -p plecto-host -- --save-baseline main   # on the base branch
 cargo bench -p plecto-control -p plecto-host -- --baseline main        # on a change, to read the deltas
+# 2) instruction counts (gungraun/callgrind; frequency/thermal-invariant — the deterministic
+#    judge for "did the contract surface get more expensive?"). Needs valgrind + a
+#    version-matched `cargo install gungraun-runner`; feature-gated so plain `cargo bench` skips it:
+cargo bench -p plecto-host    --features instruction-bench --bench wasm_inst     -- --save-baseline main
+cargo bench -p plecto-control --features instruction-bench --bench fastpath_inst -- --save-baseline main
+#    ...then on a change: the same commands with `-- --baseline main` (soft limits are also
+#    available, e.g. `-- --callgrind-limits 'ir=5%'`).
 
 # Optional live dashboard (images are a one-time setup pull; the load stays on loopback):
 INFLUX=1 bash bench/perf/run-perf.sh all     # http://localhost:3000/d/plecto-lb-k6
@@ -824,8 +901,11 @@ plecto-loadgen tls --mode resumed --target https://localhost:PORT/api/hello --ca
 
 The k6 scenarios live in `bench/k6/` and `bench/k6-wasm/`; the round-robin counter, the open-loop
 fault/swap timelines, and the WebSocket handshake/hold/echo scenarios are `plecto-loadgen`
-subcommands (`bench/loadgen/`, built lazily by the runbook). Charts are regenerated from the
-measured CSVs:
+subcommands (`bench/loadgen/`, built lazily by the runbook). The open-loop driver records
+schedule-latency into an HDR histogram (fixed footprint at any rate/window) and dumps the FULL
+distribution alongside the summary (`--hist-out`, written to `performance/data/openloop_hist.csv`
+by the runbook) — so a p99 move can be attributed to a second mode appearing vs one mode's tail
+stretching, without a re-run. Charts are regenerated from the measured CSVs:
 
 ```bash
 python3 performance/plot.py     # reads performance/data/*.csv -> performance/img/*.webp

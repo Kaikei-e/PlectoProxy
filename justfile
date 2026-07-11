@@ -52,3 +52,21 @@ build-filters:
 sync-template-wit:
     cp {{plecto}}/wit/world.wit {{plecto}}/examples/filters/filter-template/wit/world.wit
     @echo "synced filter-template/wit/world.wit from plecto/wit/world.wit"
+
+# build the release examples the perf runbook drives (run-perf.sh does not build)
+bench-build:
+    cd {{plecto}} && cargo build --release -p plecto-server --features bench-harnesses \
+        --example load-balancing --example bench-server --example tls-http --example swap-bench
+
+# T1 perf gate (~6-7 min): interleaved invariant deltas vs bench/perf/gate_tolerances.toml,
+# machine verdict (exit 0 = in band). Run on hot-path changes; see bench/methodology.md § tiers
+gate:
+    bash bench/perf/run-perf.sh gate
+
+# T2 release-snapshot perf report (~22 min): the full suite at report-tier windows
+report:
+    bash bench/perf/run-perf.sh all
+
+# T3 deep phase by name (opt-in diagnostics): v03, tls, h3, or any single runbook phase
+deep PHASE:
+    bash bench/perf/run-perf.sh {{PHASE}}

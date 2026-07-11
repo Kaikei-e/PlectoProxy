@@ -34,6 +34,11 @@ outbound-tcp = ["plecto-host/outbound-tcp"]
 # `wasi = "minimal"` as outbound-http above (unlike those, no sub-config to lower: the grant is
 # fixed).
 fat-guest = ["plecto-host/fat-guest"]
+# Marker for the instruction-count bench target (benches/fastpath_inst.rs): running it needs
+# valgrind plus a version-matched gungraun-runner on PATH, so the target is skipped by a plain
+# `cargo bench` (CI included) and opted into explicitly:
+#   cargo bench -p plecto-control --features instruction-bench --bench fastpath_inst
+instruction-bench = []
 
 [dependencies]
 plecto-host = { path = "../host" }
@@ -92,7 +97,18 @@ proptest = "1"
 # path normalization). `default-features = false` drops plotters/rayon — we only need the bench
 # harness + baseline comparison (the CI regression gate uses --save-baseline / --baseline).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# gungraun (the renamed iai-callgrind): callgrind-based instruction counts for the LB pick hot
+# path (benches/fastpath_inst.rs) — the deterministic twin of the criterion wall-clock benches.
+# Dev-only + feature-gated (`instruction-bench`); see the host crate's note.
+gungraun = "0.19"
 
 [[bench]]
 name = "fastpath"
 harness = false
+
+# Instruction-count twin of `fastpath` (LB pick only — the per-request ADR-surface judge).
+# required-features keeps it out of a plain `cargo bench`.
+[[bench]]
+name = "fastpath_inst"
+harness = false
+required-features = ["instruction-bench"]

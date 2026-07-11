@@ -13,6 +13,12 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+# hdrhistogram: fixed-footprint HDR latency recording for `openloop` — replaces the per-worker
+# full-sample Vec (~78 MB spread across workers at 90 s x 108 krps) with a few-hundred-KB
+# histogram per worker, and lets --hist-out dump the WHOLE distribution (bimodality vs tail
+# stretch is readable without a re-run). default-features = false: no serialization extras,
+# the text dump is written by hand.
+hdrhistogram = { version = "7", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "process", "io-util"] }
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

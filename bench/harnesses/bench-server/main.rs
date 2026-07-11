@@ -14,6 +14,10 @@
 //!   * `/noop-fresh/*`      — the same no-op, fresh instance per request       → + instantiation
 //!   * `/trusted/*`         — the signed `filter-apikey` component, pooled     → + a real filter's work
 //!   * `/ondemand/*`        — the apikey filter, fresh instance per request
+//!   * `/resp-ctx/*`        — lean `filter-resp` reads as-forwarded request on `on-response` (ADR 000073)
+//!   * `/resp-replace/*`    — same filter, `replace` via `x-plecto-resp-replace` (upstream body dropped)
+//!   * `/compress/*`        — no filter; `[route.compression]` opt-in (ADR 000074/075) — pair with
+//!     `Accept-Encoding` + `RESP_BYTES≥1024` (compressible `text/plain` upstream)
 //!   * `/ratelimit/*`       — `filter-hello` consults the host-native token bucket (`x-plecto-ratelimit`
 //!     selects the key)
 //!   * `/body/*`            — `filter-hello`'s `on-request-body` buffers + uppercases the POST body
@@ -55,7 +59,7 @@ use plecto_control::oci::write_layout;
 use plecto_control::{Control, ResolvedArtifact};
 use plecto_host::test_support::{
     TestSigner, bound_sbom, filter_apikey_component, filter_hello_component, filter_noop_component,
-    filter_quickstart_component,
+    filter_quickstart_component, filter_resp_component,
 };
 use plecto_server::serve;
 
@@ -107,6 +111,9 @@ async fn main() -> anyhow::Result<()> {
     // /body-noop (the on-request-body pass-through-cost control), since it is the identical
     // component under the identical (trusted) isolation.
     let noop_digest = sign_and_write(&signer, filter_noop_component(), &base.join("filters/noop"))?;
+    // resp: ADR 000073 response-context read + optional replace (no host-API) — the response-side
+    // ladder rungs adjacent to noop-pooled.
+    let resp_digest = sign_and_write(&signer, filter_resp_component(), &base.join("filters/resp"))?;
     // hello / hello-u: on-request-body buffer+uppercase, pooled vs fresh; also the rate-limit
     // filter (the bucket spec is host-configured on the filter, ADR 000026).
     let hello_digest = sign_and_write(
@@ -139,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     let digests = Digests {
         apikey: &apikey_digest,
         noop: &noop_digest,
+        resp: &resp_digest,
         hello: &hello_digest,
         quickstart: &quickstart_digest,
     };
@@ -206,8 +214,12 @@ async fn spawn_upstream(latency_ms: u64, resp_bytes: usize) -> anyhow::Result<So
                         if latency_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(latency_ms)).await;
                         }
-                        let mut builder =
-                            Response::builder().status(200).header("x-from", "backend");
+                        let mut builder = Response::builder()
+                            .status(200)
+                            .header("x-from", "backend")
+                            // text/plain + repeating filler: eligible for [route.compression]
+                            // (ADR 000074 defaults) when RESP_BYTES ≥ min_length (1024).
+                            .header("content-type", "text/plain; charset=utf-8");
                         if let Some(u) = user {
                             builder = builder.header("x-authenticated-user", u);
                         }
@@ -227,11 +239,12 @@ async fn spawn_upstream(latency_ms: u64, resp_bytes: usize) -> anyhow::Result<So
     Ok(addr)
 }
 
-/// The four filters' component digests (all four are the same three components, `apikey` and
-/// `noop` each reused under two isolation modes via a separate manifest `[[filter]]` id).
+/// The five filters' component digests (`apikey` / `noop` / `resp` reused under separate
+/// manifest `[[filter]]` ids where isolation or header-gated behaviour differs).
 struct Digests<'a> {
     apikey: &'a str,
     noop: &'a str,
+    resp: &'a str,
     hello: &'a str,
     quickstart: &'a str,
 }
@@ -253,6 +266,7 @@ fn manifest_toml(
     let Digests {
         apikey: apikey_digest,
         noop: noop_digest,
+        resp: resp_digest,
         hello: hello_digest,
         quickstart: quickstart_digest,
     } = *digests;
@@ -295,6 +309,13 @@ id = "noop_od"
 source = "filters/noop"
 digest = "{noop_digest}"
 isolation = "untrusted"
+request_deadline_ms = 1000
+
+[[filter]]
+id = "resp"
+source = "filters/resp"
+digest = "{resp_digest}"
+isolation = "trusted"
 request_deadline_ms = 1000
 
 [[filter]]
@@ -368,6 +389,29 @@ strip_prefix = "/ondemand"
 path_prefix = "/ondemand"
 
 [[route]]
+filters = ["resp"]
+upstream = "backend"
+strip_prefix = "/resp-ctx"
+[route.match]
+path_prefix = "/resp-ctx"
+
+[[route]]
+filters = ["resp"]
+upstream = "backend"
+strip_prefix = "/resp-replace"
+[route.match]
+path_prefix = "/resp-replace"
+
+[[route]]
+filters = []
+upstream = "backend"
+strip_prefix = "/compress"
+[route.match]
+path_prefix = "/compress"
+[route.compression]
+algorithms = ["gzip"]
+
+[[route]]
 filters = ["hello"]
 upstream = "backend"
 strip_prefix = "/ratelimit"
@@ -437,6 +481,13 @@ fn print_banner(
     );
     println!(
         "    /ondemand/*        apikey, fresh/req    curl -H 'x-api-key: alice-secret' http://localhost:{p}/ondemand/x"
+    );
+    println!("    /resp-ctx/*        on-response reads req  curl http://localhost:{p}/resp-ctx/x");
+    println!(
+        "    /resp-replace/*    replace (418)        curl -H 'x-plecto-resp-replace: 1' http://localhost:{p}/resp-replace/x"
+    );
+    println!(
+        "    /compress/*        gzip opt-in          curl -H 'Accept-Encoding: gzip' http://localhost:{p}/compress/x"
     );
     println!("  host-API paths:");
     println!(

@@ -11,9 +11,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use hdrhistogram::Histogram;
 use tokio::time::Instant;
 
 use crate::{BoxError, Target, connect, get_once, parse_target};
+
+/// HDR bounds for schedule latency in µs: 1 µs .. 1 hour, 3 significant figures. Recording is a
+/// few ns and the footprint is fixed, so window length / rate no longer scale generator memory.
+const HIST_LOW_US: u64 = 1;
+const HIST_HIGH_US: u64 = 3_600_000_000;
+const HIST_SIGFIG: u8 = 3;
+
+fn new_hist() -> Histogram<u64> {
+    Histogram::new_with_bounds(HIST_LOW_US, HIST_HIGH_US, HIST_SIGFIG)
+        .expect("static histogram bounds are valid")
+}
 
 pub(crate) struct OpenloopArgs {
     pub(crate) target: String,
@@ -23,10 +35,11 @@ pub(crate) struct OpenloopArgs {
     pub(crate) workers: u64,
     pub(crate) backlog_secs: u64,
     pub(crate) out: String,
+    pub(crate) hist_out: Option<String>,
 }
 
 struct WorkerOut {
-    lats_us: Vec<u64>,
+    hist: Histogram<u64>,
     ok: u64,
     fail: u64,
     dropped: u64,
@@ -54,7 +67,7 @@ async fn openloop_worker(
         backlog,
     } = sched;
     let mut out = WorkerOut {
-        lats_us: Vec::new(),
+        hist: new_hist(),
         ok: 0,
         fail: 0,
         dropped: 0,
@@ -100,18 +113,19 @@ async fn openloop_worker(
             .duration_since(scheduled)
             .as_micros()
             .min(u128::from(u32::MAX)) as u64;
+        let lat_us = lat_us.clamp(HIST_LOW_US, HIST_HIGH_US);
         match res {
             Ok(Ok((status, _))) if (200..500).contains(&status) => {
                 out.ok += 1;
-                out.lats_us.push(lat_us);
+                let _ = out.hist.record(lat_us);
             }
             Ok(Ok(_)) => {
                 out.fail += 1;
-                out.lats_us.push(lat_us);
+                let _ = out.hist.record(lat_us);
             }
             Ok(Err(_)) | Err(_) => {
                 out.fail += 1;
-                out.lats_us.push(lat_us);
+                let _ = out.hist.record(lat_us);
                 conn = connect(&t).await.ok();
             }
         }
@@ -119,13 +133,11 @@ async fn openloop_worker(
     out
 }
 
-fn percentile_us(sorted: &[u64], p: f64) -> f64 {
-    if sorted.is_empty() {
+fn quantile_ms(hist: &Histogram<u64>, q: f64) -> f64 {
+    if hist.is_empty() {
         return 0.0;
     }
-    let n = sorted.len();
-    let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
-    sorted[idx.min(n - 1)] as f64 / 1000.0 // µs → ms
+    hist.value_at_quantile(q) as f64 / 1000.0 // µs → ms
 }
 
 pub(crate) async fn run_openloop(a: OpenloopArgs) -> Result<(), BoxError> {
@@ -163,7 +175,7 @@ pub(crate) async fn run_openloop(a: OpenloopArgs) -> Result<(), BoxError> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     done.store(true, Ordering::Relaxed);
 
-    let mut lats = Vec::new();
+    let mut hist = new_hist();
     let mut ok = 0u64;
     let mut fail = 0u64;
     let mut dropped = 0u64;
@@ -172,9 +184,9 @@ pub(crate) async fn run_openloop(a: OpenloopArgs) -> Result<(), BoxError> {
         ok += w.ok;
         fail += w.fail;
         dropped += w.dropped;
-        lats.extend(w.lats_us);
+        hist.add(&w.hist)
+            .map_err(|e| format!("merging worker histograms (identical bounds): {e}"))?;
     }
-    lats.sort_unstable();
 
     let measured = ok + fail;
     let dur = a.duration.max(1) as f64;
@@ -192,15 +204,41 @@ pub(crate) async fn run_openloop(a: OpenloopArgs) -> Result<(), BoxError> {
         failed_frac,
         dropped,
         Percentiles {
-            p50: percentile_us(&lats, 50.0),
-            p95: percentile_us(&lats, 95.0),
-            p99: percentile_us(&lats, 99.0),
-            p99_9: percentile_us(&lats, 99.9),
+            p50: quantile_ms(&hist, 0.50),
+            p95: quantile_ms(&hist, 0.95),
+            p99: quantile_ms(&hist, 0.99),
+            p99_9: quantile_ms(&hist, 0.999),
         },
     );
     std::fs::write(&a.out, &out)?;
     print!("{out}");
+    if let Some(path) = &a.hist_out {
+        std::fs::write(path, hist_dump(&hist))?;
+        println!("histogram dump ({} samples) -> {path}", hist.len());
+    }
     Ok(())
+}
+
+/// Full-distribution text dump (CSV): one row per recorded HDR bucket, with the cumulative
+/// quantile. This is what separates "the p99 moved because a second mode appeared" from "the one
+/// mode's tail stretched" — a distinction a handful of percentile points cannot make.
+fn hist_dump(hist: &Histogram<u64>) -> String {
+    use std::fmt::Write as _;
+    let total = hist.len().max(1);
+    let mut cum = 0u64;
+    let mut s = String::from("value_us,count,cum_count,quantile\n");
+    for v in hist.iter_recorded() {
+        cum += v.count_since_last_iteration();
+        let _ = writeln!(
+            s,
+            "{},{},{},{:.6}",
+            v.value_iterated_to(),
+            v.count_at_value(),
+            cum,
+            cum as f64 / total as f64
+        );
+    }
+    s
 }
 
 struct Percentiles {

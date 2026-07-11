@@ -23,7 +23,7 @@ Plecto Proxy pairs **two complementary halves** through a typed [WIT](https://co
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (**75** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.3.0`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (**76** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.3.0`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Why Plecto Proxy?
 
@@ -251,6 +251,27 @@ cargo test --all   # builds the example filter to a WASM component, loads it int
 The example component imports only `plecto:filter/*` — zero WASI, network, or filesystem access — so
 the suite proves a filter reaches **only** the capabilities it was lent, with the typed `decision`
 round-tripping through a real component.
+
+### Prebuilt binaries & container images
+
+Every tagged release ships prebuilt artifacts in two **named runtime capability profiles**
+([ADR 000079](docs/ADR/000079.md)):
+
+| Profile | Binary / image tag | What is compiled in |
+| --- | --- | --- |
+| **minimal** (unsuffixed, the default) | `plecto-<tag>-<target>.tar.gz` · `ghcr.io/kaikei-e/plecto:<version>` | Default features only — no outbound code is compiled in. The smallest attack surface; pick this for a plain reverse proxy / gateway. |
+| **capabilities** | `plecto-<tag>-<target>-capabilities.tar.gz` · `ghcr.io/kaikei-e/plecto:<version>-capabilities` | Adds the `outbound-http`, `outbound-tcp`, and `fat-guest` capabilities — what the capability-backed reference filters (JWKS-refreshing JWT auth, ext-authz, the Redis-backed global rate limit) and TinyGo/Go guests need. |
+
+**Compiling a capability in is not granting it.** A capabilities binary lends nothing to any
+filter until the manifest declares that capability for that filter — the deny-by-default
+allowlist and SSRF floor apply unchanged ([ADR 000036](docs/ADR/000036.md) /
+[ADR 000060](docs/ADR/000060.md)). `plecto --version` prints which profile a binary was
+compiled as.
+
+Both profiles ride the same supply-chain discipline — cargo-auditable build, SPDX SBOM, cosign
+keyless signature, and per-profile image digests recorded in the release notes
+([ADR 000047](docs/ADR/000047.md)); the verification commands are in each release's notes and
+in [`release.yml`](.github/workflows/release.yml)'s header comment.
 
 ### Run the demos
 

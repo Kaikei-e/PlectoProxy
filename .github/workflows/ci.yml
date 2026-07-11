@@ -113,14 +113,35 @@ jobs:
             plecto/examples/filters/filter-hello
             plecto/examples/filters/filter-streaming
             plecto/examples/filters/filter-extauthz
+            plecto/examples/filters/filter-jwt
             plecto/examples/filters/filter-tcp-gate
+            plecto/examples/filters/filter-ratelimit-redis
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all --locked
       # Feature-gated suites as one host + one control invocation (additive features;
-      # avoids six separate re-links). Includes tcp_gate's fat-guest × outbound-tcp case.
-      - run: cargo test -p plecto-host --features streaming-body,outbound-tcp,fat-guest --locked
-      - run: cargo test -p plecto-control --features outbound-tcp,fat-guest --locked
+      # avoids six separate re-links). Includes tcp_gate's fat-guest × outbound-tcp case and the
+      # outbound-http suites (extauthz / jwt) — every capability the capabilities release profile
+      # compiles in is TESTED here, not just clippy-checked (ADR 000079: no profile ships with
+      # test discipline left minimal-only).
+      - run: cargo test -p plecto-host --features streaming-body,outbound-http,outbound-tcp,fat-guest --locked
+      - run: cargo test -p plecto-control --features outbound-http,outbound-tcp,fat-guest --locked
       - run: cargo build --release --locked
+      # Capabilities profile wiring check (ADR 000079): the exact feature set the release ships
+      # must not be discovered broken at tag time. A dev-profile `cargo check` catches the
+      # feature-wiring class (cfg misses, forwarding-chain typos, unused optional deps) in
+      # seconds — Cargo keys build artifacts on the enabled feature set, so this reuses the
+      # warm cache instead of thrashing it. Only link/codegen-time breakage escapes a check
+      # (RFC 3477); the main-only release build below still catches that before any tag exists.
+      # Its own cargo invocation, never folded into a workspace build: feature unification
+      # would leak the capability deps into the minimal artifact's graph.
+      - run: cargo check --locked -p plecto-server --features capabilities
+      # The real release-profile capabilities build runs on main pushes only, so PR wall-time
+      # stays flat while every commit a tag can point at has built the shipped feature set in
+      # the shipped profile (release.yml's gate requires the tagged commit's CI run — i.e. this
+      # one — to be green). The wasmtime-CI-style "PRs light, merge-time heavy" split.
+      - name: Release parity for the capabilities profile (main only)
+        if: github.ref == 'refs/heads/main'
+        run: cargo build --release --locked -p plecto-server --features capabilities
 
       # --- Polyglot Tier A (MoonBit / JS / C): guests then conformance on warm host ---
       - name: Install wasm-tools / wit-bindgen / wasi-sdk (sha256-pinned)

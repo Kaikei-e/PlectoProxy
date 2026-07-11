@@ -3,14 +3,25 @@
 # Triggered by a version tag the maintainer pushes; every job output lands in a DRAFT release,
 # so publishing stays a deliberate human action.
 #
-# Artifacts per release:
-#   - plecto-<tag>-<target>.tar.gz         binary (cargo-auditable: dep list embedded in-binary)
+# Artifacts per release — each in TWO named runtime capability profiles (ADR 000079):
+# unsuffixed = minimal (default features, smallest attack surface); -capabilities =
+# outbound-http + outbound-tcp + fat-guest compiled in. Compile-time inclusion is not a runtime
+# grant: a capabilities binary still lends nothing to a filter unless the manifest declares it
+# per filter (deny-by-default + allowlist + SSRF floor, ADR 000036 / 000060). Both profiles ride
+# the same supply-chain discipline (auditable build, SBOM, cosign, draft release); per-profile
+# image digests are recorded in the draft release notes.
+#   - plecto-<tag>-<target>[-capabilities].tar.gz
+#                                          binary (cargo-auditable: dep list embedded in-binary;
+#                                          the profiles' embedded lists genuinely differ — the
+#                                          capability features pull crates minimal never links)
 #   - *.sha256                             checksum
 #   - *.sigstore.json                      cosign keyless signature bundle (verify against the
 #                                          workflow's OIDC identity — no key to manage or leak)
 #   - *.spdx.json                          SBOM (syft, reads the auditable data too)
-#   - ghcr.io/<owner>/plecto               multi-arch image, provenance + SBOM attestations,
-#                                          cosign-signed by digest
+#   - ghcr.io/<owner>/plecto               one multi-arch image per profile: tags <ver> /
+#                                          <major>.<minor> (minimal) and the same + "-capabilities"
+#                                          suffix; provenance + SBOM attestations, cosign-signed
+#                                          by each profile's own index digest
 #   - ghcr.io/kaikei-e/wit/plecto/*        plecto:filter (+ experimental plecto:filter-streaming)
 #                                          WIT contract, CNCF Wasm OCI Artifact layout (ADR 000064);
 #                                          digest recorded in this tag's release notes
@@ -75,12 +86,18 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
+        # Profile × arch (ADR 000079). The profile name doubles as the cargo feature name
+        # (`--features capabilities`); minimal is the plain default-features build. Each profile
+        # builds in its OWN job / cargo invocation — folding them into one invocation would let
+        # cargo's feature unification leak the capability deps into the minimal binary's graph.
+        profile: [minimal, capabilities]
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
         include:
           # Native runners per arch — no cross toolchain to trust or debug.
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -94,10 +111,14 @@ jobs:
       # (syft >= 1.15 reads it) can audit a deployed plecto without the source tree.
       - name: Build release binary (Debian bookworm container, matches the runtime image's glibc)
         run: |
-          docker run --rm -v "${{ github.workspace }}:/src" -w /src rust:1.96.0-bookworm bash -euxc '
+          FEATURES=''
+          if [ "${{ matrix.profile }}" != "minimal" ]; then
+            FEATURES="--features ${{ matrix.profile }}"
+          fi
+          docker run --rm -e "FEATURES=${FEATURES}" -v "${{ github.workspace }}:/src" -w /src rust:1.96.0-bookworm bash -euxc '
             apt-get update && apt-get install -y --no-install-recommends cmake clang
             cargo install cargo-auditable --locked
-            cargo auditable build --manifest-path plecto/Cargo.toml --release --locked -p plecto-server
+            cargo auditable build --manifest-path plecto/Cargo.toml --release --locked -p plecto-server ${FEATURES}
           '
       # Feeds the container-build job below: it COPYs this binary into the runtime image
       # instead of recompiling Rust a second time under QEMU emulation for the arm64 leg
@@ -106,13 +127,19 @@ jobs:
       - name: Upload binary artifact for the container build
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: plecto-bin-${{ matrix.target }}
+          name: plecto-bin-${{ matrix.target }}-${{ matrix.profile }}
           path: plecto/target/release/plecto
           retention-days: 1
       - name: Package
         id: package
         run: |
-          NAME="plecto-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # Unsuffixed = minimal (deny-by-default posture: the artifact you get without asking
+          # for more is the smallest attack surface); other profiles carry their name as suffix.
+          SUFFIX=''
+          if [ "${{ matrix.profile }}" != "minimal" ]; then
+            SUFFIX="-${{ matrix.profile }}"
+          fi
+          NAME="plecto-${GITHUB_REF_NAME}-${{ matrix.target }}${SUFFIX}"
           mkdir "${NAME}"
           cp plecto/target/release/plecto LICENSE "${NAME}/"
           tar czf "${NAME}.tar.gz" "${NAME}"
@@ -137,7 +164,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           NAME="${{ steps.package.outputs.name }}"
-          # both matrix jobs race to create the draft once; the loser just uploads.
+          # the profile × arch matrix jobs race to create the draft once; the losers just upload.
           gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
             --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md" || true
           gh release upload "${GITHUB_REF_NAME}" \
@@ -156,25 +183,29 @@ jobs:
   # Each leg pushes its single-platform image by digest (no tag yet); container-merge below
   # assembles the multi-arch manifest list from those digests and signs it.
   container-build:
-    name: container image (${{ matrix.target }})
+    name: container image (${{ matrix.target }}, ${{ matrix.profile }})
     needs: [gate, binaries]
     timeout-minutes: 15
     strategy:
       matrix:
+        # Same profile × arch split as `binaries` — each profile gets its own multi-arch image
+        # (ADR 000079), assembled from the per-arch digests by container-merge below.
+        profile: [minimal, capabilities]
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
         include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
             platform: linux/amd64
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Download the native binary already built for this arch
+      - name: Download the native binary already built for this arch and profile
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: plecto-bin-${{ matrix.target }}
+          name: plecto-bin-${{ matrix.target }}-${{ matrix.profile }}
           path: dist
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
@@ -202,24 +233,27 @@ jobs:
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
+      # The artifact name leads with the profile so the merge job can glob one profile's
+      # per-arch digests (digests-<profile>-*) without mixing the two images.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ matrix.target }}
+          name: digests-${{ matrix.profile }}-${{ matrix.target }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   container-merge:
-    name: container image (merge manifest + sign)
+    name: container image (merge manifests + sign, both profiles)
     needs: container-build
     timeout-minutes: 10
     runs-on: ubuntu-24.04
     steps:
+      # No merge-multiple: each digests-<profile>-<target> artifact keeps its own subdirectory,
+      # so the per-profile loop below can glob one profile's arch digests without mixing images.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests
           pattern: digests-*
-          merge-multiple: true
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
         with:
@@ -229,24 +263,55 @@ jobs:
       - name: Lowercase the image reference (registries reject the mixed-case repo owner)
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/plecto" >> "$GITHUB_ENV"
       - id: meta
+        # Emits the minimal (unsuffixed) tag set; the loop below appends the profile-name
+        # suffix for every other profile (ADR 000079's naming: unsuffixed = minimal).
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      - name: Create and push the multi-arch manifest list
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create --metadata-file /tmp/imagetools-metadata.json \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Sign the image digest (cosign keyless)
-        # Sign the DIGEST, never a tag — a tag is mutable, the digest is the artifact.
+      - name: Create, push, and sign one multi-arch manifest list per profile
+        # One sequential loop, not a profile matrix: both profiles' digests then land in the
+        # release notes through a single append below, so two jobs never race the notes edit.
+        # Sign each profile's index DIGEST, never a tag — a tag is mutable, the digest is the
+        # artifact, and each profile is its own index.
         run: |
-          digest=$(jq -r '.["containerimage.descriptor"].digest' /tmp/imagetools-metadata.json)
-          cosign sign --yes "${{ env.IMAGE }}@${digest}"
+          : > /tmp/image-digests.md
+          for profile in minimal capabilities; do
+            suffix=''
+            if [ "${profile}" != "minimal" ]; then suffix="-${profile}"; fi
+            tags=$(jq -cr --arg s "${suffix}" '.tags | map("-t " + . + $s) | join(" ")' \
+              <<< "$DOCKER_METADATA_OUTPUT_JSON")
+            refs=''
+            for f in /tmp/digests/digests-${profile}-*/*; do
+              refs="${refs}${IMAGE}@sha256:$(basename "${f}") "
+            done
+            docker buildx imagetools create --metadata-file "/tmp/imagetools-${profile}.json" \
+              ${tags} ${refs}
+            digest=$(jq -r '.["containerimage.descriptor"].digest' "/tmp/imagetools-${profile}.json")
+            cosign sign --yes "${IMAGE}@${digest}"
+            echo "- ${profile}: \`${IMAGE}@${digest}\`" >> /tmp/image-digests.md
+          done
+      - name: Record the per-profile image digests in this tag's release notes
+        # ADR 000079 decision 4: track each profile's digest. This job starts only after
+        # binaries + container-build, long past wit-publish's own notes edit (needs: gate only),
+        # so the read-append-write below does not race it in practice.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }} # no checkout in this job — point gh at the repo
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
+            --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md" || true
+          {
+            gh release view "${GITHUB_REF_NAME}" --json body -q .body
+            echo
+            echo "Container images (per runtime capability profile, ADR 000079):"
+            cat /tmp/image-digests.md
+          } >/tmp/release-notes.md
+          gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/release-notes.md
 
   # Publishes the plecto:filter WIT contract (and the experimental plecto:filter-streaming) to
   # ghcr.io as CNCF Wasm OCI Artifacts (ADR 000064) — the contract-side counterpart of the

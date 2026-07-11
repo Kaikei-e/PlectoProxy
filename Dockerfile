@@ -3,8 +3,13 @@
 # binary (or a prebuilt one is copied in, see SOURCE below); the runtime stage is distroless (no
 # shell, no package manager — minimal CVE surface).
 #
-# Build from source (repo root, default — no prerequisites beyond Docker):
+# Build from source (repo root, default — no prerequisites beyond Docker). The default is the
+# `minimal` runtime capability profile (ADR 000079: default features, smallest attack surface);
+# pass FEATURES to compile a named profile in — e.g. the `capabilities` profile (outbound-http +
+# outbound-tcp + fat-guest). Compile-time inclusion is not a runtime grant: capabilities are
+# still lent per filter by the manifest's deny-by-default allowlist + SSRF floor.
 #   docker build -t plecto .
+#   docker build -t plecto:capabilities --build-arg FEATURES=capabilities .
 #
 # Build from an already-built binary instead of compiling (used by the release workflow's
 # native-per-arch matrix, so a multi-arch image is never cross-compiled under QEMU emulation —
@@ -37,7 +42,11 @@ RUN apt-get update \
 WORKDIR /src
 COPY plecto/ plecto/
 # --locked: the committed Cargo.lock is the supply-chain pin; a drifted lockfile fails the build.
+# FEATURES: empty (default) = the minimal profile; "capabilities" compiles the outbound + fat-guest
+# capability code in (ADR 000079). Deliberately expanded unquoted — it is a cargo flag list.
+ARG FEATURES=""
 RUN cargo build --manifest-path plecto/Cargo.toml --release --locked -p plecto-server \
+    ${FEATURES:+--features ${FEATURES}} \
     && cp plecto/target/release/plecto /plecto
 
 FROM scratch AS build-prebuilt

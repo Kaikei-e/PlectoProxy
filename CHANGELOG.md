@@ -23,6 +23,18 @@ All notable changes to Plecto are documented here. The format follows
 
 ### Added
 
+- Named runtime capability profiles in the release artifacts (ADR 000079). Every release now
+  ships **two** profiles of the binary and the container image: **minimal** (unsuffixed — the
+  former single artifact, default features, smallest attack surface) and **capabilities**
+  (`-capabilities` suffix on the tarball name and the image tag) with `outbound-http`,
+  `outbound-tcp` and `fat-guest` compiled in — what the capability-backed reference filters
+  (JWKS-refreshing JWT auth, ext-authz, Redis-backed global rate limit) and TinyGo/Go guests
+  need, prebuilt. Compile-time inclusion is not a runtime grant: the manifest's per-filter
+  deny-by-default allowlist + SSRF floor (ADR 000036 / 000060) apply unchanged. Both profiles
+  carry the full supply-chain discipline (cargo-auditable, SBOM, cosign, draft release);
+  per-profile image digests land in the release notes. `plecto --version` now names the
+  compiled profile. Source builds pick a profile with `cargo build -p plecto-server --features
+  capabilities` or `docker build --build-arg FEATURES=capabilities .`.
 - Mutual TLS in both directions (ADR 000078). Downstream: `[listen.client_auth] ca_path`
   makes a verified client certificate **required** on every TLS handshake the listener
   terminates (HTTP/1.1, h2 and h3/QUIC alike — one verifier for both wire faces; required

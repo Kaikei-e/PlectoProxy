@@ -104,6 +104,20 @@ bench-harnesses = []
 # glibc build and `MALLOC_ARENA_MAX=1`. No effect on the lib or the default build; tikv-jemallocator
 # is a dev-dependency, never linked into a production build.
 jemalloc = []
+# --- Named runtime capability profiles (ADR 000079) ---
+# Forward to the control plane's capability features (which forward to the host). OFF by default:
+# the unsuffixed release artifact is the `minimal` profile — smallest attack surface, no outbound
+# code compiled in. Compile-time inclusion is NOT a runtime grant: even a capabilities binary lends
+# nothing to a filter unless the manifest declares it per filter (deny-by-default + allowlist +
+# SSRF floor, ADR 000036 / 000060).
+outbound-http = ["plecto-control/outbound-http"]
+outbound-tcp = ["plecto-control/outbound-tcp"]
+fat-guest = ["plecto-control/fat-guest"]
+# The `capabilities` release profile: both outbound capabilities plus the fat-guest minimal-WASI
+# grant, whose dependencies are a subset of what the outbound features already pull — zero
+# additional supply-chain surface over outbound-http + outbound-tcp. The experimental
+# streaming-body feature deliberately stays out of every prebuilt profile.
+capabilities = ["outbound-http", "outbound-tcp", "fat-guest"]
 
 [dependencies]
 plecto-control = { path = "../control" }

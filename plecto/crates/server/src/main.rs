@@ -55,7 +55,11 @@ async fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let manifest = match args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.as_str() {
         "--version" | "-V" => {
-            println!("plecto {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "plecto {} (profile: {})",
+                env!("CARGO_PKG_VERSION"),
+                capability_profile()
+            );
             return Ok(());
         }
         // The manifest's JSON Schema (ADR 000049), derived from the same serde model `validate`
@@ -200,6 +204,29 @@ async fn run() -> anyhow::Result<()> {
     serve_with_shutdown(control, listener, shutdown_signal()).await?;
     tracing::info!("plecto fast path stopped");
     Ok(())
+}
+
+/// The named runtime capability profile this binary was compiled as (ADR 000079). The two
+/// shipped feature sets get their release-profile name; any other set is reported feature by
+/// feature, so a source build with a partial set never masquerades as a named profile.
+/// Compile-time inclusion is not a runtime grant — capabilities are still lent per filter by
+/// the manifest (deny-by-default, ADR 000036 / 000060).
+fn capability_profile() -> String {
+    let compiled: Vec<&str> = [
+        (cfg!(feature = "outbound-http"), "outbound-http"),
+        (cfg!(feature = "outbound-tcp"), "outbound-tcp"),
+        (cfg!(feature = "fat-guest"), "fat-guest"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    match compiled.as_slice() {
+        [] => "minimal".to_owned(),
+        ["outbound-http", "outbound-tcp", "fat-guest"] => {
+            "capabilities (outbound-http, outbound-tcp, fat-guest)".to_owned()
+        }
+        partial => format!("custom ({})", partial.join(", ")),
+    }
 }
 
 /// Resolves on the operator's "stop serving" signal — SIGTERM (process supervisors) or SIGINT

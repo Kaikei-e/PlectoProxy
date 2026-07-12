@@ -12,6 +12,9 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
+# MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
+# gives consumers a proper diagnostic on older compilers instead of a random parse error.
+rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/Kaikei-e/Plecto"
 homepage = "https://github.com/Kaikei-e/Plecto"
@@ -20,11 +23,22 @@ categories = ["network-programming", "web-programming", "wasm"]
 # Not published to crates.io yet (early development). Flip per-crate when distribution begins.
 publish = false
 
+# Shared lint floor (bp-rust §10), inherited by every member via `[lints] workspace = true`.
+# The hot-path panic lints (unwrap_used/expect_used/panic/indexing_slicing) stay as per-crate
+# `#![cfg_attr(not(test), warn(...))]` blocks — a `[lints]` table cannot exempt `cfg(test)`.
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+
 [workspace.dependencies]
 # wasmtime 46.0.x for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46
 # (2026-06-22) ships Component Model async + WASI 0.3 by default. The async / bindgen API is still
 # moving on this line, so we track the latest 46 patch (Cargo.lock pins the resolved build).
 wasmtime = "46.0.1"
+# wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
+# here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
+wasmtime-wasi = "46.0.1"
+wasmtime-wasi-http = "46.0.1"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"

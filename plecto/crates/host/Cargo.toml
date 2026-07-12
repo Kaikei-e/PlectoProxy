@@ -3,6 +3,7 @@ name = "plecto-host"
 description = "Plecto's wasmtime embedding host: loads, sandboxes, and runs plecto:filter WASM components (the extension plane)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -14,6 +15,9 @@ publish.workspace = true
 # ONLY the criterion targets (which alone understand `--save-baseline` for the CI regression gate).
 [lib]
 bench = false
+
+[lints]
+workspace = true
 
 [features]
 # Gates `test_support` (the fixture loaders: filter-hello/apikey/quickstart/noop components,
@@ -96,11 +100,11 @@ wasmtime = { workspace = true }
 # Streaming-body / outbound-http only: a MINIMAL WASI slice (proxy interfaces — no fs/sockets/env) for
 # guests that, unlike the no-WASI header-only filters, import wasi:io. Optional, so the default build
 # never sees it.
-wasmtime-wasi = { version = "46.0.1", optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
 # outbound-http only: the standard `wasi:http/outgoing-handler` host implementation. We take its
 # WasiHttpHooks::send_request seam but OWN the connector (allowlist + DNS + IP-pinned connect), so the
 # built-in one is only a source of types/building-blocks. Optional — absent from the default build.
-wasmtime-wasi-http = { version = "46.0.1", optional = true }
+wasmtime-wasi-http = { workspace = true, optional = true }
 # outbound-http only: CIDR parsing/containment for the operator's per-filter `allow_private` opt-in
 # ranges (the SSRF guard's explicit deny ranges are hand-written octet predicates, not this).
 ipnet = { workspace = true, optional = true }
@@ -116,7 +120,7 @@ http-body-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-webpki-roots = { version = "0.26", optional = true }
+webpki-roots = { workspace = true, optional = true }
 # M3 Stage 1 (ADR 000021): a minimal `block_on` to drive wasmtime's now-async `call_async` /
 # `instantiate_async` from the host's still-sync public API. The guest runs to completion on a
 # fiber without suspending (epoch is trap-mode, host-API imports never block), so a no-reactor

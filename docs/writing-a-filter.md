@@ -454,7 +454,14 @@ normal, expected state.
   not silently break a filter built against an older `plecto:filter` version; the host branches on
   the component's own world version at load time. On a major bump, the previous major stays
   accepted for **at least two release series** before its removal is declared — via ADR, the same
-  way any other deprecation in this project is declared (never silently).
+  way any other deprecation in this project is declared (never silently). This is not aspiration:
+  `0.1.0` / `0.2.0` components load on today's host via frozen contract trees + load-time adapters.
+- **The promise is staged, and gets stronger at contract 1.0** (ADR 000085). Everything above is
+  the 0.x policy. From `plecto:filter` 1.0 onward, **every shipped world stays loadable
+  permanently** — the sole exception is "keeping this world loadable is itself unsafe to
+  maintain", and even that requires a dedicated ADR, **at least 24 months' notice**, and a
+  migration document. Cutting 1.0 is the act that brings this pledge into force (which is why 1.0
+  waits for the `wasi:http` convergence major to settle first).
 - **`filter` vs. `filter-body` compatibility is part of this policy** (ADR 000038): the base
   `filter` world exporting nothing new stays minor-compatible forever by construction (the
   *absence* of `on-request-body` is itself contractual, not an oversight). Adding an export to

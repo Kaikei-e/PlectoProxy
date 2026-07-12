@@ -3,7 +3,7 @@
 [English](design-principles.md) · 日本語
 
 > **策定日**: 2026-07-06（[ADR 000056](ADR/000056.md) と同日に docs/ へ採録）
-> **根拠**: リポジトリ HEAD（2026-07-11）の一次情報——WIT 契約（`plecto/wit/world.wit` @ 0.2.0）・accepted ADR 74 本（`amends` / `supersedes` の append-only グラフ）・`CLAUDE.md`・`CONTEXT-MAP.md`・各 crate の `CONTEXT.md`・`docs/ROADMAP.md`・運用ドキュメント——から直接策定・同期した。最新タグは `v0.2.6`。
+> **根拠**: リポジトリ HEAD（2026-07-13）の一次情報——WIT 契約（`plecto/wit/world.wit` @ 0.3.0）・ADR 86 本（`amends` / `supersedes` の append-only グラフ）・`CLAUDE.md`・`CONTEXT-MAP.md`・各 crate の `CONTEXT.md`・`docs/ROADMAP.md`・運用ドキュメント——から直接策定・同期した。最新タグは `v0.3.0`。
 > **性格**: 本書は Plecto Proxy の設計思想を「原則（変わらないもの）」「方針（構造の選び方）」「指針（日々の判断の当て方）」の三層で一冊に定礎する原典である。個別判断の一次記録は `docs/ADR/` にあり、契約の正文は `wit/` にある。本書と ADR/WIT が食い違う場合は ADR/WIT を正とし、本書を改訂する（第7章）。英語版 [design-principles.md](design-principles.md) と同期して保守する。
 
 ---
@@ -111,6 +111,8 @@ Plecto Proxy の Rust workspace は三つの crate = 三つの文脈から成り
 
 契約進化の方針: 変更は additive を基本とし、body の真のストリーミング化は `list<u8>` → `stream<u8>` の差し替えとして契約に席を確保済み。ホット経路（rate limit の refill 等）は契約の外＝native に落とす——「WASM 税は判断ロジックにのみ払う」。`plecto new-filter` は現状 `wkg` 経由で公開契約を取得する（ADR 000064 / 000065）。オフライン self-vendoring（ホスト bindgen と同じ `wit/world.wit` の同梱）は ADR 000072 で採択済み・実装は後続。
 
+互換性の約束は**段階化**されている（ADR 000085）。0.x の間は発効済みポリシーがそのまま立つ: host は出荷サポートした全契約バージョンを読み続け（0.1 / 0.2 は凍結ツリー＋ロード時アダプタで現に動いている）、旧 major は ADR で廃止を宣言するまで最低 2 リリース系列は受理し続ける（ADR 000064）。契約 1.0 以降は、**出荷したすべての world を恒久的に読み続ける**——唯一の例外は「当該 world を読み続けること自体が安全上維持不能」な場合のみで、その場合も単独 ADR・最低 24 ヶ月の告知・移行文書を必須とする。1.0 を切る行為がこの保証の発効であり、1.0 は機能量ではなく**約束の節目**である。
+
 ### 2.3 実行モデル: 信頼で分岐するライフサイクル
 
 「ステートレス」の精密化（P6）から、インスタンス・ライフサイクルの二分岐が**必然として**導かれる（ADR 000011 / 000012）:
@@ -166,6 +168,8 @@ ADR 000029 の役割駆動基準と Fork 6 から、配置は次の順で問う:
 
 README や docs に書く強み・性能・対応言語は、テストか計測で反証可能な形にしてから主張する。正典例は ADR 000055: 「任意言語で書ける（polyglot）」という掲示が Rust 実例しか持たない aspirational な主張だったことを認め、MoonBit / JS / C の zero-WASI 例フィルタを**単一の共有アサーション・スイート**（`tests/polyglot.rs`）で CI 検証する形に置き換え、コミットメッセージ自体が "replace the aspirational polyglot claim with the verified per-language status" と記録した。同様に、セキュリティ性質（署名ゲート迂回不能・fail-closed・quota）は E2E テストで固定し、性能主張は regression baseline として計測手順ごと開示する（P9）。**検証できない主張は、削るか、検証を先に作る。**
 
+対外メッセージは**固定の看板順序**に従う（ADR 000083）: 第一看板は供給網検証つき拡張性。WIT 型付き契約と契約駆動の性能はその実現手段・根拠として語り、単独の看板にはしない。mesh を持ち込まない環境に射程を明示した両方向 mTLS が補完第二看板。実装言語は土台として背後に置く。規制文脈（EU CRA）は「検証可能なコンポーネントの需要が構造的に高まる」ことの背景説明にのみ使い、適合主張はせず、規制カレンダーを発信期限の根拠にしない（ADR 000076）。寿命に関する主張も同じ反証可能性の水準に置く（ADR 000086）: 年限のサポート宣言はせず、意図の宣言＋撤退プロトコル（意図的な終了なら EOL 告知 ≥12 ヶ月＋期間中の security fix 継続。不可抗力への正直な答えは再現可能な署名済み最終リリース）と、検証文化の可視化（記録の実体は default-branch CI green、別台帳は作らない）で担保する。
+
 ### 3.5 プロセス規約（要点）
 
 ADR は `docs/ADR/NNNNNN.md`、frontmatter + wikilink、テンプレは `template.md`。TDD は outside-in（E2E → WIT-conformance → Unit）で、RED と GREEN は別コミット（直近の striped-lock 修正 `3648508`→`486e6cf` がその実演）。仕上げに fmt / clippy（`-D warnings`）/ type / test のローカル CI パリティを必ず回す。ドキュメントの役割分離を守る: 用語は CONTEXT.md、判断は ADR、契約は WIT、規約は CLAUDE.md、運用指針は hardening ガイド、計測は performance/README。
@@ -205,6 +209,9 @@ ADR は `docs/ADR/NNNNNN.md`、frontmatter + wikilink、テンプレは `templat
 | リモート filter-registry 取得（wkg 境界）の需要成立 | M4 の残余——現行はオフライン image-layout が意図された既定 |
 | crypto provider の代替（例: 第三者監査済み pure-Rust 実装）の成熟 | ADR 000051 の再訪。判断基準は同 ADR が確立した「実リンク検証 + ビルド DX + 保守状況」 |
 | opt-in 分散合意（foca / openraft）の実需 | M5 deferred 分の着手可否。single-node first（P7）は維持したまま opt-in レイヤとして |
+| technical preview の床（ADR 000077 + 000084）の着地 | 到達性優先の規則が失効し、順序は役割駆動（ADR 000029 / 000084）へ戻る。それまでは到達性項目——署名検証込み 1 コマンド quick-start（operator TTFV ≤5 分の物差し）・compose reference・英語 first-run 文書——が新規機能スライスに優先する |
+| 契約 1.0 を切る（wasi:http 収斂 major の帰趨確定後に限る） | 恒久 world 読み込み保証が発効する（ADR 000085）: 例外は security のみ、単独 ADR＋最低 24 ヶ月告知＋移行文書 |
+| 型付き契約への移行需要の一次証拠（移行事例・運用者/作者からの要望）が出る | 対外メッセージにおける WIT の従属位置（ADR 000083）の格上げを再評価する。同様に、mesh 級 mTLS が非オーケストレーション環境へ実用拡大したら補完第二看板を降格する |
 
 再検討は常に「トリガ → 個別 ADR → 実装」の順で行い、feature gate の既定化・deferred の繰上げを ADR なしに行わない。
 

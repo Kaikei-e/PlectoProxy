@@ -3,7 +3,7 @@
 English · [日本語](design-principles.ja.md)
 
 > **Established**: 2026-07-06 (adopted into `docs/` alongside [ADR 000056](ADR/000056.md))
-> **Basis**: Derived from the primary sources of the Plecto repository at HEAD (2026-07-11), including the WIT contract (`plecto/wit/world.wit` @ 0.2.0), 74 ADRs (append-only graph with `amends` / `supersedes`), `CLAUDE.md`, `CONTEXT-MAP.md`, crate `CONTEXT.md` files, `docs/ROADMAP.md`, and operational docs.
+> **Basis**: Derived from the primary sources of the Plecto repository at HEAD (2026-07-13), including the WIT contract (`plecto/wit/world.wit` @ 0.3.0), 86 ADRs (append-only graph with `amends` / `supersedes`), `CLAUDE.md`, `CONTEXT-MAP.md`, crate `CONTEXT.md` files, `docs/ROADMAP.md`, and operational docs.
 > **Nature**: This document crystallises Plecto Proxy's design philosophy in three layers — **principles** (what does not change), **policy** (how structure is chosen), and **guidelines** (how day-to-day judgment is applied). The primary record of individual decisions lives in `docs/ADR/`; the contract's authoritative text lives in `wit/`. Where this document disagrees with an ADR or the WIT, the ADR/WIT wins and this document is revised (Chapter 7).
 
 ---
@@ -111,6 +111,8 @@ The contract is defined as its own world, with type convergence toward `wasi:htt
 
 Contract-evolution policy: changes are additive by default; true streaming of bodies has a reserved seat in the contract as the `list<u8>` → `stream<u8>` swap. Hot-path work (rate-limit refill and the like) drops out of the contract into native — "the WASM tax is paid only on decision logic." `plecto new-filter` fetches the published contract via `wkg` today (ADR 000064 / 000065); ADR 000072 accepts offline self-vendoring of the same `wit/world.wit` the host bindgen reads as the follow-on.
 
+The compatibility promise is **staged** (ADR 000085). Through 0.x, the shipped policy stands: the host keeps loading every contract version it has shipped support for (0.1 / 0.2 run today via frozen trees + load-time adapters), and a superseded major stays accepted for at least two release series before an ADR-declared removal (ADR 000064). From contract 1.0 onward, **every shipped world stays loadable permanently** — the sole exception, "keeping this world loadable is itself unsafe to maintain", requires a dedicated ADR, at least 24 months' notice, and a migration document. Cutting 1.0 is the act that brings this pledge into force, so 1.0 is a milestone of promise, not of feature count.
+
 ### 2.3 Execution model: a lifecycle that branches on trust
 
 The precise definition of "stateless" (P6) makes the two-way branch of instance lifecycles a **necessity** (ADR 000011 / 000012):
@@ -166,6 +168,8 @@ A new dependency must pass cargo-deny (`deny.toml`, CI-blocking); must not drag 
 
 Strengths, performance, and language support written in README or docs are claimed only after being made falsifiable by tests or measurement. The canonical example is ADR 000055: admitting that the "write filters in any language (polyglot)" banner was an aspirational claim backed only by a Rust example, it was replaced by MoonBit / JS / C zero-WASI example filters verified in CI through a **single shared assertion suite** (`tests/polyglot.rs`) — the commit message itself records "replace the aspirational polyglot claim with the verified per-language status". Likewise, security properties (signature-gate non-bypassability, fail-closed, quotas) are fixed by E2E tests, and performance claims are published as regression baselines together with their measurement method (P9). **A claim that cannot be verified is either cut, or its verification is built first.**
 
+Outward messaging follows a **fixed banner order** (ADR 000083): supply-chain-verified extensibility is the first banner; the typed WIT contract and contract-derived performance are spoken as its means and evidence, never as banners of their own; mesh-less mutual TLS is the complementary second banner, scoped to environments that do not bring a mesh; the implementation language stays in the background as substrate. Regulatory context (EU CRA) may explain why verifiable components matter, but compliance is never claimed and regulatory dates never justify a publishing deadline (ADR 000076). Longevity claims are held to the same falsifiability bar (ADR 000086): no year-number support pledge — an intent declaration plus a retirement protocol (≥12 months' EOL notice with continued security fixes for a deliberate wind-down; reproducible, signed final releases as the honest answer to the involuntary case) and a visible map of the verification culture whose record of truth is default-branch CI green, never a separate ledger.
+
 ### 3.5 Process conventions (essentials)
 
 ADRs live at `docs/ADR/NNNNNN.md` with frontmatter + wikilinks; the template is `template.md`. TDD is outside-in (E2E → WIT-conformance → Unit) with RED and GREEN as separate commits. Finish with the local CI-parity sweep: fmt / clippy (`-D warnings`) / type / test. Respect the separation of document roles: terms in CONTEXT.md, decisions in ADRs, contracts in WIT, conventions in CLAUDE.md, operational guidance in the hardening guide, measurement in performance/README.
@@ -205,6 +209,9 @@ The principles do not change, but the policies carry explicit external triggers 
 | Demand materialises for remote filter-registry fetch (the wkg boundary) | The M4 remainder — offline image-layout is the intended default today |
 | A credible alternative crypto provider matures (e.g. an audited pure-Rust implementation) | Revisiting ADR 000051, using the criteria that ADR established: actual-link verification + build DX + maintenance status |
 | Real demand for opt-in distributed consensus (foca / openraft) | Whether to start the deferred M5 portion — as an opt-in layer, keeping single-node first (P7) |
+| The technical-preview floor (ADR 000077 + 000084) lands | The reachability-first priority rule expires and ordering returns to role-driven (ADR 000029 / 000084). Until then, reachability items — the signature-verified one-command quick start (operator TTFV ≤ 5 min yardstick), the compose reference, English first-run docs — outrank new feature slices |
+| Contract 1.0 is cut (only after the wasi:http convergence major has settled) | The permanent world-loading pledge comes into force (ADR 000085): security-only exception, via a dedicated ADR + ≥24 months' notice + a migration document |
+| Primary evidence of demand for typed-contract migration appears (migration cases, operator/author asks) | The subordinate place of the WIT contract in outward messaging is re-evaluated for promotion (ADR 000083); likewise, mesh-grade mTLS reaching non-orchestrated environments demotes the complementary second banner |
 
 Reconsideration always runs "trigger → dedicated ADR → implementation"; feature-gate defaulting and deferred-item promotion never happen without an ADR.
 

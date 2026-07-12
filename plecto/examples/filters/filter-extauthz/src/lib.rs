@@ -69,7 +69,8 @@ fn authorize(url: &str) -> Result<u16, String> {
     let (scheme, authority, path) = parse_url(url).ok_or_else(|| "bad url".to_string())?;
 
     let req = OutgoingRequest::new(Fields::new());
-    req.set_method(&Method::Get).map_err(|_| "method".to_string())?;
+    req.set_method(&Method::Get)
+        .map_err(|_| "method".to_string())?;
     req.set_scheme(Some(&scheme))
         .map_err(|_| "scheme".to_string())?;
     req.set_authority(Some(&authority))

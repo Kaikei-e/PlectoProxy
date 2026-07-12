@@ -58,6 +58,16 @@ pub enum ControlError {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// An I/O failure carrying the file it was for: a bare `Io` ("No such file or directory
+    /// (os error 2)") gives the operator no hint WHICH referenced file — the manifest, a trust
+    /// key, a state dir — was the problem. Preferred over `Io` wherever the path is known.
+    #[error("i/o error on {path}: {source}", path = .path.display())]
+    IoAt {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("trusted key error: {0}")]
     TrustKey(String),
 

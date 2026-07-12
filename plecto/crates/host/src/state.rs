@@ -470,32 +470,28 @@ impl host_kv::Host for HostState {
             return;
         }
         let nskey = self.ns_key(TAG_KV, &key);
-        let stripe_key = nskey.clone();
-        let kv_read = self.kv.clone();
-        let kv_write = self.kv.clone();
-        let read_nskey = nskey.clone();
+        let kv = &self.kv;
         let key_len = key.len();
         let value_len = value.len();
         // Charge the byte delta vs. any existing value (a new key also charges its key bytes + 1
         // entry), then write — atomically with the quota decision (`KvQuota::charge_and_apply`),
         // so a concurrent `set` on the same key (the pool runs many instances of one filter at
-        // once) cannot race the read-old-value step against this call's write.
+        // once) cannot race the read-old-value step against this call's write. The closures run
+        // synchronously inside `charge_and_apply`, so they BORROW `nskey` / the backend (no
+        // per-call key clones or `Arc` bumps on this per-guest-call path — DECREE §4).
         self.quota.charge_and_apply(
             &self.kv_prefix,
-            &stripe_key,
-            move || match kv_read.get(&read_nskey).map(|v| v.len()) {
+            &nskey,
+            || match kv.get(&nskey).map(|v| v.len()) {
                 None => (1isize, (key_len + value_len) as isize),
                 Some(old) => (0isize, value_len as isize - old as isize),
             },
-            move || kv_write.set(&nskey, value),
+            || kv.set(&nskey, value),
         );
     }
     fn delete(&mut self, key: String) {
         let nskey = self.ns_key(TAG_KV, &key);
-        let stripe_key = nskey.clone();
-        let kv_read = self.kv.clone();
-        let kv_write = self.kv.clone();
-        let read_nskey = nskey.clone();
+        let kv = &self.kv;
         let key_len = key.len();
         // Read-then-release must be atomic with the quota decision too: two concurrent deletes
         // of the same key must not both observe `Some(old)` and both release — the second must
@@ -503,12 +499,12 @@ impl host_kv::Host for HostState {
         // `KvQuota::charge_and_apply` doc for the race this closes).
         self.quota.charge_and_apply(
             &self.kv_prefix,
-            &stripe_key,
-            move || match kv_read.get(&read_nskey).map(|v| v.len()) {
+            &nskey,
+            || match kv.get(&nskey).map(|v| v.len()) {
                 Some(old) => (-1isize, -((key_len + old) as isize)),
                 None => (0isize, 0isize),
             },
-            move || kv_write.delete(&nskey),
+            || kv.delete(&nskey),
         );
     }
 }
@@ -520,10 +516,7 @@ impl host_counter::Host for HostState {
         if delta == 0 {
             return self.kv.increment(&nskey, 0);
         }
-        let stripe_key = nskey.clone();
-        let kv_read = self.kv.clone();
-        let kv_write = self.kv.clone();
-        let read_nskey = nskey.clone();
+        let kv = &self.kv;
         let key_len = key.len();
         // A counter is a fixed 8-byte value: only a NEW key grows the store, so charge one entry
         // when first created and fail closed (report the current value, do not create) over quota
@@ -534,15 +527,15 @@ impl host_counter::Host for HostState {
         self.quota
             .charge_and_apply(
                 &self.kv_prefix,
-                &stripe_key,
-                move || {
-                    if kv_read.get(&read_nskey).is_none() {
+                &nskey,
+                || {
+                    if kv.get(&nskey).is_none() {
                         (1isize, (key_len + 8) as isize)
                     } else {
                         (0isize, 0isize)
                     }
                 },
-                move || kv_write.increment(&nskey, delta),
+                || kv.increment(&nskey, delta),
             )
             .unwrap_or(0)
     }
@@ -566,10 +559,7 @@ impl host_ratelimit::Host for HostState {
             };
         };
         let nskey = self.ns_key(TAG_RATELIMIT, &key);
-        let stripe_key = nskey.clone();
-        let kv_read = self.kv.clone();
-        let kv_write = self.kv.clone();
-        let read_nskey = nskey.clone();
+        let kv = &self.kv;
         let key_len = key.len();
         let now_ms = self.now_ms;
         // A bucket is a fixed 16-byte value: charge one entry when first created. Over quota a
@@ -579,15 +569,15 @@ impl host_ratelimit::Host for HostState {
         // cannot both observe "absent" and both charge an entry for one logical bucket.
         let result = self.quota.charge_and_apply(
             &self.kv_prefix,
-            &stripe_key,
-            move || {
-                if kv_read.get(&read_nskey).is_none() {
+            &nskey,
+            || {
+                if kv.get(&nskey).is_none() {
                     (1isize, (key_len + 16) as isize)
                 } else {
                     (0isize, 0isize)
                 }
             },
-            move || kv_write.try_acquire(&nskey, cost, spec, now_ms),
+            || kv.try_acquire(&nskey, cost, spec, now_ms),
         );
         match result {
             Some(r) => host_ratelimit::Acquire {

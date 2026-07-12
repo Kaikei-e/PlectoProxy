@@ -54,15 +54,7 @@ pub(crate) async fn run(filter_dir: &Path, project_root: &Path) -> Result<()> {
     );
 
     #[cfg(unix)]
-    {
-        let control = control.clone();
-        std::thread::spawn(move || match plecto_control::SignalReloadSource::sighup() {
-            Ok(mut source) => plecto_control::serve_reloads(&control, &mut source),
-            Err(e) => {
-                tracing::error!(error = %e, "cannot register SIGHUP handler; hot reload disabled")
-            }
-        });
-    }
+    crate::spawn_sighup_reload(control.clone());
 
     spawn_watch_loop(filter_dir.clone(), manifest_path.clone(), filter_id, signer)?;
 

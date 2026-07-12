@@ -202,15 +202,31 @@ impl UpstreamRegistry {
 
     /// The group named `name`, if present — used to resolve a route's upstream at config-build time.
     pub fn group(&self, name: &str) -> Option<Arc<UpstreamGroup>> {
-        self.groups.lock().ok()?.get(name).cloned()
+        let Ok(groups) = self.groups.lock() else {
+            // A poisoned lock (a panic while it was held) must not be a SILENT `None` — the
+            // caller would misreport it as an unknown upstream (DECREE §3: no swallowed errors).
+            tracing::error!(
+                upstream = name,
+                "upstream registry lock poisoned in group()"
+            );
+            return None;
+        };
+        groups.get(name).cloned()
     }
 
     /// A snapshot of every current group, for the health-check supervisor to probe.
     pub fn groups(&self) -> Vec<Arc<UpstreamGroup>> {
-        self.groups
-            .lock()
-            .map(|g| g.values().cloned().collect())
-            .unwrap_or_default()
+        match self.groups.lock() {
+            Ok(g) => g.values().cloned().collect(),
+            Err(_) => {
+                // An empty snapshot here silently STOPS all health probing — new instances would
+                // never promote. Loud, so the operator sees why health froze.
+                tracing::error!(
+                    "upstream registry lock poisoned in groups(); health probing sees no upstreams"
+                );
+                Vec::new()
+            }
+        }
     }
 }
 

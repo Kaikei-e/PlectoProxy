@@ -3,6 +3,7 @@ name = "plecto-server"
 description = "Plecto's fast path: an L7 reverse proxy / API gateway data plane (HTTP/1.1, HTTP/2, HTTP/3, TLS, routing, load balancing)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -16,6 +17,9 @@ publish.workspace = true
 [lib]
 name = "plecto_server"
 path = "src/lib.rs"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "plecto"

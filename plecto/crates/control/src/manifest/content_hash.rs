@@ -68,6 +68,37 @@ isolation = "untrusted"   # the default, written explicitly
     }
 
     #[test]
+    fn client_auth_rides_the_content_hash_but_startup_fixed_listen_fields_do_not() {
+        // Regression (large-review finding): `build_active` consumes `listen.client_auth` on
+        // every reload, so a client_auth-only edit MUST flip the config version — otherwise
+        // SIGHUP reports `Unchanged` and the mTLS change is silently not applied. The
+        // startup-fixed `[listen]` fields (addr etc.) stay hash-exempt as before.
+        let base = Manifest::from_toml("").unwrap();
+        let with_addr = Manifest::from_toml("[listen]\naddr = \"0.0.0.0:8443\"\n").unwrap();
+        assert_eq!(
+            base.content_hash().unwrap(),
+            with_addr.content_hash().unwrap(),
+            "a bind-address edit is startup-fixed and must not flip the config version"
+        );
+
+        let with_client_auth =
+            Manifest::from_toml("[listen.client_auth]\nca_path = \"ca.pem\"\n").unwrap();
+        assert_ne!(
+            base.content_hash().unwrap(),
+            with_client_auth.content_hash().unwrap(),
+            "adding [listen.client_auth] must flip the config version"
+        );
+
+        let other_ca =
+            Manifest::from_toml("[listen.client_auth]\nca_path = \"other.pem\"\n").unwrap();
+        assert_ne!(
+            with_client_auth.content_hash().unwrap(),
+            other_ca.content_hash().unwrap(),
+            "changing the client-auth CA must flip the config version"
+        );
+    }
+
+    #[test]
     fn content_hash_changes_on_meaningful_edit() {
         let v1 = Manifest::from_toml(
             r#"

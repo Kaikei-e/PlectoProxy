@@ -3,6 +3,7 @@ name = "plecto-control"
 description = "Plecto's control plane: declarative manifest, OCI artifact loading, filter-chain dispatch, and atomic hot reload."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -20,6 +21,9 @@ publish.workspace = true
 # criterion targets (which alone understand `--save-baseline` for the CI regression gate).
 [lib]
 bench = false
+
+[lints]
+workspace = true
 
 [features]
 # Forwards to the host's outbound HTTP capability (ADR 000036). OFF by default: without it a
@@ -59,6 +63,10 @@ arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# zeroize: wipe STEK input keying material / derived key buffers and TLS private-key PEM reads
+# after the aws-lc-rs / rustls key objects are constructed — freed heap/stack must not retain
+# key material (already resolved transitively via sigstore in plecto-host).
+zeroize = { workspace = true }
 oci-spec = { workspace = true }
 # tracing: control-plane diagnostics for the reload loop (bp-rust: never println!).
 tracing = { workspace = true }

@@ -20,10 +20,15 @@ use plecto_control::{Control, HealthConfig, UpstreamInstance};
 
 use crate::upstream_client::{HyperUpstreamClient, UpstreamClient, UpstreamClients};
 
-/// Run the health-check supervisor until the server stops (ADR 000017). Drives `GET {health.path}`
-/// to each upstream instance on its configured interval and feeds the result into the instance's
-/// shared health state, which `proxy_core`'s round-robin then reads.
-pub(crate) async fn serve_health_checks(control: Arc<Control>) {
+/// Run the health-check supervisor until the drain flag flips (ADR 000017 / 000039). Drives
+/// `GET {health.path}` to each upstream instance on its configured interval and feeds the result
+/// into the instance's shared health state, which `proxy_core`'s round-robin then reads. Exiting
+/// on drain matters for embedders of `serve_with_shutdown`: a supervisor that never returns would
+/// keep probing upstreams and hold `Control` alive after serve returned.
+pub(crate) async fn serve_health_checks(
+    control: Arc<Control>,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) {
     // Dedicated per-scheme probe clients (empty bodies), separate from the request path's pools —
     // a probe should validate the upstream, not ride (or disturb) a live traffic connection pool.
     let clients = UpstreamClients::new();
@@ -61,7 +66,10 @@ pub(crate) async fn serve_health_checks(control: Arc<Control>) {
         }
         // forget bookkeeping for instances that vanished on a reload.
         last.retain(|k, _| live.contains(k));
-        tokio::time::sleep(period.max(Duration::from_millis(20))).await;
+        tokio::select! {
+            _ = crate::listener::drained(&mut drain) => return,
+            _ = tokio::time::sleep(period.max(Duration::from_millis(20))) => {}
+        }
     }
 }
 

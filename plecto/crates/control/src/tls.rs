@@ -39,7 +39,16 @@ impl ResolvesServerCert for SniResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         hello
             .server_name()
-            .and_then(|name| self.by_host.get(&name.to_ascii_lowercase()))
+            .and_then(|name| {
+                // The map keys are lowercased at build; a wire SNI is almost always lowercase
+                // already, so the common case looks up borrowed — the lowercasing allocation is
+                // paid only when a client actually sent uppercase.
+                if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                    self.by_host.get(&name.to_ascii_lowercase())
+                } else {
+                    self.by_host.get(name)
+                }
+            })
             .cloned()
             .or_else(|| self.default.clone())
     }
@@ -470,8 +479,12 @@ fn read_certs(
 }
 
 fn read_key(entry: &TlsCert, base_dir: &Path) -> Result<PrivateKeyDer<'static>, ControlError> {
-    let bytes = std::fs::read(base_dir.join(&entry.key_path))
-        .map_err(|e| tls_err_path(entry, &entry.key_path, &format!("read failed: {e}")))?;
+    // `Zeroizing`: `PrivateKeyDer` wipes its own copy on drop, but the source PEM buffer would
+    // otherwise linger in freed heap — wipe it too (same discipline as the STEK IKM read).
+    let bytes = zeroize::Zeroizing::new(
+        std::fs::read(base_dir.join(&entry.key_path))
+            .map_err(|e| tls_err_path(entry, &entry.key_path, &format!("read failed: {e}")))?,
+    );
     // `from_pem_slice` returns the first private key, or a typed error if there is none / it is
     // malformed — so the previous "no key" branch folds into the error path.
     PrivateKeyDer::from_pem_slice(&bytes)

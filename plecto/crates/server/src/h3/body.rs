@@ -45,7 +45,18 @@ impl Body for H3ReqBody {
             Poll::Ready(Ok(Some(mut buf))) => {
                 let bytes = buf.copy_to_bytes(buf.remaining());
                 if let Some(remaining) = &mut this.remaining {
-                    *remaining = remaining.saturating_sub(bytes.len() as u64);
+                    match remaining.checked_sub(bytes.len() as u64) {
+                        Some(rest) => *remaining = rest,
+                        // More DATA than the declared content-length is a malformed request
+                        // (RFC 9114 §4.1.2): surface a body error instead of silently forwarding
+                        // the extra bytes under the original declaration (bp-rust §6 — no second
+                        // framing interpretation).
+                        None => {
+                            return Poll::Ready(Some(Err(
+                                "h3 request body exceeds its declared content-length".into(),
+                            )));
+                        }
+                    }
                 }
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }

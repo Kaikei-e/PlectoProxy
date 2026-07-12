@@ -12,25 +12,33 @@ use crate::error::ControlError;
 /// config, so the bind address lives here rather than only in a positional CLI arg (containers
 /// need `0.0.0.0` binds without entrypoint gymnastics); an explicit CLI `listen_addr` still wins
 /// as the operator's override.
+/// Serialization note (the semantic content hash, ADR 000008): the startup-fixed fields —
+/// `addr` / `advertised_port` / `proxy_protocol` / `drain` are captured at construction (the
+/// listener binds once; a reload does not re-bind) — carry `skip_serializing`, keeping them OUT
+/// of the config version exactly as before. `client_auth` is the exception: `build_active`
+/// consumes it on EVERY reload (it feeds the rustls server configs), so it must ride the hash —
+/// otherwise a client_auth-only edit + SIGHUP would report `Unchanged` and silently not apply
+/// (or not remove) a security control. `Listen::content_hash_exempt` keeps a manifest WITHOUT
+/// client_auth serializing to nothing, so existing config versions are unchanged.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
     /// `host:port` the data plane binds (e.g. `0.0.0.0:8443`). `None` = the binary's default
     /// (`127.0.0.1:8080`) unless the CLI arg overrides.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub addr: Option<String>,
     /// The port `Alt-Svc` advertises for HTTP/3 (RFC 7838), when the PUBLISHED port differs from
     /// the bound one (container port mapping: internal 8443 → published 443 would otherwise
     /// advertise a dead h3 port). `None` = advertise the bound port (the default).
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub advertised_port: Option<u16>,
     /// `[listen.proxy_protocol]` (ADR 000057): opt-in PROXY protocol v2 reception on the TCP
     /// listener, restoring the real client address behind an L4 load balancer. Absent = off.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub proxy_protocol: Option<ProxyProtocol>,
     /// `[listen.drain]` (ADR 000059): graceful-shutdown tuning. Absent = drain starts the
     /// moment the signal lands, with the 30 s default window.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub drain: Option<Drain>,
     /// `[listen.client_auth]` (ADR 000078): downstream mTLS — the section's presence makes a
     /// verified client certificate REQUIRED on every TLS handshake this listener terminates
@@ -38,8 +46,19 @@ pub struct Listen {
     /// is refused at the handshake). Absent = no client authentication (the default). There is
     /// no "optional" mode: requesting a certificate without requiring it only pays off once a
     /// verified identity propagates to filters, which ADR 000078 declares deferred.
+    ///
+    /// Reload-consumed, so it rides the content hash (see the struct-level serialization note).
     #[serde(default)]
     pub client_auth: Option<ClientAuth>,
+}
+
+impl Listen {
+    /// Whether `[listen]` is exempt from the semantic content hash: true iff `client_auth` — the
+    /// only reload-consumed field — is absent, so manifests without downstream mTLS keep their
+    /// pre-existing config versions byte-for-byte.
+    pub(crate) fn content_hash_exempt(&self) -> bool {
+        self.client_auth.is_none()
+    }
 }
 
 /// `[listen.client_auth]` (ADR 000078): downstream client-certificate verification. Granularity

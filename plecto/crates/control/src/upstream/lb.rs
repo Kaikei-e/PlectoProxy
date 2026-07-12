@@ -209,9 +209,10 @@ impl UpstreamGroup {
             return None;
         }
         if n == 1 {
-            let only = instances
-                .iter()
-                .find(|i| self.is_eligible(i, exclude, ctx))?;
+            let Some(only) = instances.iter().find(|i| self.is_eligible(i, exclude, ctx)) else {
+                // Flipped ineligible since the count pass — same race-fallback as below.
+                return self.round_robin_pick(instances, exclude);
+            };
             return Some(self.metered_pick(only.clone()));
         }
         let (a, b) = rng::two_distinct_below(n as u32);
@@ -231,12 +232,19 @@ impl UpstreamGroup {
                 seen += 1;
             }
         }
+        // An instance can flip ineligible between the count pass and the ordinal capture; other
+        // eligible instances may remain, so a missed capture falls back to round-robin (which
+        // tolerates the same race with its `last` fallback) instead of a spurious fail-closed
+        // `None` → 503.
+        let (Some(cand_lo), Some(cand_hi)) = (cand_lo, cand_hi) else {
+            return self.round_robin_pick(instances, exclude);
+        };
         // Restore draw order so a load tie keeps the FIRST sampled instance (uniform over the
         // eligible set) — keeping min(a, b) would bias ties toward low ordinals and starve the last.
         let (x, y) = if a <= b {
-            (cand_lo?, cand_hi?)
+            (cand_lo, cand_hi)
         } else {
-            (cand_hi?, cand_lo?)
+            (cand_hi, cand_lo)
         };
         let chosen = if lower_load(x, y) { x } else { y };
         Some(self.metered_pick(chosen.clone()))

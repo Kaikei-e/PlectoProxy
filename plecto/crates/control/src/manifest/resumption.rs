@@ -126,7 +126,7 @@ mod tests {
             "client_key_path",  // ditto
         ];
         let schema: serde_json::Value =
-            serde_json::from_str(&crate::manifest_json_schema()).unwrap();
+            serde_json::from_str(&crate::manifest_json_schema().unwrap()).unwrap();
         let mut names = Vec::new();
         property_names(&schema, &mut names);
         for name in &names {

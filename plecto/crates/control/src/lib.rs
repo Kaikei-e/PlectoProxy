@@ -23,8 +23,7 @@
 // a dry run measures 400+ pre-existing hits crate-wide, almost entirely pre-existing stylistic
 // noise unrelated to this refactor's scope; scoped-allow-ing all of them would be disproportionate
 // busy-work. Left as a known, explicit gap rather than silently skipped.
-#![warn(rust_2018_idioms)]
-#![deny(unsafe_op_in_unsafe_fn)]
+// `rust_2018_idioms` (warn) and `unsafe_op_in_unsafe_fn` (deny) come from `[workspace.lints]`.
 #![cfg_attr(
     not(test),
     warn(
@@ -186,22 +185,28 @@ pub struct Control {
 }
 
 impl Control {
-    /// Build a control plane entirely from a manifest and a base directory — the ops
-    /// entrypoint. Reads the trusted-key PEMs (ADR 000006), constructs the `Host`, and
-    /// resolves filters from offline OCI image-layouts under `base_dir` (ADR 000007). Every
-    /// path in the manifest (`trust.keys`, each filter `source`) is resolved relative to
-    /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
-    pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
-        let (host, store, filter_metrics, otlp) = build_host_and_store(manifest, base_dir)?;
+    /// The ONE place a `Control` is put together: every public constructor reduces to "obtain a
+    /// `Host` + store + observability handles, then assemble" — a new field means one edit here,
+    /// not four (the four constructors previously hand-built the 15-field struct and had already
+    /// drifted subtly on `filter_metrics`).
+    fn assemble(
+        host: Host,
+        store: Box<dyn ArtifactStore>,
+        manifest: &Manifest,
+        base_dir: &Path,
+        manifest_path: Option<&Path>,
+        filter_metrics: Arc<MetricsSink>,
+        otlp: Option<Arc<plecto_host::otlp::OtlpBuffer>>,
+    ) -> Result<Self, ControlError> {
         let upstreams = Arc::new(UpstreamRegistry::new());
-        let active = build_active(&host, manifest, &store, base_dir, &upstreams)?;
+        let active = build_active(&host, manifest, store.as_ref(), base_dir, &upstreams)?;
         Ok(Self {
             host,
-            store: Box::new(store),
+            store,
             active: ArcSwap::from_pointee(active),
             reload_gate: parking_lot::Mutex::new(()),
             upstreams,
-            manifest_path: None,
+            manifest_path: manifest_path.map(Path::to_path_buf),
             trust: manifest.trust.clone(),
             state: manifest.state.clone(),
             base_dir: base_dir.to_path_buf(),
@@ -211,6 +216,24 @@ impl Control {
             proxy_protocol: manifest.listen.proxy_protocol_trust()?,
             otlp,
         })
+    }
+
+    /// Build a control plane entirely from a manifest and a base directory — the ops
+    /// entrypoint. Reads the trusted-key PEMs (ADR 000006), constructs the `Host`, and
+    /// resolves filters from offline OCI image-layouts under `base_dir` (ADR 000007). Every
+    /// path in the manifest (`trust.keys`, each filter `source`) is resolved relative to
+    /// `base_dir`. Remote fetch (`wkg`) is an out-of-band step that populates those layouts.
+    pub fn from_manifest(manifest: &Manifest, base_dir: &Path) -> Result<Self, ControlError> {
+        let (host, store, filter_metrics, otlp) = build_host_and_store(manifest, base_dir)?;
+        Self::assemble(
+            host,
+            Box::new(store),
+            manifest,
+            base_dir,
+            None,
+            filter_metrics,
+            otlp,
+        )
     }
 
     /// Build from a pre-constructed `Host` (carrying its `TrustPolicy`) and an artifact store
@@ -225,30 +248,20 @@ impl Control {
     ) -> Result<Self, ControlError> {
         // The in-memory core has no manifest directory; relative paths resolve against the cwd.
         // Tests that exercise `[[tls]]` use absolute cert paths, so this base does not bite them.
-        let base_dir = Path::new(".");
-        let upstreams = Arc::new(UpstreamRegistry::new());
         // OTLP export (ADR 000040): fan the span buffer in BESIDE the caller's sink (never
         // replacing it), before `build_active` loads filters (the sink is cloned into each).
+        // The caller supplied the `Host`, so its sink is the caller's (or `NoopSink`); this
+        // testable core keeps its own empty `filter_metrics` tally rather than reaching into it.
         let (host, otlp) = add_otlp_buffer(host, manifest);
-        let active = build_active(&host, manifest, store.as_ref(), base_dir, &upstreams)?;
-        Ok(Self {
+        Self::assemble(
             host,
             store,
-            active: ArcSwap::from_pointee(active),
-            reload_gate: parking_lot::Mutex::new(()),
-            upstreams,
-            manifest_path: None,
-            trust: manifest.trust.clone(),
-            state: manifest.state.clone(),
-            base_dir: base_dir.to_path_buf(),
-            // The caller supplied the `Host`, so its sink is the caller's (or `NoopSink`); this
-            // testable core keeps its own empty tally rather than reaching into that host.
-            filter_metrics: Arc::new(MetricsSink::new()),
-            observability: manifest.observability.clone(),
-            listen: manifest.listen.clone(),
-            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
+            manifest,
+            Path::new("."),
+            None,
+            Arc::new(MetricsSink::new()),
             otlp,
-        })
+        )
     }
 
     /// Build the whole control plane from a single on-disk manifest file — the
@@ -260,24 +273,15 @@ impl Control {
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
         let (host, store, filter_metrics, otlp) = build_host_and_store(&manifest, base_dir)?;
-        let upstreams = Arc::new(UpstreamRegistry::new());
-        let active = build_active(&host, &manifest, &store, base_dir, &upstreams)?;
-        Ok(Self {
+        Self::assemble(
             host,
-            store: Box::new(store),
-            active: ArcSwap::from_pointee(active),
-            reload_gate: parking_lot::Mutex::new(()),
-            upstreams,
-            manifest_path: Some(manifest_path.to_path_buf()),
-            trust: manifest.trust.clone(),
-            state: manifest.state.clone(),
-            base_dir: base_dir.to_path_buf(),
+            Box::new(store),
+            &manifest,
+            base_dir,
+            Some(manifest_path),
             filter_metrics,
-            observability: manifest.observability.clone(),
-            listen: manifest.listen.clone(),
-            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
             otlp,
-        })
+        )
     }
 
     /// Like `load`, but the manifest lives on disk at `manifest_path`: the path is remembered
@@ -289,30 +293,18 @@ impl Control {
         manifest_path: &Path,
         store: Box<dyn ArtifactStore>,
     ) -> Result<Self, ControlError> {
-        let base_dir = manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
-        let upstreams = Arc::new(UpstreamRegistry::new());
         let (host, otlp) = add_otlp_buffer(host, &manifest);
-        let active = build_active(&host, &manifest, store.as_ref(), &base_dir, &upstreams)?;
-        Ok(Self {
+        Self::assemble(
             host,
             store,
-            active: ArcSwap::from_pointee(active),
-            reload_gate: parking_lot::Mutex::new(()),
-            upstreams,
-            manifest_path: Some(manifest_path.to_path_buf()),
-            trust: manifest.trust.clone(),
-            state: manifest.state.clone(),
+            &manifest,
             base_dir,
-            filter_metrics: Arc::new(MetricsSink::new()),
-            observability: manifest.observability.clone(),
-            listen: manifest.listen.clone(),
-            proxy_protocol: manifest.listen.proxy_protocol_trust()?,
+            Some(manifest_path),
+            Arc::new(MetricsSink::new()),
             otlp,
-        })
+        )
     }
 
     /// The ids currently loaded (for diagnostics / tests). Order is unspecified.
@@ -323,8 +315,20 @@ impl Control {
 
 /// Read + parse a manifest from disk (shared by the on-disk constructors and `reload_from_disk`).
 fn read_manifest(path: &Path) -> Result<Manifest, ControlError> {
-    let toml = std::fs::read_to_string(path)?;
+    let toml = std::fs::read_to_string(path).map_err(|e| ControlError::IoAt {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     Manifest::from_toml(&toml)
+}
+
+/// Read a manifest-referenced file with the path attached to any failure (DECREE §3: an error a
+/// human acts on must say WHICH file — trust keys and manifests are read from several places).
+fn read_file(path: &Path) -> Result<Vec<u8>, ControlError> {
+    std::fs::read(path).map_err(|e| ControlError::IoAt {
+        path: path.to_path_buf(),
+        source: e,
+    })
 }
 
 /// [`validate_manifest`] / [`validate_manifest_path`]'s success value: the manifest's config
@@ -355,7 +359,7 @@ pub fn validate_manifest(
     let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
     let mut warnings = Vec::new();
     for key_path in &manifest.trust.keys {
-        let pem = std::fs::read(base_dir.join(key_path))?;
+        let pem = read_file(&base_dir.join(key_path))?;
         if pem.starts_with(plecto_host::DEV_KEY_MARKER.as_bytes()) {
             warnings.push(DEV_KEY_IN_TRUST);
         }
@@ -364,18 +368,7 @@ pub fn validate_manifest(
     TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
     manifest.state.validate()?;
     manifest.listen.validate()?;
-    let mut filter_ids: HashSet<&str> = HashSet::with_capacity(manifest.filters.len());
-    for entry in &manifest.filters {
-        if !filter_ids.insert(entry.id.as_str()) {
-            return Err(ControlError::DuplicateFilterId(entry.id.clone()));
-        }
-        entry.validate()?;
-    }
-    for id in &manifest.chain.filters {
-        if !filter_ids.contains(id.as_str()) {
-            return Err(ControlError::UnknownChainFilter(id.clone()));
-        }
-    }
+    let filter_ids = validate_filters_and_chain(manifest)?;
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
     route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
@@ -407,12 +400,13 @@ pub fn validate_manifest_path(path: &Path) -> Result<ValidateOutcome, ControlErr
 /// with — the schema cannot drift from the structs, and `deny_unknown_fields` surfaces as
 /// `additionalProperties: false`, so editor validation rejects exactly what `validate` rejects.
 /// draft-07 output: the level taplo / Even Better TOML consume (schemars' 2020-12 default is
-/// outside taplo's documented support). Serialising a just-generated schema cannot fail; the
-/// fallback keeps this total rather than panicking in a CLI path.
-pub fn manifest_json_schema() -> String {
+/// outside taplo's documented support). Serialising a just-generated schema cannot fail, but if
+/// it ever did, the error surfaces to the CLI caller — a silent `"{}"` fallback would be a
+/// schema that validates EVERYTHING, fail-open for the editor validation this exists to provide.
+pub fn manifest_json_schema() -> Result<String, ControlError> {
     let generator = schemars::generate::SchemaSettings::draft07().into_generator();
     let schema = generator.into_root_schema_for::<Manifest>();
-    serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string())
+    Ok(serde_json::to_string_pretty(&schema)?)
 }
 
 /// What `build_host_and_store` assembles for the manifest-driven constructors: the `Host` (sinks
@@ -430,7 +424,7 @@ type BuiltHost = (
 fn build_host_and_store(manifest: &Manifest, base_dir: &Path) -> Result<BuiltHost, ControlError> {
     let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
     for key_path in &manifest.trust.keys {
-        pems.push(std::fs::read(base_dir.join(key_path))?);
+        pems.push(read_file(&base_dir.join(key_path))?);
     }
     let trust =
         TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
@@ -489,6 +483,27 @@ fn add_otlp_buffer(
     (host.with_added_telemetry_sink(buffer.clone()), Some(buffer))
 }
 
+/// The pure filter/chain-semantics checks shared by [`validate_manifest`] (the `nginx -t` core)
+/// and [`build_active`] (the load path): duplicate filter ids, per-entry metering / rate-limit
+/// ranges, and default-chain references. ONE function so a check added for one caller cannot be
+/// silently missed by the other (the two previously re-implemented this sequence in parallel).
+fn validate_filters_and_chain(manifest: &Manifest) -> Result<HashSet<&str>, ControlError> {
+    let mut filter_ids: HashSet<&str> = HashSet::with_capacity(manifest.filters.len());
+    for entry in &manifest.filters {
+        if !filter_ids.insert(entry.id.as_str()) {
+            return Err(ControlError::DuplicateFilterId(entry.id.clone()));
+        }
+        // Reject out-of-range metering / rate-limit values before they reach the host.
+        entry.validate()?;
+    }
+    for id in &manifest.chain.filters {
+        if !filter_ids.contains(id.as_str()) {
+            return Err(ControlError::UnknownChainFilter(id.clone()));
+        }
+    }
+    Ok(filter_ids)
+}
+
 /// Resolve + verify + load every manifest filter into a fresh `ActiveConfig`. Pure w.r.t. the
 /// live set: it touches nothing until it fully succeeds, so a failed `reload` leaves the
 /// running set untouched.
@@ -499,13 +514,11 @@ fn build_active(
     base_dir: &Path,
     registry: &UpstreamRegistry,
 ) -> Result<ActiveConfig, ControlError> {
+    // The pure semantic checks run FIRST (shared with `validate_manifest`), so the load loop
+    // below never sees a duplicate id or an unreferenced chain filter.
+    let filter_ids = validate_filters_and_chain(manifest)?;
     let mut filters: HashMap<String, Arc<LoadedFilter>> = HashMap::new();
     for entry in &manifest.filters {
-        if filters.contains_key(&entry.id) {
-            return Err(ControlError::DuplicateFilterId(entry.id.clone()));
-        }
-        // Reject out-of-range metering / rate-limit values before they reach the host.
-        entry.validate()?;
         let artifact = store.resolve(&entry.source, &entry.digest)?;
         let signed = SignedArtifact {
             component_bytes: &artifact.component,
@@ -521,11 +534,6 @@ fn build_active(
             })?;
         filters.insert(entry.id.clone(), Arc::new(loaded));
     }
-    for id in &manifest.chain.filters {
-        if !filters.contains_key(id) {
-            return Err(ControlError::UnknownChainFilter(id.clone()));
-        }
-    }
 
     // Routing table (ADR 000013 / 000017). Validate every route reference (upstream name, filter
     // ids), the weighted split, and the native rate limit PURELY first — before the persistent
@@ -535,7 +543,6 @@ fn build_active(
     // below instead of calling `targets()` again.
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
-    let filter_ids: HashSet<&str> = filters.keys().map(String::as_str).collect();
     let validated_routes = route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
 
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
@@ -585,60 +592,9 @@ fn build_active(
                 reason,
             }
         })?;
-        routes.push(route::CompiledRoute {
-            // Pre-normalise the compiled match dimensions so per-request matching is allocation-free
-            // (ADR 000034): host + header names lower-cased (case-insensitive), method upper-cased
-            // (exact upper-case token), query names kept as-is (case-sensitive).
-            host: r.matcher.host.as_ref().map(|h| h.to_ascii_lowercase()),
-            path_prefix: r.matcher.path_prefix.clone(),
-            method: r.matcher.method.as_ref().map(|m| m.to_ascii_uppercase()),
-            headers: r
-                .matcher
-                .headers
-                .iter()
-                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-                .collect(),
-            query: r
-                .matcher
-                .query
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            // The route buffers the body iff at least one of its filters exports `on-request-body`
-            // (ADR 000038). Computed from the loaded filters here so the fast path only checks a bool.
-            reads_body: r
-                .filters
-                .iter()
-                .any(|id| filters.get(id).is_some_and(|f| f.reads_body())),
-            // present: `validate_routes` already checked every id against `filter_ids` above, so
-            // this is always `Some` — `filter_map` stays total (no indexing/unwrap panic) rather
-            // than asserting an invariant that's already enforced one step earlier.
-            resolved_chain: r
-                .filters
-                .iter()
-                .filter_map(|id| filters.get(id).cloned())
-                .collect(),
-            filters: r.filters.clone(),
-            backends: Arc::new(backends),
-            // Built once per reload (unlike the per-request `RouteInfo` clone in `snapshot.rs`),
-            // so allocating here to convert into the per-request-cheap `Arc<str>` is fine.
-            strip_prefix: r.strip_prefix.as_deref().map(Arc::from),
-            // Build the native limiter (ADR 000033) — `rate`/`burst` were validated non-zero above.
-            // A fresh limiter per build means a reload resets the node-local buckets (ephemeral).
-            rate_limit: r
-                .rate_limit
-                .map(|rl| Arc::new(ratelimit::NativeRateLimit::new(rl))),
-            // Compile the Upgrade opt-in (ADR 000048) — tokens were validated non-empty/non-h2c.
-            upgrade: r
-                .upgrade
-                .as_ref()
-                .map(|u| Arc::new(route::UpgradeConfig::new(&u.protocols, u.idle_timeout_ms))),
-            // Compile the compression opt-in (ADR 000074) — codings / allowlist validated above.
-            compression: r
-                .compression
-                .as_ref()
-                .map(|c| Arc::new(route::CompressionConfig::new(c))),
-        });
+        // The compilation itself (pre-normalised match dimensions, resolved chain, limiter /
+        // upgrade / compression facilities) lives beside `CompiledRoute` in route.rs.
+        routes.push(route::CompiledRoute::compile(r, backends, &filters));
     }
 
     let resolved_chain = manifest

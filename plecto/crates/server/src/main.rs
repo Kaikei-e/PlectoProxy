@@ -26,6 +26,7 @@ use plecto_control::Control;
 use plecto_server::serve_with_shutdown;
 use tokio::net::TcpListener;
 
+mod cli;
 mod dev_cmd;
 mod dev_key;
 mod new_filter;
@@ -65,7 +66,7 @@ async fn run() -> anyhow::Result<()> {
         // The manifest's JSON Schema (ADR 000049), derived from the same serde model `validate`
         // parses with — pipe to a file and point taplo / Even Better TOML at it (`#:schema`).
         "schema" => {
-            println!("{}", plecto_control::manifest_json_schema());
+            println!("{}", plecto_control::manifest_json_schema()?);
             return Ok(());
         }
         // Static manifest validation (the `nginx -t` shape): strict parse + every fail-closed
@@ -75,79 +76,17 @@ async fn run() -> anyhow::Result<()> {
             let path = args
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("usage: plecto validate <manifest.toml>"))?;
-            match plecto_control::validate_manifest_path(Path::new(&path)) {
-                Ok(outcome) => {
-                    println!(
-                        "manifest OK: {path} (config version {})",
-                        outcome.config_version
-                    );
-                    for warning in &outcome.warnings {
-                        println!("warning {warning}");
-                    }
-                    return Ok(());
-                }
-                Err(e) => anyhow::bail!("manifest INVALID: {path}: {e}"),
-            }
+            return cli::validate(&path);
         }
         // Filter Dev Kit conformance CLI (ADR 000065 decision 3): the CLI surface over the same
         // generic-property battery `plecto dev` runs before every reload. Self-signs with a
         // throwaway key (never `.plecto/dev-key`), so this needs no manifest, no trust setup —
         // just a component.
-        "conformance" => {
-            let rest: Vec<String> = args.collect();
-            let json = rest.iter().any(|a| a == "--json");
-            let path = rest
-                .iter()
-                .find(|a| a.as_str() != "--json")
-                .ok_or_else(|| {
-                    anyhow::anyhow!("usage: plecto conformance <component.wasm> [--json]")
-                })?
-                .clone();
-            let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
-            let report = plecto_control::run_conformance(&bytes);
-            if json {
-                let checks: Vec<serde_json::Value> = report
-                    .checks
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({"name": c.name, "passed": c.passed, "detail": c.detail})
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({"conformant": report.is_conformant(), "checks": checks})
-                );
-            } else {
-                for check in &report.checks {
-                    let mark = if check.passed { "PASS" } else { "FAIL" };
-                    println!("[{mark}] {} — {}", check.name, check.detail);
-                }
-            }
-            if report.is_conformant() {
-                return Ok(());
-            }
-            anyhow::bail!("{path} is not conformant with plecto:filter");
-        }
+        "conformance" => return cli::conformance(args.collect()),
         // Filter Dev Kit scaffold CLI (ADR 000065 decision 4): `plecto new-filter --lang rust
         // <name>` — the `filter-template` directory, CLI-ified, plus the project's dev key and
         // a ready-to-run dev manifest. `--lang`/`<name>` accepted in either order.
-        "new-filter" => {
-            let rest: Vec<String> = args.collect();
-            let usage = || anyhow::anyhow!("usage: plecto new-filter --lang <lang> <name>");
-            let lang_idx = rest.iter().position(|a| a == "--lang");
-            let lang = lang_idx.and_then(|i| rest.get(i + 1)).ok_or_else(usage)?;
-            let lang_value_idx = lang_idx.map(|i| i + 1);
-            let name = rest
-                .iter()
-                .enumerate()
-                .find(|(i, a)| a.as_str() != "--lang" && Some(*i) != lang_value_idx)
-                .map(|(_, a)| a.as_str())
-                .ok_or_else(usage)?;
-            let project_root = std::env::current_dir()
-                .map_err(|e| anyhow::anyhow!("resolve the current directory: {e}"))?;
-            new_filter::run(lang, name, &project_root)?;
-            return Ok(());
-        }
+        "new-filter" => return cli::new_filter(args.collect()),
         // Filter Dev Kit inner loop (ADR 000065 decision 2): watch → componentize → conformance
         // gate → dev-key sign → reload, in-process, reusing the exact SIGHUP reload plumbing
         // `plecto serve` uses. unix-only, like the rest of the SIGHUP reload mechanism.
@@ -189,15 +128,7 @@ async fn run() -> anyhow::Result<()> {
     // thread beside the async data plane. Signals are a unix concept; elsewhere the config is
     // static for the process lifetime.
     #[cfg(unix)]
-    {
-        let control = control.clone();
-        std::thread::spawn(move || match plecto_control::SignalReloadSource::sighup() {
-            Ok(mut source) => plecto_control::serve_reloads(&control, &mut source),
-            Err(e) => {
-                tracing::error!(error = %e, "cannot register SIGHUP handler; hot reload disabled")
-            }
-        });
-    }
+    spawn_sighup_reload(control.clone());
 
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, version = %control.config_version(), "plecto fast path listening");
@@ -227,6 +158,19 @@ fn capability_profile() -> String {
         }
         partial => format!("custom ({})", partial.join(", ")),
     }
+}
+
+/// Spawn the SIGHUP reload loop on its own thread (ADR 000008 / 000039): `serve_reloads` is a
+/// blocking loop, so it runs beside the async data plane. Shared by `plecto serve` and
+/// `plecto dev` (which reuses the exact same reload plumbing).
+#[cfg(unix)]
+pub(crate) fn spawn_sighup_reload(control: Arc<plecto_control::Control>) {
+    std::thread::spawn(move || match plecto_control::SignalReloadSource::sighup() {
+        Ok(mut source) => plecto_control::serve_reloads(&control, &mut source),
+        Err(e) => {
+            tracing::error!(error = %e, "cannot register SIGHUP handler; hot reload disabled")
+        }
+    });
 }
 
 /// Resolves on the operator's "stop serving" signal — SIGTERM (process supervisors) or SIGINT

@@ -109,11 +109,11 @@ impl LoadedFilter {
         // Header-only filter: no `on-request-body` export, so the body never enters guest memory.
         // The fast path already skips buffering (`reads_body()` is false); this is the defensive
         // floor — pass the body through unchanged without instantiating anything.
-        let Some(idx) = self.inner.runtime.body_export.as_ref() else {
+        if self.inner.runtime.body_export.is_none() {
             return Ok((RequestBodyDecision::Continue(body.to_vec()), Vec::new()));
-        };
+        }
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
-            self.inner.runtime.call_body_hook(inst, idx, body)
+            self.inner.runtime.call_body_hook(inst, body)
         })
     }
 

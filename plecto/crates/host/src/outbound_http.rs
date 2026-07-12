@@ -198,7 +198,10 @@ async fn resolve_and_connect(
     between_bytes_timeout: Duration,
     request: Request<HyperOutgoingBody>,
 ) -> Result<IncomingResponse, ErrorCode> {
-    let addrs = resolver.resolve(host, port).await.map_err(|_| dns_err())?;
+    let addrs = resolver.resolve(host, port).await.map_err(|e| {
+        tracing::debug!(host, port, error = %e, "outbound-http DNS resolution failed");
+        dns_err()
+    })?;
     let Some(&first_addr) = addrs.first() else {
         return Err(dns_err());
     };
@@ -271,7 +274,10 @@ async fn connect_and_send(
         .await
         .map_err(|_| ErrorCode::ConnectionTimeout)?
         .map_err(|_| ErrorCode::ConnectionRefused)?;
-    let _ = tcp.set_nodelay(true);
+    // Best-effort, but not silently discarded (DECREE §3): Nagle staying on is a latency signal.
+    if let Err(e) = tcp.set_nodelay(true) {
+        tracing::trace!(error = %e, "outbound-http set_nodelay failed");
+    }
 
     let (mut sender, worker) = if use_tls {
         let tls = tls_connect(host, tcp, connect_timeout).await?;
@@ -333,7 +339,11 @@ where
         .map_err(|_| ErrorCode::ConnectionTimeout)?
         .map_err(hyper_request_error)?;
     let worker = wasmtime_wasi::runtime::spawn(async move {
-        let _ = conn.await;
+        // The request side still surfaces its own error via the sender; the driver's error is a
+        // diagnostic signal only — logged, not discarded (DECREE §3), and fail-safe either way.
+        if let Err(e) = conn.await {
+            tracing::trace!(error = %e, "outbound-http connection driver ended with error");
+        }
     });
     Ok((sender, worker))
 }

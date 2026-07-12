@@ -236,7 +236,9 @@ fn read_blob(layout: &Path, desc: &Descriptor, source: &str) -> Result<Vec<u8>, 
 /// Write a filter as an offline OCI image-layout under `layout` (the wasm component plus its
 /// signature / SBOM bundled as custom-mediaType layers). Returns the `sha256:...`
 /// image-manifest digest to pin it by in a manifest. Test / dev / tooling helper —
-/// production artifacts come from `wkg` (out-of-band).
+/// production artifacts come from `wkg` (out-of-band). `doc(hidden)` keeps it off the
+/// documented embedder surface (DECREE §2: the pub face stays minimal and deliberate).
+#[doc(hidden)]
 pub fn write_layout(layout: &Path, artifact: &ResolvedArtifact) -> Result<String, ControlError> {
     std::fs::create_dir_all(layout.join("blobs").join("sha256"))?;
 

@@ -50,22 +50,37 @@ pub(crate) fn empty_req() -> ReqBody {
         .boxed()
 }
 
+/// What buffering a request body settled on: the caller maps each case to its own fail-closed
+/// status (over-cap → 413, read fault → 400) instead of conflating a client abort with an
+/// oversized body (they were previously one `None`).
+pub(crate) enum BufferOutcome {
+    Buffered(Vec<u8>),
+    /// The body exceeded the cap; nothing over `max` was ever resident (bp-rust: DoS-aware).
+    TooLarge,
+    /// A frame-read fault (client abort / transport error) before the body completed.
+    ReadError,
+}
+
 /// Buffer a request body for the `on-request-body` hook (ADR 000025), capped at `max` bytes.
-/// Streams frame-by-frame so an over-cap body is rejected without first reading it all into memory;
-/// returns `None` on over-cap OR a body read fault, so the caller fails closed (413) rather than
-/// holding an unbounded buffer (data-plane no-panic / DoS-aware, bp-rust).
-pub(crate) async fn buffer_request_body(mut body: ReqBody, max: usize) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
+/// Streams frame-by-frame so an over-cap body is rejected without first reading it all into
+/// memory (data-plane no-panic / DoS-aware, bp-rust). The size hint seeds the buffer's capacity
+/// (clamped to the cap — the hint is client-supplied and untrusted).
+pub(crate) async fn buffer_request_body(mut body: ReqBody, max: usize) -> BufferOutcome {
+    use hyper::body::Body;
+    let hint = usize::try_from(body.size_hint().lower()).unwrap_or(usize::MAX);
+    let mut buf = Vec::with_capacity(hint.min(max));
     while let Some(frame) = body.frame().await {
-        let frame = frame.ok()?;
+        let Ok(frame) = frame else {
+            return BufferOutcome::ReadError;
+        };
         if let Ok(data) = frame.into_data() {
             if buf.len() + data.len() > max {
-                return None;
+                return BufferOutcome::TooLarge;
             }
             buf.extend_from_slice(&data);
         }
     }
-    Some(buf)
+    BufferOutcome::Buffered(buf)
 }
 
 /// A buffered request body (post `on-request-body` hook, ADR 000025) boxed into `ReqBody` — one

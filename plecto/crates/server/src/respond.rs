@@ -8,7 +8,7 @@ use plecto_control::{Header, HttpResponse};
 
 use crate::ResponseBody;
 use crate::body::full;
-use crate::headers::{copy_headers, copy_headers_direct, copy_headers_synth};
+use crate::headers::{copy_headers_direct, copy_headers_synth};
 
 const X_PLECTO_FAULT: HeaderName = HeaderName::from_static("x-plecto-fault");
 const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
@@ -28,6 +28,7 @@ pub(crate) mod fault {
         HeaderValue::from_static("no-healthy-upstream");
     pub(crate) static BODY_TOO_LARGE: HeaderValue = HeaderValue::from_static("body-too-large");
     pub(crate) static BODY_TIMEOUT: HeaderValue = HeaderValue::from_static("body-timeout");
+    pub(crate) static BODY_READ_ERROR: HeaderValue = HeaderValue::from_static("body-read-error");
     pub(crate) static BODY_BUFFER_UNAVAILABLE: HeaderValue =
         HeaderValue::from_static("body-buffer-unavailable");
     pub(crate) static CIRCUIT_OPEN: HeaderValue = HeaderValue::from_static("circuit-open");
@@ -35,6 +36,17 @@ pub(crate) mod fault {
     pub(crate) static UPSTREAM_TIMEOUT: HeaderValue = HeaderValue::from_static("upstream-timeout");
     pub(crate) static UPSTREAM: HeaderValue = HeaderValue::from_static("upstream");
     pub(crate) static BAD_UPGRADE: HeaderValue = HeaderValue::from_static("bad-upgrade");
+    pub(crate) static BAD_CONTENT_LENGTH: HeaderValue =
+        HeaderValue::from_static("bad-content-length");
+}
+
+/// The total fallback for the "impossible" `Response::builder()` error paths in this module: the
+/// inputs are guarded above each use, but if one were ever reached it must fail CLOSED — a plain
+/// `Response::new` would default to 200 OK and report a build fault as success.
+fn build_error_response() -> Response<ResponseBody> {
+    let mut resp = Response::new(full(b"response build error".to_vec()));
+    *resp.status_mut() = StatusCode::BAD_GATEWAY;
+    resp
 }
 
 /// A synthesised response (short-circuit / `replace` / fail-closed) → a hyper `Response` with a
@@ -45,10 +57,10 @@ pub(crate) fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     copy_headers_synth(builder.headers_mut(), &resp.headers);
-    builder.body(full(resp.body)).unwrap_or_else(|_| {
-        // builder only errors on an invalid status/header already guarded above; stay total.
-        Response::new(full(b"response build error".to_vec()))
-    })
+    // builder only errors on an invalid status/header already guarded above; stay total.
+    builder
+        .body(full(resp.body))
+        .unwrap_or_else(|_| build_error_response())
 }
 
 /// Drop an upstream response body without blocking the client path. Small bodies are drained in
@@ -79,17 +91,30 @@ pub(crate) fn discard_upstream_body(mut body: ResponseBody) {
 /// A forwarded response: the chain-edited status + headers, with the upstream body streamed.
 /// `body` is already boxed into `ResponseBody` — both the real `HyperUpstreamClient` and a test
 /// double box their response bodies identically, so this has no transport-specific type to accept.
+///
+/// The host owns framing here exactly as it does for synthesised responses: the chain is
+/// header-only, so the streamed body's true length is the UPSTREAM's — a chain-supplied
+/// `Content-Length` (filter output is untrusted, CLAUDE.md) is stripped and the upstream's
+/// original re-issued from `upstream_headers`, so a hostile `modified` decision cannot desync the
+/// advertised length from the bytes on the wire (CWE-444 response-desync primitive).
 pub(crate) fn stream_response(
     status: u16,
     headers: &[Header],
+    upstream_headers: &hyper::HeaderMap,
     body: ResponseBody,
 ) -> Response<ResponseBody> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
-    copy_headers(builder.headers_mut(), headers);
+    copy_headers_synth(builder.headers_mut(), headers);
+    if let (Some(h), Some(len)) = (
+        builder.headers_mut(),
+        upstream_headers.get(hyper::header::CONTENT_LENGTH),
+    ) {
+        h.insert(hyper::header::CONTENT_LENGTH, len.clone());
+    }
     builder
         .body(body)
-        .unwrap_or_else(|_| Response::new(full(b"response build error".to_vec())))
+        .unwrap_or_else(|_| build_error_response())
 }
 
 /// Stream an upstream response through untouched — the filterless fast path. No contract
@@ -104,7 +129,7 @@ pub(crate) fn stream_response_direct(
     copy_headers_direct(builder.headers_mut(), headers);
     builder
         .body(body)
-        .unwrap_or_else(|_| Response::new(full(b"response build error".to_vec())))
+        .unwrap_or_else(|_| build_error_response())
 }
 
 /// A small fail-closed response with an `x-plecto-fault` marker (404 no-route, 502 upstream).

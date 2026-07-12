@@ -200,7 +200,7 @@ impl KvBackend for MemoryBackend {
 
 // --- redb backend (durable; ADR 000004) ---
 
-const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("plecto_state");
+const STATE_TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("plecto_state");
 
 /// Cap on redb's lazily-filled page cache. The library default (1 GiB) is sized for a
 /// process that IS the database; embedded stores conventionally cap far lower (SQLite ~2 MiB,

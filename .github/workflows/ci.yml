@@ -85,9 +85,28 @@ jobs:
           # this action.yml revision doesn't declare a `toolchain` input at all, so don't pass one.
           components: rustfmt
       - run: cargo fmt --all -- --check
-      # filter-hello is a separate workspace, formatted on its own.
-      - run: cargo fmt --all -- --check
-        working-directory: plecto/examples/filters/filter-hello
+      # Every example filter guest is a SEPARATE workspace; loop them all so a new guest
+      # can never land unformatted (previously only filter-hello was checked).
+      - name: rustfmt (guest workspaces)
+        working-directory: plecto/examples/filters
+        run: |
+          set -euo pipefail
+          for m in */Cargo.toml; do
+            echo "== $(dirname "$m")"
+            (cd "$(dirname "$m")" && cargo fmt --all -- --check)
+          done
+      # The live wit/ copy and the frozen v0.3.0 snapshot both declare plecto:filter@0.3.0;
+      # nothing else guards them against drifting apart. Comment/blank-line differences are
+      # tolerated (the snapshot carries freeze annotations); token streams must be identical.
+      - name: WIT root vs v0.3.0 snapshot drift check
+        working-directory: plecto/wit
+        run: |
+          set -euo pipefail
+          strip() { grep -v '^[[:space:]]*//' "$1" | tr -s '[:space:]' ' '; }
+          for f in *.wit; do
+            [ -f "v0.3.0/$f" ] || { echo "missing v0.3.0/$f"; exit 1; }
+            diff <(strip "$f") <(strip "v0.3.0/$f") || { echo "wit/$f drifted from wit/v0.3.0/$f"; exit 1; }
+          done
 
   docs:
     name: ADR graph check
@@ -364,26 +383,50 @@ jobs:
         working-directory: .
         run: ./scripts/build-reference-filters.sh "${{ runner.temp }}/shelf"
 
-  # Lint the excluded WASM guest against its real target.
+  # Lint the excluded WASM guest workspaces against their real targets (previously only
+  # filter-hello was linted; the other cargo guests compiled via build.rs but never saw clippy).
+  # Zero-WASI guests build for wasm32-unknown-unknown; the outbound/streaming fixtures use
+  # wasip2 std, so they lint against wasm32-wasip2 (the split mirrors crates/host/build.rs).
   guest-lint:
-    name: filter-hello (wasm32-unknown-unknown)
+    name: guest workspaces (clippy, wasm targets)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     defaults:
       run:
-        working-directory: plecto/examples/filters/filter-hello
+        working-directory: plecto/examples/filters
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           components: clippy
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: plecto-guest
-          workspaces: plecto/examples/filters/filter-hello
+          workspaces: |
+            plecto/examples/filters/filter-hello
+            plecto/examples/filters/filter-apikey
+            plecto/examples/filters/filter-cors
+            plecto/examples/filters/filter-quickstart
+            plecto/examples/filters/filter-template
+            plecto/examples/filters/filter-streaming
+            plecto/examples/filters/filter-extauthz
+            plecto/examples/filters/filter-jwt
+            plecto/examples/filters/filter-tcp-gate
+            plecto/examples/filters/filter-ratelimit-redis
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+      - name: clippy every cargo guest workspace
+        run: |
+          set -euo pipefail
+          # wasip2 guests (wasi std / outbound imports), per crates/host/build.rs:
+          wasip2="filter-streaming filter-extauthz filter-jwt filter-tcp-gate filter-ratelimit-redis"
+          for m in */Cargo.toml; do
+            d=$(dirname "$m")
+            target=wasm32-unknown-unknown
+            case " $wasip2 " in *" $d "*) target=wasm32-wasip2;; esac
+            echo "== $d ($target)"
+            (cd "$d" && cargo clippy --target "$target" --all-targets --locked -- -D warnings)
+          done
 
   # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).
   # A security vulnerability, unmaintained crate, or yanked version fails CI — supply-chain

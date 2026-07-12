@@ -74,60 +74,93 @@ fn build_engine() -> Result<Engine> {
     Ok(Engine::new(&config)?)
 }
 
-/// Run a streaming body filter `component` over `body`: feed the bytes as a `stream<u8>`, drive
-/// `process-body` on component-model-async with a minimal WASI slice and the sandbox bounds in
-/// `limits`, and return the decision. A trap / deadline / link failure is an `Err` the caller maps
-/// fail-closed (never fail-open).
+/// A streaming body filter loaded once and runnable per request — the Engine, epoch ticker,
+/// Linker, and compiled `Component` are init-time work (Tenet 4 / wasmtime-host: never rebuild
+/// an Engine or recompile a Component per request); each [`run`](Self::run) pays only a fresh
+/// Store + instantiation.
+pub struct StreamingFilterRuntime {
+    engine: Engine,
+    // Owned so the ticker thread lives (and keeps metering) for the runtime's lifetime; dropping
+    // the runtime stops and joins it.
+    _ticker: EpochTicker,
+    linker: Linker<Ctx>,
+    component: Component,
+}
+
+impl StreamingFilterRuntime {
+    /// Compile `component` and build the engine / linker once. A link-level failure (e.g. a guest
+    /// importing filesystem/sockets) surfaces at first instantiation, not here — wasmtime resolves
+    /// imports per instantiation for this experimental path.
+    pub fn load(component: &[u8]) -> Result<Self> {
+        let engine = build_engine()?;
+        let ticker = EpochTicker::spawn(vec![engine.clone()]);
+        let component = Component::from_binary(&engine, component)?;
+
+        // deny-by-default WASI (security audit F-002): the wasi:http/proxy interfaces (io / clocks /
+        // random / stdio) PLUS the rest of the wasi:cli set the std guest's runtime imports
+        // (environment / exit / terminal-*), every one inert under an empty `WasiCtx` (environment
+        // returns `[]`, exit traps, the terminals are not TTYs). Filesystem and sockets are
+        // deliberately NOT added, so a guest importing them fails to link — the capability boundary
+        // that matters. Aligns with the `wasi:http/middleware` convergence (ADR 000020).
+        let mut linker: Linker<Ctx> = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
+        crate::state::add_cli_runtime::<Ctx>(&mut linker)?;
+
+        Ok(Self {
+            engine,
+            _ticker: ticker,
+            linker,
+            component,
+        })
+    }
+
+    /// Run the filter over `body`: feed the bytes as a `stream<u8>`, drive `process-body` on
+    /// component-model-async with the sandbox bounds in `limits`, and return the decision. A
+    /// trap / deadline / link failure is an `Err` the caller maps fail-closed (never fail-open).
+    pub fn run(&self, body: Vec<u8>, limits: &StreamingLimits) -> Result<StreamingDecision> {
+        let store_limits = StoreLimitsBuilder::new()
+            .memory_size(limits.memory_cap)
+            .build();
+        let mut store = Store::new(
+            &self.engine,
+            Ctx {
+                limits: store_limits,
+                table: ResourceTable::new(),
+                wasi: WasiCtxBuilder::new().build(),
+            },
+        );
+        store.limiter(|c| &mut c.limits);
+        store.set_epoch_deadline(limits.deadline_ms);
+
+        // Drive with pollster (the host stays no-tokio; ADR 000021). The guest never blocks on
+        // real I/O — it only pulls the host-fed stream — so a no-reactor executor suffices.
+        let instance = pollster::block_on(bindings::StreamingFilter::instantiate_async(
+            &mut store,
+            &self.component,
+            &self.linker,
+        ))?;
+
+        let reader = StreamReader::new(&mut store, body)?;
+        let decision = pollster::block_on(store.run_concurrent(async move |accessor| {
+            instance
+                .plecto_filter_streaming_body_filter()
+                .call_process_body(accessor, reader)
+                .await
+        }))??;
+
+        Ok(map_decision(decision))
+    }
+}
+
+/// One-shot convenience over [`StreamingFilterRuntime`]: load + run once. Callers running MORE
+/// than one body through the same component should hold a `StreamingFilterRuntime` instead —
+/// this pays the whole Engine/compile cost per call.
 pub fn run_streaming_body(
     component: &[u8],
     body: Vec<u8>,
     limits: &StreamingLimits,
 ) -> Result<StreamingDecision> {
-    let engine = build_engine()?;
-    // The ticker lives for the whole run; dropping it stops and joins the thread.
-    let _ticker = EpochTicker::spawn(vec![engine.clone()]);
-
-    let component = Component::from_binary(&engine, component)?;
-
-    // deny-by-default WASI (security audit F-002): the wasi:http/proxy interfaces (io / clocks /
-    // random / stdio) PLUS the rest of the wasi:cli set the std guest's runtime imports (environment
-    // / exit / terminal-*), every one inert under an empty `WasiCtx` (environment returns `[]`, exit
-    // traps, the terminals are not TTYs). Filesystem and sockets are deliberately NOT added, so a
-    // guest importing them fails to link — the capability boundary that matters. Aligns with the
-    // `wasi:http/middleware` convergence (ADR 000020).
-    let mut linker: Linker<Ctx> = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
-    crate::state::add_cli_runtime::<Ctx>(&mut linker)?;
-
-    let store_limits = StoreLimitsBuilder::new()
-        .memory_size(limits.memory_cap)
-        .build();
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            limits: store_limits,
-            table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().build(),
-        },
-    );
-    store.limiter(|c| &mut c.limits);
-    store.set_epoch_deadline(limits.deadline_ms);
-
-    // Drive with pollster (the host stays no-tokio; ADR 000021). The guest never blocks on real I/O
-    // — it only pulls the host-fed stream — so a no-reactor executor suffices.
-    let instance = pollster::block_on(bindings::StreamingFilter::instantiate_async(
-        &mut store, &component, &linker,
-    ))?;
-
-    let reader = StreamReader::new(&mut store, body)?;
-    let decision = pollster::block_on(store.run_concurrent(async move |accessor| {
-        instance
-            .plecto_filter_streaming_body_filter()
-            .call_process_body(accessor, reader)
-            .await
-    }))??;
-
-    Ok(map_decision(decision))
+    StreamingFilterRuntime::load(component)?.run(body, limits)
 }
 
 /// Lower the guest's typed decision to the host-visible `StreamingDecision` (pure — no wasmtime

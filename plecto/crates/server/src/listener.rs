@@ -38,6 +38,13 @@ const MAX_HEADERS: usize = 100;
 /// server sets both the timer and this value rather than relying on the (timer-less, inert) default.
 const INBOUND_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// HTTP/2 keep-alive ping cadence / response deadline: detects and closes connections whose peer
+/// is gone (dead NAT entry, vanished client) so they release their `MAX_CONNECTIONS` permits —
+/// h1 gets the same effect from `header_read_timeout` between requests; h3 from quinn's idle
+/// timeout. An idle-but-responsive h2 client keeps its connection (normal keep-alive behaviour).
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Default drain window for graceful shutdown (ADR 000039), used when `[listen.drain] window_ms`
 /// is not declared (ADR 000059): generous enough for normal in-flight requests (the default
 /// per-try upstream timeout is 30 s too) and aligned with the common 30 s termination grace of
@@ -135,7 +142,7 @@ async fn serve_inner(
     if let Some(admin_addr) = state.control.admin_addr() {
         match admin_addr.parse::<SocketAddr>() {
             Ok(addr) => {
-                tokio::spawn(admin::serve_admin(state.clone(), addr));
+                tokio::spawn(admin::serve_admin(state.clone(), addr, drain_rx.clone()));
             }
             Err(e) => {
                 tracing::error!(addr = admin_addr, error = %e, "invalid observability.admin_addr; admin endpoint disabled");
@@ -146,12 +153,18 @@ async fn serve_inner(
     // Active health checks (ADR 000017): a background supervisor probes each upstream instance and
     // flips its healthy/unhealthy state, so the round-robin in `proxy_core` only ever picks live
     // instances. Spawned like the reload loop — the server owns the task, Control owns the state.
-    tokio::spawn(serve_health_checks(state.control.clone()));
+    // Every supervisor observes the drain flag: in the binary the process exits anyway, but an
+    // embedder calling `serve_with_shutdown` must not be left with orphan tasks probing upstreams
+    // and holding `Control` alive after serve returns.
+    tokio::spawn(serve_health_checks(state.control.clone(), drain_rx.clone()));
 
     // Periodic DNS re-resolution of hostname upstreams (`resolve_interval_ms`): a second
     // supervisor beside the health checks, swapping each resolving group's endpoint set in place
     // (nginx `resolve` / Envoy STRICT_DNS shape). Idles cheaply when no upstream opts in.
-    tokio::spawn(crate::dns::serve_dns_refresh(state.control.clone()));
+    tokio::spawn(crate::dns::serve_dns_refresh(
+        state.control.clone(),
+        drain_rx.clone(),
+    ));
 
     // OTLP export pump (ADR 000040): drains the span buffer to the collector. The handle is kept
     // (unlike the fire-and-forget tasks above) so shutdown can await its final flush.
@@ -163,28 +176,31 @@ async fn serve_inner(
         ))
     });
 
-    if let Some(cfg) = quic_cfg {
-        match build_h3_endpoint(cfg, tcp_addr) {
-            Ok(endpoint) => {
-                tracing::info!(port = tcp_addr.port(), "HTTP/3 (QUIC) listener bound");
-                tokio::spawn(serve_h3(
-                    state.clone(),
-                    endpoint,
-                    drain_rx.clone(),
-                    drain_window,
-                ));
-            }
-            // a QUIC bind failure must not take down the TCP fast path; log and serve TCP only.
-            Err(e) => {
-                tracing::error!(error = %e, "failed to bind HTTP/3 listener; serving TCP only")
-            }
+    // The handle is kept (like `otlp_pump`) so shutdown can await the h3 drain — otherwise the
+    // closing CONNECTION_CLOSE flush can be cut by process exit and peers idle out instead of
+    // learning of the close.
+    let h3_task = quic_cfg.and_then(|cfg| match build_h3_endpoint(cfg, tcp_addr) {
+        Ok(endpoint) => {
+            tracing::info!(port = tcp_addr.port(), "HTTP/3 (QUIC) listener bound");
+            Some(tokio::spawn(serve_h3(
+                state.clone(),
+                endpoint,
+                drain_rx.clone(),
+                drain_window,
+            )))
         }
-    }
+        // a QUIC bind failure must not take down the TCP fast path; log and serve TCP only.
+        Err(e) => {
+            tracing::error!(error = %e, "failed to bind HTTP/3 listener; serving TCP only");
+            None
+        }
+    });
 
     // PROXY protocol v2 (ADR 000057): read once at startup, like the bind itself — `[listen]`
     // is fixed for the process lifetime, a reload does not change it. `Some` = every trusted
     // peer must present a v2 header (and only trusted peers may), `None` = feature off.
-    let proxy_trust = state.control.proxy_protocol_trust();
+    // `Arc` so the per-connection capture below is a refcount bump, not a CIDR-list clone.
+    let proxy_trust = state.control.proxy_protocol_trust().map(Arc::new);
     if proxy_trust.is_some() {
         tracing::info!(
             "PROXY protocol v2 enabled on the TCP listener (the h3/UDP listener is not covered — ADR 000057)"
@@ -238,7 +254,11 @@ async fn serve_inner(
         };
         // Disable Nagle downstream, symmetric with `upstream_connector`: a streamed response
         // relayed to the client in several writes must not stall on the peer's delayed-ACK timer.
-        let _ = stream.set_nodelay(true);
+        // A failure is survivable but operationally meaningful (Nagle staying on reproduces the
+        // documented ~40 ms p99 cliff), so it is logged instead of discarded.
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(error = %e, "set_nodelay failed; Nagle stays on for this connection");
+        }
         let state = state.clone();
         // The TLS config is read PER accept (ADR 000014): a reload's new certs apply to new
         // connections, while in-flight ones keep the cert they negotiated with. `None` → plain.
@@ -271,8 +291,19 @@ async fn serve_inner(
                 None => peer,
             };
             match tls {
-                Some(cfg) => match TlsAcceptor::from(cfg).accept(stream).await {
-                    Ok(tls_stream) => {
+                // The handshake is bounded like the h1 header read (pre-TLS slowloris): a client
+                // that connects and never completes its ClientHello would otherwise hold this
+                // task — and its `MAX_CONNECTIONS` permit — forever.
+                Some(cfg) => match tokio::time::timeout(
+                    INBOUND_HEADER_READ_TIMEOUT,
+                    TlsAcceptor::from(cfg).accept(stream),
+                )
+                .await
+                {
+                    Err(_elapsed) => {
+                        tracing::debug!(peer = %peer, "TLS handshake timed out");
+                    }
+                    Ok(Ok(tls_stream)) => {
                         // ALPN picks the protocol: `h2` → HTTP/2, anything else (`http/1.1`, or no
                         // ALPN) → HTTP/1.1 (ADR 000015 — h2 over TLS+ALPN only). The connection
                         // terminated TLS, so the chain sees `https`.
@@ -281,7 +312,7 @@ async fn serve_inner(
                     }
                     // a failed TLS handshake (incl. ALPN mismatch) just drops the connection
                     // (fail-closed; nothing is forwarded), it is not a server error.
-                    Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
+                    Ok(Err(e)) => tracing::debug!(error = %e, "TLS handshake failed"),
                 },
                 // plaintext: HTTP/1.1 only — no h2c / prior-knowledge (ADR 000015). `http` scheme.
                 None => serve_conn(state, TokioIo::new(stream), "http", false, peer, drain).await,
@@ -307,6 +338,12 @@ async fn serve_inner(
             "graceful shutdown: drain window expired; cutting remaining connections"
         );
         conns.abort_all();
+    }
+    // Await the h3 drain (bounded by its own window + a beat): serve_h3 closes its endpoint and
+    // flushes CONNECTION_CLOSE frames; returning before that flush completes would cut it in the
+    // binary (process exit) and leave h3 peers idling out instead of learning of the close.
+    if let Some(h3) = h3_task {
+        let _ = tokio::time::timeout(drain_window + Duration::from_secs(1), h3).await;
     }
     // Flush the OTLP queue before returning (the spec's Shutdown-includes-ForceFlush): the pump
     // saw the same drain flip and is flushing under its own deadline; give it that long plus a
@@ -350,6 +387,13 @@ async fn serve_conn<I>(
     let result = if h2 {
         let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+            // Detect dead h2 peers (the h2 sibling of h1's `header_read_timeout`): without a
+            // ping-based keep-alive, a client that completes the preface and vanishes holds its
+            // connection permit until the process exits. hyper's keep-alive only runs with a
+            // timer configured, so the timer is set here exactly like the h1 branch below.
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(Some(H2_KEEP_ALIVE_INTERVAL))
+            .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT)
             .serve_connection(io, service);
         tokio::pin!(conn);
         tokio::select! {

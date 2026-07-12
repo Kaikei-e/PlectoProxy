@@ -197,40 +197,40 @@ impl WasmtimeRuntime {
     }
 
     /// Call the guest's optional `on-request-body` export (world `filter-body`) on an
-    /// already-instantiated instance. Because the export is OPTIONAL it is looked up by index
-    /// (`idx`, resolved once at load) rather than through the base `filter` bindgen, then called
-    /// with the buffered body borrowed (zero extra host-side copy). The raw decision type is the
-    /// instance's bound contract version. The caller only reaches here for a body-reading filter
-    /// (`body_export` is `Some`). wasmtime 46 handles component `post-return` internally, so a
-    /// single `call_async` is the whole interaction.
+    /// already-instantiated instance, with the buffered body borrowed (zero extra host-side
+    /// copy). The raw decision type is the instance's bound contract version. The caller only
+    /// reaches here for a body-reading filter (`body_export` is `Some`, so `body_func` was
+    /// resolved and signature-validated at instantiation — Tenet 4: the lookup/type-check is
+    /// init work, not per-request work; a `TypedFunc` itself cannot be cached because its
+    /// borrowed `(&[u8],)` params would need a lifetime on the instance). wasmtime 46 handles
+    /// component `post-return` internally, so a single `call_async` is the whole interaction.
     pub(crate) fn call_body_hook(
         &self,
         inst: &mut WasmtimeInstance,
-        idx: &ComponentExportIndex,
         body: &[u8],
     ) -> wasmtime::Result<RequestBodyDecision> {
+        let Some(func) = inst.body_func else {
+            // Unreachable: the caller gates on `reads_body()`. Fail closed, never panic.
+            return Err(wasmtime::Error::msg(
+                "on-request-body called on a filter without a body export",
+            ));
+        };
         match &inst.filter {
             BoundFilter::V03(_) => {
                 use contract::types_v03::RequestBodyDecision as Raw;
-                let func = inst
-                    .instance
-                    .get_typed_func::<(&[u8],), (Raw,)>(&mut inst.store, idx)?;
+                let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
                 let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
                 request_body_decision_from_v03(decision).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V02(_) => {
                 use contract::types_v02::RequestBodyDecision as Raw;
-                let func = inst
-                    .instance
-                    .get_typed_func::<(&[u8],), (Raw,)>(&mut inst.store, idx)?;
+                let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
                 let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
                 request_body_decision_from_v02(decision).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V01(_) => {
                 use contract::types_v01::RequestBodyDecision as Raw;
-                let func = inst
-                    .instance
-                    .get_typed_func::<(&[u8],), (Raw,)>(&mut inst.store, idx)?;
+                let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
                 let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
                 request_body_decision_from_v01(decision).ok_or_else(invalid_guest_header_error)
             }
@@ -285,38 +285,61 @@ impl FilterRuntime for WasmtimeRuntime {
         // (ADR 000036). Two-step instantiate (raw instance + typed view) so the raw `Instance`
         // survives for the optional body-hook lookup; the typed `Filter` binding still drives the
         // required init / on-request / on-response, at whichever contract version `pre` targets.
-        match &self.pre {
+        let (filter, instance) = match &self.pre {
             FilterPreBinding::V03(pre) => {
                 let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
                 let filter = FilterV03::new(&mut store, &instance)?;
                 self.drive_call(filter.call_init(&mut store))?;
-                Ok(WasmtimeInstance {
-                    store,
-                    filter: BoundFilter::V03(filter),
-                    instance,
-                })
+                (BoundFilter::V03(filter), instance)
             }
             FilterPreBinding::V02(pre) => {
                 let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
                 let filter = FilterV02::new(&mut store, &instance)?;
                 self.drive_call(filter.call_init(&mut store))?;
-                Ok(WasmtimeInstance {
-                    store,
-                    filter: BoundFilter::V02(filter),
-                    instance,
-                })
+                (BoundFilter::V02(filter), instance)
             }
             FilterPreBinding::V01(pre) => {
                 let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
                 let filter = FilterV01::new(&mut store, &instance)?;
                 self.drive_call(filter.call_init(&mut store))?;
-                Ok(WasmtimeInstance {
-                    store,
-                    filter: BoundFilter::V01(filter),
-                    instance,
-                })
+                (BoundFilter::V01(filter), instance)
             }
-        }
+        };
+        // Resolve (and signature-check) the optional `on-request-body` export ONCE per instance
+        // (Tenet 4: init vs per-request): a body-hook call then only re-derives the typed view,
+        // never the export lookup, and a signature-mismatched guest fails here — at instantiate —
+        // instead of on its first request.
+        let body_func = match &self.body_export {
+            Some(idx) => {
+                let func = instance.get_func(&mut store, idx).ok_or_else(|| {
+                    anyhow::anyhow!("on-request-body export index did not resolve to a function")
+                })?;
+                match &filter {
+                    BoundFilter::V03(_) => {
+                        func.typed::<(&[u8],), (contract::types_v03::RequestBodyDecision,)>(
+                            &store,
+                        )?;
+                    }
+                    BoundFilter::V02(_) => {
+                        func.typed::<(&[u8],), (contract::types_v02::RequestBodyDecision,)>(
+                            &store,
+                        )?;
+                    }
+                    BoundFilter::V01(_) => {
+                        func.typed::<(&[u8],), (contract::types_v01::RequestBodyDecision,)>(
+                            &store,
+                        )?;
+                    }
+                }
+                Some(func)
+            }
+            None => None,
+        };
+        Ok(WasmtimeInstance {
+            store,
+            filter,
+            body_func,
+        })
     }
 
     fn begin_request(&self, instance: &mut WasmtimeInstance) {
@@ -349,9 +372,9 @@ pub(crate) enum BoundFilter {
 pub(crate) struct WasmtimeInstance {
     pub(crate) store: Store<HostState>,
     pub(crate) filter: BoundFilter,
-    /// The raw component instance, kept so the optional `on-request-body` export (world
-    /// `filter-body`, not part of the base `filter` bindgen) can be looked up and called by index.
-    pub(crate) instance: wasmtime::component::Instance,
+    /// The optional `on-request-body` export (world `filter-body`, not part of the base `filter`
+    /// bindgen), resolved once at instantiation — `Some` iff the runtime's `body_export` is.
+    pub(crate) body_func: Option<wasmtime::component::Func>,
 }
 
 /// Block on `fut` under a wall-clock `deadline` (the outbound-TCP I/O bound, ADR 000060). A

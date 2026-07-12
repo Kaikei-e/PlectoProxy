@@ -210,11 +210,10 @@ impl Host for TcpLookupView<'_> {
         }
         let inner = inner.clone();
         let task = wasmtime_wasi::runtime::spawn(async move {
-            let addrs = inner
-                .resolver
-                .resolve(&lower, 0)
-                .await
-                .map_err(|()| SocketError::from(ErrorCode::NameUnresolvable))?;
+            let addrs = inner.resolver.resolve(&lower, 0).await.map_err(|e| {
+                tracing::debug!(host = %lower, error = %e, "outbound-tcp DNS resolution failed");
+                SocketError::from(ErrorCode::NameUnresolvable)
+            })?;
             if addrs.is_empty() {
                 return Err(ErrorCode::NameUnresolvable.into());
             }

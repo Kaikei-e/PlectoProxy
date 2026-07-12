@@ -34,7 +34,8 @@ fn main() {
     // Fixture guests (test_support's env!() consts): built ONLY when `test-support` is on, so a
     // plain production build of this crate (or of a dependent crate's default build) never touches
     // wasm32-unknown-unknown or these guest sources (some of which live outside `plecto/`).
-    if std::env::var("CARGO_FEATURE_TEST_SUPPORT").is_ok() {
+    let test_support = std::env::var("CARGO_FEATURE_TEST_SUPPORT").is_ok();
+    if test_support {
         // Each guest crate → a componentized `plecto:filter`, exposed to `test_support` via an env
         // var. filter-hello is the conformance fixture; filter-apikey is the real-world example
         // (auth gate).
@@ -98,10 +99,18 @@ fn main() {
         );
     }
 
+    // The wasip2 fixture guests below are ALSO test fixtures (their bytes are only ever read by
+    // `test_support`'s cfg-gated accessors and the feature-gated integration tests), so they too
+    // build only under `test-support` — a production `--features capabilities` build must not
+    // require wasm32-wasip2 or the guest sources. release.yml's binaries job compiles in a plain
+    // rust:bookworm container with no wasm targets installed; gating on the capability feature
+    // alone made that job the first place the gap could surface (E0463, v0.3.2 first attempt),
+    // because ci.yml's release-parity environment does install the targets.
+
     // Experimental streaming body filter (feature `streaming-body`, OFF by default): build the
     // filter-streaming guest for wasm32-wasip2, which emits a Component directly (no wit-component
     // wrap). Only when the feature is on, so the default build never touches wasm32-wasip2.
-    if std::env::var("CARGO_FEATURE_STREAMING_BODY").is_ok() {
+    if test_support && std::env::var("CARGO_FEATURE_STREAMING_BODY").is_ok() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-streaming"),
@@ -114,7 +123,7 @@ fn main() {
     // ext_authz-style guest imports wasi:http/outgoing-handler, so it builds for wasm32-wasip2.
     // filter-jwt (ADR 000070) is the same target: JWKS-at-init uses outbound; the static PEM/JWK
     // path simply never calls it.
-    if std::env::var("CARGO_FEATURE_OUTBOUND_HTTP").is_ok() {
+    if test_support && std::env::var("CARGO_FEATURE_OUTBOUND_HTTP").is_ok() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-extauthz"),
@@ -131,7 +140,7 @@ fn main() {
 
     // Outbound TCP capability (ADR 000060, feature `outbound-tcp`, OFF by default): the TCP-gate
     // guest imports wasi:sockets, so it builds for wasm32-wasip2.
-    if std::env::var("CARGO_FEATURE_OUTBOUND_TCP").is_ok() {
+    if test_support && std::env::var("CARGO_FEATURE_OUTBOUND_TCP").is_ok() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-tcp-gate"),
@@ -176,7 +185,8 @@ fn build_wasip2_component(cargo: &str, guest: &Path, stem: &str, env_var: &str) 
     if !status.success() {
         panic!(
             "building {} for wasm32-wasip2 failed.\n\
-             The streaming-body feature needs the wasm32-wasip2 target:\n    \
+             The wasip2 fixture guests (streaming-body / outbound-http / outbound-tcp test\n\
+             fixtures) need the wasm32-wasip2 target:\n    \
              rustup target add wasm32-wasip2",
             guest.display()
         );

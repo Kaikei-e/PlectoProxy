@@ -35,6 +35,24 @@ impl Upstream {
     /// `[upstream.hash]` correspondence, and (for Maglev) the hash key and table size. Returns the
     /// reason a caller wraps with the upstream name.
     pub(crate) fn validate_lb(&self) -> Result<(), String> {
+        // Health-probe timing: a config typo must not reach the arithmetic (the same rationale as
+        // every other zero rejection here). `interval_ms = 0` would clamp to a 1 ms probe loop
+        // (~1000 probes/s per instance — a self-inflicted upstream DoS); `timeout_ms = 0` makes
+        // every probe fail, so instances stay pessimistic forever (permanent 503) with no
+        // build-time diagnostic.
+        if self.health.interval_ms == 0 {
+            return Err(
+                "[upstream.health] interval_ms must be >= 1 (0 would probe in a busy loop)"
+                    .to_string(),
+            );
+        }
+        if self.health.timeout_ms == 0 {
+            return Err(
+                "[upstream.health] timeout_ms must be >= 1 (0 fails every probe, so no instance \
+                 could ever become healthy)"
+                    .to_string(),
+            );
+        }
         for spec in &self.addresses {
             let w = spec.weight();
             if w == 0 {

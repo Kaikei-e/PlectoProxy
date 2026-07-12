@@ -114,10 +114,14 @@ pub struct Manifest {
     #[serde(default, skip_serializing)]
     pub observability: Observability,
     /// `[listen]`: the data-plane bind address + h3 advertisement (moka-1 field report §3.2/§3.4).
-    /// Captured at construction like `[observability]` — the listener binds once at startup, so a
-    /// reload does not re-bind (restart to move the listener); `skip_serializing` keeps it out of
-    /// the semantic `content_hash` for the same reason.
-    #[serde(default, skip_serializing)]
+    /// Mostly captured at construction like `[observability]` (the listener binds once at
+    /// startup, so a reload does not re-bind — restart to move the listener), and those fields
+    /// stay out of the semantic `content_hash` via field-level `skip_serializing` in `Listen`.
+    /// The exception is `listen.client_auth`, which `build_active` consumes on every reload and
+    /// therefore rides the hash (see `Listen`'s serialization note) — the section as a whole is
+    /// only skipped when it hashes to nothing anyway (no client_auth), preserving existing
+    /// config versions.
+    #[serde(default, skip_serializing_if = "Listen::content_hash_exempt")]
     pub listen: Listen,
 }
 

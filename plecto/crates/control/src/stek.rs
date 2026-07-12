@@ -334,7 +334,11 @@ fn read_and_derive(path: &Path, cert_binding: &[u8; 32]) -> Result<DerivedKeys, 
     let mtime = metadata
         .modified()
         .map_err(|e| format!("mtime unavailable: {e}"))?;
-    let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
+    // `Zeroizing`: the raw IKM is re-read on every rotation check — the freed buffer must not
+    // retain key material (the crate is meticulous about file permissions; the memory copy gets
+    // the same treatment).
+    let bytes =
+        zeroize::Zeroizing::new(std::fs::read(path).map_err(|e| format!("read failed: {e}"))?);
     if bytes.len() != STEK_FILE_LEN {
         return Err(format!(
             "must be exactly {STEK_FILE_LEN} raw random bytes (openssl rand {STEK_FILE_LEN}), got {}",
@@ -365,6 +369,13 @@ fn derive(ikm: &[u8], cert_binding: &[u8; 32], mtime: SystemTime) -> Result<Deri
         .and_then(PaddedBlockDecryptingKey::cbc_pkcs7)
         .map_err(|_| "AES decrypt key init failed".to_string())?;
     let mac = hmac::Key::new(hmac::HMAC_SHA256, &mac_key);
+    // The aws-lc-rs key objects hold their own copies now; wipe the stack buffers (`key_name` is
+    // not secret — it rides in every ticket).
+    {
+        use zeroize::Zeroize;
+        aes_key.zeroize();
+        mac_key.zeroize();
+    }
     Ok(DerivedKeys {
         key_name,
         enc,

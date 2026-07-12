@@ -76,6 +76,15 @@ impl Control {
         // Cheap idempotency gate: skip the rebuild + drain entirely when the config version
         // is unchanged (a comment-only edit, or a spurious trigger).
         if new_hash == self.active.load().hash {
+            // Deliberate ADR 000014 sharp edge, surfaced instead of silent: only cert/key PATHS
+            // ride the content hash, so an in-place certificate renewal (certbot overwriting the
+            // same files) + SIGHUP lands here and the new certs are NOT re-read. The log tells
+            // the operator why, instead of leaving them to believe the renewal took effect.
+            tracing::info!(
+                config_version = %new_hash,
+                "reload: config version unchanged — no rebuild; note that referenced files \
+                 (TLS certs/keys) are not re-read on an unchanged version (ADR 000014)"
+            );
             return Ok(ReloadOutcome::Unchanged);
         }
         // Build the new set fully before swapping; on failure the running set is untouched.

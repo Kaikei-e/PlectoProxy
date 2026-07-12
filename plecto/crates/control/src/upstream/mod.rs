@@ -237,6 +237,16 @@ impl UpstreamGroup {
     /// Maglev table indexes the new set). Returns `false` (and swaps nothing) when the set is
     /// unchanged, so an idle refresh tick costs one atomic load and a compare.
     pub fn update_endpoints(&self, resolved: &[(String, u32)]) -> bool {
+        // An empty set never replaces a serving one (API hardening — the shipped DNS supervisor
+        // never passes one, but a public method must not be a foot-gun): keep the last-known-good
+        // endpoints, exactly like a failed re-resolution does.
+        if resolved.is_empty() {
+            tracing::warn!(
+                upstream = %self.name,
+                "update_endpoints called with an empty set; keeping the current endpoints"
+            );
+            return false;
+        }
         let current = self.endpoints.load();
         let unchanged = current.instances.len() == resolved.len()
             && current

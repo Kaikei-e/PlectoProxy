@@ -69,6 +69,73 @@ pub(crate) struct CompiledRoute {
     pub(crate) compression: Option<Arc<CompressionConfig>>,
 }
 
+impl CompiledRoute {
+    /// Compile one already-validated manifest route (ADR 000013 / 000034): pre-normalise the
+    /// match dimensions, resolve the chain against the loaded filters, and build the per-route
+    /// facilities (native limiter / upgrade / compression). Lives beside the struct so the
+    /// knowledge of a `CompiledRoute`'s shape stays in this file (`build_active` previously
+    /// inlined the whole block).
+    pub(crate) fn compile(
+        r: &Route,
+        backends: WeightedBackends,
+        filters: &std::collections::HashMap<String, Arc<LoadedFilter>>,
+    ) -> Self {
+        Self {
+            // Pre-normalise the compiled match dimensions so per-request matching is
+            // allocation-free (ADR 000034): host + header names lower-cased (case-insensitive),
+            // method upper-cased (exact upper-case token), query names kept as-is
+            // (case-sensitive).
+            host: r.matcher.host.as_ref().map(|h| h.to_ascii_lowercase()),
+            path_prefix: r.matcher.path_prefix.clone(),
+            method: r.matcher.method.as_ref().map(|m| m.to_ascii_uppercase()),
+            headers: r
+                .matcher
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                .collect(),
+            query: r
+                .matcher
+                .query
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            // The route buffers the body iff at least one of its filters exports
+            // `on-request-body` (ADR 000038). Computed from the loaded filters here so the fast
+            // path only checks a bool.
+            reads_body: r
+                .filters
+                .iter()
+                .any(|id| filters.get(id).is_some_and(|f| f.reads_body())),
+            // present: `validate_routes` already checked every id against the loaded set, so
+            // this is always `Some` — `filter_map` stays total (no indexing/unwrap panic)
+            // rather than asserting an invariant that's already enforced one step earlier.
+            resolved_chain: r
+                .filters
+                .iter()
+                .filter_map(|id| filters.get(id).cloned())
+                .collect(),
+            filters: r.filters.clone(),
+            backends: Arc::new(backends),
+            // Built once per reload (unlike the per-request `RouteInfo` clone in `snapshot.rs`),
+            // so allocating here to convert into the per-request-cheap `Arc<str>` is fine.
+            strip_prefix: r.strip_prefix.as_deref().map(Arc::from),
+            // Build the native limiter (ADR 000033) — `rate`/`burst` were validated non-zero.
+            rate_limit: r.rate_limit.map(|rl| Arc::new(NativeRateLimit::new(rl))),
+            // Compile the Upgrade opt-in (ADR 000048) — tokens were validated non-empty/non-h2c.
+            upgrade: r
+                .upgrade
+                .as_ref()
+                .map(|u| Arc::new(UpgradeConfig::new(&u.protocols, u.idle_timeout_ms))),
+            // Compile the compression opt-in (ADR 000074) — codings / allowlist validated.
+            compression: r
+                .compression
+                .as_ref()
+                .map(|c| Arc::new(CompressionConfig::new(c))),
+        }
+    }
+}
+
 // Manual `Debug`: `LoadedFilter` (behind `resolved_chain`'s `Arc`) doesn't implement it, so this
 // can't be `#[derive(Debug)]`. Reports `resolved_chain` by length — the same information `filters`
 // (the id list, printed in full) already carries, just resolved.
@@ -391,7 +458,10 @@ fn normalize_host(authority: &str) -> &str {
     let host = if let Some(rest) = authority.strip_prefix('[') {
         // `[::1]:8080` → `[::1]`
         match rest.split_once(']') {
-            Some((inner, _)) => &authority[..inner.len() + 2],
+            // In-bounds by construction (`authority = "[" + inner + "]" + rest`, ASCII
+            // delimiters), but stay total anyway — this is the request hot path, and `get` keeps
+            // it panic-free under the crate's `indexing_slicing` discipline without an `allow`.
+            Some((inner, _)) => authority.get(..inner.len() + 2).unwrap_or(authority),
             None => authority,
         }
     } else {
@@ -587,6 +657,11 @@ pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts<'_>) -> Option
 /// original). Leaves the path unchanged if it does not start with `strip`; always keeps a
 /// leading `/`. `/api` stripped from `/api/users` → `/users`; from `/api` → `/`. The unchanged
 /// and clean-strip cases are borrowed — no allocation on the request path.
+///
+/// The strip is SEGMENT-boundary strict, mirroring `path_under_prefix`'s discipline: `/api`
+/// strips from `/api` and `/api/…` but NOT from `/apix/…` — a mid-segment strip would forward
+/// `/apix/y` as `/x/y`, an origin-side path confusion (CWE-436-adjacent) whenever `strip_prefix`
+/// is laxer than the route's `path_prefix`.
 pub(crate) fn rewrite_path<'a>(path: &'a str, strip: Option<&str>) -> Cow<'a, str> {
     let Some(strip) = strip else {
         return Cow::Borrowed(path);
@@ -598,8 +673,13 @@ pub(crate) fn rewrite_path<'a>(path: &'a str, strip: Option<&str>) -> Cow<'a, st
         Cow::Borrowed("/")
     } else if rest.starts_with('/') {
         Cow::Borrowed(rest)
-    } else {
+    } else if strip.ends_with('/') {
+        // The strip consumed the boundary slash (`/api/` from `/api/users`): still a segment
+        // match — re-add the leading `/`.
         Cow::Owned(format!("/{rest}"))
+    } else {
+        // Mid-segment "prefix" (`/api` vs `/apix/y`): not a path-segment match — don't strip.
+        Cow::Borrowed(path)
     }
 }
 
@@ -1049,6 +1129,20 @@ mod tests {
         assert_eq!(rewrite_path("/api/", Some("/api")), "/");
         assert_eq!(rewrite_path("/other", Some("/api")), "/other", "no strip");
         assert_eq!(rewrite_path("/api/x", None), "/api/x", "no rule");
+    }
+
+    #[test]
+    fn strip_prefix_is_segment_boundary_strict() {
+        // Regression (large-review finding): `/api` must NOT strip mid-segment from `/apix/y` —
+        // forwarding it as `/x/y` would be an origin-side path confusion (CWE-436-adjacent),
+        // inconsistent with `path_under_prefix`'s boundary discipline.
+        assert_eq!(
+            rewrite_path("/apix/y", Some("/api")),
+            "/apix/y",
+            "a mid-segment match must not strip"
+        );
+        // A strip ending in `/` consumed the boundary slash — still a segment match.
+        assert_eq!(rewrite_path("/api/users", Some("/api/")), "/users");
     }
 
     #[test]

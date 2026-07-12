@@ -48,6 +48,16 @@ impl MaglevTable {
     #[allow(clippy::indexing_slicing)]
     pub(crate) fn build(entries: &[(&str, u32)], m: usize) -> Self {
         let n = entries.len();
+        // Guard the documented preconditions instead of trusting every caller forever: an empty
+        // entry set (or all-zero weights) would make the fill loop below spin FOREVER (`filled`
+        // can never reach `m` when no backend ever takes a turn) — a permanent 100%-CPU hang, not
+        // a panic, so the crate's no-panic discipline alone doesn't cover it. An empty table is
+        // safe: `lookup` on it returns `None` and the caller falls back to round-robin.
+        if n == 0 || entries.iter().all(|(_, w)| *w == 0) || m < 2 {
+            return Self {
+                table: Box::default(),
+            };
+        }
         // Per-backend permutation parameters from two independent hashes (the 128-bit halves).
         let mut offset = vec![0usize; n];
         let mut skip = vec![0usize; n];

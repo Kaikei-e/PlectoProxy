@@ -72,22 +72,36 @@ impl Control {
         // the content hash below.
         self.ensure_trust_unchanged(&manifest)?;
         self.ensure_state_unchanged(&manifest)?;
-        let new_hash = manifest.content_hash()?;
-        // Cheap idempotency gate: skip the rebuild + drain entirely when the config version
-        // is unchanged (a comment-only edit, or a spurious trigger).
-        if new_hash == self.active.load().hash {
-            // Deliberate ADR 000014 sharp edge, surfaced instead of silent: only cert/key PATHS
-            // ride the content hash, so an in-place certificate renewal (certbot overwriting the
-            // same files) + SIGHUP lands here and the new certs are NOT re-read. The log tells
-            // the operator why, instead of leaving them to believe the renewal took effect.
-            tracing::info!(
-                config_version = %new_hash,
-                "reload: config version unchanged — no rebuild; note that referenced files \
-                 (TLS certs/keys) are not re-read on an unchanged version (ADR 000014)"
-            );
-            return Ok(ReloadOutcome::Unchanged);
+        // Cheap idempotency gate: skip the rebuild + drain entirely when the config version is
+        // unchanged (a comment-only edit, or a spurious trigger). A version that cannot be
+        // computed (the client-auth CA momentarily unreadable, e.g. mid-rotation) falls through
+        // to the full build instead of failing a possibly-idempotent SIGHUP outright — the build
+        // re-reads the CA and fails closed with the precise error if the problem persists.
+        match manifest.content_hash_at(Some(&self.base_dir)) {
+            Ok(new_hash) if new_hash == self.active.load().hash => {
+                // Deliberate ADR 000014 sharp edge for paths that are NOT file-digested yet
+                // (e.g. [[tls]] cert/key in-place renewals): an unchanged version does not
+                // re-read those files. `[listen.client_auth].ca_path` bytes ARE mixed into the
+                // version, so in-place CA rotation does flip and rebuild.
+                tracing::info!(
+                    config_version = %new_hash,
+                    "reload: config version unchanged — no rebuild; note that referenced files \
+                     without a content digest in the version (TLS certs/keys) are not re-read \
+                     on an unchanged version (ADR 000014); client_auth CA bytes are digested"
+                );
+                return Ok(ReloadOutcome::Unchanged);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "reload: config version unavailable — attempting the full rebuild"
+                );
+            }
         }
-        // Build the new set fully before swapping; on failure the running set is untouched.
+        // Build the new set fully before swapping; on failure the running set is untouched. The
+        // outcome carries the hash the build computed (from the SAME CA read as its verifier),
+        // not the gate's — the two could differ if the CA file changed in between.
         let active = build_active(
             &self.host,
             &manifest,
@@ -95,8 +109,9 @@ impl Control {
             &self.base_dir,
             &self.upstreams,
         )?;
+        let hash = active.hash.clone();
         self.active.store(Arc::new(active));
-        Ok(ReloadOutcome::Reloaded { hash: new_hash })
+        Ok(ReloadOutcome::Reloaded { hash })
     }
 
     /// The active config's `content_hash` (ADR 000008 `config version`): the audit identity of

@@ -174,9 +174,33 @@ fn is_field_value_byte(b: u8) -> bool {
     b == b'\t' || (b >= 0x20 && b != 0x7f)
 }
 
+/// Hop-by-hop names (RFC 9110 §7.6.1) a guest cannot meaningfully set — the fast path strips
+/// them at egress. Kept in sync with the strip list in `plecto-server::headers`. The mappers
+/// DROP these instead of failing the decision: the observable behavior (the header never
+/// reaches the peer) is what deployments already had, whereas failing closed would turn a
+/// filter that harmlessly sets `Connection: close` into an every-request `InvalidOutput`.
+const HOP_BY_HOP_GUEST_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+];
+
+fn is_hop_by_hop_guest_header(name: &str) -> bool {
+    HOP_BY_HOP_GUEST_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
 /// Validate a guest-supplied header (guest output is untrusted): reject CRLF / CTLs / non-tchar
 /// names / oversize, fail-closed instead of trapping. Alignment with hyper's accepted sets means
-/// everything admitted here survives egress byte-for-byte.
+/// everything admitted here survives egress byte-for-byte. Hop-by-hop names never reach this
+/// gate — the mappers below drop them first (see [`HOP_BY_HOP_GUEST_HEADERS`]).
 fn validate_and_header(name: &str, value: &[u8]) -> Option<Header> {
     if name.is_empty() || name.len() > MAX_GUEST_HEADER_NAME_LEN {
         return None;
@@ -200,6 +224,7 @@ fn request_edit_from_v01(edit: types_v01::RequestEdit) -> Option<RequestEdit> {
     let set_headers = edit
         .set_headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v01)
         .collect::<Option<Vec<_>>>()?;
     Some(RequestEdit {
@@ -212,6 +237,7 @@ fn request_edit_from_v02(edit: types_v02::RequestEdit) -> Option<RequestEdit> {
     let set_headers = edit
         .set_headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v02)
         .collect::<Option<Vec<_>>>()?;
     Some(RequestEdit {
@@ -224,6 +250,7 @@ fn response_edit_from_v01(edit: types_v01::ResponseEdit) -> Option<ResponseEdit>
     let set_headers = edit
         .set_headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v01)
         .collect::<Option<Vec<_>>>()?;
     Some(ResponseEdit {
@@ -240,6 +267,7 @@ fn response_edit_from_v02(edit: types_v02::ResponseEdit) -> Option<ResponseEdit>
     let set_headers = edit
         .set_headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v02)
         .collect::<Option<Vec<_>>>()?;
     Some(ResponseEdit {
@@ -256,6 +284,7 @@ fn request_edit_from_v03(edit: types_v03::RequestEdit) -> Option<RequestEdit> {
     let set_headers = edit
         .set_headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v03)
         .collect::<Option<Vec<_>>>()?;
     Some(RequestEdit {
@@ -268,6 +297,7 @@ fn response_edit_from_v03(edit: types_v03::ResponseEdit) -> Option<ResponseEdit>
     let set_headers = edit
         .set_headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v03)
         .collect::<Option<Vec<_>>>()?;
     Some(ResponseEdit {
@@ -300,6 +330,7 @@ fn response_from_v01(resp: types_v01::HttpResponse) -> Option<HttpResponse> {
     let headers = resp
         .headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v01)
         .collect::<Option<Vec<_>>>()?;
     Some(HttpResponse {
@@ -313,6 +344,7 @@ fn response_from_v02(resp: types_v02::HttpResponse) -> Option<HttpResponse> {
     let headers = resp
         .headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v02)
         .collect::<Option<Vec<_>>>()?;
     Some(HttpResponse {
@@ -326,6 +358,7 @@ fn response_from_v03(resp: types_v03::HttpResponse) -> Option<HttpResponse> {
     let headers = resp
         .headers
         .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
         .map(header_from_v03)
         .collect::<Option<Vec<_>>>()?;
     Some(HttpResponse {
@@ -618,6 +651,70 @@ mod tests {
         assert!(validate_and_header("x", b"a\rb").is_none());
         assert!(validate_and_header("x", b"a\nb").is_none());
         assert!(validate_and_header("x", b"ok").is_some());
+    }
+
+    #[test]
+    fn hop_by_hop_guest_headers_are_dropped_not_fatal() {
+        // RFC 9110 §7.6.1 names never survive the proxy (the fast path strips them at egress),
+        // so the mappers drop them instead of failing the whole decision — a deployed filter
+        // that harmlessly sets `Connection: close` must not start failing every request.
+        let edit = types_v03::RequestDecision::Modified(types_v03::RequestEdit {
+            set_headers: vec![
+                types_v03::Header {
+                    name: "Connection".to_string(),
+                    value: b"close".to_vec(),
+                },
+                types_v03::Header {
+                    name: "x-user".to_string(),
+                    value: b"alice".to_vec(),
+                },
+            ],
+            remove_headers: vec![],
+        });
+        match request_decision_from_v03(edit) {
+            Some(RequestDecision::Modified(edit)) => {
+                assert_eq!(
+                    edit.set_headers.len(),
+                    1,
+                    "hop-by-hop dropped, the rest kept"
+                );
+                assert_eq!(edit.set_headers[0].name, "x-user");
+            }
+            other => panic!("expected Modified, got {other:?}"),
+        }
+        for name in [
+            "Keep-Alive",
+            "transfer-encoding",
+            "proxy-authorization",
+            "TE",
+            "upgrade",
+        ] {
+            let sc = types_v03::RequestDecision::ShortCircuit(types_v03::HttpResponse {
+                status: 200,
+                headers: vec![types_v03::Header {
+                    name: name.to_string(),
+                    value: b"x".to_vec(),
+                }],
+                body: Vec::new(),
+            });
+            match request_decision_from_v03(sc) {
+                Some(RequestDecision::ShortCircuit(resp)) => {
+                    assert!(resp.headers.is_empty(), "{name} must be dropped, not fatal");
+                }
+                other => panic!("expected ShortCircuit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validated_guest_status_accepts_only_http_range() {
+        assert_eq!(validated_guest_status(100), Some(100));
+        assert_eq!(validated_guest_status(200), Some(200));
+        assert_eq!(validated_guest_status(599), Some(599));
+        assert_eq!(validated_guest_status(99), None);
+        assert_eq!(validated_guest_status(600), None);
+        assert_eq!(validated_guest_status(0), None);
+        assert_eq!(validated_guest_status(1000), None);
     }
 
     #[test]

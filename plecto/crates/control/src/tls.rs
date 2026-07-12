@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use rustls::ServerConfig;
 use rustls::crypto::aws_lc_rs as provider;
@@ -21,6 +21,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, NoServerSessionStorage, ProducesTickets, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use sha2::{Digest, Sha256};
 
 use crate::error::ControlError;
 use crate::manifest::{ClientAuth, Resumption, TlsCert};
@@ -62,6 +63,11 @@ impl ResolvesServerCert for SniResolver {
 /// and, critically, surviving manifest reloads: rebuilding the `ServerConfig`s must not invalidate
 /// outstanding tickets. Keys live in process memory only, node-local (ADR 000053) — never on disk,
 /// never in the manifest.
+///
+/// **Exception — `[listen.client_auth]`:** when mTLS gates access, the build uses a per-CA-content
+/// ticketer (`client_auth_ticketer`), never this process-wide producer. TLS 1.3 PSK resumption
+/// skips CertificateRequest, so ticket keys must be isolated from the anonymous context and
+/// rotate with the trust roots that authenticated the peer.
 fn shared_ticketer() -> Result<Arc<dyn ProducesTickets>, ControlError> {
     static TICKETER: OnceLock<Arc<dyn ProducesTickets>> = OnceLock::new();
     if let Some(ticketer) = TICKETER.get() {
@@ -75,6 +81,31 @@ fn shared_ticketer() -> Result<Arc<dyn ProducesTickets>, ControlError> {
         reason: format!("session-ticket key init: {e}"),
     })?;
     Ok(TICKETER.get_or_init(|| fresh).clone())
+}
+
+/// Ticket producer for an mTLS-enabled build, keyed by the CA bundle's content digest: a reload
+/// that leaves the CA bytes unchanged keeps outstanding tickets resumable (no full-handshake
+/// stampede for an unrelated config edit), while a CA rotation re-keys so no ticket outlives the
+/// trust roots that authenticated its peer (TLS 1.3 PSK resumption skips CertificateRequest).
+/// Never the process-wide anonymous ticketer: an anonymous-era ticket must not resume once
+/// client_auth gates access. The map holds one entry per distinct CA content seen this process —
+/// operator-driven rotations, so bounded in practice.
+fn client_auth_ticketer(ca_bytes: &[u8]) -> Result<Arc<dyn ProducesTickets>, ControlError> {
+    type ByCaDigest = HashMap<[u8; 32], Arc<dyn ProducesTickets>>;
+    static BY_CA: LazyLock<parking_lot::Mutex<ByCaDigest>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    let digest: [u8; 32] = Sha256::digest(ca_bytes).into();
+    let mut by_ca = BY_CA.lock();
+    if let Some(ticketer) = by_ca.get(&digest) {
+        return Ok(ticketer.clone());
+    }
+    let fresh = provider::Ticketer::new().map_err(|e| ControlError::TlsCert {
+        host: None,
+        path: String::new(),
+        reason: format!("client-auth session-ticket key init: {e}"),
+    })?;
+    by_ca.insert(digest, fresh.clone());
+    Ok(fresh)
 }
 
 /// The TLS configs built from `[[tls]]`: the TCP config (HTTP/1.1 + HTTP/2 via ALPN, ADR 000015)
@@ -92,10 +123,14 @@ pub(crate) struct TlsConfigs {
 /// duplicate cert is a fail-closed `ControlError` that aborts the caller's build (ADR 000014). The
 /// TCP config advertises ALPN `[h2, http/1.1]` (h2 preferred, ADR 000015); the QUIC config
 /// advertises `[h3]` and is TLS-1.3 only (QUIC mandates 1.3, RFC 9001). Both share one `SniResolver`.
+///
+/// `client_auth` carries the CA bundle's bytes alongside the manifest section: the caller reads
+/// the file ONCE (`Manifest::read_client_auth_ca`) and shares it between the config version and
+/// the verifier built here, so the two can never describe different trust roots.
 pub(crate) fn build_server_configs(
     entries: &[TlsCert],
     resumption: Option<&Resumption>,
-    client_auth: Option<&ClientAuth>,
+    client_auth: Option<(&ClientAuth, &[u8])>,
     base_dir: &Path,
 ) -> Result<Option<TlsConfigs>, ControlError> {
     // ADR 000062 (b) / 000078: TLS 1.3 resumption accepts a ticket without re-running
@@ -127,7 +162,7 @@ pub(crate) fn build_server_configs(
         }
         // Same shape for `[listen.client_auth]`: there is no TLS handshake to authenticate a
         // client on, so the section is a mistake, not a no-op.
-        if let Some(auth) = client_auth {
+        if let Some((auth, _)) = client_auth {
             return Err(ControlError::ClientAuthCa {
                 path: auth.ca_path.clone(),
                 reason: "[listen.client_auth] requires at least one [[tls]] cert — a plain-HTTP \
@@ -167,20 +202,23 @@ pub(crate) fn build_server_configs(
     // per-node process-lifetime key (ADR 000052); `[resumption]` swaps in the shared cert-bound
     // ticketer (ADR 000062) — rebuilt each build, which is safe because its keys are a pure
     // function of (key file, cert set): unchanged inputs re-derive the same keys across reloads.
-    let ticketer: Arc<dyn ProducesTickets> = match resumption {
-        Some(resumption) => SharedStekTicketer::from_manifest(
+    // `[listen.client_auth]` uses the per-CA-content ticketer: a CA rotation re-keys (PSK
+    // resumption must not outlive the verifier), an unrelated reload keeps tickets valid.
+    let ticketer: Arc<dyn ProducesTickets> = match (resumption, client_auth) {
+        (Some(resumption), _) => SharedStekTicketer::from_manifest(
             resumption,
             base_dir,
             cert_set_binding(&all_certified, resumption)?,
         )?,
-        None => shared_ticketer()?,
+        (None, Some((_, ca_bytes))) => client_auth_ticketer(ca_bytes)?,
+        (None, None) => shared_ticketer()?,
     };
 
     // Downstream client-certificate verification ([listen.client_auth], ADR 000078): one
     // required-mode verifier for BOTH configs — the granularity is the listener, and TCP + QUIC
     // are two wire faces of the same one. `None` = today's no-client-auth listener.
     let client_verifier = client_auth
-        .map(|auth| build_client_verifier(auth, base_dir))
+        .map(|(auth, ca_bytes)| build_client_verifier(auth, ca_bytes))
         .transpose()?;
 
     // TCP: HTTP/1.1 + HTTP/2 via ALPN (h2 preferred, ADR 000015), TLS 1.2 + 1.3.
@@ -236,15 +274,13 @@ pub(crate) fn build_server_configs(
 /// declared deferral.
 fn build_client_verifier(
     auth: &ClientAuth,
-    base_dir: &Path,
+    ca_bytes: &[u8],
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, ControlError> {
     let err = |reason: String| ControlError::ClientAuthCa {
         path: auth.ca_path.clone(),
         reason,
     };
-    let bytes = std::fs::read(base_dir.join(&auth.ca_path))
-        .map_err(|e| err(format!("read failed: {e}")))?;
-    let certs = CertificateDer::pem_slice_iter(&bytes)
+    let certs = CertificateDer::pem_slice_iter(ca_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| err(format!("bad CA PEM: {e}")))?;
     if certs.is_empty() {
@@ -329,8 +365,12 @@ pub(crate) fn build_upstream_client_config(
             }
             let key_file = base_dir.join(key_path);
             owner_only(&key_file).map_err(|reason| cerr(key_path, reason))?;
-            let key_bytes = std::fs::read(&key_file)
-                .map_err(|e| cerr(key_path, format!("read failed: {e}")))?;
+            // Same Zeroizing discipline as `read_key` for [[tls]] server keys: wipe the source
+            // PEM buffer after `PrivateKeyDer` has copied the material.
+            let key_bytes = zeroize::Zeroizing::new(
+                std::fs::read(&key_file)
+                    .map_err(|e| cerr(key_path, format!("read failed: {e}")))?,
+            );
             let key = PrivateKeyDer::from_pem_slice(&key_bytes)
                 .map_err(|e| cerr(key_path, format!("bad key PEM: {e}")))?;
             builder
@@ -880,13 +920,75 @@ mod tests {
     }
 
     #[test]
+    fn client_auth_ticketer_is_isolated_and_rotates_with_the_ca() {
+        // mTLS builds must not share the process-wide anonymous ticketer: enabling client_auth
+        // after anonymous tickets were issued would otherwise let those tickets resume without a
+        // CertificateRequest (RFC 8446 PSK). Within one CA generation tickets survive unrelated
+        // reloads (no full-handshake stampede); rotating the CA bytes re-keys, so no ticket
+        // outlives the trust roots that authenticated its peer.
+        let (dir, entry) = default_cert_entry();
+        let without = build_server_configs(std::slice::from_ref(&entry), None, None, dir.path())
+            .unwrap()
+            .unwrap();
+        let ca = some_ca_pem();
+        let auth = client_auth_entry(dir.path(), &ca);
+        let with = build_server_configs(
+            std::slice::from_ref(&entry),
+            None,
+            Some((&auth, ca.as_slice())),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !Arc::ptr_eq(&without.tcp.ticketer, &with.tcp.ticketer),
+            "client_auth must not reuse the anonymous process-wide ticketer"
+        );
+        let again = build_server_configs(
+            std::slice::from_ref(&entry),
+            None,
+            Some((&auth, ca.as_slice())),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&with.tcp.ticketer, &again.tcp.ticketer),
+            "an unchanged CA keeps tickets valid across rebuilds (reload continuity)"
+        );
+        let rotated_ca = some_ca_pem();
+        let rotated = build_server_configs(
+            &[entry],
+            None,
+            Some((&auth, rotated_ca.as_slice())),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !Arc::ptr_eq(&with.tcp.ticketer, &rotated.tcp.ticketer),
+            "a CA rotation re-keys the ticketer (tickets cannot outlive the verifier's roots)"
+        );
+        assert!(
+            Arc::ptr_eq(&with.tcp.ticketer, &with.quic.ticketer),
+            "TCP and QUIC still share one ticketer within a single build"
+        );
+    }
+
+    #[test]
     fn client_auth_with_shared_stek_fails_closed() {
         // ADR 000062 (b) / 000078: shared STEK × client auth amplifies resume-without-reverify
         // across replicas — the combination is refused.
         let (dir, entry) = default_cert_entry();
         let resumption = resumption_entry(dir.path(), 7);
-        let auth = client_auth_entry(dir.path(), &some_ca_pem());
-        let err = match build_server_configs(&[entry], Some(&resumption), Some(&auth), dir.path()) {
+        let ca = some_ca_pem();
+        let auth = client_auth_entry(dir.path(), &ca);
+        let err = match build_server_configs(
+            &[entry],
+            Some(&resumption),
+            Some((&auth, ca.as_slice())),
+            dir.path(),
+        ) {
             Err(e) => e,
             Ok(_) => {
                 panic!("[listen.client_auth] with [resumption] shared STEK must fail the build")
@@ -933,11 +1035,16 @@ mod tests {
         let (dir, entry) = default_cert_entry();
         let client_id =
             rcgen::generate_simple_self_signed(vec!["plecto-client".to_string()]).unwrap();
-        let auth = client_auth_entry(dir.path(), client_id.cert.pem().as_bytes());
-        let configs =
-            build_server_configs(std::slice::from_ref(&entry), None, Some(&auth), dir.path())
-                .unwrap()
-                .expect("client-auth listener yields TCP + QUIC configs");
+        let ca = client_id.cert.pem().into_bytes();
+        let auth = client_auth_entry(dir.path(), &ca);
+        let configs = build_server_configs(
+            std::slice::from_ref(&entry),
+            None,
+            Some((&auth, ca.as_slice())),
+            dir.path(),
+        )
+        .unwrap()
+        .expect("client-auth listener yields TCP + QUIC configs");
 
         let server_pem = std::fs::read(&entry.cert_path).unwrap();
         let server_certs: Vec<CertificateDer<'static>> =
@@ -1017,8 +1124,9 @@ mod tests {
     #[test]
     fn client_auth_without_tls_entries_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let auth = client_auth_entry(dir.path(), &some_ca_pem());
-        let err = match build_server_configs(&[], None, Some(&auth), dir.path()) {
+        let ca = some_ca_pem();
+        let auth = client_auth_entry(dir.path(), &ca);
+        let err = match build_server_configs(&[], None, Some((&auth, ca.as_slice())), dir.path()) {
             Err(e) => e,
             Ok(_) => panic!("[listen.client_auth] with no [[tls]] must fail the build"),
         };
@@ -1029,7 +1137,12 @@ mod tests {
     fn client_auth_ca_with_no_usable_root_fails_closed() {
         let (dir, entry) = default_cert_entry();
         let auth = client_auth_entry(dir.path(), b"not a pem at all");
-        let err = match build_server_configs(&[entry], None, Some(&auth), dir.path()) {
+        let err = match build_server_configs(
+            &[entry],
+            None,
+            Some((&auth, b"not a pem at all".as_slice())),
+            dir.path(),
+        ) {
             Err(e) => e,
             Ok(_) => panic!("an unusable client-auth CA bundle must fail the build"),
         };

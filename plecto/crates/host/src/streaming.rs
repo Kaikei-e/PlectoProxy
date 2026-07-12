@@ -120,6 +120,9 @@ impl StreamingFilterRuntime {
     pub fn run(&self, body: Vec<u8>, limits: &StreamingLimits) -> Result<StreamingDecision> {
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.memory_cap)
+            // Same table/resource ceiling as the sync host (`state::MAX_TABLE_ELEMENTS`): memory
+            // alone does not bound Component resource-table growth.
+            .table_elements(crate::state::MAX_TABLE_ELEMENTS)
             .build();
         let mut store = Store::new(
             &self.engine,

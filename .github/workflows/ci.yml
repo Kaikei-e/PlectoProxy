@@ -443,5 +443,6 @@ jobs:
         with:
           manifest-path: plecto/Cargo.toml
           # `sources` also gates crate origin (only crates.io), catching a typosquat / unexpected
-          # registry or git source early (A03). `licenses` stays out until an allow-list lands.
-          command: check advisories bans sources
+          # registry or git source early (A03). `licenses` uses deny.toml's allow-list so an
+          # incompatible-license transitive cannot land silently with the SBOM release path.
+          command: check advisories bans sources licenses

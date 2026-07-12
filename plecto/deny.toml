@@ -27,11 +27,10 @@ unknown-registry = "deny"
 unknown-git = "deny"
 
 # License allow-list (the repo ships Apache-2.0 release artifacts with SBOMs, so an
-# incompatible-license transitive dependency must not land silently). STAGED, not yet in the CI
-# command: run `cargo deny check licenses` locally and confirm the list covers the tree before
-# appending `licenses` to ci.yml's cargo-deny `command` — a blocking gate must not be enabled
-# unvalidated. The set below is the permissive-family superset a tokio/hyper/wasmtime/aws-lc
-# tree conventionally needs.
+# incompatible-license transitive dependency must not land silently). Blocking in CI via
+# `cargo deny check ... licenses`. Permissive-family set for the tokio/hyper/wasmtime/aws-lc
+# tree; CC0-1.0 covers `notify` (file-watcher) which is FSF Free/Libre / OSI-adjacent public
+# domain dedication commonly accepted in infrastructure trees.
 [licenses]
 allow = [
     "Apache-2.0",
@@ -44,4 +43,5 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
     "OpenSSL", # aws-lc-sys
+    "CC0-1.0", # notify → notify-debouncer-mini
 ]

@@ -551,6 +551,9 @@ jobs:
       - name: Compose and set the draft release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job — gh cannot infer the repo from a git remote, so pin it
+          # explicitly (first exercised on v0.3.2: "failed to run git: not a git repository").
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \

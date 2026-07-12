@@ -59,11 +59,19 @@ pub(super) async fn handle_h3_request(
                 Ok(data) => send.send_data(data).await.map_err(http3_err)?,
                 Err(f) => {
                     if let Ok(trailers) = f.into_trailers() {
-                        // Trailers are the stream's last frame — gRPC's `grpc-status` rides
-                        // here; dropping them would lose the call's real outcome.
+                        // Trailers are the stream's last HEADERS frame — gRPC's `grpc-status`
+                        // rides here; dropping them would lose the call's real outcome.
+                        // h3 still requires `finish()` after `send_trailers` to close the QUIC
+                        // send stream (`poll_finish`); returning without it leaves the stream
+                        // unfinished and peers may see a reset instead of a clean trailer end.
                         send.send_trailers(trailers).await.map_err(http3_err)?;
+                        send.finish().await.map_err(http3_err)?;
                         return Ok(());
                     }
+                    // A non-data, non-trailer frame is not a clean response end — leave the
+                    // send stream unfinished so quinn resets on drop (same as mid-body error).
+                    tracing::debug!("h3 response stream produced a non-trailer unknown frame");
+                    return Ok(());
                 }
             },
             Err(e) => {

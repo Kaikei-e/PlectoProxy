@@ -55,11 +55,12 @@ const MAX_LOG_LINES_PER_REQUEST: usize = 256;
 /// Per-line cap on a host-log message; a longer message is truncated on a char boundary.
 const MAX_LOG_MSG_BYTES: usize = 8 * 1024;
 
-/// Per-instance cap on total table elements (review f000003 #2). `StoreLimits::memory_size`
-/// bounds linear memory but NOT `table.grow`; a guest growing a huge funcref table could eat
-/// host memory outside the linear-memory cap before the epoch deadline trips. This is generous
-/// for any reasonable filter and bounds the pathological case — cheap defense-in-depth.
-const MAX_TABLE_ELEMENTS: usize = 100_000;
+/// Per-instance cap on total table elements (review f000003 #2), shared by the sync and
+/// streaming runtimes. `StoreLimits::memory_size` bounds linear memory but NOT `table.grow`;
+/// a guest growing a huge funcref table could eat host memory outside the linear-memory cap
+/// before the epoch deadline trips. This is generous for any reasonable filter and bounds the
+/// pathological case — cheap defense-in-depth.
+pub(crate) const MAX_TABLE_ELEMENTS: usize = 100_000;
 
 /// Neutralize a guest-supplied log message (CWE-117): truncate to `max_bytes` on a char
 /// boundary and replace control characters (CR/LF for log-line injection, C0/C1/ESC for terminal

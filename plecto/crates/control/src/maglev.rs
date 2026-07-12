@@ -155,6 +155,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_or_zero_weight_entries_yield_empty_table_without_hanging() {
+        // Guard against the infinite-fill loop when no backend can take a turn.
+        let empty = MaglevTable::build(&[], 97);
+        assert!(empty.lookup(0).is_none());
+        let zeros = MaglevTable::build(&[("a:1", 0), ("b:2", 0)], 97);
+        assert!(zeros.lookup(0).is_none());
+    }
+
+    #[test]
     fn fills_every_slot_unweighted() {
         // Each of N equal-weight backends gets ⌊M/N⌋..⌈M/N⌉ entries (differ by <= 1) and the table
         // is fully populated.

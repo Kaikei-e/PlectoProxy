@@ -15,12 +15,10 @@ use crate::error::ServerError;
 use crate::listener::drained;
 use crate::{MAX_CONCURRENT_STREAMS, ServerState};
 
-/// Build the QUIC `Endpoint` for HTTP/3 from control's QUIC TLS config, bound on the same port
-/// number as the TCP listener (UDP). Caps concurrent request streams (see below).
-pub(crate) fn build_h3_endpoint(
+/// Build a quinn `ServerConfig` from control's QUIC TLS config (transport caps included).
+pub(crate) fn build_quinn_server_config(
     quic_cfg: Arc<plecto_control::TlsServerConfig>,
-    tcp_addr: SocketAddr,
-) -> Result<quinn::Endpoint, ServerError> {
+) -> Result<quinn::ServerConfig, ServerError> {
     let crypto = QuicServerConfig::try_from(quic_cfg).map_err(http3_err)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     // Cap concurrent request streams per connection (mirrors ADR 000015's h2 cap): each h3 request
@@ -31,6 +29,16 @@ pub(crate) fn build_h3_endpoint(
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into());
     server_config.transport_config(Arc::new(transport));
+    Ok(server_config)
+}
+
+/// Build the QUIC `Endpoint` for HTTP/3 from control's QUIC TLS config, bound on the same port
+/// number as the TCP listener (UDP). Caps concurrent request streams (see below).
+pub(crate) fn build_h3_endpoint(
+    quic_cfg: Arc<plecto_control::TlsServerConfig>,
+    tcp_addr: SocketAddr,
+) -> Result<quinn::Endpoint, ServerError> {
+    let server_config = build_quinn_server_config(quic_cfg)?;
     // Same port as the TCP listener, but UDP — an independent protocol namespace.
     let udp_addr = SocketAddr::new(tcp_addr.ip(), tcp_addr.port());
     quinn::Endpoint::server(server_config, udp_addr).map_err(http3_err)
@@ -41,6 +49,11 @@ pub(crate) fn build_h3_endpoint(
 /// drain flag flips (graceful shutdown, ADR 000039 / 000059) no new QUIC connections are accepted,
 /// each open h3 connection sends GOAWAY and finishes its in-flight requests inside the shared
 /// drain window, and the endpoint is closed at the window (cutting the stragglers, fail-closed).
+///
+/// Before each accept, re-read `quic_tls_config()` and call `Endpoint::set_server_config` when the
+/// Arc identity changes — so a reload's new `client_auth` / certs apply to **new** QUIC handshakes
+/// the same way TCP reads TLS per accept (ADR 000014). In-flight connections keep the config they
+/// negotiated with.
 pub(crate) async fn serve_h3(
     state: Arc<ServerState>,
     endpoint: quinn::Endpoint,
@@ -51,7 +64,42 @@ pub(crate) async fn serve_h3(
     // close the endpoint as soon as they all finish, instead of unconditionally sleeping the
     // full window. Finished tasks are reaped opportunistically in the accept loop.
     let mut conns = JoinSet::new();
+    // Last QUIC TLS `Arc` applied to the endpoint (ptr_eq). `None` means "no TLS / clear config".
+    let mut applied_quic: Option<Arc<plecto_control::TlsServerConfig>> = None;
     loop {
+        // Apply a reloaded QUIC TLS config before waiting for the next connection (pull model,
+        // same as TCP's per-accept `tls_config()` — no watch channel required).
+        let current = state.control.quic_tls_config();
+        let changed = match (&applied_quic, &current) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            match &current {
+                Some(cfg) => match build_quinn_server_config(cfg.clone()) {
+                    Ok(sc) => {
+                        endpoint.set_server_config(Some(sc));
+                        applied_quic = current.clone();
+                        tracing::info!("HTTP/3 QUIC TLS config updated for new connections");
+                    }
+                    Err(e) => {
+                        // Keep serving with the previous config rather than killing the UDP
+                        // listener — fail soft on the update, fail closed on new bad builds at
+                        // Control reload time (build_active already validated this config).
+                        tracing::error!(error = %e, "HTTP/3 QUIC TLS config update failed; keeping previous");
+                    }
+                },
+                None => {
+                    endpoint.set_server_config(None);
+                    applied_quic = None;
+                    tracing::info!(
+                        "HTTP/3 QUIC TLS cleared; new connections will not complete handshake"
+                    );
+                }
+            }
+        }
+
         // Count a QUIC connection against the same global cap as TCP.
         let permit = tokio::select! {
             _ = drained(&mut drain) => break,

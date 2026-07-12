@@ -372,16 +372,23 @@ pub fn validate_manifest(
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
     route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
+    // ONE read of the client-auth CA, shared between the verifier build and the config version
+    // (same rule as `build_active`): the reported version always describes the validated bytes.
+    let client_auth_ca = manifest.read_client_auth_ca(base_dir)?;
     tls::build_server_configs(
         &manifest.tls,
         manifest.resumption.as_ref(),
-        manifest.listen.client_auth.as_ref(),
+        manifest
+            .listen
+            .client_auth
+            .as_ref()
+            .zip(client_auth_ca.as_deref()),
         base_dir,
     )?;
     // A throwaway registry runs the full upstream validation (names, LB, `[upstream.tls]` CA
     // loads) without touching any live state.
     UpstreamRegistry::new().reconcile(&manifest.upstreams, base_dir)?;
-    let config_version = manifest.content_hash()?;
+    let config_version = manifest.content_hash_with_ca(client_auth_ca.as_deref())?;
     Ok(ValidateOutcome {
         config_version,
         warnings,
@@ -548,10 +555,17 @@ fn build_active(
     // TLS termination config (ADR 000014 TCP / ADR 000016 QUIC): build the rustls ServerConfigs
     // from `[[tls]]`, sharing one SNI cert resolver. A bad cert is fail-closed here, so a failed
     // reload never swaps in a TLS config that cannot serve. Built before the registry is touched.
+    // The client-auth CA is read ONCE and shared with the content hash below, so the recorded
+    // config version always describes the trust roots the verifier was actually built from.
+    let client_auth_ca = manifest.read_client_auth_ca(base_dir)?;
     let (tls, quic_tls) = match tls::build_server_configs(
         &manifest.tls,
         manifest.resumption.as_ref(),
-        manifest.listen.client_auth.as_ref(),
+        manifest
+            .listen
+            .client_auth
+            .as_ref()
+            .zip(client_auth_ca.as_deref()),
         base_dir,
     )? {
         Some(configs) => (Some(configs.tcp), Some(configs.quic)),
@@ -562,7 +576,7 @@ fn build_active(
     // is the step that MUTATES persistent state (the health registry, which survives reloads), so
     // every other fallible step — including this hash — must run before it for the "after reconcile
     // the build is infallible" / all-or-nothing invariant to hold literally, not just in practice.
-    let hash = manifest.content_hash()?;
+    let hash = manifest.content_hash_with_ca(client_auth_ca.as_deref())?;
 
     // Reconcile the upstream registry LAST among the fallible steps (ADR 000017): this validates
     // duplicate names / empty address lists and preserves health for unchanged `(name, address)`

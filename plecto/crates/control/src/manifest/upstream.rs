@@ -772,5 +772,39 @@ path = "/healthz"
         )
         .unwrap();
         assert!(ok.upstreams[0].validate_lb().is_ok());
+
+        // health interval/timeout of 0 must fail closed (busy-loop / permanent 503).
+        let interval0 = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "u"
+addresses = ["a:1"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 0
+timeout_ms = 1000
+"#,
+        )
+        .unwrap();
+        assert!(
+            interval0.upstreams[0].validate_lb().is_err(),
+            "interval_ms = 0 rejected"
+        );
+        let timeout0 = Manifest::from_toml(
+            r#"
+[[upstream]]
+name = "u"
+addresses = ["a:1"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 1000
+timeout_ms = 0
+"#,
+        )
+        .unwrap();
+        assert!(
+            timeout0.upstreams[0].validate_lb().is_err(),
+            "timeout_ms = 0 rejected"
+        );
     }
 }

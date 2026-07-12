@@ -135,9 +135,10 @@ impl<R: FilterRuntime> LoadedInner<R> {
     /// Check out a trusted instance from the pool (ADR 000012): reuse an idle one, lazily build
     /// a fresh one while under `cap`, or — when every instance is checked out — wait up to the
     /// pool's `checkout_timeout` for one to free and then fail **closed** (`Unavailable`).
-    /// Also fails closed fast while the pool-wide breaker's cooldown is open. wasmtime's pooling
-    /// allocator has no internal wait queue, so this bounded wait is the host-side backpressure
-    /// its docs call for.
+    /// While the pool-wide breaker's cooldown is open, idle reuse stays allowed but anything
+    /// else fails closed fast — the breaker gates builds, not proven-healthy instances.
+    /// wasmtime's pooling allocator has no internal wait queue, so this bounded wait is the
+    /// host-side backpressure its docs call for.
     fn checkout(
         &self,
         pool: &TrustedPool<R::Instance>,
@@ -155,11 +156,16 @@ impl<R: FilterRuntime> LoadedInner<R> {
         loop {
             let step = {
                 let mut g = pool.inner.lock();
-                if g.breaker.is_open() {
-                    return Err(RunError::Unavailable);
-                }
                 if let Some(p) = g.idle.pop() {
                     Step::Use(p)
+                } else if g.breaker.is_open() {
+                    // An idle instance above is proven healthy and serving it costs nothing, so
+                    // the open breaker only gates from here on: a transient instantiate failure
+                    // (e.g. the engine-wide slot budget under a cross-filter spike) must not
+                    // 503 requests an already-built instance could serve. A deterministically
+                    // trapping/failing filter accumulates no idle instances, so it still fails
+                    // closed fast here.
+                    return Err(RunError::Unavailable);
                 } else if g.live < pool.cap {
                     g.live += 1; // reserve the slot before the (slow) build, done outside the lock
                     Step::Build
@@ -184,7 +190,15 @@ impl<R: FilterRuntime> LoadedInner<R> {
                                 served: 0,
                             });
                         }
-                        Err(e) => return Err(RunError::Instantiate(e)),
+                        Err(e) => {
+                            // Mirror the untrusted path: a deterministically failing init must
+                            // open the pool-wide breaker so the next request fails closed cheaply
+                            // instead of re-paying instantiate+init on every checkout. Idle reuse
+                            // stays allowed while open (see above), so a trip caused by transient
+                            // allocator slot exhaustion cannot take servable traffic down with it.
+                            pool.inner.lock().breaker.record_trap();
+                            return Err(RunError::Instantiate(e));
+                        }
                     }
                 }
                 Step::Retry => continue,
@@ -401,7 +415,7 @@ impl<I> TrustedPool<I> {
 /// failures that a real wasm component cannot give.
 #[cfg(test)]
 mod pool_tests {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -417,6 +431,7 @@ mod pool_tests {
     struct FakeRuntime {
         next_id: AtomicU64,
         instantiate_calls: AtomicUsize,
+        fail_instantiate: AtomicBool,
     }
 
     impl FakeRuntime {
@@ -424,6 +439,7 @@ mod pool_tests {
             Self {
                 next_id: AtomicU64::new(0),
                 instantiate_calls: AtomicUsize::new(0),
+                fail_instantiate: AtomicBool::new(false),
             }
         }
 
@@ -444,6 +460,9 @@ mod pool_tests {
 
         fn instantiate_initialized(&self) -> Result<FakeInstance> {
             self.instantiate_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_instantiate.load(Ordering::SeqCst) {
+                anyhow::bail!("fake instantiate failure");
+            }
             Ok(FakeInstance {
                 id: self.next_id.fetch_add(1, Ordering::SeqCst),
             })
@@ -466,6 +485,39 @@ mod pool_tests {
             Arc::new(NoopSink),
             Isolation::Trusted,
         )
+    }
+
+    #[test]
+    fn trusted_pool_init_failure_opens_circuit_breaker() {
+        // A deterministically failing instantiate on the Build path must trip the pool breaker
+        // so subsequent checkouts fail closed with Unavailable instead of re-paying init.
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(4, Duration::from_millis(50), 1000, first);
+        let inner = fake_inner(runtime);
+        // Consume the eager idle instance so the next checkouts take the Build path.
+        let held = inner.checkout(&pool).expect("idle checkout succeeds");
+        inner.runtime.fail_instantiate.store(true, Ordering::SeqCst);
+
+        for _ in 0..TRUSTED_TRAP_BREAKER_THRESHOLD {
+            match inner.checkout(&pool) {
+                Err(RunError::Instantiate(_)) => {}
+                Err(e) => panic!("expected Instantiate, got {e:?}"),
+                Ok(_) => panic!("expected Instantiate, got Ok"),
+            }
+        }
+        match inner.checkout(&pool) {
+            Err(RunError::Unavailable) => {}
+            Err(e) => panic!("after threshold, expected Unavailable, got {e:?}"),
+            Ok(_) => panic!("after threshold, expected Unavailable, got Ok"),
+        }
+        // The breaker gates BUILDS, not reuse: an instance checked back in while the breaker is
+        // open (e.g. a transient allocator-slot-exhaustion trip) still serves requests.
+        pool.inner.lock().idle.push(held);
+        assert!(
+            inner.checkout(&pool).is_ok(),
+            "idle reuse must stay allowed while the breaker is open"
+        );
     }
 
     #[test]

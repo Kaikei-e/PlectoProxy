@@ -60,7 +60,20 @@ impl Body for H3ReqBody {
                 }
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Ok(None)) => {
+                // Fewer DATA bytes than Content-Length is also malformed (RFC 9114 §4.1.2):
+                // intermediaries MUST NOT forward such a request. Surface a body error, not a
+                // short success — same class as the oversize branch above; a length mismatch
+                // that survives re-framing onto HTTP/1.1 is request-smuggling surface.
+                if let Some(n) = this.remaining
+                    && n != 0
+                {
+                    return Poll::Ready(Some(Err(
+                        "h3 request body shorter than its declared content-length".into(),
+                    )));
+                }
+                Poll::Ready(None)
+            }
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Box::new(e)))),
             Poll::Pending => Poll::Pending,
         }

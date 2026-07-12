@@ -142,9 +142,16 @@ fn build_tls_client(
 /// `http` upstream, plus one pooled TLS client per DISTINCT `[upstream.tls]` config, built
 /// lazily and keyed on the config `Arc`'s identity — which control keeps stable across reloads
 /// while the section is unchanged, so reloads never cold-start the connection pool.
+///
+/// The map value RETAINS the config `Arc` alongside the client: pointer identity is only stable
+/// while the pointee is alive, so a cache that keyed on `Arc::as_ptr` without holding the `Arc`
+/// would be ABA-prone — after a reload drops an old config, its heap address can be reused by a
+/// DIFFERENT config's allocation, and the cache would then serve a client with the wrong TLS
+/// settings (wrong roots / SNI / verification) for that upstream. Retention is bounded by
+/// `MAX_TLS_CLIENTS`.
 pub(crate) struct UpstreamClients {
     plain: HyperUpstreamClient,
-    tls: parking_lot::RwLock<HashMap<usize, HyperUpstreamClient>>,
+    tls: parking_lot::RwLock<HashMap<usize, (Arc<TlsClientConfig>, HyperUpstreamClient)>>,
 }
 
 /// Cap on retained TLS clients. Reached only by pathological reload churn over many distinct
@@ -167,7 +174,7 @@ impl UpstreamClients {
             return self.plain.clone();
         };
         let key = Arc::as_ptr(config) as usize;
-        if let Some(client) = self.tls.read().get(&key) {
+        if let Some((_config, client)) = self.tls.read().get(&key) {
             return client.clone();
         }
         let built = build_tls_client(config, group.tls_sni());
@@ -175,7 +182,8 @@ impl UpstreamClients {
         if map.len() >= MAX_TLS_CLIENTS {
             map.clear();
         }
-        map.entry(key).or_insert(built).clone()
+        // The stored `Arc` keeps the keyed address alive (see the struct doc: ABA guard).
+        map.entry(key).or_insert((config.clone(), built)).1.clone()
     }
 }
 

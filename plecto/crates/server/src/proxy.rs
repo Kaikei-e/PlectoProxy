@@ -61,18 +61,7 @@ pub(crate) async fn proxy_core(
         .access_log_enabled()
         .then(|| access_log::Access {
             method: parts.method.as_str().to_string(),
-            authority: parts
-                .uri
-                .authority()
-                .map(|a| a.to_string())
-                .or_else(|| {
-                    parts
-                        .headers
-                        .get(hyper::header::HOST)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                })
-                .unwrap_or_default(),
+            authority: crate::headers::request_authority(&parts),
             path: parts.uri.path().to_string(),
         });
 
@@ -134,6 +123,13 @@ async fn proxy_core_inner(
     mut parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
+    // Client-IP propagation, edge model (ADR 000018 / review f000005 P2#3): strip any inbound
+    // `X-Forwarded-*` / `Forwarded` (which an untrusted client can forge) and set them afresh from
+    // the connection's real peer + scheme — directly on the inbound `HeaderMap`, BEFORE the
+    // contract projection, so the chain (IP-based rate-limit / auth filters), route matching, the
+    // filterless direct forward path, and the upstream all see the same trusted values.
+    set_forwarded(&mut parts.headers, peer.ip(), scheme);
+
     let mut http_req = to_http_request(&parts, scheme);
     // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
     // body moves: only a bodyless request can be an Upgrade handshake (ADR 000048), and bodyless
@@ -160,12 +156,6 @@ async fn proxy_core_inner(
             ));
         }
     }
-
-    // Client-IP propagation, edge model (ADR 000018 / review f000005 P2#3): strip any inbound
-    // `X-Forwarded-*` / `Forwarded` (which an untrusted client can forge) and set them afresh from
-    // the connection's real peer + scheme. Done BEFORE the chain so an IP-based rate-limit / auth
-    // filter sees a value it can trust; the corrected headers then forward to the upstream.
-    set_forwarded(&mut http_req.headers, peer.ip(), scheme);
 
     // One snapshot pins config + trace for the whole transaction (a concurrent reload cannot
     // desync the request and response halves); cloning it is a cheap Arc + trace-id clone. The
@@ -244,7 +234,7 @@ async fn proxy_core_inner(
     // canonical octets, NOT a spoofable forwarding header). `None` for the other algorithms, or when
     // the configured header is absent (the group then falls back to round-robin). Borrowed from
     // `parts`, which outlives the retry loop, and `Copy`, so each attempt reuses it unchanged.
-    let hash_key: Option<HashInput> = group.hash_key_source().and_then(|src| match src {
+    let hash_key: Option<HashInput<'_>> = group.hash_key_source().and_then(|src| match src {
         HashKeySource::Header(name) => parts
             .headers
             .get(name)
@@ -273,6 +263,12 @@ async fn proxy_core_inner(
     // with no body-reading filter (or a bodyless request) skips this entirely and keeps the body on
     // the zero-copy streaming path — the real fix for the body-tax (docs/servey). The chain runs on
     // the blocking pool (sync wasmtime, !Send Store), like the header chain.
+    // The buffer permit must outlive the BUFFER, not just the read: the buffered bytes live on in
+    // `ForwardBody::Replayable` through the whole forward/retry/response phase, so a permit
+    // dropped at the end of the buffering block would bound concurrent *reads* while resident
+    // buffered-body memory grew past `MAX_INFLIGHT_BODY_BUFFERS × MAX_REQUEST_BODY_BUFFER` under
+    // slow upstreams. Declared at function scope so it drops with the transaction.
+    let mut _buf_permit = None;
     if route.reads_body
         && let Some(b) = real_body.take_oneshot()
     {
@@ -281,8 +277,8 @@ async fn proxy_core_inner(
         // size cap → 413, over the time budget → 408 — both fail closed (never an unbounded buffer).
         // An acquire error (the semaphore closed) must fail closed too, not silently proceed
         // without a permit — that would bypass the concurrency cap entirely for this request.
-        let _buf_permit = match state.body_buffer_limit.clone().acquire_owned().await {
-            Ok(permit) => permit,
+        _buf_permit = match state.body_buffer_limit.clone().acquire_owned().await {
+            Ok(permit) => Some(permit),
             Err(_) => {
                 return Ok(synth(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -297,12 +293,21 @@ async fn proxy_core_inner(
         )
         .await
         {
-            Ok(Some(buf)) => buf,
-            Ok(None) => {
+            Ok(crate::body::BufferOutcome::Buffered(buf)) => buf,
+            Ok(crate::body::BufferOutcome::TooLarge) => {
                 return Ok(synth(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     &fault::BODY_TOO_LARGE,
                     b"request body too large",
+                ));
+            }
+            // A client abort / transport fault mid-body is the CLIENT's fault, not an oversized
+            // body — 400, not 413 (the two were previously conflated into one `None`).
+            Ok(crate::body::BufferOutcome::ReadError) => {
+                return Ok(synth(
+                    StatusCode::BAD_REQUEST,
+                    &fault::BODY_READ_ERROR,
+                    b"request body read error",
                 ));
             }
             Err(_) => {
@@ -357,7 +362,15 @@ async fn proxy_core_inner(
 
     let forward_req = ForwardRequest {
         method: forward.method.as_str(),
-        chain_headers: &forward.headers,
+        // The filterless fast path forwards the inbound headers directly (no contract re-parse
+        // per attempt) — `set_forwarded` already corrected them on `parts.headers`, and the
+        // hop-by-hop strip applies at copy time either way. A filtered route forwards the
+        // chain-edited contract bytes.
+        headers: if route.has_filters {
+            crate::forward::AttemptHeaders::Chain(&forward.headers)
+        } else {
+            crate::forward::AttemptHeaders::Direct(&parts.headers)
+        },
         original_headers: &parts.headers,
         upstream_path: &upstream_path,
         traceparent: &snapshot.traceparent(),
@@ -460,10 +473,18 @@ async fn proxy_core_inner(
         } else {
             copy_headers_direct(builder.headers_mut(), upstream_resp.headers());
         }
+        // Unreachable for a validated allowlist token — but if it were ever reached, silently
+        // omitting `Upgrade` while still sending `Connection: upgrade` and splicing would relay a
+        // malformed 101. Fail closed instead (bp-rust: no implicit fail-open).
+        let Ok(upgrade_value) = hyper::header::HeaderValue::from_str(&token) else {
+            return Ok(synth(
+                StatusCode::BAD_GATEWAY,
+                &fault::BAD_UPGRADE,
+                b"bad upgrade token",
+            ));
+        };
         if let Some(h) = builder.headers_mut() {
-            if let Ok(v) = hyper::header::HeaderValue::from_str(&token) {
-                h.insert(hyper::header::UPGRADE, v);
-            }
+            h.insert(hyper::header::UPGRADE, upgrade_value);
             h.insert(
                 hyper::header::CONNECTION,
                 hyper::header::HeaderValue::from_static("upgrade"),
@@ -520,8 +541,10 @@ async fn proxy_core_inner(
         ResponseOutcome::Forward(edited) => {
             // Compression runs LAST — after the chain's header edits, on the streamed body the
             // chain never sees (ADR 000074: filters always see identity). A `Respond` below is
-            // host-framed synthesis (small, buffered), deliberately never compressed.
-            let resp = stream_response(edited.status, &edited.headers, ubody);
+            // host-framed synthesis (small, buffered), deliberately never compressed. The
+            // upstream's original headers ride along so framing stays host-owned (the chain
+            // cannot desync `Content-Length` from the streamed body).
+            let resp = stream_response(edited.status, &edited.headers, &uparts.headers, ubody);
             Ok(crate::compression::apply(resp, &route, &parts))
         }
         ResponseOutcome::Respond(resp) => {

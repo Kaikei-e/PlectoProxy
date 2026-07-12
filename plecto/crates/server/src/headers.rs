@@ -113,12 +113,15 @@ const FORWARDED_HEADERS: &[&str] = &[
 /// filters can trust them) and the upstream then see only Plecto's values, never the client's claim.
 /// A trusted-proxy *append* mode (Plecto behind another LB) is a manifest knob deferred to a later
 /// slice; overwrite is the safe default.
-pub(crate) fn set_forwarded(headers: &mut Vec<Header>, peer: IpAddr, scheme: &str) {
-    headers.retain(|h| {
-        !FORWARDED_HEADERS
-            .iter()
-            .any(|f| h.name.eq_ignore_ascii_case(f))
-    });
+///
+/// Operates directly on the inbound hyper `HeaderMap`, BEFORE the contract projection: the
+/// corrected headers then flow to the chain via `to_http_request` and to the filterless direct
+/// forward path verbatim — one application, both consumers.
+pub(crate) fn set_forwarded(headers: &mut hyper::HeaderMap, peer: IpAddr, scheme: &str) {
+    for name in FORWARDED_HEADERS {
+        // `HeaderName` lookups are case-insensitive; the constants are already lowercase.
+        headers.remove(*name);
+    }
     // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 address
     // (`::ffff:a.b.c.d`); normalise it to dotted IPv4 so backends/filters that all-list on the IPv4
     // form match, and the value matches what nginx/Envoy would emit. A genuine IPv6 peer is kept
@@ -130,18 +133,15 @@ pub(crate) fn set_forwarded(headers: &mut Vec<Header>, peer: IpAddr, scheme: &st
         },
         IpAddr::V4(v4) => v4.to_string(),
     };
-    headers.push(Header {
-        name: "x-forwarded-for".to_string(),
-        value: client_ip.clone().into_bytes(),
-    });
-    headers.push(Header {
-        name: "x-real-ip".to_string(),
-        value: client_ip.into_bytes(),
-    });
-    headers.push(Header {
-        name: "x-forwarded-proto".to_string(),
-        value: scheme.as_bytes().to_vec(),
-    });
+    // An IP address in decimal/hex-free ASCII is always a valid header value; stay total on the
+    // data plane regardless (drop rather than panic if that were ever not the case).
+    if let Ok(ip_value) = HeaderValue::from_str(&client_ip) {
+        headers.insert("x-forwarded-for", ip_value.clone());
+        headers.insert("x-real-ip", ip_value);
+    }
+    if let Ok(proto) = HeaderValue::from_str(scheme) {
+        headers.insert("x-forwarded-proto", proto);
+    }
 }
 
 /// Build a header-only `HttpRequest` (the chain's view) from the inbound request parts. The body
@@ -155,9 +155,20 @@ pub(crate) fn to_http_request(parts: &hyper::http::request::Parts, scheme: &str)
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
-    // authority: for HTTP/2 the `:authority` pseudo-header lands in the URI; for HTTP/1.1 it is the
-    // Host header. Prefer the URI authority (h2), falling back to Host, then to empty.
-    let authority = parts
+    HttpRequest {
+        method: parts.method.as_str().to_string(),
+        path,
+        authority: request_authority(parts),
+        scheme: scheme.to_string(),
+        headers: headers_to_vec(&parts.headers),
+    }
+}
+
+/// The request's authority: for HTTP/2 the `:authority` pseudo-header lands in the URI; for
+/// HTTP/1.1 it is the Host header. Prefer the URI authority (h2), falling back to Host, then to
+/// empty. Shared by the contract projection above and the access-log capture.
+pub(crate) fn request_authority(parts: &hyper::http::request::Parts) -> String {
+    parts
         .uri
         .authority()
         .map(|a| a.to_string())
@@ -168,14 +179,7 @@ pub(crate) fn to_http_request(parts: &hyper::http::request::Parts, scheme: &str)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
         })
-        .unwrap_or_default();
-    HttpRequest {
-        method: parts.method.as_str().to_string(),
-        path,
-        authority,
-        scheme: scheme.to_string(),
-        headers: headers_to_vec(&parts.headers),
-    }
+        .unwrap_or_default()
 }
 
 /// Convert a hyper `HeaderMap` to the contract's `Vec<Header>` (byte-preserving). Both the static
@@ -432,57 +436,43 @@ mod tests {
         // peer's value re-issued, never appended-to or trusted, so an untrusted client cannot forge
         // its source IP. X-Forwarded-For and X-Real-IP carry the real peer; X-Forwarded-Proto the
         // wire scheme; a stripped CDN header (CF-Connecting-IP) is NOT re-issued.
-        let mut headers = vec![
-            header("X-Forwarded-For", "9.9.9.9"),
-            header("forwarded", "for=10.0.0.1"),
-            header("X-Real-IP", "9.9.9.9"),
-            header("cf-connecting-ip", "8.8.8.8"),
-            header("x-keep", "1"),
-        ];
+        let mut headers = hyper::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("9.9.9.9"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("8.8.4.4"));
+        headers.insert("forwarded", HeaderValue::from_static("for=10.0.0.1"));
+        headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("8.8.8.8"));
+        headers.insert("x-keep", HeaderValue::from_static("1"));
         set_forwarded(&mut headers, "203.0.113.5".parse().unwrap(), "https");
 
-        let xff: Vec<&str> = headers
-            .iter()
-            .filter(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
-            .map(|h| std::str::from_utf8(&h.value).expect("utf-8"))
-            .collect();
+        let xff: Vec<&HeaderValue> = headers.get_all("x-forwarded-for").iter().collect();
         assert_eq!(
             xff,
             vec!["203.0.113.5"],
-            "the spoofed XFF is replaced by the real peer (one value, not appended)"
+            "the spoofed XFF (all values) is replaced by the real peer (one value, not appended)"
         );
-        let xrealip: Vec<&str> = headers
-            .iter()
-            .filter(|h| h.name.eq_ignore_ascii_case("x-real-ip"))
-            .map(|h| std::str::from_utf8(&h.value).expect("utf-8"))
-            .collect();
         assert_eq!(
-            xrealip,
-            vec!["203.0.113.5"],
-            "the spoofed X-Real-IP is replaced by the real peer (one value, re-issued)"
+            headers.get("x-real-ip").map(HeaderValue::as_bytes),
+            Some(b"203.0.113.5".as_ref()),
+            "the spoofed X-Real-IP is replaced by the real peer (re-issued)"
         );
         assert!(
-            !headers
-                .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("forwarded")),
+            !headers.contains_key("forwarded"),
             "a spoofed Forwarded header is stripped"
         );
         assert!(
-            !headers
-                .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("cf-connecting-ip")),
+            !headers.contains_key("cf-connecting-ip"),
             "a spoofed CDN client-IP header is stripped and not re-issued"
         );
         assert_eq!(
             headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-proto"))
-                .and_then(|h| std::str::from_utf8(&h.value).ok()),
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok()),
             Some("https"),
             "X-Forwarded-Proto reflects the connection scheme"
         );
         assert!(
-            headers.iter().any(|h| h.name == "x-keep"),
+            headers.contains_key("x-keep"),
             "an unrelated header is left intact"
         );
     }
@@ -492,27 +482,21 @@ mod tests {
         // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 peer
         // (`::ffff:a.b.c.d`); X-Forwarded-For / X-Real-IP must carry the dotted IPv4 form so a
         // backend all-listing on the IPv4 address matches (ADR 000022).
-        let mut headers = vec![];
+        let mut headers = hyper::HeaderMap::new();
         set_forwarded(&mut headers, "::ffff:203.0.113.5".parse().unwrap(), "https");
         for name in ["x-forwarded-for", "x-real-ip"] {
             assert_eq!(
-                headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case(name))
-                    .and_then(|h| std::str::from_utf8(&h.value).ok()),
+                headers.get(name).and_then(|v| v.to_str().ok()),
                 Some("203.0.113.5"),
                 "an IPv4-mapped peer normalises to dotted IPv4 in {name}"
             );
         }
 
         // A genuine IPv6 peer is preserved verbatim (no brackets in XFF).
-        let mut headers = vec![];
+        let mut headers = hyper::HeaderMap::new();
         set_forwarded(&mut headers, "2001:db8::1".parse().unwrap(), "https");
         assert_eq!(
-            headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("x-forwarded-for"))
-                .and_then(|h| std::str::from_utf8(&h.value).ok()),
+            headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
             Some("2001:db8::1"),
             "a real IPv6 peer is kept as-is"
         );

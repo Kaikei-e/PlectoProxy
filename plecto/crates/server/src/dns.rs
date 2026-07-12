@@ -32,14 +32,22 @@ struct RefreshState {
     last_good: HashMap<String, GroupCache>,
 }
 
-/// Run the DNS re-resolution supervisor until the server stops. No-ops (idles at a coarse tick)
-/// while no group sets `resolve_interval_ms`.
-pub(crate) async fn serve_dns_refresh(control: Arc<Control>) {
+/// Run the DNS re-resolution supervisor until the drain flag flips (ADR 000039 — same exit
+/// contract as the health supervisor, so an embedder of `serve_with_shutdown` is not left with an
+/// orphan task holding `Control` alive). No-ops (idles at a coarse tick) while no group sets
+/// `resolve_interval_ms`.
+pub(crate) async fn serve_dns_refresh(
+    control: Arc<Control>,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) {
     let mut state = RefreshState::default();
     loop {
         let groups = control.upstream_groups();
         let period = refresh_tick(&groups, &mut state, &lookup).await;
-        tokio::time::sleep(period.max(Duration::from_millis(20))).await;
+        tokio::select! {
+            _ = crate::listener::drained(&mut drain) => return,
+            _ = tokio::time::sleep(period.max(Duration::from_millis(20))) => {}
+        }
     }
 }
 

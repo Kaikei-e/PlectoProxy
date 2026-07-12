@@ -47,10 +47,15 @@ pub(crate) async fn serve_h3(
     mut drain: watch::Receiver<bool>,
     drain_window: Duration,
 ) {
+    // Connection tasks live in a JoinSet (the TCP accept loop's twin) so the drain below can
+    // close the endpoint as soon as they all finish, instead of unconditionally sleeping the
+    // full window. Finished tasks are reaped opportunistically in the accept loop.
+    let mut conns = JoinSet::new();
     loop {
         // Count a QUIC connection against the same global cap as TCP.
         let permit = tokio::select! {
             _ = drained(&mut drain) => break,
+            Some(_) = conns.join_next() => continue,
             permit = state.conn_limit.clone().acquire_owned() => match permit {
                 Ok(p) => p,
                 Err(_) => return, // semaphore closed → stop accepting
@@ -58,6 +63,7 @@ pub(crate) async fn serve_h3(
         };
         let incoming = tokio::select! {
             _ = drained(&mut drain) => break,
+            Some(_) = conns.join_next() => continue, // the permit is re-acquired next iteration
             incoming = endpoint.accept() => match incoming {
                 Some(i) => i,
                 None => return, // endpoint closed
@@ -65,16 +71,17 @@ pub(crate) async fn serve_h3(
         };
         let state = state.clone();
         let drain = drain.clone();
-        tokio::spawn(async move {
+        conns.spawn(async move {
             let _permit = permit; // released when this connection task ends
             serve_h3_connection(state, incoming, drain).await;
         });
     }
     // Drain (ADR 000059): every connection task saw the same flip and sent its GOAWAY. Hold the
-    // endpoint open for the shared drain window so their in-flight requests can finish, then
-    // close it — cutting whatever is still open (fail-closed; the TCP side's `abort_all` twin)
-    // — and flush the CONNECTION_CLOSE frames so peers learn instead of idling out.
-    tokio::time::sleep(drain_window).await;
+    // endpoint open until their in-flight requests finish — bounded by the shared drain window,
+    // after which whatever is still open is cut (fail-closed; the TCP side's `abort_all` twin) —
+    // then close it and flush the CONNECTION_CLOSE frames so peers learn instead of idling out.
+    let all_connections_done = async { while conns.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(drain_window, all_connections_done).await;
     endpoint.close(0u32.into(), b"");
     endpoint.wait_idle().await;
 }

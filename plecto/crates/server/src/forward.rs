@@ -10,7 +10,7 @@ use hyper::header::HeaderValue;
 use hyper::{HeaderMap, Request};
 use plecto_control::{HashInput, UpstreamGroup};
 
-use crate::headers::copy_headers;
+use crate::headers::{copy_headers, copy_headers_direct};
 use crate::metrics::ServerMetrics;
 use crate::retry::{self, AttemptOutcome};
 use crate::upstream_client::{UpstreamClient, UpstreamSendError};
@@ -84,12 +84,47 @@ impl ForwardBody {
     }
 }
 
+/// The host owns request framing toward the upstream (bp-rust §6: no double interpretation —
+/// and filter output is untrusted, CLAUDE.md): any chain-supplied `Content-Length` is stripped
+/// and the correct one re-derived from the body actually being sent — the edited buffer's length
+/// for `Replayable` (an `on-request-body` filter changed the bytes but not the header), the
+/// client's original declaration for the untouched `OneShot` stream, and none for `Bodyless`
+/// (hyper frames an empty body itself). Without this, an edited body forwards under the CLIENT's
+/// length — a request-smuggling / desync primitive (CWE-444).
+fn set_framing(dst: Option<&mut HeaderMap>, body: &ForwardBody, original: &HeaderMap) {
+    let Some(dst) = dst else { return };
+    dst.remove(hyper::header::CONTENT_LENGTH);
+    match body {
+        ForwardBody::Bodyless => {}
+        ForwardBody::OneShot(_) => {
+            if let Some(len) = original.get(hyper::header::CONTENT_LENGTH) {
+                dst.insert(hyper::header::CONTENT_LENGTH, len.clone());
+            }
+        }
+        ForwardBody::Replayable(bytes) => {
+            dst.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from(bytes.len()),
+            );
+        }
+    }
+}
+
+/// The headers one forward attempt carries: the chain-edited contract bytes when a filter chain
+/// ran, or the inbound `HeaderMap` directly on the filterless fast path — forwarding the original
+/// refcounted `HeaderName`/`HeaderValue`s verbatim instead of re-parsing a contract projection on
+/// every attempt (DECREE §4: the pure-proxy path pays no per-request copy it doesn't need).
+pub(crate) enum AttemptHeaders<'a> {
+    Chain(&'a [plecto_control::Header]),
+    Direct(&'a HeaderMap),
+}
+
 /// One forward attempt's static inputs (the parts of the request that don't change across
 /// retries) — grouped so `forward_with_retry` isn't a wall of positional parameters.
 pub(crate) struct ForwardRequest<'a> {
     pub(crate) method: &'a str,
-    /// The chain-edited headers (contract byte values).
-    pub(crate) chain_headers: &'a [plecto_control::Header],
+    /// The headers each attempt forwards (see [`AttemptHeaders`]).
+    pub(crate) headers: AttemptHeaders<'a>,
     /// The original inbound headers (TE / Upgrade pass-through decisions).
     pub(crate) original_headers: &'a HeaderMap,
     pub(crate) upstream_path: &'a str,
@@ -133,7 +168,11 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
             forward.upstream_path
         );
         let mut builder = Request::builder().method(forward.method).uri(uri);
-        copy_headers(builder.headers_mut(), forward.chain_headers);
+        match forward.headers {
+            AttemptHeaders::Chain(headers) => copy_headers(builder.headers_mut(), headers),
+            AttemptHeaders::Direct(map) => copy_headers_direct(builder.headers_mut(), map),
+        }
+        set_framing(builder.headers_mut(), &body, forward.original_headers);
         if let Some(h) = builder.headers_mut()
             && let Ok(v) = HeaderValue::from_str(forward.traceparent)
         {
@@ -179,7 +218,9 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
 
         let overall_elapsed = overall_deadline.is_some_and(|d| Instant::now() >= d);
 
-        match outcome {
+        // Per-arm side effects + the retry-decision input, computed BEFORE the shared
+        // retry-or-return step below (previously this whole block was triplicated per arm).
+        let attempt_outcome = match &outcome {
             Some(Ok(resp)) => {
                 // Feed outlier detection (ADR 000032): a gateway-class 5xx the instance RETURNED
                 // is a misbehaviour signal (a retried-around 5xx still counts). NOT a retry
@@ -188,51 +229,13 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
                 if group.record_outcome(pick.instance(), retriable_5xx) {
                     metrics.inc_outlier_ejection();
                 }
-                // `pick_excluding` has a side effect (it advances the load-balancer's
-                // round-robin/least-request state), so it is called ONLY once policy already says
-                // a retry should be attempted — never speculatively, to "just check" an alternate
-                // exists.
-                let should_retry = retry::should_attempt_retry(
-                    AttemptOutcome::Response { retriable_5xx },
-                    forward.method,
-                    replayable,
-                    tries_left,
-                    overall_elapsed,
-                );
-                if should_retry
-                    && let Some(next_pick) = group.pick_excluding(pick.instance(), hash_key)
-                {
-                    metrics.inc_retries();
-                    retry::backoff(attempt).await;
-                    attempt += 1;
-                    tries_left -= 1;
-                    pick = next_pick;
-                    continue;
-                }
-                return ForwardOutcome::Response(resp, pick);
+                AttemptOutcome::Response { retriable_5xx }
             }
             None => {
                 if overall_elapsed {
                     return ForwardOutcome::OverallTimeout;
                 }
-                let should_retry = retry::should_attempt_retry(
-                    AttemptOutcome::TimedOut,
-                    forward.method,
-                    replayable,
-                    tries_left,
-                    overall_elapsed,
-                );
-                if should_retry
-                    && let Some(next_pick) = group.pick_excluding(pick.instance(), hash_key)
-                {
-                    metrics.inc_retries();
-                    retry::backoff(attempt).await;
-                    attempt += 1;
-                    tries_left -= 1;
-                    pick = next_pick;
-                    continue;
-                }
-                return ForwardOutcome::PerTryTimeout;
+                AttemptOutcome::TimedOut
             }
             Some(Err(e)) => {
                 // A connect failure passively ejects (ADR 000017) — the upstream never received
@@ -242,26 +245,32 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
                 if connect {
                     pick.record_passive_failure();
                 }
-                let should_retry = retry::should_attempt_retry(
-                    AttemptOutcome::Failed { connect },
-                    forward.method,
-                    replayable,
-                    tries_left,
-                    overall_elapsed,
-                );
-                if should_retry
-                    && let Some(next_pick) = group.pick_excluding(pick.instance(), hash_key)
-                {
-                    metrics.inc_retries();
-                    retry::backoff(attempt).await;
-                    attempt += 1;
-                    tries_left -= 1;
-                    pick = next_pick;
-                    continue;
-                }
-                return ForwardOutcome::SendFailed(e);
+                AttemptOutcome::Failed { connect }
             }
+        };
+        let should_retry = retry::should_attempt_retry(
+            attempt_outcome,
+            forward.method,
+            replayable,
+            tries_left,
+            overall_elapsed,
+        );
+        // `pick_excluding` has a side effect (it advances the load-balancer's round-robin /
+        // least-request state), so it is called ONLY once policy already says a retry should be
+        // attempted — never speculatively, to "just check" an alternate exists.
+        if should_retry && let Some(next_pick) = group.pick_excluding(pick.instance(), hash_key) {
+            metrics.inc_retries();
+            retry::backoff(attempt).await;
+            attempt += 1;
+            tries_left -= 1;
+            pick = next_pick;
+            continue;
         }
+        return match outcome {
+            Some(Ok(resp)) => ForwardOutcome::Response(resp, pick),
+            None => ForwardOutcome::PerTryTimeout,
+            Some(Err(e)) => ForwardOutcome::SendFailed(e),
+        };
     }
 }
 
@@ -311,7 +320,7 @@ mod tests {
     fn req<'a>(method: &'a str, headers: &'a HeaderMap) -> ForwardRequest<'a> {
         ForwardRequest {
             method,
-            chain_headers: &[],
+            headers: AttemptHeaders::Chain(&[]),
             original_headers: headers,
             upstream_path: "/",
             traceparent: "test-trace",

@@ -30,10 +30,16 @@ const MAX_ADMIN_CONNECTIONS: usize = 64;
 const ADMIN_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const ADMIN_MAX_HEADERS: usize = 100;
 
-/// Bind `addr` and serve `/metrics`, `/healthz`, `/readyz` until the listener errors. A bind
-/// failure disables the admin endpoint (logged) WITHOUT taking down the data plane — observability
-/// is best-effort and never a reason to fail closed on serving traffic.
-pub(crate) async fn serve_admin(state: Arc<ServerState>, addr: SocketAddr) {
+/// Bind `addr` and serve `/metrics`, `/healthz`, `/readyz` until the listener errors or the drain
+/// flag flips (an embedder of `serve_with_shutdown` must not be left with an orphan admin
+/// listener after serve returns). A bind failure disables the admin endpoint (logged) WITHOUT
+/// taking down the data plane — observability is best-effort and never a reason to fail closed on
+/// serving traffic.
+pub(crate) async fn serve_admin(
+    state: Arc<ServerState>,
+    addr: SocketAddr,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) {
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -44,7 +50,14 @@ pub(crate) async fn serve_admin(state: Arc<ServerState>, addr: SocketAddr) {
     tracing::info!(%addr, "admin endpoint listening (/metrics /healthz /readyz)");
     let conn_limit = Arc::new(Semaphore::new(MAX_ADMIN_CONNECTIONS));
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            // Keep serving THROUGH the drain window? No — `/readyz` already flipped not-ready at
+            // the shutdown signal (before the drain), so the front LB has stopped probing; the
+            // admin listener can close with the accept loops.
+            _ = crate::listener::drained(&mut drain) => return,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, _peer) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(error = %e, "admin accept failed");

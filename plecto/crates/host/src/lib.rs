@@ -42,7 +42,9 @@ pub mod otlp;
 #[cfg(feature = "streaming-body")]
 mod streaming;
 #[cfg(feature = "streaming-body")]
-pub use streaming::{StreamingDecision, StreamingLimits, run_streaming_body};
+pub use streaming::{
+    StreamingDecision, StreamingFilterRuntime, StreamingLimits, run_streaming_body,
+};
 // Outbound capabilities for filters (ADR 000036 HTTP / ADR 000060 TCP), each OFF by default.
 // `outbound` is the pure allowlist + SSRF policy both share (one `classify` = one floor); the
 // wasmtime wirings that enforce it are `outbound_http` / `outbound_tcp` (per-feature gates), and
@@ -125,5 +127,8 @@ pub use errors::{LoadError, RunError};
 pub use filter::LoadedFilter;
 pub use host::Host;
 pub use options::{Isolation, LoadOptions};
-pub use state::{HostState, LogLine};
+// `HostState` stays crate-internal (DECREE §2: minimal pub surface) — it has no public
+// constructor or methods and no external users; only `LogLine` crosses the crate boundary
+// (returned by `on_request`).
+pub use state::LogLine;
 pub use trust::{SignedArtifact, TrustPolicy};

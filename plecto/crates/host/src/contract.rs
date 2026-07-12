@@ -227,7 +227,10 @@ fn response_edit_from_v01(edit: types_v01::ResponseEdit) -> Option<ResponseEdit>
         .map(header_from_v01)
         .collect::<Option<Vec<_>>>()?;
     Some(ResponseEdit {
-        set_status: edit.set_status,
+        set_status: match edit.set_status {
+            Some(status) => Some(validated_guest_status(status)?),
+            None => None,
+        },
         set_headers,
         remove_headers: edit.remove_headers,
     })
@@ -240,7 +243,10 @@ fn response_edit_from_v02(edit: types_v02::ResponseEdit) -> Option<ResponseEdit>
         .map(header_from_v02)
         .collect::<Option<Vec<_>>>()?;
     Some(ResponseEdit {
-        set_status: edit.set_status,
+        set_status: match edit.set_status {
+            Some(status) => Some(validated_guest_status(status)?),
+            None => None,
+        },
         set_headers,
         remove_headers: edit.remove_headers,
     })
@@ -265,7 +271,10 @@ fn response_edit_from_v03(edit: types_v03::ResponseEdit) -> Option<ResponseEdit>
         .map(header_from_v03)
         .collect::<Option<Vec<_>>>()?;
     Some(ResponseEdit {
-        set_status: edit.set_status,
+        set_status: match edit.set_status {
+            Some(status) => Some(validated_guest_status(status)?),
+            None => None,
+        },
         set_headers,
         remove_headers: edit.remove_headers,
     })
@@ -278,6 +287,15 @@ fn validated_guest_body(body: Vec<u8>) -> Option<Vec<u8>> {
     Some(body)
 }
 
+/// Guest-supplied status codes join the header rules at this gate (the module invariant:
+/// everything admitted here survives egress): only 100..=599 — the range hyper's
+/// `StatusCode::from_u16` accepts — passes; anything else is rejected as `InvalidOutput`
+/// instead of being silently rewritten to 502 downstream (the server's clamp stays as
+/// defence in depth).
+fn validated_guest_status(status: u16) -> Option<u16> {
+    (100..=599).contains(&status).then_some(status)
+}
+
 fn response_from_v01(resp: types_v01::HttpResponse) -> Option<HttpResponse> {
     let headers = resp
         .headers
@@ -285,7 +303,7 @@ fn response_from_v01(resp: types_v01::HttpResponse) -> Option<HttpResponse> {
         .map(header_from_v01)
         .collect::<Option<Vec<_>>>()?;
     Some(HttpResponse {
-        status: resp.status,
+        status: validated_guest_status(resp.status)?,
         headers,
         body: validated_guest_body(resp.body)?,
     })
@@ -298,7 +316,7 @@ fn response_from_v02(resp: types_v02::HttpResponse) -> Option<HttpResponse> {
         .map(header_from_v02)
         .collect::<Option<Vec<_>>>()?;
     Some(HttpResponse {
-        status: resp.status,
+        status: validated_guest_status(resp.status)?,
         headers,
         body: validated_guest_body(resp.body)?,
     })
@@ -311,7 +329,7 @@ fn response_from_v03(resp: types_v03::HttpResponse) -> Option<HttpResponse> {
         .map(header_from_v03)
         .collect::<Option<Vec<_>>>()?;
     Some(HttpResponse {
-        status: resp.status,
+        status: validated_guest_status(resp.status)?,
         headers,
         body: validated_guest_body(resp.body)?,
     })

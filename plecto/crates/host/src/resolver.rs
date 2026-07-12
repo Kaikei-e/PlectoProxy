@@ -15,12 +15,18 @@ pub(crate) enum Resolver {
 }
 
 impl Resolver {
-    pub(crate) async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+    /// Resolve `host:port` to socket addresses. The underlying `io::Error` is preserved (DECREE
+    /// §3: no `Result<_, ()>` swallowing) — the guest-visible mapping stays a generic DNS error
+    /// code at the call sites, but the operator gets the real cause in the trace log there.
+    pub(crate) async fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Vec<SocketAddr>, std::io::Error> {
         match self {
             Resolver::System => tokio::net::lookup_host((host, port))
                 .await
-                .map(|it| it.collect())
-                .map_err(|_| ()),
+                .map(|it| it.collect()),
             #[cfg(any(test, feature = "test-support"))]
             Resolver::Static(map) => Ok(map
                 .get(host)

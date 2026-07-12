@@ -3,14 +3,13 @@
 //! trap circuit-breaker.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
 #[cfg(test)]
 use crate::NoopSink;
 use crate::runtime::FilterRuntime;
-use crate::util::wall_now_ms;
 use crate::{Isolation, LogLine, RunError, TelemetrySink};
 #[cfg(test)]
 use anyhow::Result;
@@ -40,25 +39,45 @@ pub(crate) struct LoadedInner<R: FilterRuntime> {
     untrusted_breaker: Mutex<TrapBreaker>,
 }
 
-/// Consecutive traps before a circuit breaker opens a cooldown; shared shape for both the
-/// pool-wide trusted breaker and the per-filter untrusted breaker.
-#[derive(Default)]
+/// Consecutive traps before a circuit breaker opens a cooldown; the ONE breaker implementation
+/// shared by both the pool-wide trusted breaker and the per-filter untrusted breaker (the trusted
+/// pool previously hand-inlined a copy of this arithmetic on its raw fields).
+///
+/// Deadlines are `Instant` (monotonic), not wall-clock: a backwards clock step must not re-open
+/// or extend a cooldown, and a forward step must not defeat it. (The KV `now_ms` snapshot in
+/// `state.rs` legitimately stays wall-clock — filters observe real time.)
 struct TrapBreaker {
     consecutive_traps: u32,
-    cooldown_until_ms: u64,
+    cooldown_until: Option<Instant>,
+    threshold: u32,
+    cooldown: Duration,
 }
 
 impl TrapBreaker {
+    fn new(threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            consecutive_traps: 0,
+            cooldown_until: None,
+            threshold,
+            cooldown,
+        }
+    }
+
     fn record_trap(&mut self) {
         self.consecutive_traps = self.consecutive_traps.saturating_add(1);
-        if self.consecutive_traps >= UNTRUSTED_TRAP_BREAKER_THRESHOLD {
-            self.cooldown_until_ms = wall_now_ms().saturating_add(UNTRUSTED_TRAP_COOLDOWN_MS);
+        if self.consecutive_traps >= self.threshold {
+            self.cooldown_until = Some(Instant::now() + self.cooldown);
         }
     }
 
     fn clear(&mut self) {
         self.consecutive_traps = 0;
-        self.cooldown_until_ms = 0;
+        self.cooldown_until = None;
+    }
+
+    /// Whether the cooldown is currently open (calls fail closed cheaply while it is).
+    fn is_open(&self) -> bool {
+        self.cooldown_until.is_some_and(|t| Instant::now() < t)
     }
 }
 
@@ -69,7 +88,7 @@ impl TrapBreaker {
 const UNTRUSTED_TRAP_BREAKER_THRESHOLD: u32 = 3;
 /// How long the untrusted breaker stays open once tripped: during it, calls fail closed cheaply
 /// (`RunError::Unavailable`) without paying `instantiate_initialized()` at all.
-const UNTRUSTED_TRAP_COOLDOWN_MS: u64 = 500;
+const UNTRUSTED_TRAP_COOLDOWN: Duration = Duration::from_millis(500);
 
 /// Releases a reserved/held `live` pool slot on unwind. Armed while a checked-out instance (or a
 /// reserved build slot) is outside the pool's bookkeeping; the normal return paths disarm it and
@@ -106,7 +125,10 @@ impl<R: FilterRuntime> LoadedInner<R> {
             filter_id,
             sink,
             isolation,
-            untrusted_breaker: Mutex::new(TrapBreaker::default()),
+            untrusted_breaker: Mutex::new(TrapBreaker::new(
+                UNTRUSTED_TRAP_BREAKER_THRESHOLD,
+                UNTRUSTED_TRAP_COOLDOWN,
+            )),
         }
     }
 
@@ -126,10 +148,14 @@ impl<R: FilterRuntime> LoadedInner<R> {
             Build,
             Retry,
         }
+        // ONE absolute deadline for the whole checkout: a per-`wait` timeout would restart in
+        // full on every spurious / raced wakeup (`Step::Retry`), making the worst-case checkout
+        // latency an unbounded multiple of the configured timeout under contention.
+        let deadline = Instant::now() + pool.checkout_timeout;
         loop {
             let step = {
                 let mut g = pool.inner.lock();
-                if wall_now_ms() < g.cooldown_until_ms {
+                if g.breaker.is_open() {
                     return Err(RunError::Unavailable);
                 }
                 if let Some(p) = g.idle.pop() {
@@ -137,11 +163,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 } else if g.live < pool.cap {
                     g.live += 1; // reserve the slot before the (slow) build, done outside the lock
                     Step::Build
-                } else if pool
-                    .available
-                    .wait_for(&mut g, pool.checkout_timeout)
-                    .timed_out()
-                {
+                } else if pool.available.wait_until(&mut g, deadline).timed_out() {
                     // saturated and nothing freed in time → shed load, fail closed.
                     return Err(RunError::Unavailable);
                 } else {
@@ -180,7 +202,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
         &self,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
     ) -> HookResult<T> {
-        if wall_now_ms() < self.untrusted_breaker.lock().cooldown_until_ms {
+        if self.untrusted_breaker.lock().is_open() {
             return Err((RunError::Unavailable, Vec::new()));
         }
         let mut inst = match self.runtime.instantiate_initialized() {
@@ -240,20 +262,28 @@ impl<R: FilterRuntime> LoadedInner<R> {
 
         match result {
             Ok(value) => {
-                let logs = self.runtime.take_logs(&mut pooled.instance);
-                slot.armed = false;
                 pooled.served = pooled.served.saturating_add(1);
-                if pooled.served >= pool.max_requests_per_instance {
+                let recycle = pooled.served >= pool.max_requests_per_instance;
+                // An instance about to be DISCARDED (recycle) gets the final drain — recovering
+                // an unterminated fat-guest stdio partial line (ADR 000063) exactly like the trap
+                // arm below — while one returning to `idle` gets the plain mid-lifetime drain.
+                let logs = if recycle {
+                    self.runtime.take_logs_final(&mut pooled.instance)
+                } else {
+                    self.runtime.take_logs(&mut pooled.instance)
+                };
+                slot.armed = false;
+                if recycle {
                     // Recycle: drop the Store (returning the slot + freeing memory) BEFORE the
                     // logical `live` decrement, so the physical instance count never transiently
                     // exceeds `cap`. The next checkout lazily rebuilds (re-init).
                     drop(pooled);
                     let mut g = pool.inner.lock();
-                    g.clear_breaker();
+                    g.breaker.clear();
                     g.live = g.live.saturating_sub(1);
                 } else {
                     let mut g = pool.inner.lock();
-                    g.clear_breaker();
+                    g.breaker.clear();
                     g.idle.push(pooled);
                 }
                 pool.available.notify_one();
@@ -269,10 +299,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 drop(pooled);
                 let mut g = pool.inner.lock();
                 g.live = g.live.saturating_sub(1);
-                g.consecutive_traps = g.consecutive_traps.saturating_add(1);
-                if g.consecutive_traps >= TRUSTED_TRAP_BREAKER_THRESHOLD {
-                    g.cooldown_until_ms = wall_now_ms().saturating_add(TRUSTED_TRAP_COOLDOWN_MS);
-                }
+                g.breaker.record_trap();
                 drop(g);
                 pool.available.notify_one();
                 Err((RunError::from_call(e), logs))
@@ -308,7 +335,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
 const TRUSTED_TRAP_BREAKER_THRESHOLD: u32 = 3;
 /// How long the breaker stays open once tripped: during it, trusted checkouts fail closed
 /// cheaply (`RunError::Unavailable`) without rebuilding. After it, the next checkout retries.
-const TRUSTED_TRAP_COOLDOWN_MS: u64 = 500;
+const TRUSTED_TRAP_COOLDOWN: Duration = Duration::from_millis(500);
 
 /// An instance in the trusted pool, plus how many requests it has served since it was last
 /// (re)initialized — the counter that drives recycling (ADR 000012 / §6.6). Generic over the
@@ -326,16 +353,7 @@ pub(crate) struct PooledInstance<I> {
 struct PoolInner<I> {
     idle: Vec<PooledInstance<I>>,
     live: usize,
-    consecutive_traps: u32,
-    cooldown_until_ms: u64,
-}
-
-impl<I> PoolInner<I> {
-    /// Clear the breaker after a successful call (a healthy request resets the trap streak).
-    fn clear_breaker(&mut self) {
-        self.consecutive_traps = 0;
-        self.cooldown_until_ms = 0;
-    }
+    breaker: TrapBreaker,
 }
 
 /// A fixed-capacity pool of reusable trusted instances (ADR 000012). Replaces the v0.1
@@ -366,8 +384,7 @@ impl<I> TrustedPool<I> {
                     served: 0,
                 }],
                 live: 1,
-                consecutive_traps: 0,
-                cooldown_until_ms: 0,
+                breaker: TrapBreaker::new(TRUSTED_TRAP_BREAKER_THRESHOLD, TRUSTED_TRAP_COOLDOWN),
             }),
             available: Condvar::new(),
             cap,
@@ -554,7 +571,7 @@ mod pool_tests {
             "the pool-wide breaker should be open"
         );
 
-        std::thread::sleep(Duration::from_millis(TRUSTED_TRAP_COOLDOWN_MS + 20));
+        std::thread::sleep(TRUSTED_TRAP_COOLDOWN + Duration::from_millis(20));
         let result = inner.run_hook(Some(&pool), |inst: &mut FakeInstance| {
             Ok::<_, wasmtime::Error>(inst.id)
         });
@@ -619,13 +636,46 @@ mod pool_tests {
             "a call during the cooldown must not pay instantiate_initialized at all"
         );
 
-        std::thread::sleep(Duration::from_millis(UNTRUSTED_TRAP_COOLDOWN_MS + 20));
+        std::thread::sleep(UNTRUSTED_TRAP_COOLDOWN + Duration::from_millis(20));
         let result = inner.run_hook(None, |inst: &mut FakeInstance| {
             Ok::<_, wasmtime::Error>(inst.id)
         });
         assert!(
             result.is_ok(),
             "the untrusted lifecycle should self-heal once the cooldown elapses, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_pooled_uses_final_drain_on_the_recycling_call() {
+        // Regression: the call that hits max_requests_per_instance DISCARDS its instance, so it
+        // must use take_logs_final (partial-line flush, ADR 000063) like run_fresh / the trap arm
+        // — a plain take_logs would lose an unterminated stdio partial line with the recycled
+        // instance.
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(4, Duration::from_millis(50), 2, first);
+        let inner = fake_inner(runtime);
+
+        let (_v, logs) = inner
+            .run_hook(Some(&pool), |i: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(i.id)
+            })
+            .unwrap();
+        assert_eq!(
+            logs,
+            marker_log("take_logs"),
+            "a call returning to idle uses the mid-lifetime drain"
+        );
+        let (_v, logs) = inner
+            .run_hook(Some(&pool), |i: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(i.id)
+            })
+            .unwrap();
+        assert_eq!(
+            logs,
+            marker_log("take_logs_final"),
+            "the recycling call must use the final drain"
         );
     }
 

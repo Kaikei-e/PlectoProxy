@@ -114,6 +114,7 @@ fn main() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-streaming"),
+            &out_dir,
             "filter_streaming",
             "FILTER_STREAMING_COMPONENT",
         );
@@ -127,12 +128,14 @@ fn main() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-extauthz"),
+            &out_dir,
             "filter_extauthz",
             "FILTER_EXTAUTHZ_COMPONENT",
         );
         build_wasip2_component(
             &cargo,
             &filters.join("filter-jwt"),
+            &out_dir,
             "filter_jwt",
             "FILTER_JWT_COMPONENT",
         );
@@ -144,6 +147,7 @@ fn main() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-tcp-gate"),
+            &out_dir,
             "filter_tcp_gate",
             "FILTER_TCP_GATE_COMPONENT",
         );
@@ -152,6 +156,7 @@ fn main() {
         build_wasip2_component(
             &cargo,
             &filters.join("filter-ratelimit-redis"),
+            &out_dir,
             "filter_ratelimit_redis",
             "FILTER_RATELIMIT_REDIS_COMPONENT",
         );
@@ -161,11 +166,16 @@ fn main() {
 /// Build one guest crate for `wasm32-wasip2`, which already emits a Component Model component (the
 /// target links with `wasm-component-ld`), and emit `cargo:rustc-env=<env_var>=<path>`. Used for the
 /// async `stream<u8>` streaming guest, which — unlike the no-WASI header-only filters — imports WASI.
-fn build_wasip2_component(cargo: &str, guest: &Path, stem: &str, env_var: &str) {
+fn build_wasip2_component(cargo: &str, guest: &Path, out_dir: &Path, stem: &str, env_var: &str) {
     println!("cargo:rerun-if-changed={}", guest.join("src").display());
     println!(
         "cargo:rerun-if-changed={}",
         guest.join("Cargo.toml").display()
+    );
+    // A lockfile-only guest dep bump must also retrigger the fixture build.
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest.join("Cargo.lock").display()
     );
 
     let target_dir = guest.join("target");
@@ -192,14 +202,25 @@ fn build_wasip2_component(cargo: &str, guest: &Path, stem: &str, env_var: &str) 
         );
     }
 
-    // wasm32-wasip2 emits a component directly — no wit-component wrapping.
+    // wasm32-wasip2 emits a component directly — no wit-component wrapping. Copy the final
+    // artifact into OUT_DIR (like `build_component`'s wrapped output) so the referenced path
+    // lives in cargo-managed build output — `cargo clean` cleans it, and a concurrent build of
+    // the guest workspace cannot rewrite the file the host build points at.
     let component = target_dir.join(format!("wasm32-wasip2/release/{stem}.wasm"));
     assert!(
         component.exists(),
         "guest component not found at {}",
         component.display()
     );
-    println!("cargo:rustc-env={env_var}={}", component.display());
+    let published = out_dir.join(format!("{stem}-wasip2.wasm"));
+    std::fs::copy(&component, &published).unwrap_or_else(|e| {
+        panic!(
+            "copying {} to {} failed: {e}",
+            component.display(),
+            published.display()
+        )
+    });
+    println!("cargo:rustc-env={env_var}={}", published.display());
 }
 
 /// Build one guest crate for `wasm32-unknown-unknown`, wrap the core module into a Component (no
@@ -211,6 +232,11 @@ fn build_component(cargo: &str, guest: &Path, out_dir: &Path, stem: &str, env_va
     println!(
         "cargo:rerun-if-changed={}",
         guest.join("Cargo.toml").display()
+    );
+    // A lockfile-only guest dep bump must also retrigger the fixture build.
+    println!(
+        "cargo:rerun-if-changed={}",
+        guest.join("Cargo.lock").display()
     );
 
     // 1) Build the guest core module (no WASI imports on this target).

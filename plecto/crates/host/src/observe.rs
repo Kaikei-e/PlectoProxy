@@ -486,6 +486,13 @@ impl TelemetrySink for FanOutSink {
             sink.export(span);
         }
     }
+
+    /// Enabled iff ANY child is: without this override the trait default (`true`) would make
+    /// composing onto a `NoopSink` pay per-hook span construction (name / attribute / event
+    /// allocations) for spans no child would ever export.
+    fn enabled(&self) -> bool {
+        self.sinks.iter().any(|s| s.enabled())
+    }
 }
 
 #[cfg(test)]

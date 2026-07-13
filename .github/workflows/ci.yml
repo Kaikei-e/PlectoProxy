@@ -112,6 +112,7 @@ jobs:
       # respectively. Nothing else guards those copies against drifting from their canonical
       # source — this does.
       - name: vendored publish-sources drift check
+        working-directory: .
         run: python3 scripts/check_wit_vendoring.py
 
   docs:

@@ -47,7 +47,7 @@ fat-guest = ["plecto-host/fat-guest"]
 instruction-bench = []
 
 [dependencies]
-plecto-host = { path = "../host" }
+plecto-host = { workspace = true }
 anyhow = { workspace = true }
 # CIDR parse/containment: `[listen.proxy_protocol] trusted` (ADR 000057) always, plus the
 # outbound `[filter.outbound_http]` / `[filter.outbound_tcp]` allow_private ranges (ADR 000036/000060).

@@ -3,31 +3,33 @@
 //! own 90-day-plan phasing) — `go`/`moonbit`/`c`/`js` return a clear "not yet" error rather than
 //! silently doing nothing, so the CLI's surface honestly reflects what is built.
 //!
-//! The Rust template's `Cargo.toml` / `src/lib.rs`, and the `plecto:filter` WIT contract itself,
-//! are all embedded at COMPILE time via `include_str!` from this same source tree
-//! (`examples/filters/filter-template/` and `wit/world.wit` respectively) — so a released
-//! `plecto` binary ships a working scaffold, on the exact contract version that binary's own
-//! host runs, without needing this repo checked out at runtime or a network round-trip to a WIT
-//! registry (self-vendoring, ADR 000072). The WIT text `new-filter` writes is the same file
-//! `plecto-host`'s bindgen resolves, so the CLI can no longer scaffold a different *package
-//! version* than the host loads. The guest Rust template (`lib.rs`) is a separate embed and must
-//! stay API-compatible with that WIT — a compile smoke test guards that coupling. `wkg`
-//! (ADR 000064) remains the distribution channel for filter authors who do NOT use this CLI
-//! (polyglot / out-of-tree).
+//! The Rust template's `Cargo.toml` / `src/lib.rs` are embedded at COMPILE time via
+//! `include_str!` from a vendored copy under `templates/filter-template/` (kept in sync with the
+//! canonical `examples/filters/filter-template/` by `scripts/check_wit_vendoring.py`, run in
+//! CI — the crates.io package can only contain files under this crate's own root, so a sibling
+//! `../../../examples/...` path cannot survive publishing). The `plecto:filter` WIT contract text
+//! comes from `plecto_control::FILTER_WIT` — a re-export of `plecto-host`'s own vendored copy —
+//! so a released `plecto` binary ships a working scaffold on the exact contract version that
+//! binary's own host runs, without needing this repo checked out at runtime or a network
+//! round-trip to a WIT registry (self-vendoring, ADR 000072). Reusing the host's constant instead
+//! of a separate embed means the CLI can no longer scaffold a different *package version* than
+//! the host loads — there is only one copy to drift from. The guest Rust template (`lib.rs`) is a
+//! separate embed and must stay API-compatible with that WIT — a compile smoke test guards that
+//! coupling. `wkg` (ADR 000064) remains the distribution channel for filter authors who do NOT
+//! use this CLI (polyglot / out-of-tree).
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use plecto_control::FILTER_WIT;
 
 use crate::dev_key;
 
-const TEMPLATE_CARGO_TOML: &str =
-    include_str!("../../../examples/filters/filter-template/Cargo.toml");
-const TEMPLATE_LIB_RS: &str = include_str!("../../../examples/filters/filter-template/src/lib.rs");
-
-/// The canonical `plecto:filter` contract text — the same file `plecto-host`'s
-/// `wasmtime::component::bindgen!({ path: "../../wit", .. })` resolves.
-const FILTER_WIT: &str = include_str!("../../../wit/world.wit");
+// `Cargo.toml.template`, not `Cargo.toml`: a literal nested `Cargo.toml` makes `cargo package`
+// treat this directory as a separate package boundary and silently drop it, even with an
+// explicit `include` pattern (verified empirically — `cargo package -p plecto-server --list`).
+const TEMPLATE_CARGO_TOML: &str = include_str!("../templates/filter-template/Cargo.toml.template");
+const TEMPLATE_LIB_RS: &str = include_str!("../templates/filter-template/src/lib.rs");
 
 pub(crate) fn run(lang: &str, name: &str, project_root: &Path) -> Result<()> {
     if lang != "rust" {

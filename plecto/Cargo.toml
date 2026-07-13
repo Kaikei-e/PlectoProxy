@@ -33,6 +33,12 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.dependencies]
+# Internal workspace crates, with both `path` (used in this repo) and `version` (used once
+# packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
+# package at all without one). Bump `version` here in lockstep with `workspace.package.version`
+# above at release time.
+plecto-host = { path = "crates/host", version = "0.3.4" }
+plecto-control = { path = "crates/control", version = "0.3.4" }
 # wasmtime 46.0.x for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46
 # (2026-06-22) ships Component Model async + WASI 0.3 by default. The async / bindgen API is still
 # moving on this line, so we track the latest 46 patch (Cargo.lock pins the resolved build).

@@ -2,20 +2,29 @@
 //! (ADR 000071 / 000073).
 
 mod bindings_v01 {
+    // Vendored copy of `plecto/wit/v0.1.0/` — see `crate::bindings`'s comment for why.
     wasmtime::component::bindgen!({
-        path: "../../wit/v0.1.0",
+        path: "wit/v0.1.0",
         world: "filter",
         exports: { default: async },
     });
 }
 
 mod bindings_v02 {
+    // Vendored copy of `plecto/wit/v0.2.0/` — see `crate::bindings`'s comment for why.
     wasmtime::component::bindgen!({
-        path: "../../wit/v0.2.0",
+        path: "wit/v0.2.0",
         world: "filter",
         exports: { default: async },
     });
 }
+
+/// The canonical `plecto:filter@0.3.0` contract text, byte-identical to the vendored
+/// `wit/world.wit` this module's `crate::bindings` resolves — so a consumer that needs the raw
+/// WIT source (e.g. `plecto new-filter`'s scaffold, ADR 000072) can never drift from what this
+/// binary's own host actually runs. Re-exported via `plecto-control` for `plecto-server`, which
+/// takes no direct `plecto-host` production dependency.
+pub const FILTER_WIT: &str = include_str!("../wit/world.wit");
 
 pub(crate) use crate::bindings::{
     Filter as FilterV03, FilterPre as FilterPreV03, plecto::filter::types as types_v03,

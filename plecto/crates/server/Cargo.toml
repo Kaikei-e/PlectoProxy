@@ -12,6 +12,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
+# `templates/filter-template/` has its own Cargo.toml (it's a vendored copy of a real guest
+# crate, `include_str!`-embedded by `new_filter.rs`) — cargo's default VCS-tracked file
+# collection treats a directory containing a nested Cargo.toml as a separate package boundary
+# and silently drops it, so it needs an explicit `include` to survive `cargo package`.
+include = ["src/**", "tests/**", "templates/**", "CONTEXT.md"]
 
 # The M2 fast path: a listener that drives requests through the control plane's routed filter
 # chains and forwards to upstreams — HTTP/1.1 + HTTP/2 over TCP and HTTP/3 over QUIC (ADR 000013 /
@@ -126,7 +131,7 @@ fat-guest = ["plecto-control/fat-guest"]
 capabilities = ["outbound-http", "outbound-tcp", "fat-guest"]
 
 [dependencies]
-plecto-control = { path = "../control" }
+plecto-control = { workspace = true }
 # libc: glibc `mallopt(M_ARENA_MAX)` to cap per-thread malloc arenas at startup, bounding RSS on
 # many-core hosts (docs/servey body-tax). Used only on glibc targets; a no-op elsewhere.
 libc = "0.2"

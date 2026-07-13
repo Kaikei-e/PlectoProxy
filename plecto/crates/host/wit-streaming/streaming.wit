@@ -1,0 +1,44 @@
+// Experimental streaming body-filter world — NOT the shipped plecto:filter@0.1.0 contract, and a
+// SEPARATE package so the stable `world filter` resolution is untouched. This is the feature-gated
+// `streaming-body` increment (direction_0003 gates 1+2): a body filter that consumes the request
+// body as a `stream<u8>` (no whole-body buffer) and returns a decision. It stays out of the default
+// build until wasm32-wasip3 reaches Tier 2 (ADR 000010 / 000020 / 000021 / 000025).
+package plecto:filter-streaming@0.1.0;
+
+interface types {
+    // A single HTTP header field (mirrors plecto:filter's shape).
+    record header {
+        name: string,
+        value: string,
+    }
+
+    // A response a filter synthesises when it short-circuits the chain.
+    record http-response {
+        status: u16,
+        headers: list<header>,
+        body: list<u8>,
+    }
+
+    // The outcome of a streaming request-body filter. Mirrors plecto:filter's request-body-decision,
+    // but the body arrives as a CONSUMED stream, so `continue` carries no re-buffered payload — the
+    // host tees the body to the upstream (server-side wiring is a later increment). Never a bare flag
+    // (Tenet 3).
+    variant request-body-decision {
+        // forward the body to the upstream unchanged
+        %continue,
+        // stop the chain and synthesise this response now (don't reach upstream)
+        short-circuit(http-response),
+    }
+}
+
+interface body-filter {
+    use types.{request-body-decision};
+
+    // Consume the request body as a stream and decide. The filter pulls the body lazily (no
+    // whole-body buffer on either side); returning short-circuit stops the chain before upstream.
+    process-body: async func(input: stream<u8>) -> request-body-decision;
+}
+
+world streaming-filter {
+    export body-filter;
+}

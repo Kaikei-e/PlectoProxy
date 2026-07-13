@@ -21,7 +21,9 @@ fn main() {
     let crates = manifest.parent().unwrap(); // plecto/crates
     let plecto = crates.parent().unwrap(); // plecto
     let repo_root = plecto.parent().unwrap(); // repo root (holds bench/)
-    let wit = plecto.join("wit"); // plecto/wit
+    // The vendored copy `bindgen!` actually resolves (crates/host/wit/) — not the canonical
+    // `plecto/wit/` (kept in sync by `scripts/check_wit_vendoring.py`, run in CI).
+    let wit = manifest.join("wit");
     // The example filter guests live OUTSIDE the workspace, under examples/filters/ (each its own
     // workspace), built here for wasm32 and componentized. Benchmark-only guests live under bench/.
     let filters = plecto.join("examples").join("filters");

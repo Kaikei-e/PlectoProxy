@@ -102,8 +102,8 @@ pub use plecto_host::{
 // production dependency; a plain (non-`test-support`) `plecto-host` build needs no wasm32
 // toolchain, so this widens no dependency edge, just this crate's existing re-export list.
 pub use plecto_host::{
-    ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevKeyError, DevSigner, bound_sbom,
-    public_key_path_for, run_conformance,
+    ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevKeyError, DevSigner, FILTER_WIT,
+    bound_sbom, public_key_path_for, run_conformance,
 };
 // The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.

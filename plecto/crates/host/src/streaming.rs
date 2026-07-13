@@ -19,8 +19,9 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::engine::EpochTicker;
 
 mod bindings {
+    // Vendored copy of `plecto/wit-streaming/` — see `crate::bindings`'s comment in lib.rs.
     wasmtime::component::bindgen!({
-        path: "../../wit-streaming",
+        path: "wit-streaming",
         world: "streaming-filter",
         exports: { default: async },
     });

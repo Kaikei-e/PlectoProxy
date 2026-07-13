@@ -107,6 +107,12 @@ jobs:
             [ -f "v0.3.0/$f" ] || { echo "missing v0.3.0/$f"; exit 1; }
             diff <(strip "$f") <(strip "v0.3.0/$f") || { echo "wit/$f drifted from wit/v0.3.0/$f"; exit 1; }
           done
+      # crates.io packaging can only include files under a crate's own root, so the WIT
+      # contract and the filter-template guest are vendored into crates/host and crates/server
+      # respectively. Nothing else guards those copies against drifting from their canonical
+      # source — this does.
+      - name: vendored publish-sources drift check
+        run: python3 scripts/check_wit_vendoring.py
 
   docs:
     name: ADR graph check

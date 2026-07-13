@@ -97,7 +97,7 @@ pub mod test_support;
 
 pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_bucket};
 pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conformance};
-pub use contract::{ContractVersion, header};
+pub use contract::{ContractVersion, FILTER_WIT, header};
 pub use dev_signer::{DEV_KEY_MARKER, DevKeyError, DevSigner, bound_sbom, public_key_path_for};
 pub use observe::{
     FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
@@ -105,8 +105,12 @@ pub use observe::{
 };
 
 mod bindings {
+    // `wit/` here is a vendored copy of the repo-root `plecto/wit/` (the contract's source of
+    // truth) — cargo-package can only include files under this crate's own root, so publishing
+    // to crates.io needs the WIT available in-tree, not via a `../../` sibling path.
+    // `scripts/check_wit_vendoring.py` (run in CI) keeps this copy from drifting.
     wasmtime::component::bindgen!({
-        path: "../../wit",
+        path: "wit",
         world: "filter",
         // M3 Stage 1 (ADR 000021): the guest's exported hooks (init / on-request / on-response) run
         // via call_async on wasmtime fibers — the prerequisite for future WASI async host calls. The

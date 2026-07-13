@@ -17,12 +17,12 @@ services:
 
   plecto-1:
     command: ["/etc/plecto/scenario-b.toml"]
-    user: "${PLECTO_UID:-1000}"
+    user: "${PLECTO_UID:?run first: export PLECTO_UID=$(id -u)}"
     volumes:
       - ./manifests:/etc/plecto:ro
 
   plecto-2:
     command: ["/etc/plecto/scenario-b.toml"]
-    user: "${PLECTO_UID:-1000}"
+    user: "${PLECTO_UID:?run first: export PLECTO_UID=$(id -u)}"
     volumes:
       - ./manifests:/etc/plecto:ro

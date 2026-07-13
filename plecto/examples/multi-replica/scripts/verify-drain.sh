@@ -5,7 +5,7 @@
 # (ADR 000059) — so no request ever lands on a dying replica.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-url="${1:-http://localhost:8080/}"
+url="${1:-http://localhost:18080/}"
 duration="${DURATION:-15}"
 
 echo "curling $url for ${duration}s; stopping plecto-1 after 3s..."

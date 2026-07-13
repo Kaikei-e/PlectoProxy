@@ -133,7 +133,12 @@ cd .. && rm -r plecto-quickstart
 
 - **Multiple replicas behind a load balancer** — the runnable multi-replica reference
   (graceful drain, PROXY protocol v2, TLS scenarios):
-  [`plecto/examples/multi-replica/`](../../plecto/examples/multi-replica/README.md)
+  [`plecto/examples/multi-replica/`](../../plecto/examples/multi-replica/README.md).
+  Grab just that directory without a full clone:
+  ```bash
+  git clone --depth 1 --filter=blob:none --sparse https://github.com/Kaikei-e/PlectoProxy
+  cd PlectoProxy && git sparse-checkout set plecto/examples/multi-replica
+  ```
 - **Write a filter** — the extension plane is the point:
   [docs/writing-a-filter.md](../writing-a-filter.md)
 - **Signed reference filters** (JWT, CORS, API-key, ext-authz) and their verify-then-load

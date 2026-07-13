@@ -1,7 +1,7 @@
 # Multi-replica reference (ADR 000082 / 000088): front L4 LB (PROXY v2) → Plecto ×2 →
 # backend ×2, with /readyz wired into the LB's active health checks.
 #
-#   docker compose up                       # base skeleton: plaintext HTTP on :8080
+#   docker compose up                       # base skeleton: plaintext HTTP on :18080
 #   scripts/verify-drain.sh                 # drain one replica, prove zero dropped requests
 #
 # TLS scenarios are separate override files (see README.md):
@@ -28,7 +28,9 @@ services:
     volumes:
       - ./lb/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
-      - "8080:8080"
+      # Host port defaults to 18080 to avoid colliding with whatever else is already
+      # bound to 8080 on the host; override with PLECTO_HTTP_PORT if you want another.
+      - "${PLECTO_HTTP_PORT:-18080}:8080"
     networks:
       edge:
         ipv4_address: 172.28.0.10

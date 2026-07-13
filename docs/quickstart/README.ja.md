@@ -136,7 +136,12 @@ cd .. && rm -r plecto-quickstart
 
 - **LB の背後に複数レプリカ** — 走らせられるマルチレプリカ reference（graceful
   drain、PROXY protocol v2、TLS シナリオ）:
-  [`plecto/examples/multi-replica/`](../../plecto/examples/multi-replica/README.md)
+  [`plecto/examples/multi-replica/`](../../plecto/examples/multi-replica/README.md)。
+  フルクローンせずにこのディレクトリだけ取得する:
+  ```bash
+  git clone --depth 1 --filter=blob:none --sparse https://github.com/Kaikei-e/PlectoProxy
+  cd PlectoProxy && git sparse-checkout set plecto/examples/multi-replica
+  ```
 - **フィルタを書く** — extension plane こそが本題:
   [docs/writing-a-filter.md](../writing-a-filter.md)
 - **署名付き reference filter**（JWT、CORS、API-key、ext-authz）と verify-then-load

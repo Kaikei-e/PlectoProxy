@@ -44,10 +44,14 @@ endorsed by HAProxy Technologies.*
 
 ```bash
 docker compose up -d
-curl -s http://localhost:8080/        # a whoami response, via LB → plecto → backend
+curl -s http://localhost:18080/       # a whoami response, via LB → plecto → backend
 scripts/verify-drain.sh               # stops plecto-1 mid-traffic; asserts 0 failures
 docker compose down
 ```
+
+Host port defaults to `18080` to avoid colliding with whatever else is already bound to
+`8080` on your machine; override with `PLECTO_HTTP_PORT` (and adjust the `curl` above to
+match) if you want another.
 
 What the drain proof exercises: `docker compose stop plecto-1` sends SIGTERM →
 `/readyz` flips to 503 while the replica **keeps accepting** for `readiness_grace_ms`
@@ -106,7 +110,7 @@ three ([ADR 000082](../../../docs/ADR/000082.md)).
 
 ```
 multi-replica/
-├── compose.yaml                # base skeleton (plaintext :8080)
+├── compose.yaml                # base skeleton (plaintext, host :18080 by default)
 ├── compose.scenario-a.yaml     # override: TLS + shared STEK (:8443)
 ├── compose.scenario-b.yaml     # override: downstream mTLS (:8443)
 ├── lb/haproxy.cfg              # the L4 slot's example implementation

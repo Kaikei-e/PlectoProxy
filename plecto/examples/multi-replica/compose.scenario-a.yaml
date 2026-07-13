@@ -19,7 +19,7 @@ services:
     # The bind-mounted secrets are 0600 and owned by you, not by the image's
     # nonroot user — run the replica as your uid so the fail-closed permission
     # check (chmod 600, owner-only) passes for the right reason.
-    user: "${PLECTO_UID:-1000}"
+    user: "${PLECTO_UID:?run first: export PLECTO_UID=$(id -u)}"
     volumes:
       - ./manifests:/etc/plecto:ro
     ports:
@@ -29,7 +29,7 @@ services:
 
   plecto-2:
     command: ["/etc/plecto/scenario-a.toml"]
-    user: "${PLECTO_UID:-1000}"
+    user: "${PLECTO_UID:?run first: export PLECTO_UID=$(id -u)}"
     volumes:
       - ./manifests:/etc/plecto:ro
     ports:

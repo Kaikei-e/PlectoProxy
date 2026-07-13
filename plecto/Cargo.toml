@@ -20,8 +20,8 @@ repository = "https://github.com/Kaikei-e/PlectoProxy"
 homepage = "https://github.com/Kaikei-e/PlectoProxy"
 keywords = ["proxy", "gateway", "wasm", "webassembly", "http"]
 categories = ["network-programming", "web-programming", "wasm"]
-# Not published to crates.io yet (early development). Flip per-crate when distribution begins.
-publish = false
+# Published to crates.io (ADR 000090, amends 000047's earlier decline).
+publish = true
 # crates.io landing page for every member (readme.workspace = true); relative to this file.
 readme = "README.md"
 

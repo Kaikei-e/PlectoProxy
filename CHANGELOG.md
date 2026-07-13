@@ -21,6 +21,20 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-13
+
+### Fixed
+
+- **Server (fast path):** an h2 client's request carries no literal `Host` header (RFC 9113:
+  the authority lives in the `:authority` pseudo-header), and the upstream leg is always
+  HTTP/1.1 (ADR 000042); the forwarded header set had no `Host` in that case, so hyper's h1
+  upstream client synthesized one from the destination URI — the upstream saw its own
+  resolved address instead of the client's original authority. The proxy now fills `Host`
+  from the client's derived authority whenever the forwarded headers carry none, leaving an
+  HTTP/1.1 client's literal `Host` (or a filter's explicit override) untouched. Found via
+  external testing of the multi-replica reference (`plecto/examples/multi-replica/`), whose
+  TLS scenarios negotiate h2 via ALPN.
+
 ## [0.3.3] - 2026-07-13
 
 ### Added

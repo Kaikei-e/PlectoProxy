@@ -417,6 +417,148 @@ async fn try_h2_get(proxy: SocketAddr, config: Arc<ClientConfig>) -> Result<Stat
     Ok(resp.status())
 }
 
+/// Reflects the resolved Host header it received into the response body (`NONE` if absent), so a
+/// test can see exactly what the upstream leg was sent.
+async fn host_echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let body = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| Bytes::copy_from_slice(v.as_bytes()))
+        .unwrap_or_else(|| Bytes::from_static(b"NONE"));
+    Ok(Response::builder()
+        .status(200)
+        .body(Full::new(body))
+        .unwrap())
+}
+
+async fn spawn_host_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service_fn(host_echo))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// A filterless `/api`→echo route (no `[[filter]]`) with a default `[[tls]]` cert — the shape the
+/// multi-replica reference (`plecto/examples/multi-replica/`) actually runs.
+fn manifest_toml_filterless(upstream: SocketAddr, cert: &TestCert) -> String {
+    format!(
+        r#"
+[[upstream]]
+name = "echo"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+upstream = "echo"
+strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
+
+[[tls]]
+cert_path = "{cert_path}"
+key_path = "{key_path}"
+"#,
+        cert_path = cert.cert_path,
+        key_path = cert.key_path,
+    )
+}
+
+fn loaded_control_filterless(toml: &str) -> Control {
+    let signer = TestSigner::new().unwrap();
+    let manifest = Manifest::from_toml(toml).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    Control::load(host, &manifest, Box::new(MemoryStore::new())).unwrap()
+}
+
+/// Like [`drive_h2`], but sends an absolute-form URI with NO literal `host` header — what a real h2
+/// client does (RFC 9113: the authority lives only in `:authority`). `drive_h2`'s `.header("host",
+/// ...)` is a build convenience that (unlike a real h2 client) also reaches the wire as a regular
+/// header field, which would mask this bug.
+async fn drive_h2_no_host_header(proxy: SocketAddr, root: CertificateDer<'static>) -> H2Result {
+    let mut roots = RootCertStore::empty();
+    roots.add(root).unwrap();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let tcp = TcpStream::connect(proxy).await.unwrap();
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("https://localhost/api/hello")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    H2Result {
+        negotiated_alpn: None,
+        status: parts.status,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+/// Drive [`drive_h2_no_host_header`], retrying past the pessimistic-start 503 window (ADR 000017).
+async fn drive_h2_no_host_header_ready(proxy: SocketAddr, root: CertificateDer<'static>) -> H2Result {
+    for _ in 0..100 {
+        let r = drive_h2_no_host_header(proxy, root.clone()).await;
+        if r.status != StatusCode::SERVICE_UNAVAILABLE {
+            return r;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("upstream never became healthy within the readiness window");
+}
+
+/// Regression (docs/servey f00002, external multi-replica run): a real h2 client carries no literal
+/// `Host` header — RFC 9113 puts the authority in `:authority` — and the upstream leg is always
+/// HTTP/1.1 (ADR 000042). Before this fix, the forwarded header set had no `Host` at all in that
+/// case, so hyper's h1 upstream client synthesized one from the destination URI: the upstream saw
+/// ITS OWN resolved address instead of the client's original authority. It must see the client's
+/// authority instead, exactly like an HTTP/1.1 client's literal `Host` is already forwarded verbatim.
+#[tokio::test]
+async fn h2_client_forwards_original_authority_as_host_not_upstream_address() {
+    let cert = make_cert();
+    let upstream = spawn_host_echo_upstream().await;
+    let toml = manifest_toml_filterless(upstream, &cert);
+    let control = Arc::new(loaded_control_filterless(&toml));
+    let proxy = spawn_proxy(control).await;
+
+    let result = drive_h2_no_host_header_ready(proxy, cert.cert_der.clone()).await;
+
+    assert_eq!(result.status, StatusCode::OK);
+    assert_eq!(
+        result.body, "localhost",
+        "the upstream must see the client's original authority, not its own resolved address"
+    );
+}
+
 /// Downstream mTLS on the h2 path (ADR 000078): the SAME TCP acceptor + `ServerConfig` that
 /// terminate HTTP/1.1 enforce client auth for an h2-negotiating client — authenticated is
 /// served over h2, anonymous is refused at the TLS layer.

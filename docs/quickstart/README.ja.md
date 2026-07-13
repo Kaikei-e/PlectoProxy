@@ -9,6 +9,8 @@
 （[ADR 000084](../ADR/000084.md) / [ADR 000087](../ADR/000087.md)）。
 
 目標: このページを開いてから最初のプロキシ応答まで **5 分以内**。
+これはイメージのレイヤーがローカルにキャッシュ済みか、通常のブロードバンド回線を
+想定しています——初回 pull ではダウンロード時間が支配的になります。
 もし時間がかかった・詰まった場合は、どこで詰まったかを
 [Discussions](https://github.com/Kaikei-e/PlectoProxy/discussions) で教えてください。
 初回導線の摩擦報告が、このページを改善する材料になります。
@@ -85,9 +87,14 @@ EOF
 
 docker network create plecto-quickstart
 docker run -d --name backend --network plecto-quickstart traefik/whoami
-docker run -d --name plecto --network plecto-quickstart -p 8080:8080 \
+docker run -d --name plecto --network plecto-quickstart -p 18080:8080 \
   -v "$PWD:/etc/plecto:ro" "$IMAGE@$DIGEST"
 ```
+
+ホスト側ポートを `18080` にしているのは、開発機で既に `8080` が別プロセスに使われて
+いるケースを避けるためです。コンテナ内部の listen ポートに合わせて `8080` を使いたい
+場合は、マッピングを `-p 8080:8080` に変更し、次のステップの `curl` コマンドも合わせて
+変更してください。
 
 プロキシが実行しているのは、タグではなく**検証した digest そのもの**です。backend
 （`traefik/whoami`、極小のエコーサーバ）はあなた自身のサービスの代役であり、上記の
@@ -97,11 +104,25 @@ docker run -d --name plecto --network plecto-quickstart -p 8080:8080 \
 ## 4. 最初のプロキシ応答
 
 ```bash
-curl -s http://localhost:8080/
+curl -s http://localhost:18080/
 ```
 
 whoami の応答が、署名検証済みの Plecto を経由して返ってきます。これがループの全体
 です: **解決 → 検証 → 実行 → 応答**。
+
+## トラブルシューティング
+
+**`docker run` が失敗する、または再試行時に名前が既に使われていると言われる。**
+ステップ 3 が途中で失敗した場合（例えばホスト側ポートが既に使われていた場合）、
+Docker はコンテナを `Created` 状態のまま `plecto` や `backend` という名前を掴んだ状態
+で残すことがあります——`docker run` にありがちな罠です。再試行する前に、残っている
+コンテナを削除してください:
+
+```bash
+docker rm -f plecto backend
+```
+
+その後、ステップ 3 の `docker run` コマンドを再実行してください。
 
 ## 後片付け
 

@@ -9,6 +9,8 @@ part of the flow, not an optional extra ([ADR 000084](../ADR/000084.md) /
 [ADR 000087](../ADR/000087.md)).
 
 Target: from opening this page to the first proxied response in **under 5 minutes**.
+That assumes the image layers are already cached locally, or a typical broadband
+connection — on a cold pull, download time dominates the budget.
 If it took you longer — or you got stuck — please
 [tell us where](https://github.com/Kaikei-e/PlectoProxy/discussions): first-run friction
 reports are how this page gets better.
@@ -83,9 +85,14 @@ EOF
 
 docker network create plecto-quickstart
 docker run -d --name backend --network plecto-quickstart traefik/whoami
-docker run -d --name plecto --network plecto-quickstart -p 8080:8080 \
+docker run -d --name plecto --network plecto-quickstart -p 18080:8080 \
   -v "$PWD:/etc/plecto:ro" "$IMAGE@$DIGEST"
 ```
+
+Host port `18080` avoids colliding with whatever else is already bound to `8080` on
+your machine. If you'd rather use `8080` (matching the container's internal listen
+port), change the mapping to `-p 8080:8080` and update the `curl` command in the next
+step to match.
 
 Note that the proxy runs **the digest you verified** — not the tag. The backend
 (`traefik/whoami`, a tiny echo server) is a stand-in for your own service; it is *not*
@@ -95,11 +102,24 @@ loads and runs, never about your upstreams.
 ## 4. First proxied response
 
 ```bash
-curl -s http://localhost:8080/
+curl -s http://localhost:18080/
 ```
 
 You should see the whoami response — proxied through a signature-verified Plecto. That's
 the whole loop: **resolve → verify → run → respond**.
+
+## Troubleshooting
+
+**`docker run` fails, or a retry says a name is already in use.** If step 3 failed
+partway (for example the host port was already taken), Docker can leave a container
+behind in the `Created` state still holding the `plecto` or `backend` name — a common
+trap with `docker run`. Remove the stale containers before retrying:
+
+```bash
+docker rm -f plecto backend
+```
+
+Then re-run the `docker run` commands from step 3.
 
 ## Clean up
 

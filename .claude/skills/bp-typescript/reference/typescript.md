@@ -4,6 +4,19 @@
 
 二用途: **Node ツーリング/統合テスト** と **JS/TS 製 WASM フィルタ（jco / componentize-js）**。
 
+## Contents
+
+1. Strict Configuration
+2. Type Safety at Boundaries
+3. Discriminated Unions & Exhaustiveness
+4. Error Handling
+5. Async Patterns
+6. Validation
+7. Module Design (ESM)
+8. Node tooling / 統合テスト
+9. JS→WASM filter authoring (jco / componentize-js)
+- Sources
+
 ---
 
 ## 1. Strict Configuration

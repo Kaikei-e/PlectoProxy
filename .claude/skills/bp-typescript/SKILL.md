@@ -1,13 +1,19 @@
 ---
 name: bp-typescript
-description: |
+description: >-
   TypeScript / JavaScript ベストプラクティス。型安全性とコード品質を保つ規約。
   Plecto では (1) Node ツーリング・統合テスト・wasm-bindgen の node_pkg 周り、
   (2) jco / componentize-js で書く JS/TS 製 WASM フィルタ、の二用途に効く。
-  TRIGGER when: .ts / .mts / .js / .mjs ファイルを編集・作成する時、Node スクリプトや
-  統合テストを書く時、JS/TS で WASM フィルタ（plecto:filter）を実装する時。
-  DO NOT TRIGGER when: テストの実行のみ、tsconfig.json の確認のみ、ファイルの読み取りのみ、
-  Rust / Go / Python の作業時。
+when_to_use: >-
+  .ts / .mts / .js / .mjs ファイルを編集・作成する時、Node スクリプトや統合テストを書く時、
+  JS/TS で WASM フィルタ（plecto:filter）を実装する時。テスト実行・読み取りのみの作業や
+  Rust / Go / Python の作業時は不要。
+paths:
+  - "**/*.ts"
+  - "**/*.mts"
+  - "**/*.tsx"
+  - "**/*.js"
+  - "**/*.mjs"
 ---
 
 # TypeScript / JS Best Practices (Plecto)

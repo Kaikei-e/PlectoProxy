@@ -1,12 +1,14 @@
 ---
 name: bp-rust
-description: |
+description: >-
   Rust ベストプラクティス。Plecto の fast path（native Rust）と wasmtime ホスト埋め込みの
   コード品質を保つ規約とパターン集（Edition 2024）。
-  TRIGGER when: .rs ファイルを編集・作成する時、Rust コードを書く時、listener / router /
-  filter-chain dispatch / host-API / wasmtime 埋め込みなどの Rust コンポーネントを実装する時。
-  DO NOT TRIGGER when: テストの実行のみ、Cargo.toml の確認のみ、ファイルの読み取りのみ、
-  WASM フィルタを他言語（Go/JS/Python）で書く時。
+when_to_use: >-
+  .rs ファイルを編集・作成する時、listener / router / filter-chain dispatch / host-API /
+  wasmtime 埋め込みなど Rust コンポーネントを実装する時。テスト実行・ファイル読み取りのみの
+  作業や、WASM フィルタを他言語（Go/JS/Python）で書く時は不要。
+paths:
+  - "**/*.rs"
 ---
 
 # Rust Best Practices (Plecto)

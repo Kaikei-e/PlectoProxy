@@ -7,12 +7,14 @@ description: |
   verification, untrusted multi-tenant filters) and L7 proxy / gateway risks (SSRF on upstream
   construction, TLS termination, request smuggling/splitting, header injection, rate-limit/WAF
   bypass). Produces a structured findings report (severity + OWASP/CWE/ASVS mapping + evidence +
-  remediation). Use when the user asks for "security review", "脆弱性チェック", "セキュリティ監査",
-  "OWASP レビュー", threat-modeling a diff/module, or when a change touches the filter sandbox,
-  host-API, TLS, routing/upstream, auth, crypto, input validation, dependencies, or logging.
-user-invocable: true
+  remediation).
+when_to_use: >-
+  Use when the user asks for "security review", "脆弱性チェック", "セキュリティ監査",
+  "OWASP レビュー", threat-modeling a diff/module, or when a change touches the filter
+  sandbox, host-API, TLS, routing/upstream, auth, crypto, input validation, dependencies,
+  or logging.
 allowed-tools: Read, Grep, Glob, Bash, WebFetch, WebSearch, Agent
-argument-hint: <target path or PR> [--mode=baseline|diff] [--depth=shallow|deep]
+argument-hint: "<target path or PR> [--mode=baseline|diff] [--depth=shallow|deep]"
 ---
 
 # Security Auditor (Plecto)

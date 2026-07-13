@@ -1,20 +1,18 @@
 ---
 name: web-researcher
-description: |
-  Web research skill that prioritizes official documentation while covering broad literature.
-  Searches, fetches, and synthesizes findings into a structured, source-cited, actionable report.
-  Use when:
-  - 「調べて」「リサーチして」「公式ドキュメント確認して」
-  - "research X", "look up", "find docs for"
-  - Evaluating libraries, frameworks, or approaches (e.g. wasmtime APIs, WIT/Component Model,
-    WASI 0.3, quinn/redb/openraft/foca, Rust edition 2024 idioms)
-  - Investigating errors, migration guides, or breaking changes
-  - Needing up-to-date information beyond training data
-  This is the lightweight, in-repo researcher; for a deep, multi-agent, adversarially-verified
-  report prefer the built-in `deep-research` skill.
-user-invocable: true
+description: >-
+  Web research skill that prioritizes official documentation while covering broad
+  literature. Searches, fetches, and synthesizes findings into a structured, source-cited,
+  actionable report. This is the lightweight, in-repo researcher; for a deep, multi-agent,
+  adversarially-verified report prefer the built-in `deep-research` skill.
+when_to_use: >-
+  Use when the user says 「調べて」「リサーチして」「公式ドキュメント確認して」, "research X",
+  "look up", "find docs for"; when evaluating libraries, frameworks, or approaches
+  (e.g. wasmtime APIs, WIT/Component Model, WASI 0.3, quinn/redb/openraft/foca); when
+  investigating errors, migration guides, or breaking changes; or when up-to-date
+  information beyond training data is needed.
 allowed-tools: WebSearch, WebFetch, Read, Write, Agent
-argument-hint: <research topic or question> [--depth=shallow|deep] [--lang=en|ja]
+argument-hint: "<research topic or question> [--depth=shallow|deep] [--lang=en|ja]"
 ---
 
 # Web Researcher

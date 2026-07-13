@@ -5,11 +5,12 @@ description: |
   per-worker instance reuse, epoch interruption + memory limits for metering, Linker-based
   deny-by-default host functions, Store-per-request lifecycle, async host calls, pooling
   zeroization (CVE-2022-39393), and OCI-artifact load + cosign signature verification.
-  Use when writing or reviewing the host runtime that instantiates/runs WASM filters, wiring the
-  host-API into the Linker, configuring metering/limits, or loading filter components.
-user-invocable: true
+when_to_use: >-
+  Use when writing or reviewing the host runtime that instantiates/runs WASM filters,
+  wiring the host-API into the Linker, configuring metering/limits, or loading filter
+  components.
 allowed-tools: Read, Glob, Grep, Write, Edit, Bash, WebSearch, WebFetch, Agent
-argument-hint: <host-runtime area to design/review>
+argument-hint: "<host-runtime area to design/review>"
 ---
 
 # wasmtime Host Embedding (Plecto)

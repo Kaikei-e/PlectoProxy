@@ -1,15 +1,16 @@
 ---
 name: full-review
-description: |
-  Runs an adversarial full review of an AI-authored (or any) merge commit / PR / branch
-  range: Builder/Critic session separation, Spec+Diff-only critic input, parallel critic
+description: >-
+  Runs an adversarial full review of a merge commit, PR, or branch range (AI-authored or
+  not): Builder/Critic session separation, Spec+Diff-only critic input, parallel critic
   lanes (correctness, security, tests/CI), evidence-gated findings, and a structured
-  merge verdict. This skill should be used when the user asks to "full-review",
-  "/full-review", "敵対的レビュー", "フルレビュー", "AI実装をレビュー", "マージコミットを
-  レビュー", or to adversarially review a merge commit, PR, or AI-generated change set.
-user-invocable: true
+  merge verdict.
+when_to_use: >-
+  Use when the user asks to "full-review", "敵対的レビュー", "フルレビュー",
+  "AI実装をレビュー", "マージコミットをレビュー", or to adversarially review a merge
+  commit, PR, or AI-generated change set.
 allowed-tools: Bash, Read, Glob, Grep, Agent, WebFetch, WebSearch
-argument-hint: [<commit|PR|range>] [--lanes=correctness,security,tests] [--depth=standard|deep]
+argument-hint: "[<commit|PR|range>] [--lanes=correctness,security,tests] [--depth=standard|deep]"
 ---
 
 # Full Review (Adversarial)

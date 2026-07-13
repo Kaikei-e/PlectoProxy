@@ -6,6 +6,20 @@
 対象は Plecto の **fast path**（native Rust の proxy データプレーン）と **wasmtime ホスト**。
 WASM フィルタを他言語で書く作業は対象外。
 
+## Contents
+
+1. Edition 2024 Essentials
+2. Project Structure
+3. Error Handling
+4. Ownership & Borrowing
+5. Async & tokio
+6. Data-plane discipline（プロキシ固有）
+7. wasmtime host embedding（要点）
+8. Logging & Observability
+9. Testing
+10. Lints & Tooling
+- Sources
+
 ---
 
 ## 1. Edition 2024 Essentials

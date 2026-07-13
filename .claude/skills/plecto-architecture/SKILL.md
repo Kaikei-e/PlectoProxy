@@ -1,6 +1,15 @@
 ---
 name: plecto-architecture
-description: Plecto's core architecture — the two halves (native-Rust fast path / WASM extension plane), the WIT type contract between them, the deny-by-default capability boundary, the filter chain, typed decision/short-circuit, init vs per-request hooks, instance lifecycle, and host-held state. Use when implementing or reviewing fast-path code, filter execution, the host-API surface, or filter chains; when deciding "does this belong in Rust or in a WASM filter?"; or when the user mentions fast path / extension plane / filter / host-API / capability / 「どっちに置く」.
+description: >-
+  Plecto's core architecture — the two halves (native-Rust fast path / WASM extension
+  plane), the WIT type contract between them, the deny-by-default capability boundary, the
+  filter chain, typed decision/short-circuit, init vs per-request hooks, instance
+  lifecycle, and host-held state.
+when_to_use: >-
+  Use when implementing or reviewing fast-path code, filter execution, the host-API
+  surface, or filter chains; when deciding "does this belong in Rust or in a WASM
+  filter?"; or when the user mentions fast path / extension plane / filter / host-API /
+  capability / 「どっちに置く」.
 ---
 
 # Plecto Architecture
@@ -57,14 +66,17 @@ enforced by the Component Model sandbox, **not by convention** (Tenet 2, Fork 7)
 
 ## The contract: `plecto:filter`
 
-- A custom `plecto:filter` world (Fork 2) that **reuses `wasi:http` request/response types** but
-  defines Plecto's own `decision` / `short-circuit`, init/per-request hooks, and host-API. Details
-  and evolution live in the `wit-contract-design` skill.
-- **decision (a WIT variant, Tenet 3):** `continue` (pass to next filter) · `modified` (rewrite +
-  continue) · `short-circuit` (stop, synthesize a response now, don't reach upstream). Auth failure
-  and rate-limit exceed are `short-circuit`. Never express intent with ambiguous flags.
-- Bodies are `stream<u8>` (Fork 1, async-first). stream splicing is deferred to WASI 0.3.x, so body
-  transforms tolerate a hot-path intermediate copy for now.
+- A custom `plecto:filter` world (Fork 2). Current contract: `plecto:filter@0.3.0`, zero-WASI and
+  header-only (ADR 000010); 0.1 / 0.2 are frozen with load-time adapters (ADR 000071 / 000073).
+  It defines Plecto's own `decision`, init/per-request hooks, and host-API. Details and evolution
+  live in the `wit-contract-design` skill.
+- **decision (a WIT variant, Tenet 3):** request side `continue` · `modified` · `short-circuit`
+  (stop, synthesize a response now, don't reach upstream); response side `continue` · `modified` ·
+  `replace` (ADR 000073). Header values are raw bytes (`list<u8>`, ADR 000071) and `on-response`
+  receives the as-forwarded request snapshot. Auth failure and rate-limit exceed are
+  `short-circuit`. Never express intent with ambiguous flags.
+- Bodies as `stream<u8>` (Fork 1, async-first) are projected, not current — they land with the
+  wasm32-wasip2 move, and body transforms will tolerate a hot-path intermediate copy at first.
 
 ## Init vs per-request (Tenet 4)
 

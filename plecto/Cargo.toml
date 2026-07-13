@@ -10,7 +10,7 @@ members = ["crates/host", "crates/control", "crates/server"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.3"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.

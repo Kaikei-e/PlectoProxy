@@ -21,8 +21,23 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-13
+
 ### Added
 
+- Multi-replica compose reference (ADR 000082 / 000088): a two-replica, L4-LB-fronted topology
+  under `plecto/examples/multi-replica/` proves PROXY protocol v2 propagation, graceful replica
+  drain, cross-replica session resumption over the shared STEK, and downstream mTLS end to end
+  against the released signed image — switchable between TLS scenarios A/B via compose override
+  files.
+- Signed-image operator quick start (ADR 000084 / 000087): `docs/quickstart/` (English canonical,
+  Japanese mirror) walks tag-to-digest resolution, cosign signature verification, and a first
+  proxied response with Docker as the only prerequisite; the README gains a condensed Quick
+  start section pointing at it.
+- Weekly fuzz smoke workflow and a verification map (ADR 000086 / 000089): a scheduled CI
+  workflow runs every libFuzzer target from its committed corpus off the PR/merge path, and
+  `docs/verification.md` maps each verification claim this project makes to the CI workflow
+  that backs it.
 - Reference filters as signed OCI artifacts (ADR 000080). Every release now publishes the
   reference filter components — `filters/jwt`, `filters/cors`, `filters/apikey`,
   `filters/extauthz` — as individual CNCF Wasm OCI Artifacts under
@@ -57,6 +72,39 @@ All notable changes to Plecto are documented here. The format follows
   per-node resumption stays on, and its tickets carry the verified identity. The new private
   keys must be owner-only on unix (group/other-readable fails the build closed). Revocation
   (CRL/OCSP) and propagation of the verified identity to filters are declared deferred.
+
+### Fixed
+
+- **Control (config-plane):** `[listen.client_auth]` edits did not participate in the manifest
+  content hash, so changing only the trust root and reloading via `SIGHUP` could report
+  `ReloadOutcome::Unchanged` and silently keep serving the old CA; the CA bytes now ride the
+  hash, are read once per build, and are shared with the verifier so the version always
+  describes the roots actually enforced. mTLS listeners get their own per-CA-content session
+  ticketer (isolated from the anonymous ticketer, re-keyed on CA rotation); the reload gate
+  falls through to a full build rather than failing the `SIGHUP` when the version can't be
+  computed (e.g. a momentarily unreadable CA file). Also fixed: a maglev table build could loop
+  forever on an empty endpoint set or all-zero weights; `strip_prefix` route matching now
+  requires a path-segment boundary (`/api` could previously rewrite `/apix/y` into `/x/y`);
+  STEK, upstream client-key, and TLS private key material is zeroized on drop.
+- **Server (fast path):** a connection that never completed its TLS handshake could hold a
+  `MAX_CONNECTIONS` permit indefinitely (a pre-TLS slowloris), now bounded by the header-read
+  timeout; h2 gains keep-alive pings so a vanished peer can no longer pin a permit forever; an
+  upstream TLS client-config cache had an ABA bug that could serve a stale upstream's TLS
+  config after a reload reused its address; request and response `Content-Length` framing is
+  now derived by the host from the actual body instead of trusted from filter-declared output
+  (CWE-444). QUIC/h3: a TLS reload now applies to new connections, trailers and a body shorter
+  than its declared `Content-Length` are surfaced correctly (RFC 9114 §4.1.2) instead of a
+  falsely-successful `finish()`, and hop-by-hop guest headers (RFC 9110 §7.6.1) are dropped at
+  the filter boundary instead of failing the whole decision.
+- **Host (extension plane):** pool breaker/cooldown timing moved from wall-clock to monotonic
+  time (a clock adjustment could reopen or permanently disable the breaker), and an instantiate
+  failure on the trusted build path now trips the breaker for builds only — idle instance reuse
+  stays available, so a transient allocator trip can't take servable traffic down. Instance
+  checkout now waits against an absolute deadline instead of restarting on every spurious
+  wakeup; a discarded pooled instance's unterminated stdio partial line is no longer silently
+  dropped (fat-guest logging); guest status codes are range-validated at the same gate as
+  headers instead of being clamped to 502 downstream; Component resource-table growth is now
+  bounded the same way the sync host already bounds it.
 
 ## [0.3.0] - 2026-07-11
 

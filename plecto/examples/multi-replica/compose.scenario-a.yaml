@@ -1,0 +1,36 @@
+# Scenario A (ADR 000082): TLS terminates at each Plecto replica, and the session-ticket
+# key (STEK) is SHARED across replicas (ADR 000062 opt-in) — a ticket issued by one
+# replica resumes on the other, so resumption survives LB re-balancing.
+#
+#   scripts/gen-certs.sh                    # demo-only credentials into ./manifests/secrets
+#   export PLECTO_UID=$(id -u)              # replicas read your 0600-permission key files
+#   docker compose -f compose.yaml -f compose.scenario-a.yaml up
+#   scripts/verify-resumption.sh            # ticket from plecto-1 resumes on plecto-2
+
+services:
+  lb:
+    ports: !override
+      - "8443:8080"
+    environment:
+      PLECTO_PORT: "8443"
+
+  plecto-1:
+    command: ["/etc/plecto/scenario-a.toml"]
+    # The bind-mounted secrets are 0600 and owned by you, not by the image's
+    # nonroot user — run the replica as your uid so the fail-closed permission
+    # check (chmod 600, owner-only) passes for the right reason.
+    user: "${PLECTO_UID:-1000}"
+    volumes:
+      - ./manifests:/etc/plecto:ro
+    ports:
+      # Direct per-replica access, bypassing the LB — verify-resumption.sh uses it
+      # to prove the CROSS-replica resume deterministically.
+      - "18443:8443"
+
+  plecto-2:
+    command: ["/etc/plecto/scenario-a.toml"]
+    user: "${PLECTO_UID:-1000}"
+    volumes:
+      - ./manifests:/etc/plecto:ro
+    ports:
+      - "28443:8443"

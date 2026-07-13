@@ -1,0 +1,32 @@
+# Base skeleton: plaintext HTTP behind the L4 LB. The LB prepends PROXY v2, so each
+# replica sees the real client address (ADR 000057).
+
+[listen]
+addr = "0.0.0.0:8080"
+
+# Only the LB's fixed address may prepend PROXY v2 — no trust without declaration.
+[listen.proxy_protocol]
+trusted = ["172.28.0.10/32"]
+
+# Shutdown order (ADR 000059): /readyz flips 503, the LB observes it within its
+# fall × inter window (~2s), THEN the drain starts — so a stopping replica drops nothing.
+[listen.drain]
+readiness_grace_ms = 3000
+window_ms = 10000
+
+[observability]
+# /metrics /healthz /readyz for the LB's health checks. Demo-only bind: in production
+# keep the admin port on a private interface, never internet-facing.
+admin_addr = "0.0.0.0:9099"
+
+[[upstream]]
+name = "backend"
+addresses = ["backend-1:80", "backend-2:80"]
+[upstream.health]
+path = "/"
+interval_ms = 1000
+
+[[route]]
+upstream = "backend"
+[route.match]
+path_prefix = "/"

@@ -216,6 +216,7 @@ pub(crate) mod fake {
         script: Mutex<Vec<Scripted>>,
         calls: Mutex<u32>,
         bodies: Mutex<Vec<Bytes>>,
+        headers: Mutex<Vec<hyper::HeaderMap>>,
     }
 
     impl FakeUpstreamClient {
@@ -224,6 +225,7 @@ pub(crate) mod fake {
                 script: Mutex::new(script),
                 calls: Mutex::new(0),
                 bodies: Mutex::new(Vec::new()),
+                headers: Mutex::new(Vec::new()),
             }
         }
 
@@ -235,6 +237,11 @@ pub(crate) mod fake {
         pub(crate) fn bodies(&self) -> Vec<Bytes> {
             self.bodies.lock().unwrap().clone()
         }
+
+        /// The request headers each attempt carried, in attempt order.
+        pub(crate) fn headers(&self) -> Vec<hyper::HeaderMap> {
+            self.headers.lock().unwrap().clone()
+        }
     }
 
     impl UpstreamClient for FakeUpstreamClient {
@@ -243,6 +250,7 @@ pub(crate) mod fake {
             req: Request<ReqBody>,
         ) -> Result<hyper::Response<ResponseBody>, UpstreamSendError> {
             *self.calls.lock().unwrap() += 1;
+            self.headers.lock().unwrap().push(req.headers().clone());
             let body = req
                 .into_body()
                 .collect()

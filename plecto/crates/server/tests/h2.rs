@@ -525,7 +525,10 @@ async fn drive_h2_no_host_header(proxy: SocketAddr, root: CertificateDer<'static
 }
 
 /// Drive [`drive_h2_no_host_header`], retrying past the pessimistic-start 503 window (ADR 000017).
-async fn drive_h2_no_host_header_ready(proxy: SocketAddr, root: CertificateDer<'static>) -> H2Result {
+async fn drive_h2_no_host_header_ready(
+    proxy: SocketAddr,
+    root: CertificateDer<'static>,
+) -> H2Result {
     for _ in 0..100 {
         let r = drive_h2_no_host_header(proxy, root.clone()).await;
         if r.status != StatusCode::SERVICE_UNAVAILABLE {

@@ -127,6 +127,10 @@ pub(crate) struct ForwardRequest<'a> {
     pub(crate) headers: AttemptHeaders<'a>,
     /// The original inbound headers (TE / Upgrade pass-through decisions).
     pub(crate) original_headers: &'a HeaderMap,
+    /// The client's original authority (h2 `:authority`, or h1 `Host` — `request_authority`):
+    /// forwarded as `Host` when the attempt's headers carry none of their own (h2 clients don't;
+    /// ADR 000042 keeps the upstream leg HTTP/1.1, which requires one).
+    pub(crate) authority: &'a str,
     pub(crate) upstream_path: &'a str,
     pub(crate) traceparent: &'a str,
     /// `Some(token)` when this is an allowlisted Upgrade handshake (ADR 000048): the exact
@@ -171,6 +175,17 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
         match forward.headers {
             AttemptHeaders::Chain(headers) => copy_headers(builder.headers_mut(), headers),
             AttemptHeaders::Direct(map) => copy_headers_direct(builder.headers_mut(), map),
+        }
+        // An h2 client carries no literal Host header (RFC 9113: authority lives in
+        // `:authority`), so a filterless/chain-edited header set can reach here with none. Fill it
+        // from the client's real authority — never leave it to hyper's h1 upstream client, which
+        // would otherwise synthesize one from `pick.address()` (the upstream's OWN address).
+        // Never overrides a Host a filter or an h1 client already put in the header set.
+        if let Some(h) = builder.headers_mut()
+            && !h.contains_key(hyper::header::HOST)
+            && let Ok(v) = HeaderValue::from_str(forward.authority)
+        {
+            h.insert(hyper::header::HOST, v);
         }
         set_framing(builder.headers_mut(), &body, forward.original_headers);
         if let Some(h) = builder.headers_mut()
@@ -322,6 +337,7 @@ mod tests {
             method,
             headers: AttemptHeaders::Chain(&[]),
             original_headers: headers,
+            authority: "test-authority",
             upstream_path: "/",
             traceparent: "test-trace",
             upgrade_token: None,
@@ -639,5 +655,93 @@ mod tests {
             "a streamed body must surface the connect failure unretried"
         );
         assert_eq!(client.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_is_filled_from_authority_when_the_attempt_headers_carry_none() {
+        // An h2 client's chain-edited/direct headers carry no Host (RFC 9113: authority lives in
+        // `:authority`, ADR 000042 keeps the upstream leg HTTP/1.1). The attempt must fill Host
+        // from the request's real authority rather than leave it to hyper's synthesis from the
+        // upstream's own address (docs/servey f00002).
+        let group = test_group(&["127.0.0.1:1"], 0);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![Scripted::Status(200)]);
+        let metrics = ServerMetrics::new();
+        let original = HeaderMap::new();
+        let forward = ForwardRequest {
+            method: "GET",
+            headers: AttemptHeaders::Chain(&[]),
+            original_headers: &original,
+            authority: "h2-client.example",
+            upstream_path: "/",
+            traceparent: "test-trace",
+            upgrade_token: None,
+        };
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            forward,
+            ForwardBody::Bodyless,
+            Duration::from_secs(5),
+            None,
+            0,
+        )
+        .await;
+
+        assert!(matches!(outcome, ForwardOutcome::Response(..)));
+        let sent = client.headers();
+        assert_eq!(
+            sent[0].get(hyper::header::HOST).unwrap(),
+            "h2-client.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_host_header_is_not_overridden_by_authority() {
+        // An h1 client's literal Host (or a filter's `set-headers` override) must survive
+        // untouched — the authority fill-in only ever covers the ABSENT case.
+        let group = test_group(&["127.0.0.1:1"], 0);
+        let pick = group.pick(None).unwrap();
+        let client = FakeUpstreamClient::new(vec![Scripted::Status(200)]);
+        let metrics = ServerMetrics::new();
+        let original = HeaderMap::new();
+        let chain_headers = vec![plecto_control::Header {
+            name: "host".to_string(),
+            value: b"h1-client.example".to_vec(),
+        }];
+        let forward = ForwardRequest {
+            method: "GET",
+            headers: AttemptHeaders::Chain(&chain_headers),
+            original_headers: &original,
+            authority: "should-not-be-used.example",
+            upstream_path: "/",
+            traceparent: "test-trace",
+            upgrade_token: None,
+        };
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            forward,
+            ForwardBody::Bodyless,
+            Duration::from_secs(5),
+            None,
+            0,
+        )
+        .await;
+
+        assert!(matches!(outcome, ForwardOutcome::Response(..)));
+        let sent = client.headers();
+        assert_eq!(
+            sent[0].get(hyper::header::HOST).unwrap(),
+            "h1-client.example"
+        );
     }
 }

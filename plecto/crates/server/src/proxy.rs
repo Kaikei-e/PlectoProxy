@@ -372,6 +372,7 @@ async fn proxy_core_inner(
             crate::forward::AttemptHeaders::Direct(&parts.headers)
         },
         original_headers: &parts.headers,
+        authority: &forward.authority,
         upstream_path: &upstream_path,
         traceparent: &snapshot.traceparent(),
         upgrade_token: upgrade.as_ref().map(|(t, _, _)| t.as_str()),

@@ -23,7 +23,25 @@ Plecto Proxy pairs **two complementary halves** through a typed [WIT](https://co
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (**84** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.3.0`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (**88** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every tagged release (currently `v0.3.0`) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+
+## Quick start
+
+Verify the signed container image, then run it — Docker is the only prerequisite:
+
+```bash
+IMAGE=ghcr.io/kaikei-e/plecto
+DIGEST=$(docker buildx imagetools inspect "$IMAGE:0.3.2" --format '{{json .Manifest.Digest}}' | tr -d '"')
+
+docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \
+  --certificate-identity-regexp 'https://github.com/Kaikei-e/PlectoProxy/\.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Then run the digest you just verified. The full copy-paste flow — minimal manifest,
+stand-in backend, first proxied response, in under 5 minutes — is
+**[docs/quickstart/](docs/quickstart/README.md)**. Signature verification is part of the
+flow, not a footnote ([ADR 000084](docs/ADR/000084.md) / [ADR 000087](docs/ADR/000087.md)).
 
 ## Why Plecto Proxy?
 
@@ -304,6 +322,8 @@ cargo run -p plecto-server --example <name>   # or drive it yourself, Ctrl-C to 
 | `resilience` | Per-try timeout+retry, circuit breaker, outlier ejection — all visible from curl. |
 | `production` | The real `plecto` binary serving a full deploy dir, two terminals. |
 
+Beyond the single-process demos, [`examples/multi-replica/`](plecto/examples/multi-replica/README.md) is a **docker-compose reference** — an L4 load balancer speaking PROXY protocol v2 to two Plecto replicas — whose scripts *prove* the operational properties: drain one replica with zero dropped requests, TLS resumption surviving replica hops (shared STEK), and downstream mTLS ([ADR 000088](docs/ADR/000088.md)).
+
 The benchmark harnesses (`bench-server`, `swap-bench`) are not demos — they live under [`bench/harnesses/`](bench/) and produce the numbers in [performance](performance/README.md).
 
 ## Roadmap
@@ -358,7 +378,9 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 
 ## Design decisions
 
-Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All **84** accepted ADRs live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All **88** accepted ADRs live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+
+What gets verified, and where, is mapped in one page: [docs/verification.md](docs/verification.md) — a map to the CI/release machinery whose record is the workflows themselves being green, not a separate ledger ([ADR 000086](docs/ADR/000086.md)).
 
 Two of those decisions are commitments to you rather than to the code. The **contract compatibility promise** is staged: the host keeps loading every `plecto:filter` version it has shipped, and from contract 1.0 every shipped world stays loadable permanently — security-only exception, via a dedicated ADR plus ≥ 24 months' notice ([ADR 000085](docs/ADR/000085.md)). And the **longevity discipline** ([ADR 000086](docs/ADR/000086.md)): no year-number support pledge — instead a declared intent to maintain long-term, a retirement protocol (≥ 12 months' EOL notice with continued security fixes, should development ever be deliberately wound down), and reproducible signed releases (source, signed artifacts, SBOM attestation, pinned dependencies) so every tagged release stays verifiable and forkable even without its maintainer.
 
@@ -382,3 +404,5 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE). T
 ## Prior art & acknowledgements
 
 Plecto Proxy builds on the [Bytecode Alliance](https://bytecodealliance.org/) stack — [wasmtime](https://wasmtime.dev/), [WIT, and the Component Model](https://component-model.bytecodealliance.org/) — and on a decade of industry work that showed in-process WASM can carry data-plane policy. Positioning relative to other extension models is recorded in [ADR 000067](docs/ADR/000067.md) (by model type, not by product name).
+
+The PROXY protocol implemented by the listener ([ADR 000057](docs/ADR/000057.md)) is the public specification maintained by HAProxy Technologies; the multi-replica reference uses HAProxy as its example L4 load balancer. HAProxy is a trademark of HAProxy Technologies — this project is not affiliated with or endorsed by them.

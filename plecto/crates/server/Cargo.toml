@@ -12,25 +12,18 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
-# `templates/filter-template/` has its own Cargo.toml (it's a vendored copy of a real guest
-# crate, `include_str!`-embedded by `new_filter.rs`) — cargo's default VCS-tracked file
-# collection treats a directory containing a nested Cargo.toml as a separate package boundary
-# and silently drops it, so it needs an explicit `include` to survive `cargo package`.
-include = ["src/**", "tests/**", "templates/**", "CONTEXT.md"]
+include = ["src/**", "tests/**", "CONTEXT.md"]
 
 # The M2 fast path: a listener that drives requests through the control plane's routed filter
 # chains and forwards to upstreams — HTTP/1.1 + HTTP/2 over TCP and HTTP/3 over QUIC (ADR 000013 /
-# 000014 / 000015 / 000016). lib + bin + the runnable demo.
+# 000014 / 000015 / 000016). Library only — the `plecto` binary and operator CLI live in the
+# sibling `crates/plecto` crate (ADR 000090's follow-on: `cargo install plecto`).
 [lib]
 name = "plecto_server"
 path = "src/lib.rs"
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "plecto"
-path = "src/main.rs"
 
 # Runnable, use-case-focused demos live at the workspace-level `examples/` dir (a sibling of
 # `crates/`), each its own `examples/<name>/main.rs`, but built as examples of this package so they
@@ -143,11 +136,6 @@ bytes = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# serde_json: `plecto conformance --json` (ADR 000065) — machine-readable output for CI.
-serde_json = { workspace = true }
-# tracing-subscriber: the binary's JSON log + access-log formatter (ADR 000009 Stage A). Used only
-# by `main.rs` (the lib never installs a subscriber); minimal features keep the footprint small.
-tracing-subscriber = { workspace = true }
 # tokio-rustls: wrap each accepted TCP stream in a TLS handshake before handing it to hyper
 # (ADR 000014). The ServerConfig is built by control; this is just the async acceptor.
 tokio-rustls = { workspace = true }
@@ -167,18 +155,6 @@ parking_lot = { workspace = true }
 quinn = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
-# --- Filter Dev Kit (ADR 000065): `plecto dev` / `plecto new-filter` inner loop. ---
-# notify(-debouncer-mini): watch a filter's src/ for changes and debounce the rebuild trigger
-# (~300ms). 8.x is the current stable line; 9.0 was still pre-release as of the ADR's research.
-notify-debouncer-mini = "0.7"
-# toml_edit: format-preserving rewrite of a dev manifest's `[[filter]].digest` after every
-# rebuild — a plain parse+reserialize (via `toml`/serde) would blow away the operator's own
-# comments and layout in a file `plecto dev` shares write access to with a human.
-toml_edit = "0.22"
-# wit-component: wrap a rebuilt wasm32-unknown-unknown core module into a Component at runtime —
-# the same `ComponentEncoder` recipe `crates/host/build.rs` already uses at BUILD time (ADR
-# 000010), needed here because `plecto dev` componentizes on every file-watch trigger, not once.
-wit-component = "0.252"
 # --- Response compression codecs (ADR 000074): gzip baseline + zstd / brotli. ---
 # flate2 (miniz_oxide backend) and brotli are pure Rust. zstd is this workspace's one C-bindings
 # codec (bundled libzstd, BSD-3-Clause): production-grade pure-Rust zstd ENCODERs are not yet

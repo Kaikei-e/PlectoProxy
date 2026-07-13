@@ -144,7 +144,7 @@ jobs:
           docker run --rm -e "FEATURES=${FEATURES}" -v "${{ github.workspace }}:/src" -w /src rust:1.96.0-bookworm bash -euxc '
             apt-get update && apt-get install -y --no-install-recommends cmake clang
             cargo install cargo-auditable --locked
-            cargo auditable build --manifest-path plecto/Cargo.toml --release --locked -p plecto-server ${FEATURES}
+            cargo auditable build --manifest-path plecto/Cargo.toml --release --locked -p plecto ${FEATURES}
           '
       # Feeds the container-build job below: it COPYs this binary into the runtime image
       # instead of recompiling Rust a second time under QEMU emulation for the arm64 leg

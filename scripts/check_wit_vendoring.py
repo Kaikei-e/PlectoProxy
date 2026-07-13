@@ -8,9 +8,9 @@ Canonical -> vendored pairs checked:
 - plecto/wit/v0.2.0/world.wit    -> plecto/crates/host/wit/v0.2.0/world.wit
 - plecto/wit-streaming/streaming.wit -> plecto/crates/host/wit-streaming/streaming.wit
 - plecto/examples/filters/filter-template/Cargo.toml
-    -> plecto/crates/server/templates/filter-template/Cargo.toml
+    -> plecto/crates/plecto/templates/filter-template/Cargo.toml.template
 - plecto/examples/filters/filter-template/src/lib.rs
-    -> plecto/crates/server/templates/filter-template/src/lib.rs
+    -> plecto/crates/plecto/templates/filter-template/src/lib.rs
 
 Exit 0 on success, 1 on any drift or missing file.
 """
@@ -33,11 +33,11 @@ PAIRS = [
     ),
     (
         PLECTO / "examples/filters/filter-template/Cargo.toml",
-        PLECTO / "crates/server/templates/filter-template/Cargo.toml.template",
+        PLECTO / "crates/plecto/templates/filter-template/Cargo.toml.template",
     ),
     (
         PLECTO / "examples/filters/filter-template/src/lib.rs",
-        PLECTO / "crates/server/templates/filter-template/src/lib.rs",
+        PLECTO / "crates/plecto/templates/filter-template/src/lib.rs",
     ),
 ]
 

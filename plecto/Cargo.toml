@@ -4,13 +4,13 @@
 # this host-target workspace (so `cargo test --all` never builds them for the host target).
 [workspace]
 resolver = "3"
-members = ["crates/host", "crates/control", "crates/server"]
+members = ["crates/host", "crates/control", "crates/server", "crates/plecto"]
 # The cargo-fuzz harness (ADR 000057) is its own workspace, like the example filter guests:
 # libfuzzer targets need nightly + sanitizer flags that must never leak into `cargo test --all`.
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
@@ -37,8 +37,9 @@ unsafe_op_in_unsafe_fn = "deny"
 # packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
 # package at all without one). Bump `version` here in lockstep with `workspace.package.version`
 # above at release time.
-plecto-host = { path = "crates/host", version = "0.3.5" }
-plecto-control = { path = "crates/control", version = "0.3.5" }
+plecto-host = { path = "crates/host", version = "0.3.6" }
+plecto-control = { path = "crates/control", version = "0.3.6" }
+plecto-server = { path = "crates/server", version = "0.3.6" }
 # wasmtime 46.0.x for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46
 # (2026-06-22) ships Component Model async + WASI 0.3 by default. The async / bindgen API is still
 # moving on this line, so we track the latest 46 patch (Cargo.lock pins the resolved build).

@@ -9,7 +9,7 @@
 //! served by the real `plecto` binary, started in a second terminal:
 //!
 //! ```text
-//! cargo run -q -p plecto-server -- target/production-demo/manifest.toml 127.0.0.1:8086
+//! cargo run -q -p plecto -- target/production-demo/manifest.toml 127.0.0.1:8086
 //! ```
 //!
 //! This process plays the backend fleet (three `api` instances) and stays alive; the binary is the
@@ -155,7 +155,7 @@ fn manifest_toml(
 ) -> String {
     format!(
         r#"# Plecto production-shaped manifest — served by the real `plecto` binary:
-#   cargo run -q -p plecto-server -- target/production-demo/manifest.toml {proxy_addr}
+#   cargo run -q -p plecto -- target/production-demo/manifest.toml {proxy_addr}
 # Edit anything below and `kill -HUP <plecto pid>` to reload with zero downtime (ADR 000039).
 
 [trust]
@@ -212,7 +212,7 @@ fn print_banner(deploy: &Path, manifest: &Path, proxy_addr: &str, admin_addr: &s
         "\n  STEP 1 — done: the deploy dir is prepared (signed filter, trust root, manifest)."
     );
     println!("\n  STEP 2 — in a SECOND terminal, start the real gateway binary on it:\n");
-    println!("    cargo run -q -p plecto-server -- {deploy}/manifest.toml {proxy_addr}");
+    println!("    cargo run -q -p plecto -- {deploy}/manifest.toml {proxy_addr}");
     println!("\n  STEP 3 — exercise it like an operator (this terminal):\n");
     println!("    # auth: no key → the signed WASM filter short-circuits 401");
     println!("    curl -s -o /dev/null -w 'HTTP %{{http_code}}\\n' http://{proxy_addr}/api/data");

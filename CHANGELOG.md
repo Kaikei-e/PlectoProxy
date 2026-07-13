@@ -21,6 +21,23 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-07-14
+
+### Added
+
+- **`plecto` crate on crates.io**: the `plecto` binary and its operator CLI (serve /
+  `validate` / `conformance` / `new-filter` / `dev` / `schema`) now live in a dedicated
+  bin crate, so `cargo install plecto` is the first-class source-install path. The
+  signature-verified container image remains the primary distribution channel.
+
+### Changed
+
+- **`plecto-server` is now a pure library** — the `[[bin]] plecto` target and the CLI
+  modules moved to the new `plecto` crate. Migration: if you previously ran
+  `cargo install plecto-server` for the binary, install `plecto` instead; the
+  `plecto-server` library API is unchanged. Examples still run as
+  `cargo run -p plecto-server --example <name>`.
+
 ## [0.3.5] - 2026-07-13
 
 ### Added

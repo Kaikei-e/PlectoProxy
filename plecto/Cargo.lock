@@ -2507,8 +2507,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "plecto"
+version = "0.3.6"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "notify-debouncer-mini",
+ "plecto-control",
+ "plecto-host",
+ "plecto-server",
+ "rcgen",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+ "wit-component",
+]
+
+[[package]]
 name = "plecto-control"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2538,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-host"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -2578,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-server"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -2593,7 +2618,6 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
- "notify-debouncer-mini",
  "opentelemetry-proto",
  "parking_lot",
  "plecto-control",
@@ -2602,17 +2626,13 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
- "serde_json",
  "sha1",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
- "toml_edit",
  "tracing",
- "tracing-subscriber",
- "wit-component",
  "zstd",
 ]
 

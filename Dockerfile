@@ -45,7 +45,7 @@ COPY plecto/ plecto/
 # FEATURES: empty (default) = the minimal profile; "capabilities" compiles the outbound + fat-guest
 # capability code in (ADR 000079). Deliberately expanded unquoted — it is a cargo flag list.
 ARG FEATURES=""
-RUN cargo build --manifest-path plecto/Cargo.toml --release --locked -p plecto-server \
+RUN cargo build --manifest-path plecto/Cargo.toml --release --locked -p plecto \
     ${FEATURES:+--features ${FEATURES}} \
     && cp plecto/target/release/plecto /plecto
 

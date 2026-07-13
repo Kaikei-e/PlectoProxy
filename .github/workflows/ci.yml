@@ -301,9 +301,9 @@ jobs:
       # in seconds. Its own cargo invocation, never folded into the superset above: the
       # profile must be checked as it ships, and the `--version` self-report must not see
       # features the capabilities umbrella doesn't include.
-      - run: cargo check --locked -p plecto-server --features capabilities
+      - run: cargo check --locked -p plecto --features capabilities
       # Exercise the capabilities branch of `plecto --version` (ADR 000079 Decision 6).
-      - run: cargo test -p plecto-server --features capabilities --test cli --locked
+      - run: cargo test -p plecto --features capabilities --test cli --locked
 
   # Release-profile parity, main pushes only (wasmtime-CI-style "PRs light, merge-time
   # heavy"): release-profile codegen/link breakage is rare and expensive to check per PR
@@ -352,7 +352,7 @@ jobs:
           fi
           df -h /
       - run: cargo build --release --locked
-      - run: cargo build --release --locked -p plecto-server --features capabilities
+      - run: cargo build --release --locked -p plecto --features capabilities
 
   # ADR 000080: build the shelf with the exact encode path release.yml publishes
   # (scripts/build-reference-filters.sh) — the release-parity encode + import-floor gate,

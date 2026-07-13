@@ -21,6 +21,28 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-13
+
+### Added
+
+- crates.io publish preparation (ADR 000090, reconsiders ADR 000047's earlier decline):
+  `plecto-host` / `plecto-control` / `plecto-server` now carry full crates.io package metadata
+  (description, license, repository, homepage, readme, documentation, keywords, categories).
+  The `plecto:filter` WIT contract and the `plecto new-filter` guest template are vendored into
+  `crates/host/` and `crates/server/` respectively so `cargo package` can build each crate from
+  its own directory alone; `scripts/check_wit_vendoring.py` (wired into CI) guards the vendored
+  copies against drifting from their canonical sources.
+
+### Changed
+
+- Fixed the workspace `repository`/`homepage` URLs, which still pointed at the pre-rename
+  `Kaikei-e/Plecto` (redirects to the current `Kaikei-e/PlectoProxy`).
+- Internal path dependencies (`plecto-host`, `plecto-control`) now declare an explicit `version`
+  alongside `path` — required for `cargo package` / `cargo publish` to accept them.
+
+`publish` stays `false` for all three crates in this release; the first actual `cargo publish`
+is a separate, not-yet-taken step.
+
 ## [0.3.4] - 2026-07-13
 
 ### Fixed

@@ -2508,7 +2508,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plecto-control"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-host"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-server"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64",

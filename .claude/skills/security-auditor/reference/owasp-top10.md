@@ -28,20 +28,20 @@
 - **フィルタ配布**: OCI digest を固定しているか（wkg.lock 相当）、cosign 署名/SBOM をロード時検証するか。
 - grep: `grep -rn "version\|git =\|path =" Cargo.toml; ` + `cargo audit` / `npm audit`。
 
-## A04:2025 Injection
+## A04:2025 Cryptographic Failures
+- 弱いアルゴリズム、自前 crypto、TLS 検証無効化、秘密のログ/エラー露出、弱い乱数（`rand` の予測可能 seed）。
+- grep: `grep -rn "danger_accept_invalid_certs\|set_verify\|Md5\|Sha1\|ECB\|rand::random" .`
+
+## A05:2025 Injection
 - SQL/NoSQL/OS command/template/**log injection**/**HTTP header/CRLF injection**。
 - grep: `grep -rn "format!(.*SELECT\|Command::new\|process::Command\|\\\\r\\\\n\|set_header" --include='*.rs'`
 - 対策: パラメータ化、ヘッダ値の検証（CRLF 除去）、ログは構造化フィールド（値を行に直挿ししない）。
 
-## A05:2025 Insecure Design
+## A06:2025 Insecure Design
 - rate limiting / 過負荷制御 / 不可逆操作の確認・サイズ/タイムアウト上限が**設計段階で無い**。
 - Plecto: slowloris / 巨大ボディ / 無限 stream / フィルタ無限ループ（epoch 無し）への設計上の備え。
 
-## A06:2025 Cryptographic Failures
-- 弱いアルゴリズム、自前 crypto、TLS 検証無効化、秘密のログ/エラー露出、弱い乱数（`rand` の予測可能 seed）。
-- grep: `grep -rn "danger_accept_invalid_certs\|set_verify\|Md5\|Sha1\|ECB\|rand::random" .`
-
-## A07:2025 Identification & Authentication Failures
+## A07:2025 Authentication Failures
 - 弱いトークン、session fixation、MFA 欠落、タイミング非依存比較欠如（トークン比較は定数時間）。
 - grep: `grep -rn "token\|session\|== .*secret\|api_key" --include='*.rs' --include='*.ts'`
 
@@ -49,7 +49,7 @@
 - 未検証 deserialization、**無署名のフィルタ/アップデートのロード**、CI 汚染。
 - Plecto: マニフェストの content hash と実体の突合、cosign 検証前の instantiate を禁止。
 
-## A09:2025 Security Logging & Monitoring Failures
+## A09:2025 Security Logging and Alerting Failures
 - 監査ログ欠落、機微情報（Authorization/cookie/トークン/鍵）のログ出し、ログ偽装可能。
 - grep: `grep -rn "tracing::\|info!\|debug!\|println!\|console.log" . | grep -iE "token|authorization|secret|password|cookie"`
 

@@ -1,8 +1,8 @@
 # OWASP ASVS 5.0 — deep-check reference (auth / crypto / session / input)
 
 ASVS 5.0.0（2025年5月、https://asvs.dev/）から Plecto に効く要件を抜粋。各 finding に要件 ID を付ける
-（章番号は版で動くので、参照時に asvs.dev で確認）。約350要件・17章のうち、ゲートウェイ/ホストに
-直結する観点だけを掃く。
+（章番号は版で動くので、参照時に asvs.dev で確認）。345 要件・17章（V6 = Authentication）のうち、
+ゲートウェイ/ホストに直結する観点だけを掃く。
 
 ## 認証（Authentication）
 - [ ] トークン/鍵の比較は**定数時間**（タイミング攻撃を防ぐ）。`==` での秘密比較を疑う。

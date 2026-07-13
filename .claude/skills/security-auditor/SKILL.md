@@ -92,12 +92,12 @@ grep -rn "export\|on-request\|on-response\|fetch(" --include='*.ts' --include='*
 2. **A02 Security Misconfiguration** — debug 残存、過度な CORS、デフォルト認証情報、verbose error、
    wasmtime/Linker の過剰 capability
 3. **A03 Software Supply Chain Failures** — 未固定依存、署名検証欠落（フィルタ OCI / cosign）、typosquat、CI ツール
-4. **A04 Injection** — SQL/NoSQL/OS command/template/log/header、未パラメータ化
-5. **A05 Insecure Design** — rate limiting / 負荷制御 / 不可逆操作の確認が設計に無い
-6. **A06 Cryptographic Failures** — 弱いアルゴリズム、自前 crypto、TLS 無効化、秘密のログ出し
-7. **A07 Identification & Authentication Failures** — 弱いトークン、session fixation、MFA 欠落
+4. **A04 Cryptographic Failures** — 弱いアルゴリズム、自前 crypto、TLS 無効化、秘密のログ出し
+5. **A05 Injection** — SQL/NoSQL/OS command/template/log/header、未パラメータ化
+6. **A06 Insecure Design** — rate limiting / 負荷制御 / 不可逆操作の確認が設計に無い
+7. **A07 Authentication Failures** — 弱いトークン、session fixation、MFA 欠落
 8. **A08 Software or Data Integrity Failures** — 未検証 deserialization、無署名アップデート/フィルタ、CI 汚染
-9. **A09 Security Logging & Monitoring Failures** — 監査ログ欠落、機微情報のログ出し、ログ偽装
+9. **A09 Security Logging and Alerting Failures** — 監査ログ欠落、機微情報のログ出し、ログ偽装
 10. **A10 Mishandling of Exceptional Conditions** — fail-open、握り潰し、panic で worker 巻き込み、
     フィルタ trap 時のフォールバックが fail-open
 

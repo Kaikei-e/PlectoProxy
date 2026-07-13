@@ -33,7 +33,7 @@ argument-hint: "<host-runtime area to design/review>"
    フィルタは import できない能力には触れられない（sandbox が強制）。
 4. **epoch interruption で計量（Fork 7）.** `Config::epoch_interruption(true)` + 各 `Store` に
    `set_epoch_deadline(n)` + 別タスク/タイマーが `Engine::increment_epoch()`。fuel より軽量
-   （公式報告で epoch が最大 2-3x 速い）。データプレーンは決定性より低オーバーヘッドのデッドラインを
+   （公式報告で SpiderMonkey.wasm の実行が fuel 比で約 2 倍速い）。データプレーンは決定性より低オーバーヘッドのデッドラインを
    要するので epoch を採る。fuel は決定性が要る検証用途のみ。
 5. **メモリ/リソース上限.** `Store` に `ResourceLimiter` を付け linear memory・テーブル・インスタンス数の
    上限を強制。誤割当て・暴走を封じる。
@@ -103,6 +103,7 @@ let instance = pre.instantiate_async(&mut store).await?;
 | 1 | wasmtime — Config (epoch_interruption, allocation_strategy) | https://docs.wasmtime.dev/api/wasmtime/struct.Config.html | S |
 | 2 | wasmtime — Fast Instantiation (InstancePre + pooling) | https://docs.wasmtime.dev/examples-fast-instantiation.html | S |
 | 3 | wasmtime — Interrupting Execution (epoch vs fuel) | https://docs.wasmtime.dev/examples-interrupting-wasm.html | S |
+| 3b | Wasmtime 1.0: Performance（2ms→5µs・epoch ≈2x vs fuel の数値の出典） | https://bytecodealliance.org/articles/wasmtime-10-performance | S |
 | 4 | CVE-2022-39393 — pooling allocator data leakage | https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-wh6w-3828-g9qf | S |
 | 5 | CNCF Wasm OCI Artifact layout / wkg | https://github.com/bytecodealliance/wasm-pkg-tools | S |
 | 6 | Project design tenets — Fork 3/7/8 (see `CLAUDE.md`) | (in-repo) | S |

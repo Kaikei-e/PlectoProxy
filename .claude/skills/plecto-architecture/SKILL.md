@@ -66,17 +66,19 @@ enforced by the Component Model sandbox, **not by convention** (Tenet 2, Fork 7)
 
 ## The contract: `plecto:filter`
 
-- A custom `plecto:filter` world (Fork 2). Current contract: `plecto:filter@0.3.0`, zero-WASI and
-  header-only (ADR 000010); 0.1 / 0.2 are frozen with load-time adapters (ADR 000071 / 000073).
-  It defines Plecto's own `decision`, init/per-request hooks, and host-API. Details and evolution
-  live in the `wit-contract-design` skill.
+- A custom `plecto:filter` world (Fork 2). Current contract: `plecto:filter@0.3.0`, zero-WASI
+  (ADR 000010); 0.1 / 0.2 are frozen with load-time adapters (ADR 000071 / 000073). Two worlds:
+  the base `filter` world is header-only — bodies stream zero-copy past the chain (ADR 000038) —
+  and `filter-body` adds `on-request-body` over a buffered `list<u8>` body (buffer-then-decide,
+  ADR 000025). Details and evolution live in the `wit-contract-design` skill.
 - **decision (a WIT variant, Tenet 3):** request side `continue` · `modified` · `short-circuit`
   (stop, synthesize a response now, don't reach upstream); response side `continue` · `modified` ·
   `replace` (ADR 000073). Header values are raw bytes (`list<u8>`, ADR 000071) and `on-response`
   receives the as-forwarded request snapshot. Auth failure and rate-limit exceed are
   `short-circuit`. Never express intent with ambiguous flags.
-- Bodies as `stream<u8>` (Fork 1, async-first) are projected, not current — they land with the
-  wasm32-wasip2 move, and body transforms will tolerate a hot-path intermediate copy at first.
+- True-streaming bodies (`stream<u8>`, Fork 1, async-first) are projected, not current: today body
+  transforms buffer (`list<u8>`, no WASI needed); the `stream<u8>` swap comes with the
+  wasm32-wasip2 increment (ADR 000025) and tolerates a hot-path intermediate copy at first.
 
 ## Init vs per-request (Tenet 4)
 

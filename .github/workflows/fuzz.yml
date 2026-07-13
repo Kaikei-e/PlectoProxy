@@ -1,0 +1,59 @@
+# Weekly fuzz smoke (ADR 000089): runs every libfuzzer target in plecto/fuzz/ for a
+# bounded time from the committed corpus. Scheduled off the PR/merge path on purpose —
+# CI wall-time policy is PR-light / merge-heavy, and the fuzzed parsers change rarely.
+# A crash uploads the offending input as an artifact and turns the run red; the record
+# of "fuzzing runs" is this workflow's history, not a separate ledger (ADR 000086).
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: plecto
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      # cargo-fuzz builds with nightly (sanitizer flags); the workspace toolchain pin
+      # stays untouched — nightly is installed alongside and selected per-invocation.
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            plecto/fuzz
+          cache-targets: true
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets (bounded smoke)
+        run: |
+          set -euo pipefail
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::fuzz $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=300
+            echo "::endgroup::"
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: plecto/fuzz/artifacts/
+          if-no-files-found: ignore

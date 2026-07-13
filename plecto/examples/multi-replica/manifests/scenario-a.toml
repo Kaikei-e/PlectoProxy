@@ -1,0 +1,36 @@
+# Scenario A: TLS terminates here, and the session-ticket key is SHARED across
+# replicas (ADR 000062 opt-in) — a ticket issued by one replica resumes on the other.
+# The key file must be exactly 64 random bytes with owner-only permissions (chmod 600);
+# anything looser fails the build closed.
+
+[listen]
+addr = "0.0.0.0:8443"
+
+[listen.proxy_protocol]
+trusted = ["172.28.0.10/32"]
+
+[listen.drain]
+readiness_grace_ms = 3000
+window_ms = 10000
+
+[[tls]]
+cert_path = "secrets/server.crt"
+key_path = "secrets/server.key"
+
+[resumption]
+stek_file = "secrets/stek.key"
+
+[observability]
+admin_addr = "0.0.0.0:9099"
+
+[[upstream]]
+name = "backend"
+addresses = ["backend-1:80", "backend-2:80"]
+[upstream.health]
+path = "/"
+interval_ms = 1000
+
+[[route]]
+upstream = "backend"
+[route.match]
+path_prefix = "/"

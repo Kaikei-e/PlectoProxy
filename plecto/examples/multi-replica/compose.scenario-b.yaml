@@ -1,0 +1,28 @@
+# Scenario B (ADR 000082): downstream mTLS — every TLS handshake requires a client
+# certificate chaining to the demo CA (ADR 000078). Resumption stays PER-NODE: shared
+# STEK and client_auth are mutually exclusive, and the build fails closed if combined
+# (ADR 000062 / 000078) — edit scenario-b.toml to see it refuse.
+#
+#   scripts/gen-certs.sh                    # demo-only credentials into ./manifests/secrets
+#   export PLECTO_UID=$(id -u)              # replicas read your 0600-permission key files
+#   docker compose -f compose.yaml -f compose.scenario-b.yaml up
+#   scripts/verify-mtls.sh                  # no client cert → refused; demo cert → 200
+
+services:
+  lb:
+    ports: !override
+      - "8443:8080"
+    environment:
+      PLECTO_PORT: "8443"
+
+  plecto-1:
+    command: ["/etc/plecto/scenario-b.toml"]
+    user: "${PLECTO_UID:-1000}"
+    volumes:
+      - ./manifests:/etc/plecto:ro
+
+  plecto-2:
+    command: ["/etc/plecto/scenario-b.toml"]
+    user: "${PLECTO_UID:-1000}"
+    volumes:
+      - ./manifests:/etc/plecto:ro

@@ -1,0 +1,66 @@
+# Multi-replica reference (ADR 000082 / 000088): front L4 LB (PROXY v2) → Plecto ×2 →
+# backend ×2, with /readyz wired into the LB's active health checks.
+#
+#   docker compose up                       # base skeleton: plaintext HTTP on :8080
+#   scripts/verify-drain.sh                 # drain one replica, prove zero dropped requests
+#
+# TLS scenarios are separate override files (see README.md):
+#   docker compose -f compose.yaml -f compose.scenario-a.yaml up   # TLS + shared STEK
+#   docker compose -f compose.yaml -f compose.scenario-b.yaml up   # downstream mTLS
+
+name: plecto-multi-replica
+
+networks:
+  edge:
+    ipam:
+      config:
+        # Fixed subnet so the manifests can pin the LB's address as the only peer
+        # trusted to prepend PROXY v2 (deny-by-default, ADR 000057).
+        - subnet: 172.28.0.0/24
+
+services:
+  lb:
+    # The front L4 slot — a stand-in for your cloud NLB or existing L4 tier. This
+    # reference uses HAProxy as its example; any L4 load balancer that can send
+    # PROXY protocol v2 and actively health-check a separate readiness port fills
+    # the slot the same way (see README.md).
+    image: haproxy:3.4
+    volumes:
+      - ./lb/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8080:8080"
+    networks:
+      edge:
+        ipv4_address: 172.28.0.10
+
+  plecto-1:
+    image: ${PLECTO_IMAGE:-ghcr.io/kaikei-e/plecto:0.3.2}
+    command: ["/etc/plecto/base.toml"]
+    volumes:
+      - ./manifests:/etc/plecto:ro
+    # Longer than readiness_grace_ms + window_ms in the manifest, so `docker compose
+    # stop` never SIGKILLs a replica that is still draining in-flight work.
+    stop_grace_period: 20s
+    networks:
+      - edge
+
+  plecto-2:
+    image: ${PLECTO_IMAGE:-ghcr.io/kaikei-e/plecto:0.3.2}
+    command: ["/etc/plecto/base.toml"]
+    volumes:
+      - ./manifests:/etc/plecto:ro
+    stop_grace_period: 20s
+    networks:
+      - edge
+
+  backend-1:
+    # Stand-in for your own service: a tiny echo server whose response names the
+    # container that answered, so the round-robin is visible from curl.
+    image: traefik/whoami
+    networks:
+      - edge
+
+  backend-2:
+    image: traefik/whoami
+    networks:
+      - edge

@@ -33,6 +33,11 @@ around it), 9 puts it all in one real deployment.
 | 8 | **`resilience`** | The failure axes, each visible from curl: per-try timeout + retry to another instance, the overall deadline (504), the circuit breaker (503 `circuit-open`), and silent outlier ejection (ADR 000023/000028/000031/000032). |
 | 9 | **`production`** | The shape you operate: the **real `plecto` binary** serving a deploy dir (manifest + trust root + signed OCI layout), with `least_request` LB, a native rate-limit floor, and the `/metrics` admin endpoint (two terminals). |
 
+**Beyond one process.** [`multi-replica/`](multi-replica/README.md) is not a cargo example but a
+**docker-compose reference** (ADR 000082/000088): an L4 load balancer sends PROXY protocol v2 to two
+Plecto replicas running the released signed image, and its scripts prove drain-without-drops,
+cross-replica TLS resumption (shared STEK), and downstream mTLS.
+
 **Advanced (feature-gated).** The outbound **ext_authz** capability (ADR 000036, `--features
 outbound-http`) and the **streaming body** filter (`--features streaming-body`) are exercised today by
 the host test suite and their guest crates (`filters/filter-extauthz`, `filters/filter-streaming`);

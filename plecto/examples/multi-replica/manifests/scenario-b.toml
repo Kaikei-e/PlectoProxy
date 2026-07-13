@@ -1,0 +1,37 @@
+# Scenario B: downstream mTLS (ADR 000078) — every handshake requires a client
+# certificate chaining to ca_path. Resumption stays per-node: adding [resumption]
+# (shared STEK) to this manifest fails the build closed, because a shared ticket key
+# would let a ticket skip client-certificate re-verification on every replica
+# (ADR 000062 / 000078).
+
+[listen]
+addr = "0.0.0.0:8443"
+
+[listen.proxy_protocol]
+trusted = ["172.28.0.10/32"]
+
+[listen.drain]
+readiness_grace_ms = 3000
+window_ms = 10000
+
+[listen.client_auth]
+ca_path = "secrets/client-ca.crt"
+
+[[tls]]
+cert_path = "secrets/server.crt"
+key_path = "secrets/server.key"
+
+[observability]
+admin_addr = "0.0.0.0:9099"
+
+[[upstream]]
+name = "backend"
+addresses = ["backend-1:80", "backend-2:80"]
+[upstream.health]
+path = "/"
+interval_ms = 1000
+
+[[route]]
+upstream = "backend"
+[route.match]
+path_prefix = "/"

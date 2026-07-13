@@ -16,12 +16,14 @@ edition = "2024"
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
 rust-version = "1.96"
 license = "Apache-2.0"
-repository = "https://github.com/Kaikei-e/Plecto"
-homepage = "https://github.com/Kaikei-e/Plecto"
+repository = "https://github.com/Kaikei-e/PlectoProxy"
+homepage = "https://github.com/Kaikei-e/PlectoProxy"
 keywords = ["proxy", "gateway", "wasm", "webassembly", "http"]
 categories = ["network-programming", "web-programming", "wasm"]
 # Not published to crates.io yet (early development). Flip per-crate when distribution begins.
 publish = false
+# crates.io landing page for every member (readme.workspace = true); relative to this file.
+readme = "README.md"
 
 # Shared lint floor (bp-rust §10), inherited by every member via `[lints] workspace = true`.
 # The hot-path panic lints (unwrap_used/expect_used/panic/indexing_slicing) stay as per-crate

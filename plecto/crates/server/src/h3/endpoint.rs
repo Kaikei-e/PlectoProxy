@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 
 use super::http3_err;
 use super::request::handle_h3_request;
+use crate::conn_limit::PerIpConnLimit;
 use crate::error::ServerError;
 use crate::listener::drained;
 use crate::{MAX_CONCURRENT_STREAMS, ServerState};
@@ -117,10 +118,20 @@ pub(crate) async fn serve_h3(
                 None => return, // endpoint closed
             },
         };
+        // Per-IP admission (CWE-770/CWE-400, mirrors the TCP accept loop): `remote_address()` is
+        // available before the QUIC handshake completes and is never PROXY-v2-rewritten (ADR
+        // 000057 does not cover the UDP listener), so it is always the real peer here.
+        let peer_ip = incoming.remote_address().ip();
+        let Some(ip_guard) = PerIpConnLimit::try_acquire(&state.per_ip_conn_limit, peer_ip) else {
+            tracing::debug!(peer = %peer_ip, "per-IP connection limit reached; refusing QUIC connection");
+            incoming.refuse();
+            continue; // drops `permit`, releasing the global slot
+        };
         let state = state.clone();
         let drain = drain.clone();
         conns.spawn(async move {
             let _permit = permit; // released when this connection task ends
+            let _ip_guard = ip_guard; // released when this connection task ends
             serve_h3_connection(state, incoming, drain).await;
         });
     }

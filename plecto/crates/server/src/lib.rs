@@ -38,6 +38,7 @@ mod access_log;
 mod admin;
 mod body;
 mod compression;
+mod conn_limit;
 mod dispatch;
 mod dns;
 mod error;
@@ -126,6 +127,86 @@ pub(crate) type ReqBody = BoxBody<Bytes, BoxError>;
 /// the OS backlog (natural backpressure) instead of spawning per-connection tasks unboundedly.
 pub(crate) const MAX_CONNECTIONS: usize = 10_000;
 
+/// Per-source-IP cap on concurrently-served connections (CWE-770/CWE-400, docs/servey production
+/// hardening — ADR 000027 amendment), enforced by [`conn_limit::PerIpConnLimit`] in both accept
+/// loops (TCP `listener.rs`, QUIC `h3/endpoint.rs`). `MAX_CONNECTIONS` alone bounds the total but
+/// not its distribution: without this, one source can hold every permit and starve every other
+/// client. ~2.6% of `MAX_CONNECTIONS` — comfortably above any legitimate single-source workload
+/// (even a large NAT/corporate gateway), while an attacker needs ~40 distinct source addresses
+/// (or hash-colliding /64s, for IPv6) to exhaust the pool alone, instead of one.
+pub(crate) const MAX_CONNECTIONS_PER_IP: u32 = 256;
+
+/// Raise the process's soft `RLIMIT_NOFILE` to match the hard limit at startup (Unix only; a no-op
+/// twin exists for other platforms below).
+///
+/// Most distros ship a low default soft limit (often 1024) while the hard limit is already
+/// generous — an unprivileged process may always raise its own soft limit up to the hard limit
+/// (POSIX `setrlimit(2)`, no `CAP_SYS_RESOURCE` needed). Without this, an accept loop asking for
+/// `MAX_CONNECTIONS` sockets hits EMFILE at the OS default long before its own cap — and, by
+/// design, a transient accept error is logged and the loop continues (`listener.rs`), so the
+/// server silently stops admitting new connections instead of crashing loudly. Raising the HARD
+/// limit itself needs a privilege Plecto does not request (self-hosting simplicity, deny-by-default
+/// P4); if the hard limit is ALSO below what `MAX_CONNECTIONS` needs, this only warns — an
+/// operator must raise it externally (systemd `LimitNOFILE=`, `docker run --ulimit nofile=...`, or
+/// the container runtime's own ulimit configuration).
+#[cfg(unix)]
+pub fn raise_nofile_limit() {
+    match unix_raise_nofile_limit() {
+        Ok((soft, hard)) => {
+            // 1 client fd + 1 upstream fd per proxied connection (the same accounting nginx
+            // documents for a proxying worker), doubled for headroom: the admin/health listener,
+            // DNS-refresh sockets, TLS resumption file handles, and connections mid-teardown that
+            // have not yet released their `MAX_CONNECTIONS` permit.
+            let wanted = MAX_CONNECTIONS as u64 * 4;
+            if soft < wanted {
+                tracing::warn!(
+                    soft,
+                    hard,
+                    wanted,
+                    "RLIMIT_NOFILE is below the recommended floor for MAX_CONNECTIONS; raise the \
+                     HARD limit externally (systemd LimitNOFILE=, docker --ulimit nofile=, or \
+                     ulimit -Hn) — Plecto does not request CAP_SYS_RESOURCE to do this itself"
+                );
+            } else {
+                tracing::info!(soft, hard, "RLIMIT_NOFILE raised to the hard limit");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to read/raise RLIMIT_NOFILE; leaving the OS default in place"
+            );
+        }
+    }
+}
+
+/// No POSIX resource limits on this platform — nothing to raise.
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() {}
+
+#[cfg(unix)]
+fn unix_raise_nofile_limit() -> std::io::Result<(u64, u64)> {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlim` is a valid, stack-local `libc::rlimit`; `getrlimit`/`setrlimit` only read/
+    // write through the pointer we pass and signal failure via a `-1` return (checked below),
+    // never touching memory beyond the struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let hard = rlim.rlim_max;
+    if rlim.rlim_cur < hard {
+        rlim.rlim_cur = hard;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // `rlim_t` is `u64` on every Unix target this crate builds for (Linux glibc/musl, macOS).
+    Ok((rlim.rlim_cur, hard))
+}
+
 /// Per-connection cap on concurrent HTTP/2 streams (ADR 000015). A fixed, conservative bound (not
 /// yet manifest-configurable): it stops a single h2 connection from monopolising the fixed-capacity
 /// M1 instance pool (ADR 000012) with concurrent chain dispatches, and is defence-in-depth against
@@ -146,6 +227,9 @@ pub(crate) struct ServerState {
     /// Global connection cap across TCP + QUIC: a permit is held for each connection's
     /// lifetime, so the server never serves more than `MAX_CONNECTIONS` at once.
     conn_limit: Arc<Semaphore>,
+    /// Per-source-IP connection cap across TCP + QUIC (`MAX_CONNECTIONS_PER_IP`): a slot is held
+    /// for each connection's lifetime, so one source cannot exhaust `conn_limit` alone.
+    per_ip_conn_limit: Arc<conn_limit::PerIpConnLimit>,
     /// Cap on concurrently-buffered request bodies for the `on-request-body` hook, bounding
     /// total buffered memory.
     body_buffer_limit: Arc<Semaphore>,
@@ -197,5 +281,25 @@ mod alloc_tuning_tests {
     fn cap_is_a_noop_when_disabled() {
         // 0 leaves glibc's default in place; must not panic (and compiles/no-ops off glibc).
         super::apply_arena_cap(0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod nofile_tests {
+    #[test]
+    fn raises_soft_limit_to_match_the_hard_limit() {
+        // An unprivileged process may always raise its own soft limit up to the hard limit
+        // (POSIX) — every sandbox this test runs in must allow it, so a failure here is real.
+        let (soft, hard) =
+            super::unix_raise_nofile_limit().expect("getrlimit/setrlimit must succeed");
+        assert_eq!(
+            soft, hard,
+            "soft limit must be raised to match the hard limit"
+        );
+
+        // Calling it again is idempotent: the limit is already at its ceiling.
+        let (soft2, hard2) =
+            super::unix_raise_nofile_limit().expect("a second call must also succeed");
+        assert_eq!((soft2, hard2), (soft, hard));
     }
 }

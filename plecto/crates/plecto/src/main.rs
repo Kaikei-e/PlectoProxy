@@ -130,6 +130,13 @@ async fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     spawn_sighup_reload(control.clone());
 
+    // Raise the soft RLIMIT_NOFILE to the hard limit (docs/servey production hardening) — only on
+    // the actual serve path, not the utility subcommands above (`schema` prints bare JSON to
+    // stdout; a stray log line here would corrupt it). Unlike `cap_malloc_arenas` this has no
+    // thread-creation ordering requirement, but it does need the subscriber above so its warning
+    // (if the hard limit is itself too low) is actually visible.
+    plecto_server::raise_nofile_limit();
+
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, version = %control.config_version(), "plecto fast path listening");
     serve_with_shutdown(control, listener, shutdown_signal()).await?;

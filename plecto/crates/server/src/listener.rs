@@ -22,13 +22,14 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::body::MAX_INFLIGHT_BODY_BUFFERS;
+use crate::conn_limit::PerIpConnLimit;
 use crate::dispatch::handle;
 use crate::error::ServerError;
 use crate::h3::{build_h3_endpoint, serve_h3};
 use crate::health::serve_health_checks;
 use crate::metrics::ServerMetrics;
 use crate::upstream_client::UpstreamClients;
-use crate::{MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, ServerState, admin};
+use crate::{MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP, ServerState, admin};
 
 /// Explicit cap on inbound request header lines. hyper's http1 default (~100) is documented
 /// as not API-stable, so pin it — as `MAX_CONCURRENT_STREAMS` already does for h2.
@@ -121,6 +122,7 @@ async fn serve_inner(
         clients: UpstreamClients::new(),
         alt_svc,
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+        per_ip_conn_limit: Arc::new(PerIpConnLimit::new(MAX_CONNECTIONS_PER_IP)),
         body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
         metrics: Arc::new(ServerMetrics::new()),
         otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
@@ -289,6 +291,16 @@ async fn serve_inner(
                     }
                 }
                 None => peer,
+            };
+            // Per-IP admission (CWE-770/CWE-400): keyed on the RESOLVED peer, not the raw accept()
+            // address — with PROXY v2 trust configured, the raw peer is the load balancer's own
+            // address, and every connection behind it would collide on one slot. Checked here
+            // (post-resolution, pre-TLS) rather than before accept: the real client is only known
+            // once PROXY v2 (if any) has been read off the wire.
+            let Some(_ip_guard) = PerIpConnLimit::try_acquire(&state.per_ip_conn_limit, peer.ip())
+            else {
+                tracing::debug!(peer = %peer, "per-IP connection limit reached; refusing connection");
+                return;
             };
             match tls {
                 // The handshake is bounded like the h1 header read (pre-TLS slowloris): a client

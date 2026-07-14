@@ -27,7 +27,7 @@ use crate::dev_key;
 
 // `Cargo.toml.template`, not `Cargo.toml`: a literal nested `Cargo.toml` makes `cargo package`
 // treat this directory as a separate package boundary and silently drop it, even with an
-// explicit `include` pattern (verified empirically — `cargo package -p plecto-server --list`).
+// explicit `include` pattern (verified empirically — `cargo package -p plecto --list`).
 const TEMPLATE_CARGO_TOML: &str = include_str!("../templates/filter-template/Cargo.toml.template");
 const TEMPLATE_LIB_RS: &str = include_str!("../templates/filter-template/src/lib.rs");
 

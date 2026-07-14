@@ -34,6 +34,9 @@ _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）,
   分散・全 unhealthy は 503 fail-closed ADR 000017、LB algorithm を weighted least-request P2C ＋ weighted maglev
   consistent hashing へ拡張 ADR 000035）。upstream への h2/h3・EWMA/latency-based LB・ring hash・ノード横断 health
   は後続スライス。
+- [plecto binary / operator CLI](./plecto/crates/plecto/CONTEXT.md) — `plecto` バイナリと Filter Dev Kit
+  CLI（validate/conformance/new-filter/dev/schema、ADR 000065）。Fast path・Control の上の薄い入口
+  （`plecto-server` を純ライブラリへ分離した際に新設、ADR 000091）。
 
 ## Relationships
 

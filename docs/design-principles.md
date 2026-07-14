@@ -90,7 +90,10 @@ Untrusted input is never allowed to take a worker down. Filter traps are isolate
 
 ### 2.1 Three bounded contexts
 
-Plecto Proxy's Rust workspace consists of three crates = three contexts, each with its own `CONTEXT.md`.
+Plecto Proxy's Rust workspace consists of three bounded contexts, each with its own `CONTEXT.md`. A
+fourth crate, `plecto` (ADR 000091), is a thin operator-CLI entry point over Fast path + Control
+(`cargo install plecto`) — it introduces no context of its own, and only exists as the landing spot
+for the CLI once it was split out of `plecto-server`.
 
 | Context | crate | Responsibility |
 |---|---|---|

@@ -35,7 +35,9 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
     ├── crates/
     │   ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
     │   ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
-    │   └── server/            ← fast path（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
+    │   ├── server/            ← fast path ライブラリ（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
+    │   └── plecto/            ← `plecto` バイナリ + operator CLI（validate/conformance/new-filter/dev/schema）。
+    │                             `cargo install plecto` の一等導線（ADR 000091）
     └── examples/              ← 動かせるデモ（`<use-case>/` = cargo run -p plecto-server --example）と
         └── filters/           ← 例フィルタ guest（独立 workspace・build.rs が component 化）
             ├── filter-hello/  ← conformance 用フィクスチャ（wasm32-unknown-unknown ゲスト）

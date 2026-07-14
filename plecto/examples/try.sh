@@ -224,9 +224,9 @@ scenario_production() {
   done
   banner
   say "starting the REAL plecto binary on the deploy dir (this is what you'd supervise in prod)"
-  note "cargo run -q -p plecto-server -- target/production-demo/manifest.toml 127.0.0.1:8086"
-  ( cd "$WS" && CARGO_BUILD_JOBS=2 cargo build -q -p plecto-server --bin plecto )
-  ( cd "$WS" && cargo run -q -p plecto-server -- target/production-demo/manifest.toml 127.0.0.1:8086 ) >/dev/null 2>&1 &
+  note "cargo run -q -p plecto -- target/production-demo/manifest.toml 127.0.0.1:8086"
+  ( cd "$WS" && CARGO_BUILD_JOBS=2 cargo build -q -p plecto --bin plecto )
+  ( cd "$WS" && cargo run -q -p plecto -- target/production-demo/manifest.toml 127.0.0.1:8086 ) >/dev/null 2>&1 &
   BIN_PID=$!
   wait_ready "http://127.0.0.1:8086/api/data" 401 || return 1
   say "auth: no key → the signed WASM filter short-circuits 401; a valid key → 200"

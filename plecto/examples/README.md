@@ -39,9 +39,11 @@ Plecto replicas running the released signed image, and its scripts prove drain-w
 cross-replica TLS resumption (shared STEK), and downstream mTLS.
 
 **Advanced (feature-gated).** The outbound **ext_authz** capability (ADR 000036, `--features
-outbound-http`) and the **streaming body** filter (`--features streaming-body`) are exercised today by
-the host test suite and their guest crates (`filters/filter-extauthz`, `filters/filter-streaming`);
-dedicated server demos are a follow-up.
+outbound-http`), the **outbound-tcp** capability (ADR 000060, `--features outbound-tcp` —
+`filters/filter-tcp-gate` and `filters/filter-ratelimit-redis`), and the **streaming body** filter
+(`--features streaming-body`) are exercised today by the host test suite and their guest crates
+(`filters/filter-extauthz`, `filters/filter-tcp-gate`, `filters/filter-ratelimit-redis`,
+`filters/filter-streaming`); dedicated server demos are a follow-up.
 
 ## Write your own filter
 
@@ -58,10 +60,17 @@ componentized by `crates/host/build.rs` (ADR 000010).
 | `filter-quickstart` | Minimal starter — stamps one response header (behind `quickstart`). |
 | `filter-apikey` | Real-world API-key auth gate (behind `wasm-auth`). |
 | `filter-hello` | The **conformance fixture** the host tests load — exercises every host-API. Not a starter (it does everything on purpose). |
+| `filter-hello-moonbit` | Zero-WASI conformance port of `filter-hello` — MoonBit (Tier A). |
+| `filter-hello-js` | Zero-WASI conformance port of `filter-hello` — JS/TS via ComponentizeJS (Tier A). |
+| `filter-hello-c` | Zero-WASI conformance port of `filter-hello` — C via wasi-sdk (Tier A). |
+| `filter-hello-go` | Fat-guest conformance port of `filter-hello` — Go/TinyGo, minimal WASI (Tier B, behind `fat-guest`, ADR 000063). |
 | `filter-template` | Scaffold for your own filter. |
 | `filter-streaming` | Streaming `stream<u8>` body filter (feature-gated). |
 | `filter-extauthz` | ext_authz over the SSRF-guarded outbound capability (feature-gated, ADR 000036). |
 | `filter-cors` | CORS policy reference — preflight short-circuit + dynamic origin echo from the as-forwarded request snapshot (ADR 000073). |
+| `filter-jwt` | Resource-Server JWT verification — `Authorization: Bearer`, ES256/RS256 only (ADR 000070). `isolation = "trusted"`; the JWKS-at-init key path needs the outbound-HTTP capability (feature-gated), the static PEM/JWK path never calls out. |
+| `filter-tcp-gate` | Raw-TCP consult gate over the outbound-tcp capability (feature-gated, ADR 000060). |
+| `filter-ratelimit-redis` | Redis/Valkey-backed global rate-limit reference filter, the global layer of the local-floor × global two-tier model (feature-gated, ADR 000061/000066). **Demo-only**: ships without AUTH/ACL/TLS — see the [hardening guide](../../docs/hardening.md) and [ADR 000081](../../docs/ADR/000081.md) before treating it as a production claim. |
 
 ## Not here: benchmarks
 

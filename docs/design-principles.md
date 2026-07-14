@@ -3,7 +3,7 @@
 English · [日本語](design-principles.ja.md)
 
 > **Established**: 2026-07-06 (adopted into `docs/` alongside [ADR 000056](ADR/000056.md))
-> **Basis**: Derived from the primary sources of the Plecto repository at HEAD (2026-07-13), including the WIT contract (`plecto/wit/world.wit` @ 0.3.0), 86 ADRs (append-only graph with `amends` / `supersedes`), `CLAUDE.md`, `CONTEXT-MAP.md`, crate `CONTEXT.md` files, `docs/ROADMAP.md`, and operational docs.
+> **Basis**: Derived directly from the Plecto Proxy repository's primary sources — the WIT contract (`plecto/wit/world.wit`), the `docs/ADR/` append-only graph (`amends` / `supersedes`), `CLAUDE.md`, `CONTEXT-MAP.md`, crate `CONTEXT.md` files, `docs/ROADMAP.md`, and operational docs — and kept in sync as those evolve. For the current WIT version and ADR count, read those sources directly rather than this line.
 > **Nature**: This document crystallises Plecto Proxy's design philosophy in three layers — **principles** (what does not change), **policy** (how structure is chosen), and **guidelines** (how day-to-day judgment is applied). The primary record of individual decisions lives in `docs/ADR/`; the contract's authoritative text lives in `wit/`. Where this document disagrees with an ADR or the WIT, the ADR/WIT wins and this document is revised (Chapter 7).
 
 ---

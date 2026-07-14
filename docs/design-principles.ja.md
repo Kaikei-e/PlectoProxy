@@ -3,7 +3,7 @@
 [English](design-principles.md) · 日本語
 
 > **策定日**: 2026-07-06（[ADR 000056](ADR/000056.md) と同日に docs/ へ採録）
-> **根拠**: リポジトリ HEAD（2026-07-13）の一次情報——WIT 契約（`plecto/wit/world.wit` @ 0.3.0）・ADR 86 本（`amends` / `supersedes` の append-only グラフ）・`CLAUDE.md`・`CONTEXT-MAP.md`・各 crate の `CONTEXT.md`・`docs/ROADMAP.md`・運用ドキュメント——から直接策定・同期した。最新タグは `v0.3.0`。
+> **根拠**: リポジトリの一次情報——WIT 契約（`plecto/wit/world.wit`）・`docs/ADR/` の append-only グラフ（`amends` / `supersedes`）・`CLAUDE.md`・`CONTEXT-MAP.md`・各 crate の `CONTEXT.md`・`docs/ROADMAP.md`・運用ドキュメント——から直接策定し、それらの更新に追随して同期する。現在の WIT バージョンや ADR 本数はこの行ではなく一次情報側を参照すること。
 > **性格**: 本書は Plecto Proxy の設計思想を「原則（変わらないもの）」「方針（構造の選び方）」「指針（日々の判断の当て方）」の三層で一冊に定礎する原典である。個別判断の一次記録は `docs/ADR/` にあり、契約の正文は `wit/` にある。本書と ADR/WIT が食い違う場合は ADR/WIT を正とし、本書を改訂する（第7章）。英語版 [design-principles.md](design-principles.md) と同期して保守する。
 
 ---

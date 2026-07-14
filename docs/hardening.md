@@ -89,6 +89,13 @@ persistent backend connection across requests instead of reconnecting every time
 eager load-time instantiation turns a missing/invalid required config value into a load failure
 rather than a per-request 503 (see the filter's own doc comments and `docs/writing-a-filter.md`).
 
+**Demo-only, not a production claim by itself.** As shipped, `filter-ratelimit-redis` has no
+`AUTH`, ACL, or TLS — trusted-network-only. Treat it as a technical-preview / learning aid, not
+evidence for a fleet-wide production quota, until it is upgraded per the promotion checklist in
+[ADR 000081](ADR/000081.md): ACL user + `AUTH` (or equivalent), TLS (or equivalent verifiable
+encryption), and credentials delivered through a secret-file capability rather than inline
+manifest config.
+
 Deploying it alongside the local floor is the two-layer model this guide recommends above: the
 local bucket sheds bursts before they cost a Redis round trip, and the filter enforces the actual
 fleet-wide number on what gets through. A quantified local-vs-combined comparison across a real
@@ -119,3 +126,5 @@ for the underlying single-node measurements.
   business config (backend, window, limit, `on_backend_error`, ...) from.
 - [ADR 000029](ADR/000029.md) — the role-driven placement rule (shared/global state stays out of
   native).
+- [ADR 000081](ADR/000081.md) — declares the current transport/auth as demo-only and sets the
+  AUTH/ACL/TLS production-promotion conditions for `filter-ratelimit-redis`.

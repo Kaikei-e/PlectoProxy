@@ -23,7 +23,7 @@ Plecto Proxy pairs **two complementary halves** through a typed [WIT](https://co
 The speed-critical path stays native Rust. Your request logic runs as a sandboxed WASM component that can touch **only** the capabilities the host explicitly lends it — enforced by the sandbox, not by convention.
 
 > [!WARNING]
-> **Status: early development.** The design is settled (**88** accepted ADRs) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every [tagged release](https://github.com/Kaikei-e/PlectoProxy/releases) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
+> **Status: early development.** The design is settled (see [`docs/ADR/`](docs/ADR/) for the accepted decisions) and the foundation runs end to end: the `plecto:filter@0.3.0` contract (byte-valued headers; response hooks see the as-forwarded request and can `replace` the response; `0.1.0` / `0.2.0` still loadable), a wasmtime host that loads and runs filters, and a **fast path** that terminates **HTTP/1.1, HTTP/2 (ALPN), HTTP/3 (QUIC)** and **TLS**, **routes** by host · path-prefix · method · header · query in specificity order with weighted **traffic split (canary)**, runs the route's filter chain over headers **and** a request body, propagates the client IP in an edge model, and **load-balances across healthy upstream instances** — round-robin, **weighted least-request (power-of-two-choices)**, or **weighted Maglev consistent hashing** — backed by active/passive **health checks**, **outlier detection**, a per-upstream **circuit breaker**, two-tier (per-try + overall) **timeouts**, jittered **retry**, and a two-tier **rate-limit** model (a native per-replica local floor plus a Redis-backed global reference filter). TLS terminates on a consolidated **aws-lc-rs** crypto provider with post-quantum X25519MLKEM768 key exchange preferred by default and **stateless TLS 1.3 session resumption** (rotated ticket keys, 0-RTT rejected). Upstream legs can be **re-encrypted with TLS+ALPN** (gRPC/HTTP-2 passthrough, custom CA, a pinned verification-name **`sni`** override for IP-literal or DNS-expanded endpoints) and **periodically re-resolved** from DNS so hostname upstreams track container churn; a per-route **HTTP/1.1 `Upgrade` token allowlist** splices WebSocket tunnels end to end. A security-hardening pass ([ADR 000027](docs/ADR/000027.md)) makes route selection a reliable auth boundary — the path is normalized at ingress and encoded escapes are rejected fail-closed — bounds host-held state with per-filter quotas, and enforces inbound resource limits. The shipped binary wires SIGHUP hot reload, graceful shutdown, OTLP trace export, and an operator CLI (`plecto validate` / `schema` / `new-filter` / `dev` / `conformance` / `--version`); every [tagged release](https://github.com/Kaikei-e/PlectoProxy/releases) ships its own signed-artifact pipeline (cosign + SBOM). The full suite is green on CI — a foundation you can read, run, and build filters against. See the [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -31,7 +31,8 @@ Verify the signed container image, then run it — Docker is the only prerequisi
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-DIGEST=$(docker buildx imagetools inspect "$IMAGE:0.3.2" --format '{{json .Manifest.Digest}}' | tr -d '"')
+TAG=0.3.6   # pick the latest release: https://github.com/Kaikei-e/PlectoProxy/releases
+DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
 docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \
   --certificate-identity-regexp 'https://github.com/Kaikei-e/PlectoProxy/\.github/workflows/release\.yml@.*' \
@@ -350,26 +351,18 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 │   ├── crates/
 │   │   ├── host/              # wasmtime embedding: Linker, InstancePre, host-API (+ CONTEXT.md)
 │   │   ├── control/           # control plane: manifest, OCI load, chain, reload, TLS/QUIC (+ CONTEXT.md)
-│   │   └── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, LB, upstream (+ CONTEXT.md)
+│   │   ├── server/            # fast path: HTTP/1.1·2 (hyper) + HTTP/3 (quinn), routing, LB, upstream (+ CONTEXT.md)
+│   │   └── plecto/            # the `plecto` binary + operator CLI (validate/conformance/new-filter/dev/schema, + CONTEXT.md)
 │   └── examples/              # runnable demos + example filter guests — see examples/README.md (the DX map)
-│       ├── README.md          # the guided learning path (quickstart → real use cases)
+│       ├── README.md          # the guided learning path + the full filter guest catalog (canonical list)
 │       ├── <use-case>/        # nine demos: cargo run -p plecto-server --example <name>
-│       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs)
-│           ├── filter-quickstart/ # minimal starter (stamps one header)
-│           ├── filter-apikey/ # API-key auth gate (real-world example)
-│           ├── filter-hello/  # the host's own conformance fixture
-│           ├── filter-hello-moonbit/ # zero-WASI conformance port — MoonBit (Tier A)
-│           ├── filter-hello-js/   # zero-WASI conformance port — JS/TS via ComponentizeJS (Tier A)
-│           ├── filter-hello-c/    # zero-WASI conformance port — C via wasi-sdk (Tier A)
-│           ├── filter-hello-go/   # fat-guest conformance port — Go/TinyGo, minimal WASI (Tier B, ADR 000063)
-│           ├── filter-template/ # copy-ready starter (or prefer `plecto new-filter`)
-│           ├── filter-streaming/ # experimental stream<u8> filter (feature-gated)
-│           ├── filter-extauthz/ # ext_authz over outbound HTTP (feature-gated)
-│           ├── filter-tcp-gate/ # raw-TCP consult gate over outbound TCP (feature-gated)
-│           └── filter-ratelimit-redis/ # Redis-backed global rate-limit reference filter (feature-gated)
+│       └── filters/           # example plecto:filter guests (own workspace, componentized by build.rs) —
+│                               # see examples/README.md for the current, full list (a starter, a
+│                               # real-world example, conformance fixtures across languages, and
+│                               # feature-gated references)
 ├── bench/                     # benchmark harnesses + runbook (k6/oha; harnesses/, filters/, perf/)
 ├── performance/              # the benchmark write-up + results (see performance/README.md)
-├── docs/ADR/                  # Architecture Decision Records (000001–000086)
+├── docs/ADR/                  # Architecture Decision Records
 ├── CHANGELOG.md               # Keep a Changelog + pre-1.0 versioning policy
 ├── CLAUDE.md                  # project conventions & design summary
 ├── CONTEXT-MAP.md             # domain glossary map (split per context)
@@ -378,7 +371,7 @@ Plecto Proxy is built ADR-first, milestone by milestone. The full detail — lan
 
 ## Design decisions
 
-Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All **88** accepted ADRs live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
+Plecto Proxy records every load-bearing decision as an ADR in the Fork form (*decision / rationale / re-examination condition*). All accepted ADRs live in [`docs/ADR/`](docs/ADR/) — start at [ADR 000001](docs/ADR/000001.md) (the two complementary halves); each cross-links the decisions it builds on.
 
 What gets verified, and where, is mapped in one page: [docs/verification.md](docs/verification.md) — a map to the CI/release machinery whose record is the workflows themselves being green, not a separate ledger ([ADR 000086](docs/ADR/000086.md)).
 

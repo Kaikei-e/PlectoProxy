@@ -21,7 +21,7 @@ cargo run -p plecto-server --example production
 Terminal 2 — start the real gateway on it:
 
 ```bash
-cargo run -q -p plecto-server -- target/production-demo/manifest.toml 127.0.0.1:8086
+cargo run -q -p plecto -- target/production-demo/manifest.toml 127.0.0.1:8086
 ```
 
 (Or scripted end to end: `./examples/try.sh production`.)

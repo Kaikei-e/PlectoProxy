@@ -107,8 +107,38 @@ jobs:
             sleep 20
           done
 
-  binaries:
+  # Creates the draft release exactly once, before any other job touches it. Previously,
+  # `binaries`' profile × arch matrix legs each raced `gh release create ... || true` in
+  # parallel, on the assumption that the losers would fail because the tag already had a draft —
+  # but GitHub does not enforce that uniqueness for draft releases, so every leg quietly created
+  # its OWN empty draft (verified: v0.3.2–v0.3.6 each ended up with several orphaned empty drafts
+  # alongside the one that actually received assets). Creating it here, once, ahead of the
+  # fan-out removes the race instead of tolerating it; `gh release view` makes a rerun idempotent.
+  release-init:
+    name: create the draft release
     needs: gate
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the draft release
+    steps:
+      - name: Create the draft release (idempotent — reuse it if a rerun finds it already exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job — gh cannot infer the repo from a git remote, so pin it
+          # explicitly (same fix as release-notes below, first exercised on v0.3.2).
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "a release for ${GITHUB_REF_NAME} already exists — reusing it"
+          else
+            gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
+              --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md"
+          fi
+
+  binaries:
+    needs: [gate, release-init]
     timeout-minutes: 20
     strategy:
       matrix:
@@ -190,9 +220,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           NAME="${{ steps.package.outputs.name }}"
-          # the profile × arch matrix jobs race to create the draft once; the losers just upload.
-          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
-            --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md" || true
+          # release-init already created the single draft this tag uses; just upload to it.
           gh release upload "${GITHUB_REF_NAME}" \
             "${NAME}.tar.gz" "${NAME}.tar.gz.sha256" \
             "${NAME}.tar.gz.sigstore.json" "${NAME}.tar.gz.sha256.sigstore.json" \
@@ -534,8 +562,9 @@ jobs:
 
   # Single writer for the draft release body (ADR 000079): container-merge, wit-publish, and
   # filter-publish each upload a digest fragment; this job overwrites the notes once. Avoids the
-  # lost-update race of parallel `gh release view` → append → `gh release edit`. `binaries` may
-  # have created the draft earlier with a placeholder body — that is fine; we replace it here.
+  # lost-update race of parallel `gh release view` → append → `gh release edit`. `release-init`
+  # already created the draft (with a placeholder body) before `binaries` — which this job
+  # transitively depends on — ever ran; we only replace the notes here, never create.
   release-notes:
     name: draft release notes (images + WIT + filters)
     needs: [binaries, container-merge, wit-publish, filter-publish]
@@ -556,8 +585,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
-            --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md" || true
           {
             echo "See CHANGELOG.md"
             echo

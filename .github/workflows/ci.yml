@@ -469,3 +469,12 @@ jobs:
         with:
           manifest-path: plecto/Cargo.toml
           package: plecto-host,plecto-control,plecto-server
+          # default-features, NOT the default heuristic (≒ all-features): the heuristic turns on
+          # plecto-host's `test-support`, whose build.rs compiles the fixture guests for
+          # wasm32-unknown-unknown / wasm32-wasip2. That breaks twice over — the action's own
+          # `stable` toolchain bypasses plecto/rust-toolchain.toml (no wasm targets, E0463), and
+          # the crates.io baseline package doesn't even contain the guest sources
+          # (examples/filters/ lives outside crates/host), so the baseline could never build with
+          # `test-support` regardless of installed targets. Consumers get the default-features API
+          # from crates.io; that is the surface this gate protects.
+          feature-group: default-features

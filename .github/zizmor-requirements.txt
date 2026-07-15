@@ -1,0 +1,6 @@
+# zizmor — GitHub Actions workflow security linter, run by ci.yml's workflow-lint job.
+# Hash-pinned (pip --require-hashes): the sha256 is the linux-x86_64 manylinux wheel, the only
+# platform CI installs on. Bump the version and hash together (pip download zizmor==X.Y.Z
+# --no-deps && sha256sum the wheel).
+zizmor==1.27.0 \
+    --hash=sha256:afb28123882d2b8248f1e480bf6cc6d1af102e0d3fbe22a40f7f795b1aa9d435

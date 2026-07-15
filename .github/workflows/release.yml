@@ -54,11 +54,18 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege by default: every WRITE grant lives on the job that needs it (job-level
+# permissions REPLACE this default), so a compromised step in one job cannot use another
+# job's grant — e.g. the container build cannot touch the draft release, and only the jobs
+# that cosign-sign hold id-token.
 permissions:
-  contents: write # create the draft release + upload assets
-  packages: write # push the GHCR image
-  id-token: write # cosign keyless signing (Fulcio OIDC)
-  actions: read # the gate job reads the tagged commit's CI run
+  contents: read
+
+# One release pipeline per tag ref; never cancel a publish mid-flight (GHCR pushes are live,
+# not draft-gated) — a duplicate run of the same tag queues behind it instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,8 +78,12 @@ jobs:
   # container image is pushed live to GHCR (not draft-gated), so this gate must fail closed —
   # including when CI never ran on the default branch for this SHA.
   gate:
+    name: require green default-branch CI
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read # reads the tagged commit's ci.yml runs
     steps:
       - name: Require a green default-branch CI run for the tagged commit
         env:
@@ -138,8 +149,12 @@ jobs:
           fi
 
   binaries:
+    name: binaries (${{ matrix.target }}, ${{ matrix.profile }})
     needs: [gate, release-init]
     timeout-minutes: 20
+    permissions:
+      contents: write # upload assets to the draft release
+      id-token: write # cosign keyless signing (Fulcio OIDC)
     strategy:
       matrix:
         # Profile × arch (ADR 000079). The profile name doubles as the cargo feature name
@@ -157,6 +172,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       # Compile inside a Debian bookworm container — NOT dtolnay/rust-toolchain directly on the
       # ubuntu-24.04(-arm) runner. The runner's glibc (2.39) is newer than the runtime image's,
       # gcr.io/distroless/cc-debian12 (glibc 2.36, verified 2026-07-03); a binary linked against
@@ -211,15 +228,18 @@ jobs:
           upload-release-assets: false
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign artifacts (cosign keyless)
+        env:
+          # env indirection, not inline ${{ }} in the script: the shell sees a variable, never
+          # template-expanded text (zizmor template-injection hygiene, applied uniformly).
+          NAME: ${{ steps.package.outputs.name }}
         run: |
-          NAME="${{ steps.package.outputs.name }}"
           cosign sign-blob --yes --bundle "${NAME}.tar.gz.sigstore.json" "${NAME}.tar.gz"
           cosign sign-blob --yes --bundle "${NAME}.tar.gz.sha256.sigstore.json" "${NAME}.tar.gz.sha256"
       - name: Upload to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.package.outputs.name }}
         run: |
-          NAME="${{ steps.package.outputs.name }}"
           # release-init already created the single draft this tag uses; just upload to it.
           gh release upload "${GITHUB_REF_NAME}" \
             "${NAME}.tar.gz" "${NAME}.tar.gz.sha256" \
@@ -240,6 +260,9 @@ jobs:
     name: container image (${{ matrix.target }}, ${{ matrix.profile }})
     needs: [gate, binaries]
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # push the per-arch image by digest to ghcr.io
     strategy:
       matrix:
         # Same profile × arch split as `binaries` — each profile gets its own multi-arch image
@@ -256,6 +279,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Download the native binary already built for this arch and profile
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -283,10 +308,11 @@ jobs:
           provenance: mode=max
           sbom: true
       - name: Export the digest for the merge job
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
       # The artifact name leads with the profile so the merge job can glob one profile's
       # per-arch digests (digests-<profile>-*) without mixing the two images.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -301,6 +327,9 @@ jobs:
     needs: container-build
     timeout-minutes: 10
     runs-on: ubuntu-24.04
+    permissions:
+      packages: write # push the multi-arch manifest lists to ghcr.io
+      id-token: write # cosign keyless signing (Fulcio OIDC)
     steps:
       # No merge-multiple: each digests-<profile>-<target> artifact keeps its own subdirectory,
       # so the per-profile loop below can glob one profile's arch digests without mixing images.
@@ -374,9 +403,12 @@ jobs:
     # so it gets neither `id-token` nor `actions: read`. Digests go to an artifact; the single
     # release-notes job owns the draft-release body (no contents: write race).
     permissions:
+      contents: read
       packages: write # push the WIT OCI artifacts to ghcr.io
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Install wkg (sha256-pinned, same release ci.yml already pins for wkg wit fetch)
         working-directory: ${{ runner.temp }}
         run: |
@@ -417,11 +449,14 @@ jobs:
           publish_one plecto/wit filter filter_ref
           publish_one plecto/wit-streaming filter-streaming streaming_ref
       - name: Write WIT digests for the release-notes job
+        env:
+          FILTER_REF: ${{ steps.publish.outputs.filter_ref }}
+          STREAMING_REF: ${{ steps.publish.outputs.streaming_ref }}
         run: |
           set -euo pipefail
           {
-            echo "- ${{ steps.publish.outputs.filter_ref }}"
-            echo "- ${{ steps.publish.outputs.streaming_ref }} (experimental, off-by-default)"
+            echo "- ${FILTER_REF}"
+            echo "- ${STREAMING_REF} (experimental, off-by-default)"
           } >/tmp/wit-digests.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -463,6 +498,7 @@ jobs:
     # status nor writes the release — digests go to an artifact for the single release-notes
     # writer.
     permissions:
+      contents: read
       packages: write # push the filter OCI artifacts to ghcr.io
       id-token: write # cosign keyless signing + SBOM attestation (Fulcio OIDC)
     env:
@@ -471,6 +507,8 @@ jobs:
       OIDC_ISSUER: https://token.actions.githubusercontent.com
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       # Same toolchain shape as ci.yml's build job: rust-toolchain.toml pins the channel and
       # wasm32-unknown-unknown; wasm32-wasip2 (the outbound guests' target) is added here.
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)

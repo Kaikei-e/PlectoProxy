@@ -25,7 +25,7 @@ digest に固定します:
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.3.6   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.3.7   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
 
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 echo "$DIGEST"

@@ -21,6 +21,26 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-15
+
+### Added
+
+- **Per-source-IP concurrent connection cap** (`MAX_CONNECTIONS_PER_IP`, default 256): a
+  fixed hash-slot admission table — the same CWE-770-bounded design as the existing
+  `client-ip` native rate limiter, IPv6 coarsened to /64 — enforced on both the TCP and
+  QUIC/HTTP-3 accept loops, so a single source can no longer exhaust the global
+  `MAX_CONNECTIONS` pool alone (ADR 000092, amends 000027).
+
+### Fixed
+
+- **`RLIMIT_NOFILE` is now raised at startup**: the process's soft file-descriptor limit is
+  raised to the hard limit before serving (a POSIX-permitted operation, no `CAP_SYS_RESOURCE`
+  required), so the common distro default soft limit (often 1024) no longer causes the accept
+  loop to silently stop admitting new connections on EMFILE long before `MAX_CONNECTIONS`
+  (10,000) is reached. A warning is logged if the hard limit itself is still too low for that
+  ceiling — raising it further needs an operator's own privileged action (systemd
+  `LimitNOFILE=`, `docker --ulimit nofile=`) (ADR 000092, amends 000027).
+
 ## [0.3.6] - 2026-07-14
 
 ### Added

@@ -453,3 +453,19 @@ jobs:
           # registry or git source early (A03). `licenses` uses deny.toml's allow-list so an
           # incompatible-license transitive cannot land silently with the SBOM release path.
           command: check advisories bans sources licenses
+
+  # semver compatibility of the crates.io-published library crates (ADR 000090/000091), BLOCKING.
+  # Baseline defaults to the newest version already on crates.io, diffed against this checkout's
+  # API — so an unbumped breaking change fails CI instead of surfacing as a downstream consumer's
+  # broken build. `plecto` (crates/plecto) is bin-only (no `[lib]`, ADR 000091) and has no public
+  # API for the tool to check, so only the three library crates are listed.
+  semver-checks:
+    name: cargo-semver-checks (published crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          manifest-path: plecto/Cargo.toml
+          package: plecto-host,plecto-control,plecto-server

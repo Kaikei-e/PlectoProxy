@@ -11,13 +11,24 @@ The speed-critical path stays native Rust. Filter logic runs as a sandboxed WASM
 
 > **Status: early development.** APIs and the `plecto:filter` contract may still change between releases.
 
+## Install
+
+```bash
+cargo install plecto
+```
+
+This installs the `plecto` binary — the operator CLI (`plecto new-filter`, `plecto dev`,
+`plecto validate`, `plecto conformance`, `plecto schema`) plus the gateway itself
+(`plecto <manifest.toml> <listen-addr>`).
+
 ## This workspace
 
 This crate is one member of the Plecto Proxy Cargo workspace:
 
+- [`plecto`](https://docs.rs/plecto) — the `plecto` binary and operator CLI. `cargo install plecto` is the primary entry point.
 - [`plecto-host`](https://docs.rs/plecto-host) — the wasmtime embedding host that loads, sandboxes, and runs `plecto:filter` WASM components.
 - [`plecto-control`](https://docs.rs/plecto-control) — the control plane: declarative manifest, OCI artifact loading, filter-chain dispatch, atomic hot reload.
-- [`plecto-server`](https://docs.rs/plecto-server) — the fast path data plane (HTTP/1.1, HTTP/2, HTTP/3, TLS, routing, load balancing) and the `plecto` binary.
+- [`plecto-server`](https://docs.rs/plecto-server) — the fast path data plane library (HTTP/1.1, HTTP/2, HTTP/3, TLS, routing, load balancing).
 
 ## Links
 

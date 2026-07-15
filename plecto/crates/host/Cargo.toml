@@ -189,6 +189,12 @@ base64 = "0.22"
 name = "wasm"
 harness = false
 
+# Contended host-state writes through the KvBackend seam (redb group commit vs the in-memory
+# ceiling). Pure-Rust, no guest components — runs in bench.yml's `micro` job with `wasm`.
+[[bench]]
+name = "kv_backend"
+harness = false
+
 # Instruction-count twin of the `wasm` bench (wall-clock criterion stays authoritative for "how
 # long", this one for "how much work"). required-features keeps it out of a plain `cargo bench`.
 [[bench]]

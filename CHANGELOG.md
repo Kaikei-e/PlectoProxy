@@ -21,6 +21,31 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-07-16
+
+### Changed
+
+- **Host-state writes now group-commit**: `host-kv` / `host-counter` / `host-ratelimit`
+  writes to the redb backend are combined by the calling threads themselves (flat combining:
+  callers queue ops and an elected caller applies everything queued in one write
+  transaction), instead of paying one `begin_write`→`commit` per op on redb's global
+  single-writer lock. Contended writes drop ~60% per-op on an 8-thread benchmark; the
+  uncontended path is unchanged (the winner runs its op inline, no thread handoff). Per-op
+  atomicity, `set`/`delete` immediate durability, fail-closed behavior, and the periodic
+  durable-flush bound (now counted per op, advanced only after a successful commit) are all
+  preserved (ADR 000093, amends 000004).
+
+### Added
+
+- **Contended-write micro-benchmark** (`plecto-host/benches/kv_backend.rs`): redb vs
+  in-memory backend across writer-thread counts, so the host-state write path's scaling is
+  measured in CI instead of only at single-threaded load points.
+- **CI: semver gate for published crates** — `cargo-semver-checks` compares
+  `plecto-host` / `plecto-control` / `plecto-server` against their latest crates.io
+  release on every PR, so an accidental breaking change cannot ride a patch bump. CI
+  workflows were also hardened (least-privilege permissions, zizmor audit gate,
+  action SHA re-pins).
+
 ## [0.3.7] - 2026-07-15
 
 ### Added

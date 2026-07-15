@@ -216,11 +216,16 @@ const REDB_CACHE_BYTES: usize = 64 << 20;
 /// timeout-based re-election (the slow path) rare.
 const MAX_COMBINE_ROUNDS: u32 = 16;
 
-/// Every `DURABLE_FLUSH_EVERY`th hot-path commit is upgraded from `Durability::None` to
+/// Cap on ops drained into one write transaction. Together with `MAX_COMBINE_ROUNDS` this
+/// bounds combiner conscription by *work*, not only by round count.
+const MAX_BATCH_OPS: usize = 64;
+
+/// Every `DURABLE_FLUSH_EVERY`th hot-path **op** is upgraded from `Durability::None` to
 /// `Immediate`. redb frees pages only at a durable commit, so an unbounded None-only run
 /// (a counter/ratelimit-heavy workload with no kv writes) would grow the file without bound.
 /// 1024 amortises the fsync to noise on the hot path while bounding both the file growth
-/// between durable commits and the window of updates a crash can lose.
+/// between durable commits and the window of updates a crash can lose. The run counts ops,
+/// not commits, so combining many ops into one txn does not stretch that bound.
 const DURABLE_FLUSH_EVERY: u64 = 1024;
 
 /// redb-backed durable state. Atomicity comes from redb's single-writer write
@@ -228,21 +233,21 @@ const DURABLE_FLUSH_EVERY: u64 = 1024;
 /// fully synchronous; ADR 000011's async-aware seam is this `KvBackend` impl — callers
 /// never see the store or the batching behind it.
 ///
-/// Writes go through a **group commit** (DeWitt et al. 1984) shaped as **flat combining**
-/// (Hendler et al., SPAA'10): a caller queues its op, then competes for the combiner
-/// lock; the winner drains everything queued and applies the whole batch inside ONE
-/// write transaction, answering every waiter before releasing. redb serializes writers
+/// Writes amortize begin/commit (and fsync when durable) across concurrent callers — the
+/// classical **group-commit** idea (DeWitt et al., SIGMOD'84: share durable I/O across a
+/// commit group) — shaped as **flat combining** (Hendler et al., SPAA'10): a caller queues
+/// its op, then competes for the combiner lock; the winner drains up to `MAX_BATCH_OPS`
+/// queued ops and applies them inside ONE write transaction. redb serializes writers
 /// globally (`begin_write` blocks), so per-op transactions would serialize every filter
 /// and route on N× the begin/commit cost; combining keeps the single writer but pays
 /// that cost once per batch. The batch is self-clocking — no timer, no resident thread:
-/// an uncontended caller drains only its own op and runs it inline (zero thread handoff,
-/// per-op cost identical to a plain transaction), while contended callers batch exactly
-/// what accumulated while the previous combiner held the lock.
+/// an uncontended caller drains only its own op and runs it inline (zero thread handoff),
+/// while contended callers batch what accumulated while the previous combiner held the lock.
 pub struct RedbBackend {
     db: Database,
     flush_every: u64,
     /// Hot-path (non-durable) ops committed since the last durable commit. Mutated only
-    /// while holding the `combine` lock; atomics so tests observe them from outside.
+    /// while holding the `combine` lock, and only after a successful commit.
     non_durable_run: AtomicU64,
     /// Durable commits forced by the cadence (observability for the flush tests).
     forced_flushes: AtomicU64,
@@ -254,6 +259,20 @@ pub struct RedbBackend {
     /// died mid-batch its drained jobs' reply channels disconnect, so every waiter
     /// resolves fail-closed instead of inheriting a poisoned lock.
     combine: Mutex<mpsc::Receiver<WriteJob>>,
+    /// Test seams for combiner/durability contracts (production `open` leaves them inert).
+    #[cfg(test)]
+    test: CombineTestHooks,
+}
+
+/// Observability + fault injection for combiner tests. Not used on the production `open` path
+/// beyond default values that match the constants above.
+#[cfg(test)]
+struct CombineTestHooks {
+    combine_rounds: u32,
+    max_batch_ops: usize,
+    fail_next_commits: AtomicU64,
+    /// High-water mark of `batch.len()` seen by `apply_batch` (asserts the per-round cap).
+    max_batch_seen: AtomicU64,
 }
 
 /// One queued write, applied by the combiner inside the next batch's transaction.
@@ -295,8 +314,9 @@ enum WriteOutcome {
 
 struct WriteJob {
     op: WriteOp,
-    /// One-shot reply: the caller blocks on the paired receiver until the batch commits, so
-    /// in-flight jobs are bounded by the number of calling threads — the queue needs no cap.
+    /// One-shot reply: the caller blocks on the paired receiver until the batch commits.
+    /// In-flight jobs are bounded by calling threads; each combine round additionally caps
+    /// how many are drained (`MAX_BATCH_OPS` / test override).
     reply: mpsc::Sender<anyhow::Result<WriteOutcome>>,
 }
 
@@ -311,7 +331,21 @@ impl RedbBackend {
         path: impl AsRef<std::path::Path>,
         flush_every: u64,
     ) -> anyhow::Result<Self> {
-        Self::open_inner(path, flush_every)
+        Self::open_with_combine_limits(path, flush_every, MAX_COMBINE_ROUNDS, MAX_BATCH_OPS)
+    }
+
+    /// Test constructor: override combiner round / per-round batch caps.
+    #[cfg(test)]
+    fn open_with_combine_limits(
+        path: impl AsRef<std::path::Path>,
+        flush_every: u64,
+        combine_rounds: u32,
+        max_batch_ops: usize,
+    ) -> anyhow::Result<Self> {
+        let mut b = Self::open_inner(path, flush_every)?;
+        b.test.combine_rounds = combine_rounds.max(1);
+        b.test.max_batch_ops = max_batch_ops.max(1);
+        Ok(b)
     }
 
     fn open_inner(path: impl AsRef<std::path::Path>, flush_every: u64) -> anyhow::Result<Self> {
@@ -326,12 +360,47 @@ impl RedbBackend {
             forced_flushes: AtomicU64::new(0),
             jobs,
             combine: Mutex::new(queue),
+            #[cfg(test)]
+            test: CombineTestHooks {
+                combine_rounds: MAX_COMBINE_ROUNDS,
+                max_batch_ops: MAX_BATCH_OPS,
+                fail_next_commits: AtomicU64::new(0),
+                max_batch_seen: AtomicU64::new(0),
+            },
         })
     }
 
     #[cfg(test)]
     fn forced_flushes(&self) -> u64 {
         self.forced_flushes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn non_durable_run(&self) -> u64 {
+        self.non_durable_run.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn max_batch_seen(&self) -> u64 {
+        self.test.max_batch_seen.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn fail_next_n_commits(&self, n: u64) {
+        self.test.fail_next_commits.store(n, Ordering::Relaxed);
+    }
+
+    /// Test seam: run `ops` through `apply_batch` as one transaction (no queue).
+    #[cfg(test)]
+    fn apply_ops_as_batch(&self, ops: Vec<WriteOp>) -> anyhow::Result<Vec<WriteOutcome>> {
+        let batch: Vec<_> = ops
+            .into_iter()
+            .map(|op| {
+                let (reply, _rx) = mpsc::channel();
+                WriteJob { op, reply }
+            })
+            .collect();
+        self.apply_batch(&batch)
     }
 
     fn get_inner(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
@@ -385,10 +454,21 @@ impl RedbBackend {
             // leaving it behind would strand it for a full timeout round. Cap the rounds
             // so one caller cannot be conscripted indefinitely under sustained load —
             // past the cap the residual jobs' owners re-elect via the timeout above.
-            for _ in 0..MAX_COMBINE_ROUNDS {
+            #[cfg(test)]
+            let rounds = self.test.combine_rounds;
+            #[cfg(not(test))]
+            let rounds = MAX_COMBINE_ROUNDS;
+            #[cfg(test)]
+            let max_batch = self.test.max_batch_ops;
+            #[cfg(not(test))]
+            let max_batch = MAX_BATCH_OPS;
+            for _ in 0..rounds {
                 let mut batch = Vec::new();
-                while let Ok(job) = queue.try_recv() {
-                    batch.push(job);
+                while batch.len() < max_batch {
+                    match queue.try_recv() {
+                        Ok(job) => batch.push(job),
+                        Err(_) => break,
+                    }
                 }
                 if batch.is_empty() {
                     break;
@@ -402,12 +482,15 @@ impl RedbBackend {
                     Err(e) => {
                         // The whole batch rode one transaction, so all of it fails
                         // together; each caller resolves its own op fail-closed.
+                        // Stop combining on storage failure — further rounds would only
+                        // amplify conscription while the underlying error persists.
                         tracing::error!(error = %e, ops = batch.len(), "redb batch commit failed");
                         for job in &batch {
                             let _ = job
                                 .reply
                                 .send(Err(anyhow::anyhow!("batch commit failed: {e:#}")));
                         }
+                        break;
                     }
                 }
             }
@@ -416,35 +499,58 @@ impl RedbBackend {
         }
     }
 
-    /// The durability of one combined commit. A batch carrying durable KV (`set`/`delete`)
-    /// commits `Immediate` — the guarantee those ops always had — and restarts the hot-path
-    /// cadence (every earlier non-durable commit becomes durable with it). A hot-only batch
-    /// (counters / buckets — ephemera, ADR 000005) skips the fsync until the run reaches
-    /// `flush_every`, then one `Immediate` commit bounds file growth and the crash-loss
-    /// window; the run counts OPS, not commits, so batching does not stretch that bound.
-    fn batch_durability(&self, batch: &[WriteJob]) -> redb::Durability {
+    /// Choose durability for one combined commit without mutating the flush cadence.
+    /// Cadence side effects run only in `record_successful_commit` after `commit` succeeds.
+    fn durability_for_batch(&self, batch: &[WriteJob]) -> redb::Durability {
         if batch.iter().any(|j| j.op.needs_durable_commit()) {
-            self.non_durable_run.store(0, Ordering::Relaxed);
             return redb::Durability::Immediate;
         }
         let ops = batch.len() as u64;
-        let run = self.non_durable_run.fetch_add(ops, Ordering::Relaxed) + ops;
+        let run = self.non_durable_run.load(Ordering::Relaxed) + ops;
         if run >= self.flush_every {
-            self.non_durable_run.store(0, Ordering::Relaxed);
-            self.forced_flushes.fetch_add(1, Ordering::Relaxed);
             redb::Durability::Immediate
         } else {
             redb::Durability::None
         }
     }
 
+    /// Advance / reset the hot-path flush cadence after a successful commit.
+    fn record_successful_commit(&self, batch: &[WriteJob], durability: redb::Durability) {
+        if batch.iter().any(|j| j.op.needs_durable_commit()) {
+            // Matches main's set_inner/delete_inner: reset only after Immediate lands.
+            self.non_durable_run.store(0, Ordering::Relaxed);
+            return;
+        }
+        let ops = batch.len() as u64;
+        match durability {
+            redb::Durability::Immediate => {
+                self.non_durable_run.store(0, Ordering::Relaxed);
+                self.forced_flushes.fetch_add(1, Ordering::Relaxed);
+            }
+            redb::Durability::None => {
+                self.non_durable_run.fetch_add(ops, Ordering::Relaxed);
+            }
+            // Unused variants: prefer an extra fsync over an unbounded None run.
+            _ => {
+                self.non_durable_run.store(0, Ordering::Relaxed);
+                self.forced_flushes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Apply one batch inside a single write transaction. Outcomes are returned, not sent —
     /// replies must not leave before the commit they depend on.
     fn apply_batch(&self, batch: &[WriteJob]) -> anyhow::Result<Vec<WriteOutcome>> {
+        #[cfg(test)]
+        {
+            let len = batch.len() as u64;
+            self.test.max_batch_seen.fetch_max(len, Ordering::Relaxed);
+        }
+        let durability = self.durability_for_batch(batch);
         let mut wtxn = self.db.begin_write()?;
         // set_durability only errors if a persistent savepoint changed in this txn; we never
         // use savepoints.
-        wtxn.set_durability(self.batch_durability(batch))?;
+        wtxn.set_durability(durability)?;
         let mut outcomes = Vec::with_capacity(batch.len());
         {
             let mut table = wtxn.open_table(STATE_TABLE)?;
@@ -452,7 +558,18 @@ impl RedbBackend {
                 outcomes.push(apply_op(&mut table, &job.op)?);
             }
         }
+        #[cfg(test)]
+        if self
+            .test
+            .fail_next_commits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            drop(wtxn);
+            anyhow::bail!("injected commit failure");
+        }
         wtxn.commit()?;
+        self.record_successful_commit(batch, durability);
         Ok(outcomes)
     }
 }
@@ -673,10 +790,10 @@ mod tests {
 
     #[test]
     fn redb_periodic_durable_flush_caps_a_non_durable_run() {
-        // Hot-path commits (increment / try_acquire) skip the per-commit fsync
+        // Hot-path ops (increment / try_acquire) skip the per-commit fsync
         // (Durability::None), but redb frees pages only at a durable commit — an unbounded
         // None-only run (a counter/ratelimit-heavy workload with no kv writes) would grow the
-        // file without bound. Every `flush_every`th hot-path commit must be durable.
+        // file without bound. Every `flush_every`th hot-path **op** must be durable.
         let dir = tempfile::tempdir().unwrap();
         let b = RedbBackend::open_with_flush_every(dir.path().join("state.redb"), 4).unwrap();
 
@@ -689,17 +806,13 @@ mod tests {
         b.increment(b"c", 1);
         b.increment(b"c", 0); // a read (delta 0) commits nothing and must not advance the run
         b.try_acquire(b"rl", 1, spec, 0);
-        assert_eq!(
-            b.forced_flushes(),
-            0,
-            "three hot-path commits stay non-durable"
-        );
+        assert_eq!(b.forced_flushes(), 0, "three hot-path ops stay non-durable");
 
         b.try_acquire(b"rl", 1, spec, 0);
         assert_eq!(
             b.forced_flushes(),
             1,
-            "the 4th commit in a run is upgraded to durable"
+            "the 4th op in a run is upgraded to durable"
         );
 
         for _ in 0..4 {
@@ -768,6 +881,226 @@ mod tests {
             100,
             "the bucket admits exactly its capacity"
         );
+    }
+
+    #[test]
+    fn redb_failed_durable_commit_does_not_reset_flush_cadence() {
+        // A failed Immediate (set/delete) must not clear non_durable_run — otherwise the
+        // next None-only stretch can exceed flush_every ops since the last successful
+        // durable commit (ADR 000093; main reset set/delete cadence only post-commit).
+        let dir = tempfile::tempdir().unwrap();
+        let b = RedbBackend::open_with_flush_every(dir.path().join("state.redb"), 4).unwrap();
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        assert_eq!(b.non_durable_run(), 3);
+        b.fail_next_n_commits(1);
+        b.set(b"k", b"v".to_vec()); // Immediate attempt aborts before commit
+        assert!(b.get(b"k").is_none(), "failed set must not be observable");
+        assert_eq!(
+            b.non_durable_run(),
+            3,
+            "failed durable commit must leave the hot-path run intact"
+        );
+        b.increment(b"c", 1);
+        assert_eq!(
+            b.forced_flushes(),
+            1,
+            "the next hot op must still trip the cadence at flush_every"
+        );
+    }
+
+    #[test]
+    fn redb_flush_cadence_counts_ops_not_commits() {
+        // One write txn carrying N hot ops must advance the run by N, not by 1.
+        let dir = tempfile::tempdir().unwrap();
+        let b = RedbBackend::open_with_flush_every(dir.path().join("state.redb"), 4).unwrap();
+        let ops = (0..4)
+            .map(|_| WriteOp::Increment {
+                key: b"c".to_vec(),
+                delta: 1,
+            })
+            .collect();
+        b.apply_ops_as_batch(ops).unwrap();
+        assert_eq!(
+            b.forced_flushes(),
+            1,
+            "4 ops in one commit trip flush_every=4"
+        );
+        assert_eq!(b.increment(b"c", 0), 4);
+        let ops = (0..3)
+            .map(|_| WriteOp::Increment {
+                key: b"c".to_vec(),
+                delta: 1,
+            })
+            .collect();
+        b.apply_ops_as_batch(ops).unwrap();
+        assert_eq!(
+            b.forced_flushes(),
+            1,
+            "3 more ops stay under the next threshold"
+        );
+        b.increment(b"c", 1);
+        assert_eq!(
+            b.forced_flushes(),
+            2,
+            "the 4th op of the new run forces a flush"
+        );
+    }
+
+    #[test]
+    fn redb_batch_commit_failure_fails_closed_for_every_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = RedbBackend::open(dir.path().join("state.redb")).unwrap();
+        b.fail_next_n_commits(1);
+        let ops = vec![
+            WriteOp::Increment {
+                key: b"c".to_vec(),
+                delta: 1,
+            },
+            WriteOp::Increment {
+                key: b"c".to_vec(),
+                delta: 1,
+            },
+            WriteOp::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        ];
+        assert!(b.apply_ops_as_batch(ops).is_err());
+        assert_eq!(b.increment(b"c", 0), 0, "no partial counter apply");
+        assert!(b.get(b"k").is_none(), "no partial kv apply");
+    }
+
+    #[test]
+    fn redb_mixed_durable_and_hot_batch_resets_cadence_without_forced_flush() {
+        // set in a batch upgrades the commit to Immediate; co-batched hot ops must not
+        // bump forced_flushes, and the hot-path run restarts after success.
+        let dir = tempfile::tempdir().unwrap();
+        let b = RedbBackend::open_with_flush_every(dir.path().join("state.redb"), 4).unwrap();
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.increment(b"c", 1);
+        b.apply_ops_as_batch(vec![
+            WriteOp::Increment {
+                key: b"c".to_vec(),
+                delta: 1,
+            },
+            WriteOp::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(b.get(b"k"), Some(b"v".to_vec()));
+        assert_eq!(b.forced_flushes(), 0);
+        assert_eq!(b.non_durable_run(), 0);
+        for _ in 0..3 {
+            b.increment(b"c", 1);
+        }
+        assert_eq!(b.forced_flushes(), 0);
+        b.increment(b"c", 1);
+        assert_eq!(b.forced_flushes(), 1);
+    }
+
+    #[test]
+    fn redb_per_round_batch_cap_bounds_combiner_work() {
+        // Under contention, a combiner round must not drain more than max_batch_ops.
+        let dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(
+            RedbBackend::open_with_combine_limits(dir.path().join("state.redb"), 1024, 16, 2)
+                .unwrap(),
+        );
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let b = Arc::clone(&b);
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        b.increment(b"c", 1);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(b.increment(b"c", 0), 320);
+        assert!(
+            b.max_batch_seen() <= 2,
+            "max_batch_seen={} exceeded cap 2",
+            b.max_batch_seen()
+        );
+    }
+
+    #[test]
+    fn redb_residual_jobs_after_round_cap_still_commit() {
+        // combine_rounds=1 and max_batch_ops=1 force frequent re-election; every op must land.
+        let dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(
+            RedbBackend::open_with_combine_limits(dir.path().join("state.redb"), 1024, 1, 1)
+                .unwrap(),
+        );
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let b = Arc::clone(&b);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        b.increment(b"c", 1);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(b.increment(b"c", 0), 200);
+    }
+
+    #[test]
+    fn redb_concurrent_set_delete_are_exact_under_combining() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(RedbBackend::open(dir.path().join("state.redb")).unwrap());
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let b = Arc::clone(&b);
+                std::thread::spawn(move || {
+                    let key = format!("k{i}").into_bytes();
+                    for n in 0..20u8 {
+                        b.set(&key, vec![n]);
+                    }
+                    b.delete(&key);
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        for i in 0..8 {
+            assert_eq!(b.get(format!("k{i}").as_bytes()), None);
+        }
+    }
+
+    /// Same partitioning the `kv_backend` bench must use: total work == Criterion `iters`.
+    fn split_iters_across_threads(threads: u64, iters: u64) -> Vec<u64> {
+        let threads = threads.max(1);
+        let base = iters / threads;
+        let rem = iters % threads;
+        (0..threads).map(|t| base + u64::from(t < rem)).collect()
+    }
+
+    #[test]
+    fn split_iters_across_threads_sums_exactly_to_iters() {
+        for threads in [1u64, 2, 8] {
+            for iters in [0u64, 1, 3, 7, 8, 100] {
+                let parts = split_iters_across_threads(threads, iters);
+                assert_eq!(parts.len(), threads as usize);
+                assert_eq!(
+                    parts.iter().copied().sum::<u64>(),
+                    iters,
+                    "threads={threads} iters={iters} parts={parts:?}"
+                );
+            }
+        }
     }
 
     #[test]

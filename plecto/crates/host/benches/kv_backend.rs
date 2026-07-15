@@ -10,16 +10,25 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use plecto_host::{KvBackend, MemoryBackend, RedbBackend};
 
+/// Partition `iters` across `threads` so the total work equals Criterion's `iters`
+/// (no `div_ceil` over-count when `iters % threads != 0`).
+fn split_iters_across_threads(threads: u64, iters: u64) -> Vec<u64> {
+    let threads = threads.max(1);
+    let base = iters / threads;
+    let rem = iters % threads;
+    (0..threads).map(|t| base + u64::from(t < rem)).collect()
+}
+
 /// `threads` workers split `iters` increments of ONE shared key — worst-case write
 /// contention: every op is a read-modify-write behind the same serialization point.
 fn contended_increments(backend: &Arc<dyn KvBackend>, threads: u64, iters: u64) -> Duration {
-    let per_thread = iters.div_ceil(threads);
+    let per_thread = split_iters_across_threads(threads, iters);
     let start = Instant::now();
     std::thread::scope(|s| {
-        for _ in 0..threads {
+        for n in per_thread {
             let backend = Arc::clone(backend);
             s.spawn(move || {
-                for _ in 0..per_thread {
+                for _ in 0..n {
                     backend.increment(b"bench-counter", 1);
                 }
             });

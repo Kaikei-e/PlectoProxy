@@ -37,8 +37,11 @@
 #   just before the first cargo command — the old foreground rm burned 1.5 min of wall.
 #   /opt/hostedtoolcache is deliberately NOT removed (setup-go installs into it).
 #
-# Hardening follow-up (Plecto supply-chain stance, ADR 000006 / OWASP A08):
-# pin these third-party actions to full commit SHAs once we vendor a review.
+# Hardening (Plecto supply-chain stance, ADR 000006 / OWASP A08): every third-party action is
+# pinned to a full commit SHA, checkouts run with `persist-credentials: false` (nothing here
+# pushes, so no job needs the GITHUB_TOKEN left behind in .git/config), and the workflow-lint
+# job below gates all of .github/workflows/ with zizmor — the same blocking posture cargo-deny
+# applies to the crate graph.
 
 name: CI
 
@@ -79,7 +82,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
         with:
           # SHA-pinned (A08) to the 1.96.0-branch tip, which hardcodes its own toolchain version —
           # this action.yml revision doesn't declare a `toolchain` input at all, so don't pass one.
@@ -124,6 +129,8 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - run: python3 scripts/check_adr_graph.py
 
   # Lint world: `--all-features` is check-mode only (rmeta, no codegen), so it stays its
@@ -135,7 +142,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           components: clippy
           targets: wasm32-unknown-unknown, wasm32-wasip2
@@ -165,6 +174,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       # Debug target/ of the wasmtime/cranelift workspace is large; free the runner's
       # preinstalled bloat in the background (best-effort, waited on below) instead of
       # burning wall time on a foreground rm. Guarded to GitHub-hosted runners: their VM
@@ -175,7 +186,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           # Default features build only the zero-WASI guests (build.rs) — no wasip2 here.
           targets: wasm32-unknown-unknown
@@ -212,12 +223,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Free runner disk in the background
         if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -320,12 +333,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Free runner disk in the background
         if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -365,7 +380,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -403,7 +420,9 @@ jobs:
         working-directory: plecto/examples/filters
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0 (branch tip; no `toolchain` input to restate)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           components: clippy
           targets: wasm32-unknown-unknown,wasm32-wasip2
@@ -435,6 +454,33 @@ jobs:
             (cd "$d" && cargo clippy --target "$target" --all-targets --locked -- -D warnings)
           done
 
+  # Workflow security lint (zizmor), BLOCKING — the CI configuration itself is supply-chain
+  # surface (OWASP A08; cf. the 2025 tj-actions and 2026 trivy-action tag-rewrite compromises).
+  # Gates template injection, credential persistence (artipacked), excessive permissions,
+  # unpinned/known-vulnerable actions, and dangerous triggers across .github/workflows/.
+  # Installed from PyPI with --require-hashes (the wheel is the pin, matching the sha256-pinned
+  # curl convention used for wasm-tools/wkg). GH_TOKEN enables the online audits
+  # (known-vulnerable-actions), so a pinned action later found vulnerable turns CI red the same
+  # way a RustSec advisory does in cargo-deny.
+  workflow-lint:
+    name: zizmor (workflow security lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Install zizmor (PyPI, hash-pinned)
+        run: |
+          python3 -m pip install --require-hashes --only-binary :all: -r .github/zizmor-requirements.txt
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor .github/workflows/
+
   # Supply-chain scan (RustSec advisories + crate bans), BLOCKING (ADR 000006 / OWASP A08).
   # A security vulnerability, unmaintained crate, or yanked version fails CI — supply-chain
   # integrity is a security gate, not a courtesy check. Policy is the curated `plecto/deny.toml`
@@ -446,7 +492,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
           manifest-path: plecto/Cargo.toml
           # `sources` also gates crate origin (only crates.io), catching a typosquat / unexpected
@@ -465,7 +513,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           manifest-path: plecto/Cargo.toml
           package: plecto-host,plecto-control,plecto-server
+          # default-features, NOT the default heuristic (≒ all-features): the heuristic turns on
+          # plecto-host's `test-support`, whose build.rs compiles the fixture guests for
+          # wasm32-unknown-unknown / wasm32-wasip2. That breaks twice over — the action's own
+          # `stable` toolchain bypasses plecto/rust-toolchain.toml (no wasm targets, E0463), and
+          # the crates.io baseline package doesn't even contain the guest sources
+          # (examples/filters/ lives outside crates/host), so the baseline could never build with
+          # `test-support` regardless of installed targets. Consumers get the default-features API
+          # from crates.io; that is the surface this gate protects.
+          feature-group: default-features

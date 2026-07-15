@@ -26,6 +26,8 @@ jobs:
         working-directory: plecto
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       # cargo-fuzz builds with nightly (sanitizer flags); the workspace toolchain pin
       # stays untouched — nightly is installed alongside and selected per-invocation.

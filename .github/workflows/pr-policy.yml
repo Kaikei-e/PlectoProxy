@@ -7,8 +7,12 @@ name: PR policy
 #
 # Uses pull_request_target so the gate runs with a token that can close fork PRs. It only reads
 # metadata and never checks out or runs PR code, so this is safe.
+# zizmor flags pull_request_target as a dangerous trigger; here it is the documented,
+# deliberate exception (header comment above): the job runs NO PR code — no checkout, no
+# build — it only reads PR metadata via github-script and closes/comments. The attacker
+# controls the PR body only as DATA (issue-number matching), never as executed code.
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
     types: [opened]
 
 permissions:

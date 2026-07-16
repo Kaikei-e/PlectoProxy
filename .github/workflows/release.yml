@@ -511,7 +511,7 @@ jobs:
           persist-credentials: false
       # Same toolchain shape as ci.yml's build job: rust-toolchain.toml pins the channel and
       # wasm32-unknown-unknown; wasm32-wasip2 (the outbound guests' target) is added here.
-      - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - name: Install wasm-tools + wkg (sha256-pinned, same pins as ci.yml)

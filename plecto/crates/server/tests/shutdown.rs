@@ -312,6 +312,35 @@ async fn readyz_flips_to_503_at_the_signal_while_healthz_stays_200() {
         .expect("clean exit");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_return_leaves_no_orphan_task_holding_control() {
+    // The doc comments on the admin / health / DNS supervisors all promise the same thing: an
+    // embedder calling `serve_with_shutdown` must not be left with orphan tasks holding
+    // `Control` alive after serve returns. The observable form of that promise: at the moment
+    // serve returns, the embedder's own `Arc` is the last one. Raced 20 rounds because a
+    // fire-and-forget supervisor CAN lose the race and exit first — one leaked round is a fail.
+    let upstream = spawn_upstream(Duration::ZERO).await;
+    for round in 0..20 {
+        let admin = free_addr().await;
+        let control = control_for(
+            upstream,
+            &format!("[observability]\nadmin_addr = \"{admin}\"\n"),
+        );
+        let (_proxy, shutdown, server) = spawn_proxy(control.clone()).await;
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve must return after the shutdown signal")
+            .unwrap()
+            .expect("clean exit");
+        assert_eq!(
+            Arc::strong_count(&control),
+            1,
+            "round {round}: a background task still holds Control after serve returned"
+        );
+    }
+}
+
 #[tokio::test]
 async fn readiness_grace_keeps_accepting_before_the_drain_starts() {
     // With `readiness_grace_ms` declared (ADR 000059), the order is: signal → /readyz 503 →

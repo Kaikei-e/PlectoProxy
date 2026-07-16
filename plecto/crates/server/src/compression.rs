@@ -87,10 +87,10 @@ fn compress_response(
     mark_compressed(&mut parts.headers, algo);
     let compressed = CompressBody {
         inner: body,
-        encoder: Some(parking_lot::Mutex::new(encoder)),
+        encoder: Some(encoder),
         queue: VecDeque::new(),
     };
-    Response::from_parts(parts, http_body_util::BodyExt::boxed(compressed))
+    Response::from_parts(parts, http_body_util::BodyExt::boxed_unsync(compressed))
 }
 
 /// RFC 9110 §12.5.3: pick the coding to send from what the route offers ∩ what the client
@@ -398,14 +398,12 @@ impl Encoder {
 
 /// The compressed view of a streamed upstream body: pulls the inner body's frames, compresses
 /// data frames one-to-one (sync flush per frame), passes trailers through AFTER terminating the
-/// coded stream, and appends the codec's closing bytes at end-of-body.
-///
-/// The `Mutex` is a zero-cost `Sync` wrapper, never contended: `ResponseBody` is a `BoxBody`
-/// (`dyn Body + Send + Sync`), but a zstd context is `Send`-only — and `poll_frame` holds
-/// `&mut self`, so every access goes through `Mutex::get_mut` (no lock instruction at all).
+/// coded stream, and appends the codec's closing bytes at end-of-body. The `Send`-only zstd
+/// context sits here bare: `ResponseBody` is an `UnsyncBoxBody`, which asks exactly what
+/// `poll_frame`'s `&mut self` already guarantees.
 struct CompressBody {
     inner: ResponseBody,
-    encoder: Option<parking_lot::Mutex<Encoder>>,
+    encoder: Option<Encoder>,
     queue: VecDeque<Frame<Bytes>>,
 }
 
@@ -437,7 +435,7 @@ impl hyper::body::Body for CompressBody {
                         let Some(encoder) = this.encoder.as_mut() else {
                             continue;
                         };
-                        match encoder.get_mut().write_flush(&data) {
+                        match encoder.write_flush(&data) {
                             Ok(out) => {
                                 if !out.is_empty() {
                                     this.queue.push_back(Frame::data(out));
@@ -450,7 +448,7 @@ impl hyper::body::Body for CompressBody {
                     // the trailers follow the closing bytes.
                     Err(other) => {
                         if let Some(encoder) = this.encoder.take() {
-                            match encoder.into_inner().finish() {
+                            match encoder.finish() {
                                 Ok(out) => {
                                     if !out.is_empty() {
                                         this.queue.push_back(Frame::data(out));
@@ -465,7 +463,7 @@ impl hyper::body::Body for CompressBody {
                 Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                 None => {
                     if let Some(encoder) = this.encoder.take() {
-                        match encoder.into_inner().finish() {
+                        match encoder.finish() {
                             Ok(out) => {
                                 if !out.is_empty() {
                                     this.queue.push_back(Frame::data(out));
@@ -746,12 +744,12 @@ mod tests {
         algo: CompressionAlgorithm,
         frames: Vec<Frame<Bytes>>,
     ) -> (Vec<Bytes>, Option<HeaderMap>) {
-        let inner = http_body_util::BodyExt::boxed(ScriptedBody {
+        let inner = http_body_util::BodyExt::boxed_unsync(ScriptedBody {
             frames: frames.into(),
         });
         let mut body = CompressBody {
             inner,
-            encoder: Some(parking_lot::Mutex::new(Encoder::new(algo).unwrap())),
+            encoder: Some(Encoder::new(algo).unwrap()),
             queue: VecDeque::new(),
         };
         let mut data = Vec::new();

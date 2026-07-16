@@ -61,7 +61,7 @@ mod upstream_client;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::{BoxBody, UnsyncBoxBody};
 use hyper::header::HeaderValue;
 use hyper_util::client::legacy::connect::HttpConnector;
 use plecto_control::Control;
@@ -114,8 +114,11 @@ pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The response body the service yields: either a synthesised buffer (`Full`, for a short-circuit
 /// or a fail-closed 5xx) or the upstream's streamed body (`Incoming`), unified behind one boxed
-/// type so the service has a single return shape.
-pub(crate) type ResponseBody = BoxBody<Bytes, BoxError>;
+/// type so the service has a single return shape. `UnsyncBoxBody`, not `BoxBody`: no consumer of
+/// a response body (hyper h1/h2 serve, our h3 send loop) requires `Sync` — `poll_frame` takes
+/// `&mut self` — and demanding it here forced `Send`-only bodies (the zstd encoder in
+/// `compression.rs`) into artificial `Sync` wrappers.
+pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// The request body forwarded to the upstream, boxed so one type covers every inbound transport:
 /// the hyper `Incoming` (HTTP/1.1 + HTTP/2) and the QUIC/h3 recv stream (HTTP/3, ADR 000016). The

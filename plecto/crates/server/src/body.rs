@@ -29,12 +29,12 @@ pub(crate) const INBOUND_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) fn full(bytes: Vec<u8>) -> ResponseBody {
     Full::new(Bytes::from(bytes))
         .map_err(|e: Infallible| -> BoxError { match e {} })
-        .boxed()
+        .boxed_unsync()
 }
 
 /// The upstream's streamed body boxed into `ResponseBody`.
 pub(crate) fn stream(body: Incoming) -> ResponseBody {
-    body.map_err(|e| -> BoxError { Box::new(e) }).boxed()
+    body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync()
 }
 
 /// Box a hyper `Incoming` inbound body into the transport-agnostic `ReqBody`.

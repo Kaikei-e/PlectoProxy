@@ -273,7 +273,7 @@ pub(crate) mod fake {
                     .body(
                         Full::new(Bytes::new())
                             .map_err(|e: std::convert::Infallible| -> BoxError { match e {} })
-                            .boxed(),
+                            .boxed_unsync(),
                     )
                     .unwrap()),
                 Scripted::SendError(kind) => Err(UpstreamSendError {
@@ -287,7 +287,7 @@ pub(crate) mod fake {
                         .body(
                             Full::new(Bytes::new())
                                 .map_err(|e: std::convert::Infallible| -> BoxError { match e {} })
-                                .boxed(),
+                                .boxed_unsync(),
                         )
                         .unwrap())
                 }

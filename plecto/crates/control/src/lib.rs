@@ -37,6 +37,7 @@
 mod artifact;
 mod chain;
 mod control_observability;
+pub use control_observability::PoolResidency;
 mod control_reload;
 mod diagnostic;
 mod error;

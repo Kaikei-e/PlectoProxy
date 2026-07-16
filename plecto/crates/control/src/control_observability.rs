@@ -8,12 +8,36 @@ use plecto_host::otlp::OtlpBuffer;
 
 use crate::Control;
 
+/// Point-in-time residency of the host's trusted pooling allocator (wasmtime
+/// `PoolingAllocatorMetrics`), lowered to plain counters so the fast path renders them on
+/// `/metrics` without naming wasmtime types.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolResidency {
+    /// Live pooled component instances.
+    pub component_instances: u64,
+    /// Live pooled linear memories.
+    pub memories: usize,
+    /// Bytes kept resident for unused-but-warm pool slots (`linear_memory_keep_resident`;
+    /// left at its default 0 by the host, so this is expected to read ~0).
+    pub unused_memory_bytes_resident: usize,
+}
+
 impl Control {
     /// A snapshot of the host-aggregated filter-execution metrics (ADR 000009): the tally the
     /// `MetricsSink` wired at construction has accumulated. The fast path's admin `/metrics`
     /// endpoint renders this alongside its native RED metrics.
     pub fn filter_metrics(&self) -> MetricsSnapshot {
         self.filter_metrics.snapshot()
+    }
+
+    /// Residency of the trusted (pooling) engine, for the admin `/metrics` endpoint. `None` when
+    /// the trusted engine is not pooling (it always is today, so callers can expect `Some`).
+    pub fn pool_residency(&self) -> Option<PoolResidency> {
+        self.host.pooling_allocator_metrics().map(|m| PoolResidency {
+            component_instances: m.component_instances(),
+            memories: m.memories(),
+            unused_memory_bytes_resident: m.unused_memory_bytes_resident(),
+        })
     }
 
     /// The admin endpoint bind address (`[observability] admin_addr`), or `None` when no admin

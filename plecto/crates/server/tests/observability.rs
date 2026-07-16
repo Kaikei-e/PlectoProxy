@@ -171,6 +171,12 @@ path_prefix = "/"
         metrics.contains("plecto_request_duration_seconds_count"),
         "the latency histogram is present:\n{metrics}"
     );
+    // The trusted engine is always pooling, so its residency gauges (wasmtime
+    // PoolingAllocatorMetrics, lowered through Control::pool_residency) must be on the scrape.
+    assert!(
+        metrics.contains("plecto_pool_memories"),
+        "the pooling-allocator residency gauges are present:\n{metrics}"
+    );
     let twoxx = metrics
         .lines()
         .find(|l| l.starts_with("plecto_requests_total{status_class=\"2xx\"}"))

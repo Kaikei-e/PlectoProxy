@@ -21,6 +21,54 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Trusted-pool lifecycle knobs in the manifest**: a `[[filter]]` entry can now set
+  `pool_size` (max concurrent reusable instances), `checkout_timeout_ms` (bounded wait under
+  saturation before failing closed), and `max_requests_per_instance` (recycle bound) — the
+  ADR 000012 knobs that previously existed only as host `LoadOptions` builders with no
+  manifest path to reach them. Trusted-only: declaring any of them under
+  `isolation = "untrusted"` (fresh-per-request, no pool) is rejected at validate, as are the
+  zero-value typos. The JSON schema (`plecto schema`) picks the fields up automatically.
+- **Pooling-allocator residency on `/metrics`**: three new admin gauges —
+  `plecto_pool_component_instances`, `plecto_pool_memories`, and
+  `plecto_pool_unused_memory_resident_bytes` — surface the trusted engine's wasmtime
+  `PoolingAllocatorMetrics`, lowered through the new `plecto_control::PoolResidency` /
+  `Control::pool_residency()` so the fast path names no wasmtime types.
+- **Maglev demo**: the `load-balancing` example now also runs a `pool-sticky` upstream
+  (`lb_algorithm = "maglev"` keyed on the `x-session` header, ADR 000035) behind a `/sticky`
+  route — per-key stickiness, the round-robin fallback without the header, and the
+  eject-remaps-only-that-key behavior are all observable by hand.
+- **Hop-by-hop parity test**: the RFC 9110 §7.6.1 strip list is carried independently by the
+  fast path (`plecto-server::headers`) and the guest-output mappers
+  (`plecto-host::contract`); a new cross-crate test pins the two lists identical so they can
+  no longer drift apart silently (CWE-444 adjacent).
+
+### Changed
+
+- **Library (`plecto-control`) — `FilterEntry` gained the three pool fields above.** The
+  struct's fields are public, so external code constructing it with a struct literal must add
+  the new fields (`None` keeps host defaults); deserializing from TOML/JSON is unaffected.
+  Per the pre-1.0 policy above this rides the next **minor** bump.
+- **Graceful shutdown now joins its background supervisors**: `serve_with_shutdown` kept
+  handles for the h3 endpoint and the OTLP pump but spawned the admin, health-check, and DNS
+  supervisors fire-and-forget, so an embedder could see serve return while those tasks still
+  held `Control`. All three are now awaited (bounded, warn on expiry) in the drain sequence —
+  the guarantee their doc comments had been promising.
+- **Internal simplifications** (no behavior change, all suites green): the transaction core's
+  upgrade switch / request body hook / response-chain tail are named phase functions instead
+  of one 439-line block; response bodies are boxed `UnsyncBoxBody` (no consumer requires
+  `Sync`), which drops the lock wrapper the compression encoder had been paying for it.
+
+### Removed
+
+- **`wit/v0.3.0/` pre-frozen snapshot** (repo-internal): v0.1/v0.2 were frozen when a
+  successor replaced them, but v0.3.0 had been snapshotted in the same commit that made it
+  current — referenced by nothing except its own CI drift check, and taxing every contract
+  edit with a double maintenance step. The freeze-at-replacement pattern is restored; the
+  shipped contract `plecto:filter@0.3.0`, its published OCI artifact, and the v0.1/v0.2
+  frozen trees are all unchanged.
+
 ## [0.3.8] - 2026-07-16
 
 ### Changed

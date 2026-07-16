@@ -33,11 +33,13 @@ impl Control {
     /// Residency of the trusted (pooling) engine, for the admin `/metrics` endpoint. `None` when
     /// the trusted engine is not pooling (it always is today, so callers can expect `Some`).
     pub fn pool_residency(&self) -> Option<PoolResidency> {
-        self.host.pooling_allocator_metrics().map(|m| PoolResidency {
-            component_instances: m.component_instances(),
-            memories: m.memories(),
-            unused_memory_bytes_resident: m.unused_memory_bytes_resident(),
-        })
+        self.host
+            .pooling_allocator_metrics()
+            .map(|m| PoolResidency {
+                component_instances: m.component_instances(),
+                memories: m.memories(),
+                unused_memory_bytes_resident: m.unused_memory_bytes_resident(),
+            })
     }
 
     /// The admin endpoint bind address (`[observability] admin_addr`), or `None` when no admin

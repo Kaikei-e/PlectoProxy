@@ -184,11 +184,14 @@ fn is_field_value_byte(b: u8) -> bool {
 }
 
 /// Hop-by-hop names (RFC 9110 §7.6.1) a guest cannot meaningfully set — the fast path strips
-/// them at egress. Kept in sync with the strip list in `plecto-server::headers`. The mappers
+/// them at egress. Kept in sync with the strip list in `plecto-server::headers`; that crate's
+/// test suite asserts the two lists are identical (`doc(hidden)` keeps this off the semver
+/// surface — it exists only for that cross-crate assertion). The mappers
 /// DROP these instead of failing the decision: the observable behavior (the header never
 /// reaches the peer) is what deployments already had, whereas failing closed would turn a
 /// filter that harmlessly sets `Connection: close` into an every-request `InvalidOutput`.
-const HOP_BY_HOP_GUEST_HEADERS: &[&str] = &[
+#[doc(hidden)]
+pub const HOP_BY_HOP_GUEST_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-connection",

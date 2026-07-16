@@ -326,6 +326,16 @@ mod tests {
     }
 
     #[test]
+    fn hop_by_hop_list_matches_the_host_contract_strip_list() {
+        // Two crates carry this list — the egress strip here and the guest-output drop in
+        // plecto-host's contract mappers. Neither can depend on the other for the constant
+        // (fast path / extension plane separation), so a drift between them would silently
+        // open a smuggling-adjacent gap (CWE-444): a name one side strips and the other
+        // forwards. This assertion is the only guard.
+        assert_eq!(HOP_BY_HOP, plecto_host::HOP_BY_HOP_GUEST_HEADERS);
+    }
+
+    #[test]
     fn te_requests_trailers_matches_the_token_not_the_whole_value() {
         // RFC 9110 §10.1.4: TE is a comma-separated list whose tokens may carry parameters.
         // The forward path re-issues `te: trailers` only when the client actually asked for

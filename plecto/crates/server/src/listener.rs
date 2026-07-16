@@ -386,7 +386,10 @@ async fn serve_inner(
             .await
             .is_err()
         {
-            tracing::warn!(supervisor = name, "supervisor did not unwind within its shutdown bound");
+            tracing::warn!(
+                supervisor = name,
+                "supervisor did not unwind within its shutdown bound"
+            );
         }
     }
     Ok(())

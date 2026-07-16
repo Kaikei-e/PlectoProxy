@@ -508,6 +508,9 @@ mod tests {
             "live pooled component instances:\n{on}"
         );
         assert!(on.contains("plecto_pool_memories 2"), "{on}");
-        assert!(on.contains("plecto_pool_unused_memory_resident_bytes 4096"), "{on}");
+        assert!(
+            on.contains("plecto_pool_unused_memory_resident_bytes 4096"),
+            "{on}"
+        );
     }
 }

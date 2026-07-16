@@ -3,8 +3,8 @@
 //! persistent state (upstream registry / host load) is ever touched.
 
 use super::{
-    FilterEntry, HashKeyKind, IsolationKind, LbAlgorithm, MAX_HASH_TABLE_SIZE,
-    MAX_INSTANCE_WEIGHT, OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
+    FilterEntry, HashKeyKind, IsolationKind, LbAlgorithm, MAX_HASH_TABLE_SIZE, MAX_INSTANCE_WEIGHT,
+    OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
 };
 use crate::error::ControlError;
 

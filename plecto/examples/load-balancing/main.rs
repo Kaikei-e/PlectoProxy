@@ -198,14 +198,16 @@ fn print_banner(proxy: SocketAddr, instances: [(&str, SocketAddr); 3]) {
     for (_, addr) in instances {
         println!("    curl -s http://{addr}/toggle >/dev/null");
     }
-    println!(
-        "    curl -s -i http://localhost:{p}/ | head -1   # HTTP/1.1 503 Service Unavailable"
-    );
+    println!("    curl -s -i http://localhost:{p}/ | head -1   # HTTP/1.1 503 Service Unavailable");
     println!();
     println!("    # 5) Maglev consistent hashing (ADR 000035): on /sticky the x-session header");
     println!("    #    is the hash key — one session sticks to ONE instance across requests.");
-    println!("    for i in $(seq 4); do curl -s -H 'x-session: alice' http://localhost:{p}/sticky; done");
-    println!("    for i in $(seq 4); do curl -s -H 'x-session: bob'   http://localhost:{p}/sticky; done");
+    println!(
+        "    for i in $(seq 4); do curl -s -H 'x-session: alice' http://localhost:{p}/sticky; done"
+    );
+    println!(
+        "    for i in $(seq 4); do curl -s -H 'x-session: bob'   http://localhost:{p}/sticky; done"
+    );
     println!();
     println!("    # 6) eject the instance serving alice (/toggle it): only alice's keys remap;");
     println!("    #    bob keeps his instance — that difference from round-robin IS the point.");

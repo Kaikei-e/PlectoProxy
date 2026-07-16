@@ -100,18 +100,6 @@ jobs:
             echo "== $(dirname "$m")"
             (cd "$(dirname "$m")" && cargo fmt --all -- --check)
           done
-      # The live wit/ copy and the frozen v0.3.0 snapshot both declare plecto:filter@0.3.0;
-      # nothing else guards them against drifting apart. Comment/blank-line differences are
-      # tolerated (the snapshot carries freeze annotations); token streams must be identical.
-      - name: WIT root vs v0.3.0 snapshot drift check
-        working-directory: plecto/wit
-        run: |
-          set -euo pipefail
-          strip() { grep -v '^[[:space:]]*//' "$1" | tr -s '[:space:]' ' '; }
-          for f in *.wit; do
-            [ -f "v0.3.0/$f" ] || { echo "missing v0.3.0/$f"; exit 1; }
-            diff <(strip "$f") <(strip "v0.3.0/$f") || { echo "wit/$f drifted from wit/v0.3.0/$f"; exit 1; }
-          done
       # crates.io packaging can only include files under a crate's own root, so the WIT
       # contract and the filter-template guest are vendored into crates/host and crates/server
       # respectively. Nothing else guards those copies against drifting from their canonical

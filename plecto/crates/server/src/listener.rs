@@ -141,29 +141,33 @@ async fn serve_inner(
     // Admin endpoint (Stage A observability, ADR 000009): a SEPARATE listener for `/metrics` +
     // liveness/readiness, bound only when `[observability] admin_addr` is set. A bad address disables
     // it (logged) without affecting the data plane — observability never fails serving closed.
-    if let Some(admin_addr) = state.control.admin_addr() {
+    let admin_task = state.control.admin_addr().and_then(|admin_addr| {
         match admin_addr.parse::<SocketAddr>() {
-            Ok(addr) => {
-                tokio::spawn(admin::serve_admin(state.clone(), addr, drain_rx.clone()));
-            }
+            Ok(addr) => Some(tokio::spawn(admin::serve_admin(
+                state.clone(),
+                addr,
+                drain_rx.clone(),
+            ))),
             Err(e) => {
                 tracing::error!(addr = admin_addr, error = %e, "invalid observability.admin_addr; admin endpoint disabled");
+                None
             }
         }
-    }
+    });
 
     // Active health checks (ADR 000017): a background supervisor probes each upstream instance and
     // flips its healthy/unhealthy state, so the round-robin in `proxy_core` only ever picks live
     // instances. Spawned like the reload loop — the server owns the task, Control owns the state.
     // Every supervisor observes the drain flag: in the binary the process exits anyway, but an
     // embedder calling `serve_with_shutdown` must not be left with orphan tasks probing upstreams
-    // and holding `Control` alive after serve returns.
-    tokio::spawn(serve_health_checks(state.control.clone(), drain_rx.clone()));
+    // and holding `Control` alive after serve returns — the handles are joined in the shutdown
+    // sequence below, which is what turns that promise from a comment into behavior.
+    let health_task = tokio::spawn(serve_health_checks(state.control.clone(), drain_rx.clone()));
 
     // Periodic DNS re-resolution of hostname upstreams (`resolve_interval_ms`): a second
     // supervisor beside the health checks, swapping each resolving group's endpoint set in place
     // (nginx `resolve` / Envoy STRICT_DNS shape). Idles cheaply when no upstream opts in.
-    tokio::spawn(crate::dns::serve_dns_refresh(
+    let dns_task = tokio::spawn(crate::dns::serve_dns_refresh(
         state.control.clone(),
         drain_rx.clone(),
     ));
@@ -366,6 +370,24 @@ async fn serve_inner(
             pump,
         )
         .await;
+    }
+    // The supervisors (admin / health / DNS) saw the same drain flip and unwind on their own
+    // within one select! poll; awaiting them here is what keeps the promise their doc comments
+    // make — after serve returns, no orphan task holds `Control` (or the `ServerState`) alive
+    // in an embedder. Bounded like every other drain wait: a supervisor stuck mid-probe must
+    // not hold shutdown open, but abandoning one is worth a warning, not silence.
+    for (task, name) in [
+        (Some(health_task), "health"),
+        (Some(dns_task), "dns"),
+        (admin_task, "admin"),
+    ] {
+        let Some(task) = task else { continue };
+        if tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(supervisor = name, "supervisor did not unwind within its shutdown bound");
+        }
     }
     Ok(())
 }

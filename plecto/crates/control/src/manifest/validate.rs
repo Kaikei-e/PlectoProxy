@@ -3,8 +3,8 @@
 //! persistent state (upstream registry / host load) is ever touched.
 
 use super::{
-    FilterEntry, HashKeyKind, LbAlgorithm, MAX_HASH_TABLE_SIZE, MAX_INSTANCE_WEIGHT,
-    OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
+    FilterEntry, HashKeyKind, IsolationKind, LbAlgorithm, MAX_HASH_TABLE_SIZE,
+    MAX_INSTANCE_WEIGHT, OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
 };
 use crate::error::ControlError;
 
@@ -192,6 +192,23 @@ impl FilterEntry {
         }
         if self.max_memory_bytes == Some(0) {
             return Err(bad("max_memory_bytes must be non-zero"));
+        }
+        if self.pool_size == Some(0) {
+            return Err(bad("pool_size must be non-zero"));
+        }
+        if self.max_requests_per_instance == Some(0) {
+            return Err(bad("max_requests_per_instance must be non-zero"));
+        }
+        // The untrusted lifecycle is fresh-per-request (ADR 000012): the host would silently
+        // ignore a pool knob there, so treat it as the config typo it is — fail closed.
+        if self.isolation == IsolationKind::Untrusted
+            && (self.pool_size.is_some()
+                || self.checkout_timeout_ms.is_some()
+                || self.max_requests_per_instance.is_some())
+        {
+            return Err(bad(
+                "pool_size / checkout_timeout_ms / max_requests_per_instance apply only to isolation = \"trusted\"",
+            ));
         }
         if let Some(rl) = self.ratelimit {
             if rl.capacity == 0 {

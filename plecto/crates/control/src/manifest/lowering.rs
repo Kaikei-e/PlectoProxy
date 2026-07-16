@@ -25,6 +25,15 @@ impl FilterEntry {
         if let Some(bytes) = self.max_memory_bytes {
             opts = opts.with_max_memory_bytes(bytes);
         }
+        if let Some(n) = self.pool_size {
+            opts = opts.with_trusted_pool_size(n);
+        }
+        if let Some(ms) = self.checkout_timeout_ms {
+            opts = opts.with_checkout_timeout_ms(ms);
+        }
+        if let Some(n) = self.max_requests_per_instance {
+            opts = opts.with_max_requests_per_instance(n);
+        }
         if let Some(rl) = self.ratelimit {
             opts = opts.with_ratelimit_bucket(rl.capacity, rl.refill_tokens, rl.refill_interval_ms);
         }

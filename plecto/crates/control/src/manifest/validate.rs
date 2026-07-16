@@ -370,6 +370,9 @@ mod tests {
             init_deadline_ms: None,
             request_deadline_ms: None,
             max_memory_bytes: None,
+            pool_size: None,
+            checkout_timeout_ms: None,
+            max_requests_per_instance: None,
             ratelimit: None,
             outbound_http: None,
             outbound_tcp: None,
@@ -422,6 +425,80 @@ mod tests {
             .is_ok(),
             "a one-shot (no-refill) bucket is valid"
         );
+    }
+
+    #[test]
+    fn pool_knobs_are_trusted_only_and_non_zero() {
+        let trusted = FilterEntry {
+            id: "x".to_string(),
+            source: "s".to_string(),
+            digest: "sha256:abc".to_string(),
+            isolation: IsolationKind::Trusted,
+            init_deadline_ms: None,
+            request_deadline_ms: None,
+            max_memory_bytes: None,
+            pool_size: None,
+            checkout_timeout_ms: None,
+            max_requests_per_instance: None,
+            ratelimit: None,
+            outbound_http: None,
+            outbound_tcp: None,
+            wasi: WasiKind::None,
+            config: None,
+        };
+        assert!(
+            FilterEntry {
+                pool_size: Some(4),
+                checkout_timeout_ms: Some(0),
+                max_requests_per_instance: Some(1),
+                ..trusted.clone()
+            }
+            .validate()
+            .is_ok(),
+            "trusted pool knobs are valid (checkout 0 = fail immediately at saturation)"
+        );
+        assert!(
+            FilterEntry {
+                pool_size: Some(0),
+                ..trusted.clone()
+            }
+            .validate()
+            .is_err(),
+            "a zero pool size can never serve a checkout — a typo, rejected"
+        );
+        assert!(
+            FilterEntry {
+                max_requests_per_instance: Some(0),
+                ..trusted.clone()
+            }
+            .validate()
+            .is_err(),
+            "recycling after zero requests is degenerate — rejected"
+        );
+        // The untrusted lifecycle is fresh-per-request (ADR 000012): a pool knob there is a
+        // config typo the host would silently ignore — fail closed instead.
+        for knob in [
+            FilterEntry {
+                pool_size: Some(4),
+                isolation: IsolationKind::Untrusted,
+                ..trusted.clone()
+            },
+            FilterEntry {
+                checkout_timeout_ms: Some(100),
+                isolation: IsolationKind::Untrusted,
+                ..trusted.clone()
+            },
+            FilterEntry {
+                max_requests_per_instance: Some(10),
+                isolation: IsolationKind::Untrusted,
+                ..trusted.clone()
+            },
+        ] {
+            assert!(
+                knob.validate().is_err(),
+                "a pool knob under isolation = untrusted is rejected"
+            );
+        }
     }
 
     #[test]

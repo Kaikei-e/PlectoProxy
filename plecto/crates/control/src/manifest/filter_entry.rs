@@ -138,6 +138,18 @@ pub struct FilterEntry {
     pub init_deadline_ms: Option<u64>,
     pub request_deadline_ms: Option<u64>,
     pub max_memory_bytes: Option<u64>,
+    /// Trusted pool capacity (max concurrent reusable instances, ADR 000012), `pool_size`.
+    /// Only valid with `isolation = "trusted"` (the untrusted lifecycle is fresh-per-request);
+    /// the host clamps to its ceiling. Absent = the host default.
+    pub pool_size: Option<usize>,
+    /// Bounded wait (ms) for a free trusted-pool instance under saturation before failing closed
+    /// (ADR 000012), `checkout_timeout_ms`. Trusted-only, like `pool_size`; `0` = fail
+    /// immediately at saturation. Absent = the host default.
+    pub checkout_timeout_ms: Option<u64>,
+    /// Recycle a trusted instance (discard + rebuild) after this many requests, bounding
+    /// linear-memory state accumulation (ADR 000012), `max_requests_per_instance`.
+    /// Trusted-only, like `pool_size`. Absent = the host default.
+    pub max_requests_per_instance: Option<u64>,
     /// Host-side token bucket for this filter's `host-ratelimit` (ADR 000026). Absent = the filter
     /// has no limiter (its `try-acquire` fails closed). Operator-configured so an untrusted filter
     /// cannot override its own limit.

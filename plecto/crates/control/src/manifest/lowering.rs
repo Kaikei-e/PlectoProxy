@@ -98,6 +98,9 @@ mod tests {
             init_deadline_ms: None,
             request_deadline_ms: Some(40),
             max_memory_bytes: Some(1024),
+            pool_size: Some(3),
+            checkout_timeout_ms: Some(75),
+            max_requests_per_instance: Some(500),
             ratelimit: Some(RateLimitConfig {
                 capacity: 100,
                 refill_tokens: 10,
@@ -113,6 +116,10 @@ mod tests {
         assert_eq!(opts.isolation, plecto_host::Isolation::Trusted);
         assert_eq!(opts.request_deadline_ms, 40);
         assert_eq!(opts.max_memory_bytes, 1024);
+        // the pool lifecycle knobs (ADR 000012) reach the host from the manifest
+        assert_eq!(opts.trusted_pool_size, 3);
+        assert_eq!(opts.checkout_timeout_ms, 75);
+        assert_eq!(opts.max_requests_per_instance, 500);
         // an unset knob keeps the host default
         assert_eq!(
             opts.init_deadline_ms,

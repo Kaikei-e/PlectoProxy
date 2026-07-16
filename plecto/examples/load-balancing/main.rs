@@ -1,4 +1,5 @@
-//! Plecto demo — **load balancing + active health checks** (ADR 000017).
+//! Plecto demo — **load balancing + active health checks** (ADR 000017) and **Maglev
+//! consistent hashing** (ADR 000035).
 //!
 //! Run it:  `cargo run -p plecto-server --example load-balancing`
 //!
@@ -7,6 +8,11 @@
 //! instance's `/healthz` on an interval. Each instance also exposes a `/toggle` endpoint that flips
 //! its own health, so you can watch an instance get **ejected** when it goes unhealthy and
 //! **restored** when it recovers — and see the upstream **fail closed with 503** when none are left.
+//!
+//! A second upstream (`pool-sticky`, same three instances) balances with `lb_algorithm = "maglev"`
+//! keyed on the `x-session` header, behind the `/sticky` route: the same key always lands on the
+//! same instance, and ejecting that instance remaps ONLY its keys (the consistent-hashing claim,
+//! observable by hand).
 //!
 //! No filter / no TLS here — this example is only about upstream LB, so it serves plain HTTP/1.1
 //! (curl needs no `-k`). Everything lives in a temp dir, cleaned up on exit.
@@ -134,11 +140,35 @@ timeout_ms = 300
 healthy_threshold = 2      # ~1s to (re)enter rotation after recovering
 unhealthy_threshold = 2    # ~1s to eject after going unhealthy
 
+# The same three instances again, but balanced by Maglev consistent hashing (ADR 000035):
+# the request's `x-session` header value is the hash key, so one session sticks to one
+# instance. A request WITHOUT the header falls back to round-robin over the healthy set.
+[[upstream]]
+name = "pool-sticky"
+addresses = ["{a}", "{b}", "{c}"]
+lb_algorithm = "maglev"
+[upstream.hash]
+key = "header"
+header = "x-session"
+[upstream.health]
+path = "/healthz"
+interval_ms = 500
+timeout_ms = 300
+healthy_threshold = 2
+unhealthy_threshold = 2
+
 # A filter-less route: forward everything under / to the pool (no chain, no prefix strip).
 [[route]]
 upstream = "pool"
 [route.match]
 path_prefix = "/"
+
+# /sticky (longest prefix wins over / — deterministic specificity, ADR 000034) goes to the
+# Maglev upstream.
+[[route]]
+upstream = "pool-sticky"
+[route.match]
+path_prefix = "/sticky"
 "#
     )
 }
@@ -169,6 +199,15 @@ fn print_banner(proxy: SocketAddr, instances: [(&str, SocketAddr); 3]) {
         println!("    curl -s http://{addr}/toggle >/dev/null");
     }
     println!(
-        "    curl -s -i http://localhost:{p}/ | head -1   # HTTP/1.1 503 Service Unavailable\n"
+        "    curl -s -i http://localhost:{p}/ | head -1   # HTTP/1.1 503 Service Unavailable"
     );
+    println!();
+    println!("    # 5) Maglev consistent hashing (ADR 000035): on /sticky the x-session header");
+    println!("    #    is the hash key — one session sticks to ONE instance across requests.");
+    println!("    for i in $(seq 4); do curl -s -H 'x-session: alice' http://localhost:{p}/sticky; done");
+    println!("    for i in $(seq 4); do curl -s -H 'x-session: bob'   http://localhost:{p}/sticky; done");
+    println!();
+    println!("    # 6) eject the instance serving alice (/toggle it): only alice's keys remap;");
+    println!("    #    bob keeps his instance — that difference from round-robin IS the point.");
+    println!("    #    (no x-session header on /sticky -> plain round-robin fallback.)\n");
 }

@@ -167,7 +167,7 @@ impl ServerMetrics {
         &self,
         filter: &MetricsSnapshot,
         otlp: Option<(u64, usize)>,
-        _pool: Option<plecto_control::PoolResidency>,
+        pool: Option<plecto_control::PoolResidency>,
     ) -> String {
         const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
         let mut out: Vec<String> = Vec::new();
@@ -327,6 +327,35 @@ impl ServerMetrics {
             );
             out.push("# TYPE plecto_otlp_queue_spans gauge".to_string());
             out.push(format!("plecto_otlp_queue_spans {queued}"));
+        }
+
+        if let Some(pool) = pool {
+            out.push(
+                "# HELP plecto_pool_component_instances Live component instances in the trusted engine's pooling allocator."
+                    .to_string(),
+            );
+            out.push("# TYPE plecto_pool_component_instances gauge".to_string());
+            out.push(format!(
+                "plecto_pool_component_instances {}",
+                pool.component_instances
+            ));
+
+            out.push(
+                "# HELP plecto_pool_memories Live pooled linear memories in the trusted engine."
+                    .to_string(),
+            );
+            out.push("# TYPE plecto_pool_memories gauge".to_string());
+            out.push(format!("plecto_pool_memories {}", pool.memories));
+
+            out.push(
+                "# HELP plecto_pool_unused_memory_resident_bytes Bytes kept resident for unused-but-warm pool slots."
+                    .to_string(),
+            );
+            out.push("# TYPE plecto_pool_unused_memory_resident_bytes gauge".to_string());
+            out.push(format!(
+                "plecto_pool_unused_memory_resident_bytes {}",
+                pool.unused_memory_bytes_resident
+            ));
         }
 
         let mut text = out.join("\n");

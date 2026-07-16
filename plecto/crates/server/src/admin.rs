@@ -105,7 +105,7 @@ async fn admin_handle(
             state.metrics.render(
                 &state.control.filter_metrics(),
                 state.otlp.as_ref().map(|b| (b.dropped_spans(), b.len())),
-                None,
+                state.control.pool_residency(),
             ),
         ),
         "/healthz" => (

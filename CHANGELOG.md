@@ -21,6 +21,13 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-17
+
+Minor (not patch) per the pre-1.0 policy above: `plecto-control`'s public `FilterEntry`
+gained fields, which is breaking for external struct-literal constructors (see **Changed**).
+The WIT contract is untouched — `plecto:filter@0.3.0` remains current and every deployed
+filter keeps loading unmodified.
+
 ### Added
 
 - **Trusted-pool lifecycle knobs in the manifest**: a `[[filter]]` entry can now set

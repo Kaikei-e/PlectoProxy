@@ -21,6 +21,18 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-19
+
+Patch release: a routine dependency refresh (`cargo update`) across every workspace lockfile —
+the release workspace plus the bench, fuzz, example-filter guest, and spike workspaces. No
+source changes; the WIT contract is untouched and `plecto:filter@0.3.0` remains current.
+
+### Changed
+
+- **Dependencies**: notable bumps on the release path include `tokio` 1.53.0, `rustls` 0.23.42,
+  `aws-lc-rs` 1.17.3, `bytes` 1.12.1, and `regex` 1.13.1. No API, manifest-schema, or CLI
+  changes ride along.
+
 ## [0.4.0] - 2026-07-17
 
 Minor (not patch) per the pre-1.0 policy above: `plecto-control`'s public `FilterEntry`

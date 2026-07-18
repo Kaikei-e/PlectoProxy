@@ -10,7 +10,7 @@ members = ["crates/host", "crates/control", "crates/server", "crates/plecto"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
@@ -37,9 +37,9 @@ unsafe_op_in_unsafe_fn = "deny"
 # packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
 # package at all without one). Bump `version` here in lockstep with `workspace.package.version`
 # above at release time.
-plecto-host = { path = "crates/host", version = "0.4.0" }
-plecto-control = { path = "crates/control", version = "0.4.0" }
-plecto-server = { path = "crates/server", version = "0.4.0" }
+plecto-host = { path = "crates/host", version = "0.4.1" }
+plecto-control = { path = "crates/control", version = "0.4.1" }
+plecto-server = { path = "crates/server", version = "0.4.1" }
 # wasmtime 46.0.x for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46
 # (2026-06-22) ships Component Model async + WASI 0.3 by default. The async / bindgen API is still
 # moving on this line, so we track the latest 46 patch (Cargo.lock pins the resolved build).

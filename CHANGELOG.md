@@ -21,6 +21,21 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-19
+
+Patch release that completes what 0.4.1 started. The 0.4.1 tag's release run failed at the
+reference-filter publish step: the dependency refresh changed the built component bytes of
+the shelf entries while their own versions stayed 0.1.0, and filter tags are immutable
+(ADR 000080), so the guard failed closed. 0.4.1 therefore has a container image on GHCR but
+no GitHub release; use 0.4.2.
+
+### Changed
+
+- **Reference-filter shelf republished as 0.1.1**: `filters/jwt`, `filters/cors`,
+  `filters/apikey`, and `filters/extauthz` each bump 0.1.0 → 0.1.1 to carry the refreshed
+  dependencies under a new immutable tag. No filter source changes; the compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
+
 ## [0.4.1] - 2026-07-19
 
 Patch release: a routine dependency refresh (`cargo update`) across every workspace lockfile —

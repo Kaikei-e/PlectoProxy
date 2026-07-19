@@ -21,6 +21,52 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-20
+
+Feature release closing the packaging/CI and container-operations gaps surfaced by
+dogfooding field reports: filters were easy to write, but everything *around* them —
+producing the signed artifact in CI, delivering file-based secrets, health-checking a
+shell-less container — needed out-of-tree workarounds. All three now have first-class,
+documented paths (ADR 000094 / 000095).
+
+The minor bump (not a patch) follows the pre-1.0 policy above: one Rust-API breaking
+change, listed under **Changed** with its migration note. TOML manifests from 0.4.x are
+unaffected — every new manifest section is optional.
+
+### Changed
+
+- **Breaking (Rust embedder API)**: `plecto_control::FilterEntry` gained the
+  `config_files` field. Code constructing `FilterEntry` with a struct literal must add
+  `config_files: None`; manifests and the CLI are unaffected. (Flagged by
+  cargo-semver-checks: adding a field to an externally-constructible struct requires a
+  major-position bump.)
+
+### Added
+
+- **`plecto package`** — one-shot CI packaging: conformance-gate a built component, sign it
+  and its SBOM with an operator key (ECDSA P-256 PKCS8 PEM, the `sign-blob` scheme), write
+  the signed offline OCI image-layout the loader requires, and print only the pinned
+  image-manifest digest to stdout (`DIGEST=$(plecto package …)` composes). `--sbom` swaps in
+  a supplier-provided in-toto statement. Unlike `plecto dev` it touches no manifest, watches
+  nothing, and never generates a key (ADR 000094).
+- **`plecto validate --resolve`** — extends static validation with the loader's own
+  provenance gate, run without serving: digest-pin resolution plus trusted-signature and
+  SBOM-binding verification through the very same code path as a real load
+  (`TrustPolicy::verify_artifact`). CI can now prove a manifest + layout pair would load
+  before a deploy (ADR 000094).
+- **`plecto healthz`** — self-probe for shell-less (distroless) containers: reads
+  `[observability] admin_addr` from the manifest (or `--admin-addr`), performs one bounded
+  HTTP/1.1 GET, exits 0 on 2xx and 1 otherwise (never the reserved exit code 2). Probes
+  `/readyz` by default — what a Compose `service_healthy` start gate means — and `/healthz`
+  with `--live`. The multi-replica example now ships a working `healthcheck:` block, and the
+  operations guide documents the pattern.
+- **`[filter.config_files]`** — file-based secret indirection for filter config: same key
+  space as `[filter.config]`, but each value is a path (absolute or manifest-relative) whose
+  content — UTF-8, whitespace-trimmed, ≤ 1 MiB — is served through the existing
+  `host-config::get` keys. Resolved at every load/reload, so a SIGHUP picks up rotated
+  secret files; a key set in both sections, or a missing/unreadable file, fails closed at
+  validate and at load. The WIT contract is unchanged (ADR 000095).
+
 ## [0.4.2] - 2026-07-19
 
 Patch release that completes what 0.4.1 started. The 0.4.1 tag's release run failed at the

@@ -43,6 +43,14 @@ services:
     # Longer than readiness_grace_ms + window_ms in the manifest, so `docker compose
     # stop` never SIGKILLs a replica that is still draining in-flight work.
     stop_grace_period: 20s
+    # Self-probe against the manifest's admin endpoint (docs/operations.md). The image
+    # is distroless (no shell), so ONLY the exec-array form works, and the probe is the
+    # plecto binary itself — /readyz semantics, exit 0/1 per the healthcheck contract.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/plecto", "healthz", "/etc/plecto/base.toml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - edge
 
@@ -52,6 +60,11 @@ services:
     volumes:
       - ./manifests:/etc/plecto:ro
     stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/plecto", "healthz", "/etc/plecto/base.toml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - edge
 

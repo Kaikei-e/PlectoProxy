@@ -100,7 +100,9 @@ pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conforma
 #[doc(hidden)]
 pub use contract::HOP_BY_HOP_GUEST_HEADERS;
 pub use contract::{ContractVersion, FILTER_WIT, header};
-pub use dev_signer::{DEV_KEY_MARKER, DevKeyError, DevSigner, bound_sbom, public_key_path_for};
+pub use dev_signer::{
+    DEV_KEY_MARKER, DevKeyError, DevSigner, PemSigner, bound_sbom, public_key_path_for,
+};
 pub use observe::{
     FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
     RequestTrace, SpanOutcome, TelemetrySink,

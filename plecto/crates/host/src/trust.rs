@@ -4,6 +4,8 @@
 use anyhow::Result;
 use sigstore::crypto::{CosignVerificationKey, Signature};
 
+use crate::errors::{LoadError, sbom_binds_component};
+
 /// The set of public keys the operator trusts to sign filters (ADR 000006 provenance). A
 /// filter loads only if a trusted key verifies BOTH its component signature and its SBOM
 /// signature (keyed cosign, offline — no Fulcio / Rekor / network). An **empty** policy
@@ -50,6 +52,26 @@ impl TrustPolicy {
             k.verify_signature(Signature::Raw(signature_der), msg)
                 .is_ok()
         })
+    }
+
+    /// The whole ADR 000006 provenance gate over a resolved artifact — SBOM present, both
+    /// signatures trusted, SBOM subject bound to THIS component — with no wasmtime involved.
+    /// [`Host::load`] runs exactly this before ever compiling the bytes; `plecto validate
+    /// --resolve` runs it standalone so CI can prove a manifest + layout pair would pass the
+    /// load gate without starting a server (field report §3.5).
+    ///
+    /// [`Host::load`]: crate::Host::load
+    pub fn verify_artifact(&self, artifact: &SignedArtifact<'_>) -> Result<(), LoadError> {
+        if artifact.sbom.is_empty() {
+            return Err(LoadError::MissingSbom);
+        }
+        if !self.verifies(artifact.component_signature, artifact.component_bytes) {
+            return Err(LoadError::UnverifiedComponentSignature);
+        }
+        if !self.verifies(artifact.sbom_signature, artifact.sbom) {
+            return Err(LoadError::UnverifiedSbomSignature);
+        }
+        sbom_binds_component(artifact.sbom, artifact.component_bytes)
     }
 }
 

@@ -56,8 +56,59 @@ pub const DEV_KEY_MARKER: &str = "# plecto-dev-key -- DO NOT reference from a pr
 /// A persistent ECDSA P-256 / cosign-scheme signer. Holds one key pair; the same key signs
 /// both a filter component and its SBOM, matching a `TrustPolicy` that trusts exactly that key.
 pub struct DevSigner {
+    inner: PemSigner,
+}
+
+/// The neutral signing core: one ECDSA P-256 / cosign-scheme key pair, no persistence, no
+/// dev-key marker, no opinion about where the key came from. `plecto package` uses it with an
+/// operator's production key (field report §3.1); [`DevSigner`] wraps it with the dev-key
+/// file conventions. Signing here is a plain function of (key, bytes) — a future KMS /
+/// pre-computed-signature path replaces this struct at its call sites, nothing else.
+pub struct PemSigner {
     signer: SigStoreSigner,
     public_key_pem: String,
+}
+
+impl PemSigner {
+    /// Load a PKCS8 PEM private key. The elliptic curve is detected from the key's own OID
+    /// (sigstore-rs), so any ECDSA key of the cosign scheme works.
+    pub fn from_private_key_pem(pem: &[u8]) -> Result<Self, DevKeyError> {
+        let keys = ECDSAKeys::from_pem(pem).map_err(|e| DevKeyError::Crypto {
+            op: "load signing key",
+            source: e,
+        })?;
+        Self::from_keys(keys)
+    }
+
+    fn from_keys(keys: ECDSAKeys) -> Result<Self, DevKeyError> {
+        let public_key_pem =
+            keys.as_inner()
+                .public_key_to_pem()
+                .map_err(|e| DevKeyError::Crypto {
+                    op: "export public key",
+                    source: e,
+                })?;
+        let signer = keys.to_sigstore_signer().map_err(|e| DevKeyError::Crypto {
+            op: "build signer",
+            source: e,
+        })?;
+        Ok(Self {
+            signer,
+            public_key_pem,
+        })
+    }
+
+    /// Raw DER ECDSA signature over `msg` (the shape `SignedArtifact` expects).
+    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, DevKeyError> {
+        self.signer.sign(msg).map_err(|e| DevKeyError::Crypto {
+            op: "sign",
+            source: e,
+        })
+    }
+
+    pub fn public_key_pem(&self) -> &str {
+        &self.public_key_pem
+    }
 }
 
 impl DevSigner {
@@ -76,7 +127,9 @@ impl DevSigner {
                     op: "export dev private key",
                     source: e,
                 })?;
-        let signer = Self::from_keys(keys)?;
+        let signer = Self {
+            inner: PemSigner::from_keys(keys)?,
+        };
         Ok((signer, private_key_pem))
     }
 
@@ -84,28 +137,8 @@ impl DevSigner {
     /// detected from the key's own OID (sigstore-rs), so this works for any dev key this
     /// module has ever generated.
     pub fn from_private_key_pem(pem: &[u8]) -> Result<Self, DevKeyError> {
-        let keys = ECDSAKeys::from_pem(pem).map_err(|e| DevKeyError::Crypto {
-            op: "load dev key",
-            source: e,
-        })?;
-        Self::from_keys(keys)
-    }
-
-    fn from_keys(keys: ECDSAKeys) -> Result<Self, DevKeyError> {
-        let public_key_pem =
-            keys.as_inner()
-                .public_key_to_pem()
-                .map_err(|e| DevKeyError::Crypto {
-                    op: "export dev public key",
-                    source: e,
-                })?;
-        let signer = keys.to_sigstore_signer().map_err(|e| DevKeyError::Crypto {
-            op: "build dev signer",
-            source: e,
-        })?;
         Ok(Self {
-            signer,
-            public_key_pem,
+            inner: PemSigner::from_private_key_pem(pem)?,
         })
     }
 
@@ -141,19 +174,16 @@ impl DevSigner {
 
     /// Raw DER ECDSA signature over `msg` (the shape `SignedArtifact` expects).
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, DevKeyError> {
-        self.signer.sign(msg).map_err(|e| DevKeyError::Crypto {
-            op: "sign",
-            source: e,
-        })
+        self.inner.sign(msg)
     }
 
     pub fn public_key_pem(&self) -> &str {
-        &self.public_key_pem
+        self.inner.public_key_pem()
     }
 
     /// A `TrustPolicy` that trusts exactly this signer's key.
     pub fn trust_policy(&self) -> Result<TrustPolicy, DevKeyError> {
-        TrustPolicy::from_pem_keys([self.public_key_pem.as_bytes()])
+        TrustPolicy::from_pem_keys([self.inner.public_key_pem().as_bytes()])
             .map_err(|e| DevKeyError::Trust(e.to_string()))
     }
 }

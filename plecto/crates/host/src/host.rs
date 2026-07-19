@@ -13,7 +13,7 @@ use crate::contract::{
     detect_contract_version,
 };
 use crate::engine::{Allocation, EpochTicker, TRUSTED_POOL_MAX, build_engine};
-use crate::errors::{LoadError, sbom_binds_component};
+use crate::errors::LoadError;
 use crate::filter::LoadedFilter;
 use crate::observe;
 #[cfg(feature = "outbound-http")]
@@ -166,22 +166,10 @@ impl Host {
 
         // --- provenance gate (ADR 000006): verify BEFORE instantiate, fail-closed. A
         // --- missing / untrusted / tampered signature or a missing SBOM means we never
-        // --- touch the component bytes with wasmtime. Order is cheap-checks first.
-        if artifact.sbom.is_empty() {
-            return Err(LoadError::MissingSbom);
-        }
-        if !self
-            .trust
-            .verifies(artifact.component_signature, artifact.component_bytes)
-        {
-            return Err(LoadError::UnverifiedComponentSignature);
-        }
-        if !self.trust.verifies(artifact.sbom_signature, artifact.sbom) {
-            return Err(LoadError::UnverifiedSbomSignature);
-        }
-        // The SBOM must attest THIS component (its subject digest == sha256(component)), so a
-        // validly-signed but unrelated SBOM cannot be paired with it (review f000003 #1).
-        sbom_binds_component(artifact.sbom, artifact.component_bytes)?;
+        // --- touch the component bytes with wasmtime. The gate itself lives on
+        // --- `TrustPolicy::verify_artifact` so `plecto validate --resolve` runs the very
+        // --- same checks without an engine (field report §3.5).
+        self.trust.verify_artifact(artifact)?;
 
         let component_bytes = artifact.component_bytes;
         let engine = match opts.isolation {

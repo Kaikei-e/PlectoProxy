@@ -155,6 +155,9 @@ wasi = "minimal"                # optional (default "none"), ADR 000063: Tier B 
 
 [filter.config]                # optional, ADR 000066: arbitrary string→string business config
 on_backend_error = "deny"      # read back via `host-config::get("on_backend_error")`
+
+[filter.config_files]          # optional: same key space, but each value is a FILE PATH whose
+hmac_key = "/run/secrets/hmac" # content (UTF-8, trimmed both ends, ≤ 1 MiB) becomes the value
 ```
 
 `isolation` is the biggest performance lever. `trusted` filters are built once and pooled (fast hot
@@ -170,6 +173,22 @@ key it requires** (typically in `init`, trapping on a missing/invalid value). Co
 `isolation = "trusted"`, that trap surfaces as a load-time failure rather than a per-request one
 (the host eager-builds one trusted instance at load, see [`filter-ratelimit-redis`](../plecto/examples/filters/filter-ratelimit-redis))
 — a filter with a *required* config key should document that it needs `trusted` isolation.
+
+`[filter.config_files]` is the secret-shaped sibling: container secrets arrive as **files**
+(`/run/secrets/<name>` mounts, credential directories), and a checked-in manifest is exactly where
+a secret must not be inlined. Each value is a path — absolute, or relative to the manifest's
+directory — read at every load/reload (a SIGHUP picks up a rotated secret file) and served through
+the **same** `host-config::get` keys; the filter cannot tell the two sections apart, and the WIT
+contract is unchanged. Setting the same key in both sections is a validate error (the `X` /
+`X_file` pairs convention: mutually exclusive), and a missing/unreadable/non-UTF-8/oversized file
+fails the load — the same fail-closed posture as trust keys and TLS certs. Content is
+whitespace-trimmed at both ends (the `echo`-appended trailing newline problem); a secret that
+needs exact leading/trailing whitespace cannot ride this mechanism.
+
+One filter binary, several rates: the `ratelimit` bucket spec belongs to the `[[filter]]` *entry*,
+not the wasm — register the same layout under two ids (same `source`, same `digest`) to run, e.g.,
+a lenient global limiter and a strict `/auth` limiter from one artifact. Each id gets its own
+trusted pool and its own KV/counter namespace.
 
 ### `[[upstream]]`
 
@@ -276,11 +295,24 @@ gateway keeps serving the last good build. The verification code path is never w
 only *which* key is in `[trust]` differs from production (P5, ADR 000006).
 
 The dev key is **not** a production signing key — `plecto validate` warns (`PLECTO-E0004`) if a
-manifest's `[trust]` ever references one outside a dev context. For a **production** deploy, sign
-with `cosign sign-blob` (or your CI's signer) using a key whose public half is in `[trust].keys`,
-and follow the packaging pipeline in the [`wasm-auth` example](../plecto/examples/wasm-auth/main.rs)
-— it signs the component, writes the offline OCI layout, computes the digest, and starts a real
-proxy, all in one runnable file. **Read it as your production reference.**
+manifest's `[trust]` ever references one outside a dev context. For a **production / CI** deploy,
+`plecto package` is the one-shot pipeline: it conformance-gates the built component, signs it and
+its SBOM with *your* key (ECDSA P-256 PKCS8 PEM, the cosign `sign-blob` scheme), writes the offline
+OCI layout, and prints **only** the pinned image-manifest digest to stdout:
+
+```bash
+DIGEST=$(plecto package my_filter.component.wasm --key signer.pem --out artifacts/my-filter)
+# pin $DIGEST in the manifest's [[filter]].digest, then prove the pair loads — without serving:
+plecto validate --resolve manifest.toml
+```
+
+`validate --resolve` runs the loader's provenance gate (digest pin + trusted signatures + SBOM
+binding) against the real layout, so CI knows *before* a deploy that the manifest + artifact pair
+would pass — what plain `validate` (static, artifact-free) deliberately does not check. `--sbom
+<statement.json>` replaces the default minimal in-toto statement; the statement's subject digest
+must still be this component's sha256, or the loader refuses the pair. The
+[`wasm-auth` example](../plecto/examples/wasm-auth/main.rs) remains a runnable end-to-end
+reference of the same pipeline as embedder code.
 
 ## 6. Test it locally
 

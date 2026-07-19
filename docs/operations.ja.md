@@ -37,6 +37,30 @@ window_ms = 30000           # in-flight の作業に許す完走時間
 両エンドポイントは admin リスナー（`[observability] admin_addr`、既定オフ）上にある。
 LB 背後での無瞬断ローリングデプロイには admin_addr の設定が前提になる。
 
+## コンテナ内部からのプローブ: `plecto healthz`
+
+公式イメージは distroless — シェルも curl も無い — ため、Docker/Compose の `healthcheck:` は
+外部コマンドに頼れない。`plecto healthz` はその自己プローブで、manifest の
+`[observability] admin_addr` を読み（Compose 側にアドレスを二重記載しない）、有界の HTTP/1.1
+GET を 1 回行い、2xx なら exit `0`、それ以外は `1` を返す — Docker の healthcheck 契約が予約
+する `2` は決して返さない。既定のプローブ先は `/readyz`（Compose の
+`depends_on: condition: service_healthy` は起動順ゲート = readiness 意味論のため）。再起動監視
+向けには `--live` で `/healthz` を、manifest を読ませたくない場合は `--admin-addr <host:port>`
+を使う。
+
+```yaml
+# distroless: exec-array 形式のみ — 文字列の test: はイメージに無い /bin/sh を要求してしまう
+healthcheck:
+  test: ["CMD", "/usr/local/bin/plecto", "healthz", "/etc/plecto/manifest.toml"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+```
+
+Kubernetes では admin エンドポイントへ直接 `httpGet` プローブを使うのが良い（kubelet がコンテナ
+外からプローブするため、イメージ内で何かを実行する必要がない）— 下表の通り `/readyz` /
+`/healthz` に向ける。
+
 ## `readiness_grace_ms` の決め方
 
 原則: **最初の readiness チェック失敗から、LB が実際にレプリカを外すまでの時間を猶予が覆う

@@ -37,6 +37,30 @@ window_ms = 30000           # how long in-flight work may finish
 Both endpoints live on the admin listener (`[observability] admin_addr`), which is off by
 default — zero-downtime rollouts behind an LB require it to be set.
 
+## Probing from inside the container: `plecto healthz`
+
+The official image is distroless — no shell, no curl — so a Docker/Compose `healthcheck:` cannot
+shell out to anything. `plecto healthz` is the self-probe: it reads `[observability] admin_addr`
+from the manifest (no second copy of the address in the Compose file), performs one bounded
+HTTP/1.1 GET, and exits `0` on a 2xx response, `1` on anything else — never `2`, which the
+Docker healthcheck contract reserves. It probes `/readyz` by default, because a Compose
+`depends_on: condition: service_healthy` is a start-ordering gate — readiness semantics; pass
+`--live` to probe `/healthz` for a restart supervisor, or `--admin-addr <host:port>` to skip the
+manifest lookup.
+
+```yaml
+# distroless: exec-array form only — a string test: would need the /bin/sh the image lacks
+healthcheck:
+  test: ["CMD", "/usr/local/bin/plecto", "healthz", "/etc/plecto/manifest.toml"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+```
+
+In Kubernetes, prefer `httpGet` probes straight at the admin endpoints (the kubelet probes from
+outside the container; nothing needs to run in the image) — the table below already points them
+at `/readyz` / `/healthz`.
+
 ## Choosing `readiness_grace_ms`
 
 The rule: **the grace must cover the time between the first failed readiness check and the LB

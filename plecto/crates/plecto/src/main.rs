@@ -16,6 +16,10 @@
 //!   `plecto:filter` guest crate + a dev manifest trusting your project's dev key.
 //! - `plecto dev <filter-dir>` — Filter Dev Kit (ADR 000065): watch, componentize, gate on
 //!   conformance, sign with the dev key, and reload in a loop (unix only — SIGHUP-based).
+//! - `plecto healthz [--live] [--admin-addr <host:port>] [<manifest.toml>]` — probe the admin
+//!   endpoint's `/readyz` (or `/healthz` with `--live`) and exit 0 on a 2xx response, 1
+//!   otherwise. The self-probe a shell-less (distroless) image needs to drive a Docker/Compose
+//!   `healthcheck:` (field report §3.6) — exit code 2 is never produced (Docker reserves it).
 //! - `plecto schema` — print the manifest's JSON Schema (draft-07) for editor completion / CI
 //! - `plecto --version` — print the version and exit
 
@@ -52,7 +56,7 @@ async fn run() -> anyhow::Result<()> {
         .with_target(true)
         .try_init();
 
-    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate <manifest.toml> | plecto conformance <component.wasm> [--json] | plecto new-filter --lang rust <name> | plecto dev <filter-dir> | plecto schema | plecto --version";
+    const USAGE: &str = "usage: plecto <manifest.toml> [listen_addr] | plecto validate [--resolve] <manifest.toml> | plecto conformance <component.wasm> [--json] | plecto package <component.wasm> --key <pkcs8.pem> --out <layout-dir> [--sbom <statement.json>] | plecto new-filter --lang rust <name> | plecto dev <filter-dir> | plecto healthz [--live] [--admin-addr <host:port>] [<manifest.toml>] | plecto schema | plecto --version";
     let mut args = std::env::args().skip(1);
     let manifest = match args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.as_str() {
         "--version" | "-V" => {
@@ -70,19 +74,28 @@ async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         // Static manifest validation (the `nginx -t` shape): strict parse + every fail-closed
-        // startup check that needs no artifact and mutates nothing, then exit. Plain (non-JSON)
-        // output — this is an operator/CI command, not the serving process.
-        "validate" => {
-            let path = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: plecto validate <manifest.toml>"))?;
-            return cli::validate(&path);
-        }
+        // startup check that needs no artifact and mutates nothing, then exit. `--resolve`
+        // additionally resolves each filter's OCI layout and runs the loader's provenance gate
+        // (digest pin + signatures + SBOM binding, field report §3.5) — still without serving,
+        // without wasmtime, without state. Plain (non-JSON) output — this is an operator/CI
+        // command, not the serving process.
+        "validate" => return cli::validate(args.collect()),
         // Filter Dev Kit conformance CLI (ADR 000065 decision 3): the CLI surface over the same
         // generic-property battery `plecto dev` runs before every reload. Self-signs with a
         // throwaway key (never `.plecto/dev-key`), so this needs no manifest, no trust setup —
         // just a component.
         "conformance" => return cli::conformance(args.collect()),
+        // Self-probe for shell-less containers (field report §3.6): a Compose `healthcheck:`
+        // exec-array can point at the binary already in the image instead of a curl that a
+        // distroless image does not have. Readiness by default — `service_healthy` is a start
+        // gate, which is readiness semantics; `--live` for restart-supervisor liveness.
+        "healthz" => return cli::healthz(args.collect()),
+        // One-shot CI packaging (field report §3.1): componentize is the builder's job, this
+        // takes a built component + an operator key and emits the signed offline OCI
+        // image-layout the loader requires, printing ONLY the pinned digest to stdout. The
+        // production-shaped sibling of `plecto dev`'s inner loop — no watch, no dev key, no
+        // manifest rewrite.
+        "package" => return cli::package(args.collect()),
         // Filter Dev Kit scaffold CLI (ADR 000065 decision 4): `plecto new-filter --lang rust
         // <name>` — the `filter-template` directory, CLI-ified, plus the project's dev key and
         // a ready-to-run dev manifest. `--lang`/`<name>` accepted in either order.

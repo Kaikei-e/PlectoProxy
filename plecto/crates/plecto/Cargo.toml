@@ -52,6 +52,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 # serde_json: `plecto conformance --json` (ADR 000065) — machine-readable output for CI.
 serde_json = { workspace = true }
+# zeroize: `plecto package` reads the operator's private-key PEM into a `Zeroizing` buffer —
+# the same discipline the dev-key path applies to key material.
+zeroize = { workspace = true }
 # tracing-subscriber: the binary's JSON log + access-log formatter (ADR 000009 Stage A). Only
 # this crate's `main` installs a subscriber; the library crates stay subscriber-free.
 tracing-subscriber = { workspace = true }

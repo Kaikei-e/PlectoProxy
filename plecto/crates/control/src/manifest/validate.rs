@@ -395,6 +395,7 @@ mod tests {
             outbound_tcp: None,
             wasi: WasiKind::None,
             config: None,
+            config_files: None,
         };
         assert!(base.validate().is_ok(), "defaults are valid");
 
@@ -462,6 +463,7 @@ mod tests {
             outbound_tcp: None,
             wasi: WasiKind::None,
             config: None,
+            config_files: None,
         };
         assert!(
             FilterEntry {

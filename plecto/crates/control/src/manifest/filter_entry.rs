@@ -2,8 +2,12 @@
 //! outbound-HTTP sub-config (ADR 000006 / 000026 / 000036).
 
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::ControlError;
 
 /// Host-side token-bucket spec for a filter's `host-ratelimit` (ADR 000026), set in the manifest
 /// as an inline table `ratelimit = { capacity = .., refill_tokens = .., refill_interval_ms = .. }`.
@@ -177,7 +181,24 @@ pub struct FilterEntry {
     /// a base capability with no feature gate.
     #[serde(default)]
     pub config: Option<BTreeMap<String, String>>,
+    /// File-indirected config values (field report §3.2), `[filter.config_files]`: the same
+    /// string→string key space as `config`, but each value is a **path** — absolute, or
+    /// relative to the manifest's directory — whose file content (UTF-8, whitespace-trimmed at
+    /// both ends, ≤ 1 MiB) is served through the same `host-config::get` keys. The shape
+    /// container secrets arrive in (`/run/secrets/<name>` mounts, credential directories):
+    /// the manifest stays a static, checked-in single source while the secret material never
+    /// appears in it. Resolved at load/reload time, so a SIGHUP picks up a rotated secret
+    /// file; symlinks are followed (orchestrator secret mounts rotate via symlink swaps). A
+    /// key set in both `config` and `config_files` is a validate/load error, and a missing or
+    /// unreadable file fails the load — same fail-closed posture as trust keys and TLS certs.
+    #[serde(default)]
+    pub config_files: Option<BTreeMap<String, String>>,
 }
+
+/// Per-file ceiling for `[filter.config_files]` reads: far beyond any sane config value, small
+/// enough that a mis-pointed path (a device file, a dump) fails fast instead of ballooning the
+/// load. Matches the magnitude credential-passing systems cap secrets at.
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Manifest spelling of the host's `Isolation`. Defaults to `untrusted` (fail-closed).
 #[derive(
@@ -204,6 +225,79 @@ pub enum WasiKind {
     #[default]
     None,
     Minimal,
+}
+
+impl FilterEntry {
+    /// Merge `[filter.config]` with the file-resolved `[filter.config_files]` values (field
+    /// report §3.2), or `None` when there is nothing to resolve (the inline map alone keeps
+    /// flowing through `load_options()`, ADR 000066 behaviour unchanged). Runs at every
+    /// load/reload — a SIGHUP re-reads rotated secret files — and inside `validate_manifest`,
+    /// where it joins the artifact-free fail-closed file loads (trust keys, TLS certs).
+    ///
+    /// Fail-closed rules, all surfaced as errors rather than silent fallbacks: a key set in
+    /// both maps (the `X` / `X_file` pairs convention treats them as mutually exclusive), a
+    /// missing/unreadable file, non-UTF-8 content (`host-config::get` serves `string`), and a
+    /// file past [`MAX_CONFIG_FILE_BYTES`]. Content is whitespace-trimmed at both ends — the
+    /// trailing-newline problem of `echo`-written secret files; no standard fixes a posture,
+    /// so this one is deliberate and documented. Symlinks are followed: orchestrator secret
+    /// mounts rotate atomically via symlink swaps, and the manifest (operator input) is
+    /// trusted to point where it says — unlike an artifact blob, which stays symlink-refused.
+    pub fn resolved_config(
+        &self,
+        base_dir: &Path,
+    ) -> Result<Option<BTreeMap<String, String>>, ControlError> {
+        let Some(files) = &self.config_files else {
+            return Ok(None);
+        };
+        let mut merged = self.config.clone().unwrap_or_default();
+        for (key, path) in files {
+            if merged.contains_key(key) {
+                return Err(ControlError::InvalidFilterConfig {
+                    id: self.id.clone(),
+                    reason: format!(
+                        "config key {key} is set in both [filter.config] and \
+                         [filter.config_files] — they are mutually exclusive"
+                    ),
+                });
+            }
+            // `join` on an absolute value keeps it absolute — `/run/secrets/<name>` works as
+            // written, a bare name resolves beside the manifest.
+            let full = base_dir.join(path);
+            let file = std::fs::File::open(&full).map_err(|e| ControlError::IoAt {
+                path: full.clone(),
+                source: e,
+            })?;
+            // Bounded single-open read (no metadata-then-read race): one byte past the cap is
+            // enough to detect an oversized file without buffering it.
+            let mut bytes = Vec::new();
+            file.take(MAX_CONFIG_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| ControlError::IoAt {
+                    path: full.clone(),
+                    source: e,
+                })?;
+            if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+                return Err(ControlError::InvalidFilterConfig {
+                    id: self.id.clone(),
+                    reason: format!(
+                        "config file for key {key} ({}) exceeds the {MAX_CONFIG_FILE_BYTES}-byte \
+                         cap",
+                        full.display()
+                    ),
+                });
+            }
+            let text = String::from_utf8(bytes).map_err(|_| ControlError::InvalidFilterConfig {
+                id: self.id.clone(),
+                reason: format!(
+                    "config file for key {key} ({}) is not valid UTF-8 — host-config serves \
+                     strings",
+                    full.display()
+                ),
+            })?;
+            merged.insert(key.clone(), text.trim().to_string());
+        }
+        Ok(Some(merged))
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +681,141 @@ route_tag = "api-v1"
             Some("redis.internal")
         );
         assert_eq!(cfg.len(), 6);
+    }
+
+    #[test]
+    fn config_files_resolve_into_the_config_map_trimmed() {
+        // `[filter.config_files]` (field report §3.2): container secrets arrive as files
+        // (`/run/secrets/...`), so each value is a path — absolute, or relative to the
+        // manifest's directory — whose file content becomes the value served through the
+        // existing `host-config::get` key space. Content is whitespace-trimmed at both ends
+        // (the `echo`-appended trailing newline problem; the `*_file` sibling-key convention's
+        // usual posture) — a deliberate, documented choice since no standard fixes one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hmac_key"), "s3cret-value\n").unwrap();
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "session-auth"
+source = "oci/session-auth"
+digest = "sha256:abc"
+
+[filter.config]
+cookie_name = "session"
+
+[filter.config_files]
+hmac_key = "hmac_key"
+"#,
+        )
+        .unwrap();
+        let cfg = m.filters[0]
+            .resolved_config(dir.path())
+            .unwrap()
+            .expect("config_files present resolves to a merged map");
+        assert_eq!(
+            cfg.get("hmac_key").map(String::as_str),
+            Some("s3cret-value")
+        );
+        assert_eq!(cfg.get("cookie_name").map(String::as_str), Some("session"));
+    }
+
+    #[test]
+    fn config_files_reject_a_key_collision_with_config() {
+        // `X` and `X_file`-style pairs are conventionally mutually exclusive — both set is an
+        // operator mistake, surfaced as an error rather than a silent precedence rule.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hmac_key"), "x").unwrap();
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "session-auth"
+source = "oci/session-auth"
+digest = "sha256:abc"
+
+[filter.config]
+hmac_key = "inline"
+
+[filter.config_files]
+hmac_key = "hmac_key"
+"#,
+        )
+        .unwrap();
+        let err = m.filters[0].resolved_config(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("hmac_key"),
+            "the collision names the key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_files_fail_closed_on_a_missing_file() {
+        // Same posture as a missing trust key or TLS cert: a secret that cannot be read is a
+        // load error, never a silently absent config key.
+        let dir = tempfile::tempdir().unwrap();
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "session-auth"
+source = "oci/session-auth"
+digest = "sha256:abc"
+
+[filter.config_files]
+hmac_key = "no-such-file"
+"#,
+        )
+        .unwrap();
+        assert!(m.filters[0].resolved_config(dir.path()).is_err());
+    }
+
+    #[test]
+    fn config_files_fail_closed_on_non_utf8_and_oversize() {
+        // `host-config::get` serves `string`, so the file must decode as UTF-8; and a config
+        // value has no business being megabytes — both are load errors, fail-closed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("binary"), [0xFFu8, 0xFE, 0x00]).unwrap();
+        std::fs::write(dir.path().join("huge"), vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        for file in ["binary", "huge"] {
+            let m = Manifest::from_toml(&format!(
+                r#"
+[[filter]]
+id = "session-auth"
+source = "oci/session-auth"
+digest = "sha256:abc"
+
+[filter.config_files]
+hmac_key = "{file}"
+"#
+            ))
+            .unwrap();
+            assert!(
+                m.filters[0].resolved_config(dir.path()).is_err(),
+                "{file} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_config_is_none_without_config_files() {
+        // No `[filter.config_files]` → nothing to resolve; the inline `[filter.config]` keeps
+        // flowing through `load_options()` untouched (ADR 000066 behaviour, unchanged).
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "x"
+source = "s"
+digest = "sha256:abc"
+
+[filter.config]
+k = "v"
+"#,
+        )
+        .unwrap();
+        assert!(
+            m.filters[0]
+                .resolved_config(Path::new("."))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

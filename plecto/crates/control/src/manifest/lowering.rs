@@ -119,6 +119,7 @@ mod tests {
             outbound_tcp: None,
             wasi: crate::manifest::WasiKind::None,
             config: None,
+            config_files: None,
         };
         let opts = entry.load_options();
 

@@ -529,3 +529,27 @@ fn validate_is_silent_for_a_non_dev_key() {
     let outcome = plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
     assert!(outcome.warnings.is_empty());
 }
+
+#[test]
+fn validate_fails_closed_on_an_unreadable_config_file() {
+    // `[filter.config_files]` (field report §3.2) joins the fail-closed file loads `validate`
+    // performs without artifacts (trust keys, TLS certs): a missing secret file is caught in
+    // CI / pre-SIGHUP, not at the first request.
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+[[filter]]
+id = "session-auth"
+source = "oci/session-auth"
+digest = "sha256:abc"
+
+[filter.config_files]
+hmac_key = "no-such-file"
+"#;
+    let manifest = Manifest::from_toml(toml).unwrap();
+    assert!(plecto_control::validate_manifest(&manifest, dir.path()).is_err());
+
+    std::fs::write(dir.path().join("hmac_key"), "k\n").unwrap();
+    let ok = toml.replace("no-such-file", "hmac_key");
+    let manifest = Manifest::from_toml(&ok).unwrap();
+    plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
+}

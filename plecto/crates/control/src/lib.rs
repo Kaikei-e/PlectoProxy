@@ -104,7 +104,7 @@ pub use plecto_host::{
 // toolchain, so this widens no dependency edge, just this crate's existing re-export list.
 pub use plecto_host::{
     ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevKeyError, DevSigner, FILTER_WIT,
-    bound_sbom, public_key_path_for, run_conformance,
+    PemSigner, bound_sbom, public_key_path_for, run_conformance,
 };
 // The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.
@@ -370,6 +370,12 @@ pub fn validate_manifest(
     manifest.state.validate()?;
     manifest.listen.validate()?;
     let filter_ids = validate_filters_and_chain(manifest)?;
+    // `[filter.config_files]` joins the artifact-free fail-closed file loads (trust keys, TLS
+    // certs, upstream CA): a missing/unreadable/colliding secret file is caught here, in CI or
+    // pre-SIGHUP, not at the first request (field report §3.2).
+    for entry in &manifest.filters {
+        entry.resolved_config(base_dir)?;
+    }
     let upstream_names: HashSet<&str> =
         manifest.upstreams.iter().map(|u| u.name.as_str()).collect();
     route::validate_routes(&manifest.routes, &filter_ids, &upstream_names)?;
@@ -402,6 +408,62 @@ pub fn validate_manifest_path(path: &Path) -> Result<ValidateOutcome, ControlErr
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let manifest = read_manifest(path)?;
     validate_manifest(&manifest, base_dir)
+}
+
+/// One filter proven loadable by [`resolve_manifest`]: its manifest id and the pinned digest
+/// that resolved and verified.
+pub struct ResolvedFilterCheck {
+    pub id: String,
+    pub digest: String,
+}
+
+/// The artifact half of `plecto validate --resolve` (field report §3.5): for every
+/// `[[filter]]`, resolve its offline OCI image-layout (digest pin), then run the very
+/// provenance gate the loader runs — trusted signatures + SBOM binding
+/// ([`TrustPolicy::verify_artifact`]) — with no wasmtime engine and no state touched. What
+/// this deliberately does NOT prove: `init()` behaviour (a trusted filter's eager-build still
+/// happens only at real load) and contract-version support (detecting the targeted
+/// `plecto:filter` version needs a compile). Pair with [`validate_manifest`] for the full
+/// pre-flight.
+pub fn resolve_manifest(
+    manifest: &Manifest,
+    base_dir: &Path,
+) -> Result<Vec<ResolvedFilterCheck>, ControlError> {
+    let mut pems: Vec<Vec<u8>> = Vec::with_capacity(manifest.trust.keys.len());
+    for key_path in &manifest.trust.keys {
+        pems.push(read_file(&base_dir.join(key_path))?);
+    }
+    let trust =
+        TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
+    let store = oci::OciLayoutStore::new(base_dir);
+    let mut checks = Vec::with_capacity(manifest.filters.len());
+    for filter in &manifest.filters {
+        let resolved = store.resolve(&filter.source, &filter.digest)?;
+        trust
+            .verify_artifact(&plecto_host::SignedArtifact {
+                component_bytes: &resolved.component,
+                component_signature: &resolved.component_signature,
+                sbom: &resolved.sbom,
+                sbom_signature: &resolved.sbom_signature,
+            })
+            .map_err(|e| ControlError::Load {
+                id: filter.id.clone(),
+                err: e.into(),
+            })?;
+        checks.push(ResolvedFilterCheck {
+            id: filter.id.clone(),
+            digest: filter.digest.clone(),
+        });
+    }
+    Ok(checks)
+}
+
+/// [`resolve_manifest`] for an on-disk manifest, resolving sources and trust keys relative to
+/// the manifest's own directory — the CLI entrypoint behind `plecto validate --resolve`.
+pub fn resolve_manifest_path(path: &Path) -> Result<Vec<ResolvedFilterCheck>, ControlError> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let manifest = read_manifest(path)?;
+    resolve_manifest(&manifest, base_dir)
 }
 
 /// The manifest's JSON Schema (ADR 000049), derived from the very serde model `from_toml` parses
@@ -534,8 +596,15 @@ fn build_active(
             sbom: &artifact.sbom,
             sbom_signature: &artifact.sbom_signature,
         };
+        // File-indirected config resolves HERE, at every load/reload (field report §3.2), so a
+        // SIGHUP picks up a rotated secret file; the merged map rides the same `with_config`
+        // lane the inline `[filter.config]` already uses (ADR 000066 — WIT unchanged).
+        let mut opts = entry.load_options();
+        if let Some(merged) = entry.resolved_config(base_dir)? {
+            opts = opts.with_config(merged);
+        }
         let loaded = host
-            .load(&entry.id, &signed, entry.load_options())
+            .load(&entry.id, &signed, opts)
             .map_err(|err| ControlError::Load {
                 id: entry.id.clone(),
                 err,

@@ -2529,6 +2529,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wit-component",
+ "zeroize",
 ]
 
 [[package]]

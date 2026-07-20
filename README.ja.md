@@ -31,7 +31,7 @@ Plecto Proxy は、**相補関係にある二つの構成要素**を型付き [W
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.5.1   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.5.2   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
 docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \

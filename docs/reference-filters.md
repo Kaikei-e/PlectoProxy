@@ -34,9 +34,9 @@ the package settings (same quirk as the WIT packages, ADR 000064).
 | Artifact | Crate | Version | Contract (world) | Guest target | Imports beyond `plecto:filter` | Required runtime profile | Manifest requirements |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `filters/jwt` | `filter-jwt` | 0.1.2 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps — outgoing calls happen only on the JWKS-at-init path; the static PEM/JWK path never calls out | **capabilities** | `isolation = "trusted"` (ADR 000070); `outbound-http` allowlist for the JWKS path, `allow = []` for static keys |
-| `filters/cors` | `filter-cors` | 0.1.1 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
-| `filters/apikey` | `filter-apikey` | 0.1.1 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
-| `filters/extauthz` | `filter-extauthz` | 0.1.1 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps | **capabilities** | `outbound-http` allowlist naming the authorization endpoint |
+| `filters/cors` | `filter-cors` | 0.1.2 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
+| `filters/apikey` | `filter-apikey` | 0.1.2 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
+| `filters/extauthz` | `filter-extauthz` | 0.1.2 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps | **capabilities** | `outbound-http` allowlist naming the authorization endpoint |
 
 CI asserts the import floor for every PR (`scripts/build-reference-filters.sh`): zero-WASI
 entries must not import `wasi:http`; capabilities entries must. `wkg` embeds those imports into

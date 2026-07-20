@@ -21,10 +21,25 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-20
+
+Patch release that completes what 0.5.1 started. The 0.5.1 tag's release run pushed
+`filters/jwt:0.1.2`, then failed at the immutable-tag guard for `filters/cors:0.1.1`:
+rebuilding the shelf under Rust 1.97.1 changed component bytes while those tags stayed
+at 0.1.1 (same class of failure as 0.4.1 → 0.4.2). Use 0.5.2.
+
+### Changed
+
+- **Reference-filter shelf republished as 0.1.2**: `filters/cors`, `filters/apikey`, and
+  `filters/extauthz` each bump 0.1.1 → 0.1.2 (`filters/jwt` already at 0.1.2 from the
+  0.5.1 attempt). No filter source changes beyond the jwt clippy fix already in 0.5.1;
+  the compatibility matrix (`docs/reference-filters.md`) is updated to match.
+
 ## [0.5.1] - 2026-07-20
 
 Patch release: MSRV / CI / Docker toolchain pin follows Rust **1.97.1** (was 1.96.0).
-No WIT or manifest schema changes.
+No WIT or manifest schema changes. The tagged release run did not finish the reference-
+filter shelf publish; use **0.5.2**.
 
 ### Changed
 
@@ -33,7 +48,7 @@ No WIT or manifest schema changes.
   to Rust 1.97.1.
 - **Reference filter `filters/jwt` 0.1.1 → 0.1.2**: clippy `question_mark` cleanup in
   `parse_url` under rustc 1.97; filter tags are immutable (ADR 000080), so the shelf
-  entry takes a new version. Other reference filters stay at 0.1.1.
+  entry takes a new version.
 
 ## [0.5.0] - 2026-07-20
 

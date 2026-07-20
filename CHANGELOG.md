@@ -21,6 +21,20 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-20
+
+Patch release: MSRV / CI / Docker toolchain pin follows Rust **1.97.1** (was 1.96.0).
+No WIT or manifest schema changes.
+
+### Changed
+
+- **Toolchain / MSRV**: `rust-toolchain.toml`, `Cargo.toml` `rust-version`, CI
+  (`dtolnay/rust-toolchain` SHA pin), release bookworm image, and `Dockerfile` all move
+  to Rust 1.97.1.
+- **Reference filter `filters/jwt` 0.1.1 → 0.1.2**: clippy `question_mark` cleanup in
+  `parse_url` under rustc 1.97; filter tags are immutable (ADR 000080), so the shelf
+  entry takes a new version. Other reference filters stay at 0.1.1.
+
 ## [0.5.0] - 2026-07-20
 
 Feature release closing the packaging/CI and container-operations gaps surfaced by

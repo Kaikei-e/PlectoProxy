@@ -5,6 +5,16 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-07-11 (release confirmation) — v0.3.0 release gate
+
+A second full `bash bench/perf/run-perf.sh all` refresh (plus a fresh `cargo bench` criterion
+pass) ahead of the **v0.3.0** contract release, after landing native response compression
+(ADR 000074 / ADR 000075) and the `plecto:filter@0.3.0` response-context / `replace` contract
+(ADR 000073). Compression is opt-in (`[route.compression]`) and off by default, so it touched none
+of the routes the `all` suite measures — this pass confirmed the regression invariants with the
+features *present but unused* (pooled WASM floor **+0.11 ms p50 / +0.26 ms p99**, apikey **≈0.86 µs
+/ −9.8 %**, rate-limit **1,033/s at 79.3 % shed**, round-robin exact).
+
 ## 2026-07-11 (earlier same day) — industry-methodology pass
 
 First full refresh after the industry-methodology pass

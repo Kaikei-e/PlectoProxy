@@ -84,9 +84,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
         with:
-          # SHA-pinned (A08) to the 1.96.0-branch tip, which hardcodes its own toolchain version —
+          # SHA-pinned (A08) to the 1.97.1-branch tip, which hardcodes its own toolchain version —
           # this action.yml revision doesn't declare a `toolchain` input at all, so don't pass one.
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -132,7 +132,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           components: clippy
           targets: wasm32-unknown-unknown, wasm32-wasip2
@@ -174,7 +174,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           # Default features build only the zero-WASI guests (build.rs) — no wasip2 here.
           targets: wasm32-unknown-unknown
@@ -218,7 +218,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -328,7 +328,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -370,7 +370,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -410,7 +410,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           components: clippy
           targets: wasm32-unknown-unknown,wasm32-wasip2

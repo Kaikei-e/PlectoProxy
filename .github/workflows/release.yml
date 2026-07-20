@@ -188,7 +188,7 @@ jobs:
           if [ "${{ matrix.profile }}" != "minimal" ]; then
             FEATURES="--features ${{ matrix.profile }}"
           fi
-          docker run --rm -e "FEATURES=${FEATURES}" -v "${{ github.workspace }}:/src" -w /src rust:1.96.0-bookworm bash -euxc '
+          docker run --rm -e "FEATURES=${FEATURES}" -v "${{ github.workspace }}:/src" -w /src rust:1.97.1-bookworm bash -euxc '
             apt-get update && apt-get install -y --no-install-recommends cmake clang
             cargo install cargo-auditable --locked
             cargo auditable build --manifest-path plecto/Cargo.toml --release --locked -p plecto ${FEATURES}
@@ -511,7 +511,7 @@ jobs:
           persist-credentials: false
       # Same toolchain shape as ci.yml's build job: rust-toolchain.toml pins the channel and
       # wasm32-unknown-unknown; wasm32-wasip2 (the outbound guests' target) is added here.
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - name: Install wasm-tools + wkg (sha256-pinned, same pins as ci.yml)

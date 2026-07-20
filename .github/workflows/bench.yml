@@ -58,7 +58,7 @@ jobs:
       - name: Free disk space for the wasmtime/cranelift build
         if: runner.environment == 'github-hosted'
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           # wasm32-unknown-unknown: plecto-host's build.rs builds the header-only guest fixture the
           # WASM micro-bench loads (filter-hello).
@@ -86,7 +86,7 @@ jobs:
       - name: Free disk space for the wasmtime/cranelift build
         if: runner.environment == 'github-hosted'
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
-      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

@@ -24,7 +24,7 @@ cannot. So first pin the tag you want to the digest you will verify *and* run:
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.5.0   # pick the latest release: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.5.1   # pick the latest release: https://github.com/Kaikei-e/PlectoProxy/releases
 
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 echo "$DIGEST"

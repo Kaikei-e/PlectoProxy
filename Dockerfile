@@ -27,7 +27,7 @@
 # Base images are referenced by tag for readability; pin them by digest in a production fork
 # (`docker buildx imagetools inspect <image>` prints the current digest).
 
-ARG RUST_VERSION=1.96.0
+ARG RUST_VERSION=1.97.1
 # "source" (default) compiles plecto/ with the pinned Rust toolchain below; "prebuilt" copies a
 # binary from the `prebuilt` build context instead. BuildKit only executes the stage that
 # `build-${SOURCE}` actually resolves to, so picking "prebuilt" skips the Rust toolchain entirely.

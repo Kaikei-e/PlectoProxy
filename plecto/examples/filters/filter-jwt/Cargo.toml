@@ -8,7 +8,7 @@
 # the outbound-http host's wasmtime-wasi grant. Declares its own [workspace].
 [package]
 name = "filter-jwt"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 

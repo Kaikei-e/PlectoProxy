@@ -188,10 +188,9 @@ fn unauthorized_invalid(realm: &str) -> RequestDecision {
 fn parse_url(url: &str) -> Option<(Scheme, String, String)> {
     let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
         (Scheme::Https, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (Scheme::Http, r)
     } else {
-        return None;
+        let r = url.strip_prefix("http://")?;
+        (Scheme::Http, r)
     };
     let (authority, path) = match rest.find('/') {
         Some(i) => (rest[..i].to_string(), rest[i..].to_string()),

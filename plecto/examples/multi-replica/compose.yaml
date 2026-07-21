@@ -36,7 +36,7 @@ services:
         ipv4_address: 172.28.0.10
 
   plecto-1:
-    image: ${PLECTO_IMAGE:-ghcr.io/kaikei-e/plecto:0.5.2}
+    image: ${PLECTO_IMAGE:-ghcr.io/kaikei-e/plecto:0.5.3}
     command: ["/etc/plecto/base.toml"]
     volumes:
       - ./manifests:/etc/plecto:ro
@@ -55,7 +55,7 @@ services:
       - edge
 
   plecto-2:
-    image: ${PLECTO_IMAGE:-ghcr.io/kaikei-e/plecto:0.5.2}
+    image: ${PLECTO_IMAGE:-ghcr.io/kaikei-e/plecto:0.5.3}
     command: ["/etc/plecto/base.toml"]
     volumes:
       - ./manifests:/etc/plecto:ro

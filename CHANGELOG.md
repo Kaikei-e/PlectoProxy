@@ -21,6 +21,25 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-21
+
+Patch release: the wasmtime line moves to **47.0.1**. No WIT or manifest schema changes;
+library APIs are unchanged (`cargo semver-checks` clean against 0.5.2).
+
+### Changed
+
+- **Runtime: wasmtime 46.0.1 → 47.0.1** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep,
+  `wit-component` 0.252 → 0.254). wasmtime 47 enables the GC and exception-handling
+  proposals by default; both are now explicitly disabled in the engine config — filters
+  gain no wasm feature the host never decided to lend (deny-by-default, ADR 000096).
+  Upstream's `wasi-common` / wasi-threads removal does not affect Plecto.
+- **Reference filter `filters/jwt` 0.1.2 → 0.1.3**: republished so the shelf entry picks up
+  the guest dependency refresh that landed after the v0.5.2 tag; filter tags are immutable
+  (ADR 000080), so the entry takes a new version. No jwt source changes.
+- **CI: `actions/checkout` pin comments corrected to `v7.0.0`**: upstream moved the `v7`
+  major tag off the pinned commit, tripping zizmor's online `ref-version-mismatch` audit;
+  the SHA pin itself is unchanged.
+
 ## [0.5.2] - 2026-07-20
 
 Patch release that completes what 0.5.1 started. The 0.5.1 tag's release run pushed

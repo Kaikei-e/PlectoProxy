@@ -98,6 +98,31 @@ The admin `/metrics` endpoint exposes, alongside the RED signals:
   downstream (upstream → client) and upstream (client → upstream) by tunnels, recorded as
   each tunnel closes.
 
+## CI pre-flight: `plecto validate --resolve`
+
+A manifest edit or a filter digest bump should fail in CI, not at reload time. `plecto validate
+<manifest.toml>` runs every fail-closed startup check that needs no artifact — strict parse,
+route/upstream/TLS checks — and mutates nothing (no state file is created), so it is safe to run
+against the production manifest anywhere. `--resolve` extends it to the artifact layer: each
+`[[filter]]`'s OCI layout is resolved, the pinned digest is compared, and the loader's provenance
+gate runs — trusted component/SBOM signatures plus SBOM↔component binding — still with no serving,
+no wasmtime, no state ([ADR 000094](ADR/000094.md)).
+
+The gate is the same function the loader calls at startup and on `SIGHUP`, not a re-implementation,
+so a green pre-flight and a green load cannot drift apart at the artifact layer. Exit code is the
+contract: `0` when everything would load, non-zero otherwise (one `filter <id> OK: artifact
+verified (<digest>)` line per filter on success).
+
+```bash
+plecto validate manifest.toml            # static: config alone
+plecto validate --resolve manifest.toml  # + digest pins, signatures, SBOM binding
+```
+
+Two things stay load-time-only, by design: contract-version support and trusted `init()` behaviour
+need compile/instantiate, which would break validate's "mutates nothing" contract — both still fail
+closed at the actual load. The authoring-side pipeline that feeds this check (`plecto conformance` →
+`plecto package` → pin the printed digest) is in [writing a filter §5](writing-a-filter.md).
+
 ## Reload vs restart
 
 Configuration changes do not need this machinery at all: `SIGHUP` re-reads the manifest and

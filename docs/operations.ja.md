@@ -96,6 +96,31 @@ admin `/metrics` は RED シグナルに加えて次を出す:
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — トンネルが中継した
   バイト数（down = upstream → client、up = client → upstream）。各トンネルの close 時に加算。
 
+## CI プリフライト: `plecto validate --resolve`
+
+manifest の編集やフィルタ digest の更新は、reload 時ではなく CI で落ちるべきもの。`plecto validate
+<manifest.toml>` は artifact を要しない全 fail-closed 起動時検査（strict parse・route / upstream /
+TLS の検査）を実行し、何も変異しない（state ファイルも作られない）ので、本番 manifest に対して
+どこで実行しても安全。`--resolve` はそれを artifact 層まで拡張する: 各 `[[filter]]` の OCI layout
+を実際に解決し、pin された digest を照合し、ローダの provenance ゲート（信頼鍵による component /
+SBOM 署名検証 + SBOM↔component binding）を実走する — serving なし・wasmtime なし・状態無変更の
+まま（[ADR 000094](ADR/000094.md)）。
+
+このゲートはローダが起動時と `SIGHUP` 時に呼ぶ関数そのものであって再実装ではないため、CI の
+green と実ロードの green は artifact 層で乖離しえない。契約は exit code: すべてロード可能なら
+`0`、そうでなければ非 0（成功時はフィルタごとに `filter <id> OK: artifact verified (<digest>)`
+を 1 行出す）。
+
+```bash
+plecto validate manifest.toml            # 静的: 設定のみ
+plecto validate --resolve manifest.toml  # + digest pin・署名・SBOM binding
+```
+
+意図して load 時に残しているものが 2 つある: 契約バージョン対応と trusted `init()` の挙動は
+compile / instantiate を要し、validate の「何も変異しない」契約を壊すため — どちらも実ロード時に
+fail-closed のまま検出される。この検査に供給する authoring 側パイプライン（`plecto conformance` →
+`plecto package` → 印字された digest を pin）は [writing a filter §5](writing-a-filter.md) を参照。
+
 ## reload と restart の使い分け
 
 設定変更にこの機構は一切不要: `SIGHUP` がマニフェストを再読込し、fail-closed で原子的に

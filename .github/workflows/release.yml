@@ -171,7 +171,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       # Compile inside a Debian bookworm container — NOT dtolnay/rust-toolchain directly on the
@@ -278,7 +278,7 @@ jobs:
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Download the native binary already built for this arch and profile
@@ -406,7 +406,7 @@ jobs:
       contents: read
       packages: write # push the WIT OCI artifacts to ghcr.io
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Install wkg (sha256-pinned, same release ci.yml already pins for wkg wit fetch)
@@ -506,7 +506,7 @@ jobs:
       CERT_ID_REGEXP: https://github.com/Kaikei-e/PlectoProxy/\.github/workflows/release\.yml@.*
       OIDC_ISSUER: https://token.actions.githubusercontent.com
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       # Same toolchain shape as ci.yml's build job: rust-toolchain.toml pins the channel and

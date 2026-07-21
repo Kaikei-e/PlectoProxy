@@ -40,14 +40,15 @@ unsafe_op_in_unsafe_fn = "deny"
 plecto-host = { path = "crates/host", version = "0.5.2" }
 plecto-control = { path = "crates/control", version = "0.5.2" }
 plecto-server = { path = "crates/server", version = "0.5.2" }
-# wasmtime 46.0.x for the M3 Stage 1 host async migration (ADR 000021): wasmtime 46
-# (2026-06-22) ships Component Model async + WASI 0.3 by default. The async / bindgen API is still
-# moving on this line, so we track the latest 46 patch (Cargo.lock pins the resolved build).
-wasmtime = "46.0.1"
+# wasmtime 47.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
+# WASI 0.3). 47 enables the GC and exception-handling proposals by default — the engine turns both
+# back off explicitly (deny-by-default, crates/host/src/engine.rs). The async / bindgen API is
+# still moving on this line, so we track the latest 47 patch (Cargo.lock pins the resolved build).
+wasmtime = "47.0.1"
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "46.0.1"
-wasmtime-wasi-http = "46.0.1"
+wasmtime-wasi = "47.0.1"
+wasmtime-wasi-http = "47.0.1"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"

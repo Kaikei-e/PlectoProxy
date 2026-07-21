@@ -24,6 +24,12 @@ pub(crate) enum Allocation {
 pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    // wasmtime 47 turned the GC and exception-handling proposals on by default. Filters gain no
+    // capability from either (guests are wasm32-unknown-unknown, header-only), so keep both off:
+    // an untrusted component must not reach wasm features the host never decided to lend
+    // (deny-by-default).
+    config.wasm_gc(false);
+    config.wasm_exceptions(false);
     // Outbound HTTP (ADR 000036) / outbound TCP (ADR 000060) / fat guest (ADR 000063) lend async
     // WASI interfaces; enable the Component Model async ABI so they link. Off by default; a
     // non-async guest is unaffected.
@@ -40,7 +46,7 @@ pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
     config.epoch_interruption(true);
     // M3 Stage 1 (ADR 000021): the host runs the guest on wasmtime fibers via `call_async` and
     // bridges it to its still-sync public API with `block_on` (the server-side spawn_blocking
-    // removal is Stage 2). wasmtime 46 needs no `Config::async_support` toggle (it is deprecated /
+    // removal is Stage 2). wasmtime 46+ needs no `Config::async_support` toggle (it is deprecated /
     // a no-op) — the async path is selected by the bindgen `exports: async` config plus
     // `instantiate_async` / `call_async`. `memory_init_cow` stays at its default (enabled): every
     // instance gets its own copy-on-write heap image — safe against CVE-2022-39393 (ADR 000006).

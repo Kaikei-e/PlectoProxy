@@ -149,7 +149,7 @@ opentelemetry = { workspace = true }
 # build.rs builds the filter-hello guest (wasm32-unknown-unknown) and wraps the
 # core module into a Component Model component, hermetically (no external CLI).
 [build-dependencies]
-wit-component = "0.252"
+wit-component = "0.254"
 
 [dev-dependencies]
 # Self dev-dependency: turns on `test-support` for THIS crate's own tests/benches/examples only.

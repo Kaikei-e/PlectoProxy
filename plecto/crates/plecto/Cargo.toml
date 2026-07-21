@@ -69,7 +69,7 @@ toml_edit = "0.22"
 # wit-component: wrap a rebuilt wasm32-unknown-unknown core module into a Component at runtime —
 # the same `ComponentEncoder` recipe `crates/host/build.rs` already uses at BUILD time (ADR
 # 000010), needed here because `plecto dev` componentizes on every file-watch trigger, not once.
-wit-component = "0.252"
+wit-component = "0.254"
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for the binary

@@ -69,6 +69,10 @@ fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
+    // Same deny-by-default stance as the sync host (engine.rs): GC / exception-handling are
+    // default-on since wasmtime 47 but never lent to filters.
+    config.wasm_gc(false);
+    config.wasm_exceptions(false);
     // Same metering as the sync host (ADR 000006): a background ticker advances the epoch so the
     // per-instance deadline can trap a runaway guest fail-closed.
     config.epoch_interruption(true);

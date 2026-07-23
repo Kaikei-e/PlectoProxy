@@ -21,6 +21,33 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-07-23
+
+Patch release: the guest toolchain moves to **wit-bindgen 0.60**. No WIT or manifest schema
+changes; the runtime stays on wasmtime 47.0.1; library APIs are unchanged (`cargo
+semver-checks` clean against 0.5.3).
+
+### Changed
+
+- **Guest toolchain: wit-bindgen 0.59 → 0.60** across the Rust example filters, the filter
+  template, the compat fixture, and the streaming spike; guest lockfiles move the wasm-tools
+  family 253 → 254 in lockstep, and CI installs the sha256-pinned 0.60.0 CLI. 0.60's MoonBit
+  generator renames generated package directories from camelCase to kebab-case, so the
+  MoonBit guest's committed bindings are regenerated and its hand-written filter moves with
+  them; polyglot conformance is unchanged.
+- **Reference-filter shelf republished**: `filters/jwt` 0.1.3 → 0.1.4; `filters/cors`,
+  `filters/apikey`, `filters/extauthz` 0.1.2 → 0.1.3. The toolchain refresh changes the
+  built component bytes of every shelf entry and filter tags are immutable (ADR 000080), so
+  each entry takes a new version with this release instead of tripping the publish guard the
+  way 0.4.1 and 0.5.1 did. No filter source changes; the compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
+- **Dev/test profiles compile the wasm-compilation pipeline at `opt-level = 3`**: per-package
+  overrides in the workspace profiles speed up test runs that JIT-compile filters while
+  keeping the workspace itself debuggable with debug assertions active.
+- **Docs: the operations guide gains a CI pre-flight section** for `plecto validate
+  --resolve` — validating manifest edits and filter digest updates in CI before they can
+  fail closed at reload time.
+
 ## [0.5.3] - 2026-07-21
 
 Patch release: the wasmtime line moves to **47.0.1**. No WIT or manifest schema changes;

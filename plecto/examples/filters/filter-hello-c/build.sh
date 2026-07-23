@@ -2,7 +2,7 @@
 # Build the C guest into a zero-WASI plecto:filter component.
 #
 # Requires: wasi-sdk >= 33 ($WASI_SDK_PATH, default /opt/wasi-sdk),
-#           wit-bindgen >= 0.59, wasm-tools >= 1.252 on PATH.
+#           wit-bindgen >= 0.60, wasm-tools >= 1.252 on PATH.
 #
 # The wasm32-wasip2 clang driver links with wasm-component-ld and emits a component
 # directly. Because the filter calls no WASI API (time comes from host-clock, logging

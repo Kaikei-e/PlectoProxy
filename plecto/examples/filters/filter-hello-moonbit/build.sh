@@ -4,7 +4,7 @@
 # Requires: moon (MoonBit toolchain), wasm-tools >= 1.252 on PATH.
 #
 # The wit-bindgen bindings (interface/ world/ gen/ + moon.mod.json) are COMMITTED, not
-# regenerated here: gen/world/filterBody/ carries the hand-written filter.mbt and a
+# regenerated here: gen/world/filter-body/ carries the hand-written filter.mbt and a
 # moon.pkg.json whose host-API imports wit-bindgen would reset. Regenerate only when
 # the WIT changes, then re-add those imports:
 #   wit-bindgen moonbit ../../../wit --world filter-body --out-dir .

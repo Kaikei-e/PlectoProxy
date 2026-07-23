@@ -13,6 +13,6 @@ license = "Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.59"
+wit-bindgen = "0.60"
 
 [workspace]

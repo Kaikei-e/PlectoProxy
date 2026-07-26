@@ -48,10 +48,10 @@ fn make_cert() -> TestCert {
     let cert_pem_path = dir.path().join("cert.pem");
     let key_pem_path = dir.path().join("key.pem");
     std::fs::write(&cert_pem_path, generated.cert.pem()).unwrap();
-    std::fs::write(&key_pem_path, generated.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_pem_path, generated.signing_key.serialize_pem()).unwrap();
     TestCert {
         cert_der: generated.cert.der().clone(),
-        key_der: PrivateKeyDer::try_from(generated.key_pair.serialize_der()).unwrap(),
+        key_der: PrivateKeyDer::try_from(generated.signing_key.serialize_der()).unwrap(),
         cert_pem_path: cert_pem_path.to_str().unwrap().to_string(),
         key_pem_path: key_pem_path.to_str().unwrap().to_string(),
         _dir: dir,

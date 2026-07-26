@@ -269,7 +269,7 @@ async fn proxy_v2_header_precedes_the_tls_handshake() {
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, generated.cert.pem()).unwrap();
-    std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
     let tls_section = format!(
         "\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
         cert_path.to_str().unwrap(),

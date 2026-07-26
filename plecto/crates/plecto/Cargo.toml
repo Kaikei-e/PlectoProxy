@@ -65,7 +65,7 @@ notify-debouncer-mini = "0.7"
 # toml_edit: format-preserving rewrite of a dev manifest's `[[filter]].digest` after every
 # rebuild — a plain parse+reserialize (via `toml`/serde) would blow away the operator's own
 # comments and layout in a file `plecto dev` shares write access to with a human.
-toml_edit = "0.22"
+toml_edit = "0.25"
 # wit-component: wrap a rebuilt wasm32-unknown-unknown core module into a Component at runtime —
 # the same `ComponentEncoder` recipe `crates/host/build.rs` already uses at BUILD time (ADR
 # 000010), needed here because `plecto dev` componentizes on every file-watch trigger, not once.
@@ -83,4 +83,4 @@ hyper-util = { workspace = true }
 tokio-rustls = { workspace = true }
 # rcgen: generate a fresh self-signed cert for the `[listen]` TLS E2E (ring backend, no
 # aws-lc-rs/cmake).
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

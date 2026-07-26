@@ -10,7 +10,7 @@ members = ["crates/host", "crates/control", "crates/server", "crates/plecto"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.0"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
@@ -37,24 +37,24 @@ unsafe_op_in_unsafe_fn = "deny"
 # packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
 # package at all without one). Bump `version` here in lockstep with `workspace.package.version`
 # above at release time.
-plecto-host = { path = "crates/host", version = "0.5.4" }
-plecto-control = { path = "crates/control", version = "0.5.4" }
-plecto-server = { path = "crates/server", version = "0.5.4" }
+plecto-host = { path = "crates/host", version = "0.6.0" }
+plecto-control = { path = "crates/control", version = "0.6.0" }
+plecto-server = { path = "crates/server", version = "0.6.0" }
 # wasmtime 47.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
 # WASI 0.3). 47 enables the GC and exception-handling proposals by default — the engine turns both
 # back off explicitly (deny-by-default, crates/host/src/engine.rs). The async / bindgen API is
 # still moving on this line, so we track the latest 47 patch (Cargo.lock pins the resolved build).
-wasmtime = "47.0.1"
+wasmtime = "47.0.2"
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "47.0.1"
-wasmtime-wasi-http = "47.0.1"
+wasmtime-wasi = "47.0.2"
+wasmtime-wasi-http = "47.0.2"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"
 # parking_lot: non-poisoning locks. A panicking filter thread must not cascade a
 # poisoned lock across every later request (ADR 000011). Sync today; redb's blocking
-# story moves behind a pool only when wasmtime 46 makes host calls async.
+# story moves behind a pool only when host calls become async.
 parking_lot = "0.12"
 # tracing: host-internal diagnostics (never println!, bp-rust). Distinct from the
 # host-log capability, which is the filter-facing log surface.
@@ -91,7 +91,7 @@ thiserror = "2"
 ipnet = "2"
 # serde + toml: the declarative manifest (ADR 000008 static config). TOML mirrors Cargo.
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 # serde_json: serialize the OCI image-manifest blob to bytes we digest + write (ADR 000007).
 serde_json = "1"
 # schemars: derive the manifest JSON Schema from the same serde model (ADR 000049) —
@@ -99,8 +99,10 @@ serde_json = "1"
 schemars = "1"
 # arc-swap: lock-free atomic swap of the active filter set on reload (ADR 000007).
 arc-swap = "1"
-# sha2 + hex: OCI content-digest pinning (sha256 over blob bytes), pure-Rust / offline.
-sha2 = "0.10"
+# sha2 + hex: OCI content-digest pinning (sha256 over blob bytes), pure-Rust / offline. The 0.11
+# line (digest 0.11) is what sigstore's own key material already resolves to, so our digest code
+# and the provenance path share one hash stack instead of straddling two.
+sha2 = "0.11"
 hex = "0.4"
 # oci-spec: spec-correct OCI image-layout types; we own the std::fs layout + sha256 verify
 # (offline local artifact, no registry/tokio/openssl — ADR 000007 boundary with wkg).

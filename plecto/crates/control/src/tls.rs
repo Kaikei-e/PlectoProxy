@@ -586,7 +586,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, generated.cert.pem()).unwrap();
-        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
         let entry = TlsCert {
             host: None,
             cert_path: cert_path.to_str().unwrap().to_string(),
@@ -686,7 +686,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, a.cert.pem()).unwrap(); // cert A
-        std::fs::write(&key_path, b.key_pair.serialize_pem()).unwrap(); // key B (mismatch)
+        std::fs::write(&key_path, b.signing_key.serialize_pem()).unwrap(); // key B (mismatch)
         let entry = TlsCert {
             host: None,
             cert_path: cert_path.to_str().unwrap().to_string(),
@@ -845,7 +845,7 @@ mod tests {
         let cert_path = dir.join("client-cert.pem");
         let key_path = dir.join("client-key.pem");
         std::fs::write(&cert_path, generated.cert.pem()).unwrap();
-        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1061,7 +1061,7 @@ mod tests {
                 .with_root_certificates(roots)
                 .with_client_auth_cert(
                     vec![CertificateDer::from(client_id.cert.der().to_vec())],
-                    PrivateKeyDer::try_from(client_id.key_pair.serialize_der()).unwrap(),
+                    PrivateKeyDer::try_from(client_id.signing_key.serialize_der()).unwrap(),
                 )
                 .unwrap(),
         );

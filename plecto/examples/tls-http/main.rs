@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     std::fs::create_dir_all(base.join("tls"))?;
     std::fs::write(base.join("tls/cert.pem"), cert.cert.pem())?;
-    std::fs::write(base.join("tls/key.pem"), cert.key_pair.serialize_pem())?;
+    std::fs::write(base.join("tls/key.pem"), cert.signing_key.serialize_pem())?;
 
     let upstream = spawn_upstream().await?;
     let manifest_path = base.join("plecto.toml");

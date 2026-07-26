@@ -125,7 +125,7 @@ async fn alt_svc_advertises_the_configured_port_override() {
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, generated.cert.pem()).unwrap();
-    std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
 
     let toml = manifest_toml(&format!(
         "[listen]\nadvertised_port = 443\n\n[[tls]]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",

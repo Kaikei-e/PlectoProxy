@@ -181,10 +181,10 @@ prost = "0.14"
 hex = { workspace = true }
 parking_lot = { workspace = true }
 # rcgen: generate a fresh self-signed cert for the TLS E2E (ring backend, no aws-lc-rs/cmake).
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 # tikv-jemallocator: the jemalloc build variant of the bench-server harness (feature `jemalloc`),
 # for the memory matrix's allocator sweep. Dev-only — never in a production build.
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 # flate2 / brotli / zstd: the DECODE oracles for the response-compression E2E — each test
 # decompresses the wire bytes with the reference decoder to prove the roundtrip.
 flate2 = "1"
@@ -193,5 +193,5 @@ zstd = "0.13"
 # sha1 + base64: the RFC 6455 `Sec-WebSocket-Accept` handshake for bench-server's `/ws` mock
 # upstream (ADR 000048's WS benchmark). Both are already transitive dependencies of this workspace
 # (rustls / cosign stack) — no new supply-chain surface, just promoted to direct dev-deps.
-sha1 = "0.10"
-base64 = "0.22"
+sha1 = "0.11"
+base64 = "0.23"

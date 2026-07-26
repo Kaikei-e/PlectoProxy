@@ -127,7 +127,7 @@ webpki-roots = { workspace = true, optional = true }
 # `instantiate_async` from the host's still-sync public API. The guest runs to completion on a
 # fiber without suspending (epoch is trap-mode, host-API imports never block), so a no-reactor
 # executor suffices. The server-side spawn_blocking removal (true async) is Stage 2.
-pollster = "0.4"
+pollster = "1"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 redb = { workspace = true }
@@ -160,7 +160,7 @@ plecto-host = { path = ".", features = ["test-support"] }
 tempfile = "3"
 # criterion: in-process WASM micro-benchmarks (cold load, per-request pooled vs fresh instance).
 # default-features = false drops plotters/rayon — we only need the harness + baseline comparison.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # gungraun (the renamed iai-callgrind): callgrind-based instruction counts for the SAME hot calls
 # criterion times above (benches/wasm_inst.rs). Instruction counts are invariant to CPU frequency
 # / thermal / neighbour load, so the "did the contract surface get more expensive?" judgement is
@@ -181,9 +181,9 @@ prost = "0.14"
 # which is still open on RUSTSEC-2023-0071 (Marvin Attack timing side-channel) with no patched
 # version — `deny.toml` blocks it on sight and clears advisories by replacing the crate, not by
 # an ignore-list entry.
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 serde = { workspace = true, features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23"
 
 [[bench]]
 name = "wasm"

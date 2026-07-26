@@ -75,7 +75,7 @@ tracing = { workspace = true }
 # signal-hook: pure-Rust, no-tokio SIGHUP receiver behind the `ReloadSource` seam. SIGHUP is
 # the operator's explicit "push a new static manifest" trigger (ADR 000008: static config, no
 # xDS dynamic push). The trait keeps the loop fake-testable; this is the thin unix adapter.
-signal-hook = "0.3"
+signal-hook = "0.4"
 # rustls (sync): build the TLS ServerConfig from the manifest's `[[tls]]` certs (SNI resolver,
 # ALPN) at load/reload, so a bad cert fails closed and reload is atomic (ADR 000014). PEM parsing
 # uses rustls-pki-types' `pem` module (re-exported by rustls). No tokio — control stays sync; the
@@ -98,7 +98,7 @@ plecto-host = { path = "../host", features = ["test-support"] }
 # unique temp dirs for OCI-layout fixtures and trusted-key PEM files
 tempfile = "3"
 # rcgen: a fresh self-signed cert to unit-test the TCP/QUIC ServerConfig builder (ADR 000014/000016).
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 # proptest: pins the shared-STEK key schedule and ticket seal/open (ADR 000062) — determinism of
 # the HKDF derivation, roundtrip over arbitrary plaintexts, and decrypt-never-panics over
 # arbitrary attacker bytes.
@@ -106,7 +106,7 @@ proptest = "1"
 # criterion: in-process micro-benchmarks for the fast-path hot functions (LB pick, route match,
 # path normalization). `default-features = false` drops plotters/rayon — we only need the bench
 # harness + baseline comparison (the CI regression gate uses --save-baseline / --baseline).
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # gungraun (the renamed iai-callgrind): callgrind-based instruction counts for the LB pick hot
 # path (benches/fastpath_inst.rs) — the deterministic twin of the criterion wall-clock benches.
 # Dev-only + feature-gated (`instruction-bench`); see the host crate's note.

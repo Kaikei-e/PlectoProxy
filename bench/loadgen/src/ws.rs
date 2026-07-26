@@ -5,7 +5,6 @@
 //! its own Cargo workspace), so the two are deliberately not shared.
 
 use base64::Engine as _;
-use rand::RngCore;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,7 +22,7 @@ fn accept_key(client_key: &str) -> String {
 
 fn random_ws_key() -> String {
     let mut nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
     base64::engine::general_purpose::STANDARD.encode(nonce)
 }
 
@@ -90,7 +89,7 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
         head.extend_from_slice(&(len as u64).to_be_bytes());
     }
     let mut mask = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut mask);
+    rand::fill(&mut mask);
     head.extend_from_slice(&mask);
     w.write_all(&head).await?;
     let masked: Vec<u8> = payload

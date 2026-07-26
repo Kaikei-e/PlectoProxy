@@ -1,4 +1,4 @@
-# SPIKE host (throwaway). wasmtime 46 (same pin as the production host) with component-model-async,
+# SPIKE host (throwaway). wasmtime 47 (same pin as the production host) with component-model-async,
 # driving the streaming guest. Its own [workspace] so the native plecto/ workspace is untouched.
 [package]
 name = "streaming-host"
@@ -11,8 +11,8 @@ name = "streaming-host"
 path = "src/main.rs"
 
 [dependencies]
-wasmtime = { version = "46.0.0", features = ["async", "component-model-async"] }
-wasmtime-wasi = "46.0.0"
+wasmtime = { version = "47.0.2", features = ["async", "component-model-async"] }
+wasmtime-wasi = "47.0.2"
 tokio = { version = "1", features = ["macros", "rt"] }
 
 [workspace]

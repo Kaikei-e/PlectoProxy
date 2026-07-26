@@ -9,6 +9,12 @@ All notable changes to Plecto are documented here. The format follows
 - **Binary / manifest**: while the version is `0.x`, a **minor** bump (`0.1 → 0.2`) may contain
   breaking changes to the manifest schema or CLI; they are always listed under **Changed** /
   **Removed** with a migration note. Patch bumps are always safe to take.
+- **Library crates**: `plecto-host` / `plecto-control` / `plecto-server` are published from the
+  same version as the binary. A change a downstream crate cannot compile against takes a
+  **minor** bump too — including a change to the *type* a public signature exposes, such as the
+  error type of a dependency re-surfaced through a public enum. `cargo semver-checks` runs on
+  every release, but it compares type paths, so a dependency's major bump behind an unchanged
+  path is a gap it cannot see; that judgement stays manual.
 - **WIT contract**: the filter contract is versioned independently as `plecto:filter@<version>`.
   A manifest declares which contract its filters target; the host keeps loading every contract
   version it ships support for, so a proxy upgrade never silently breaks deployed filters. The
@@ -20,6 +26,65 @@ All notable changes to Plecto are documented here. The format follows
   release notes of each release.
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-07-27
+
+Minor release: a dependency refresh across the workspace, the guest-adjacent tooling, and the
+benchmark harnesses. There is **no WIT contract change, no manifest schema change, and no CLI
+change**, and no behavioural change to the fast path or the capability boundary — for anyone
+running the binary or the container image this upgrade carries no migration.
+
+**Why this is a minor and not a patch.** The `toml` 0.8 → 1.1 bump changes the type behind a
+public signature: `plecto_control::ControlError::ManifestParse` wraps `toml::de::Error`, so a
+crate that builds that error from its own `toml` value has to move majors together with us.
+`cargo semver-checks` reports 196 checks passing against 0.5.4, but it compares type *paths* and
+`toml::de::Error` is spelled identically in both majors, so this break is outside what it can
+detect. The versioning policy above holds patch releases to "always safe to take", and this one
+would not have been; the minor absorbs it rather than quietly widening what a patch may contain.
+
+### Changed
+
+- **Runtime: wasmtime 47.0.1 → 47.0.2** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep).
+  A patch within the 47 line; the engine still turns the GC and exception-handling proposals
+  explicitly off (deny-by-default, ADR 000096).
+- **Manifest parsing: `toml` 0.8 → 1.1** (and `toml_edit` 0.22 → 0.25 for `plecto dev`'s
+  format-preserving digest rewrite). Manifests are whole TOML *documents*, which is the path
+  1.x keeps on `from_str`, so parsing and every fail-closed validation behave identically — a
+  manifest that loaded on 0.5.4 loads here with the same diagnostics. See **Migration** for the
+  one library-level consequence.
+- **Hashing: `sha2` 0.10 → 0.11** (`digest` 0.11) for OCI content-digest pinning, the SPKI
+  fingerprints, and the STEK key schedule. This is the line sigstore's own key material already
+  resolves to, so digest computation and the provenance path now share one hash stack.
+- **Reload / guest-call plumbing**: `signal-hook` 0.3 → 0.4 (the no-tokio SIGHUP receiver behind
+  the `ReloadSource` seam) and `pollster` 0.4 → 1.0 (the no-reactor executor that drives a guest
+  call to completion). Both are drop-in at the surface Plecto uses.
+- **Dev, test, and bench dependencies**: `criterion` 0.5 → 0.8, `rcgen` 0.13 → 0.14,
+  `jsonwebtoken` 10 → 11, `base64` 0.22 → 0.23, `sha1` 0.10 → 0.11, `tikv-jemallocator`
+  0.6 → 0.7. rcgen 0.14 renames `CertifiedKey::key_pair` to `signing_key`, which the
+  self-signed-certificate helpers in the TLS/H2/H3 tests and the `tls-http` example follow.
+- **Benchmark harnesses**: the bench filters move to `wit-bindgen` 0.60, matching the example
+  filters and the compat fixture; the load generator moves to `rand` 0.10 (`thread_rng` is gone,
+  so the WebSocket nonce and frame masks use the top-level `rand::fill`); the streaming spike
+  host tracks the production wasmtime pin at 47.
+- **Lockfile refresh** for the rest of the tree: `tokio` 1.53.1, `hyper` 1.11.0, `cranelift`
+  0.134.2, `serde` 1.0.229, `serde_json` 1.0.151, `thiserror` 2.0.19, `anyhow` 1.0.104.
+
+### Migration
+
+- **Operators**: nothing to do. The manifest schema, the CLI, the WIT contract, and the container
+  image interface are unchanged; upgrade the binary or the image tag and reload as usual.
+- **Crates depending on `plecto-control`**: only code that *produces* a
+  `ControlError::ManifestParse` needs a change — move your own `toml` dependency to 1.x so the
+  `#[from]` conversion still applies (a `?` on a `toml` 0.8 `Result` inside a function returning
+  `ControlError` is the case that stops compiling). Matching the variant, or reading the error
+  through `Display` / `source()`, is unaffected.
+
+### Deferred
+
+- `rsa` 0.10, `libc` 1.0 and `rustls` 0.24 are still pre-release and are not taken.
+- The `filters/jwt` guest stays on `p256` 0.13 / `signature` 2. Moving to `p256` 0.14 requires
+  `signature` 3, which its RSA verification path cannot reach until `rsa` 0.10 is released —
+  taking one without the other would put two `signature` majors inside a single filter.
 
 ## [0.5.4] - 2026-07-23
 

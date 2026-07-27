@@ -17,9 +17,14 @@ The speed-critical path stays native Rust. Filter logic runs as a sandboxed WASM
 cargo install plecto
 ```
 
-This installs the `plecto` binary — the operator CLI (`plecto new-filter`, `plecto dev`,
-`plecto validate`, `plecto conformance`, `plecto schema`) plus the gateway itself
-(`plecto <manifest.toml> <listen-addr>`).
+This installs the `plecto` binary — the gateway itself (`plecto <manifest.toml> <listen-addr>`)
+plus the operator CLI: `new-filter` and `dev` to author a filter, `conformance` → `package` →
+`validate --resolve` to gate, sign, and pre-flight it, and `healthz` / `schema` / `--version` for
+operations.
+
+A `cargo install` build carries no release provenance. For a deployment, prefer the signed
+container image or release binary — see
+[docs/install.md](https://github.com/Kaikei-e/PlectoProxy/blob/main/docs/install.md).
 
 ## This workspace
 

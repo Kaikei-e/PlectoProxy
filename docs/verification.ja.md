@@ -21,7 +21,9 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 | reference filter の encode + import floor | `shelf`（ci.yml） | 全 PR + main |
 | guest crate の lint | `guest-lint`（ci.yml） | 全 PR + main |
 | 供給網ポリシー（ライセンス・advisory・取得元） | `cargo-deny`（ci.yml） | 全 PR + main |
-| ADR グラフ（append-only エッジ・wikilink・frontmatter） | `docs`（ci.yml → `scripts/check_adr_graph.py`） | 全 PR + main |
+| crates.io 公開ライブラリ 3 クレートの公開 API semver（最新公開版との差分） | `semver-checks`（ci.yml） | 全 PR + main |
+| workflow のセキュリティ lint（`zizmor`、`.github/workflows/` 全体） | `workflow-lint`（ci.yml） | 全 PR + main |
+| ADR グラフ（append-only エッジ・wikilink・frontmatter）**と** WIT / guest テンプレートの vendoring ドリフト | `fmt` / `docs`（ci.yml → `scripts/check_adr_graph.py`・`scripts/check_wit_vendoring.py`） | 全 PR + main |
 | 両 capability profile の release ビルド | `release-parity`（ci.yml） | main のみ（merge-heavy） |
 | **Fuzzing** — `plecto/fuzz/` の全 libfuzzer ターゲットを、コミット済み corpus 起点で時間制限つき実行 | `fuzz`（[fuzz.yml](../.github/workflows/fuzz.yml)） | 週次 + 手動 |
 | release gate: その commit で `main` CI が green のときのみ tag がリリースされる | `gate`（[release.yml](../.github/workflows/release.yml)） | 全 tag |
@@ -37,5 +39,5 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 - **ベンチマーク**（[bench.yml](../.github/workflows/bench.yml)）は計測であって gate
   ではない。公開数値は [performance/](../performance/README.md) にある。
 - 各検証が何を*意味し*、何を意図して主張しないかは、各所からリンクされた ADR に記録
-  されている。契約互換の約束と longevity discipline は README の
-  [設計判断（ADR）](../README.ja.md#設計判断adr) を参照。
+  されている。契約互換の約束は [ADR 000085](ADR/000085.md)、longevity discipline は
+  [ADR 000086](ADR/000086.md)。

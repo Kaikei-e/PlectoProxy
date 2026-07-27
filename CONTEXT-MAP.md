@@ -28,15 +28,16 @@ _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）,
 - [Control](./plecto/crates/control/CONTEXT.md) — 宣言的マニフェスト・無停止 reload・単一ノード／分散 opt-in・
   config version（`plecto-control`）。
 - [Fast path](./plecto/crates/server/CONTEXT.md) — 接続／HTTP／routing／upstream 転送（`plecto-server`、ADR 000013）。
-  M2 slice 1–5 着地（host＋path-prefix routing・host-native prefix strip・rustls TLS 終端 SNI 込み
-  ADR 000014／TLS+ALPN 上の HTTP/2 終端 ADR 000015、h2c は不採用／quinn+h3 の独立 UDP listener で HTTP/3 終端・
-  Alt-Svc 広告 ADR 000016、0-RTT 無効／複数 upstream instance を round-robin LB ＋ active/passive health check で
-  分散・全 unhealthy は 503 fail-closed ADR 000017、LB algorithm を weighted least-request P2C ＋ weighted maglev
-  consistent hashing へ拡張 ADR 000035）。upstream への h2/h3・EWMA/latency-based LB・ring hash・ノード横断 health
+  host＋path-prefix routing・host-native prefix strip・rustls TLS 終端 SNI 込み ADR 000014／TLS+ALPN 上の
+  HTTP/2 終端 ADR 000015、h2c は不採用／quinn+h3 の独立 UDP listener で HTTP/3 終端・Alt-Svc 広告 ADR 000016、
+  0-RTT 無効／複数 upstream instance を LB ＋ active/passive health check で分散・全 unhealthy は 503 fail-closed
+  ADR 000017、LB algorithm は weighted least-request P2C ＋ weighted maglev consistent hashing ADR 000035。
+  upstream 脚の TLS+ALPN 再暗号化（h2 優先）ADR 000042・両方向 mTLS ADR 000078・PROXY protocol v2 受信
+  ADR 000057・送信元 IP 単位の接続上限 ADR 000092 も着地。EWMA/latency-based LB・ring hash・ノード横断 health
   は後続スライス。
 - [plecto binary / operator CLI](./plecto/crates/plecto/CONTEXT.md) — `plecto` バイナリと Filter Dev Kit
-  CLI（validate/conformance/new-filter/dev/schema、ADR 000065）。Fast path・Control の上の薄い入口
-  （`plecto-server` を純ライブラリへ分離した際に新設、ADR 000091）。
+  CLI（validate[--resolve]/package/conformance/new-filter/dev/healthz/schema、ADR 000065 / 000094）。
+  Fast path・Control の上の薄い入口（`plecto-server` を純ライブラリへ分離した際に新設、ADR 000091）。
 
 ## Relationships
 

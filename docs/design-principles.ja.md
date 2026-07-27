@@ -160,7 +160,7 @@ ADR 000029 の役割駆動基準と Fork 6 から、配置は次の順で問う:
 
 ### 3.2 能力（capability）を増やすときの規律
 
-新しい host-API は「1 interface = 1 capability」で切り、deny-by-default を維持する。危険な能力は **off-by-default の feature gate に隔離してから**入れる——現行の実例は `outbound-http`（wasi:http 収斂ゲートまで既定ビルド外）、`streaming-body`（wasip3 Tier-2 まで）、`polyglot-conformance`（既定 `cargo test` に影響しない）、`fat-guest`（Tier B guest 向け最小 WASI 貸与、ADR 000063——既定 off、on でもフィルタの manifest が `wasi = "minimal"` を宣言しない限り不活性）。フィルタが自分に課された制約を自己申告で緩められる形（バケット容量の guest 指定等）は設計段階で禁じる。
+新しい host-API は「1 interface = 1 capability」で切り、deny-by-default を維持する。危険な能力は **off-by-default の feature gate に隔離してから**入れる——現行の実例は `outbound-http`（wasi:http 収斂ゲートまで既定ビルド外）、`outbound-tcp`（同じ SSRF 床の下に置く raw-TCP consult 能力、ADR 000060）、`streaming-body`（wasip3 Tier-2 まで）、`polyglot-conformance`（既定 `cargo test` に影響しない）、`fat-guest`（Tier B guest 向け最小 WASI 貸与、ADR 000063——既定 off、on でもフィルタの manifest が `wasi = "minimal"` を宣言しない限り不活性）。outbound 2 つ ＋ `fat-guest` が、そのまま **capabilities** release profile がコンパイル時に含むもの（ADR 000079）——含めることは、特定のフィルタに manifest が宣言するまで貸すことではない。フィルタが自分に課された制約を自己申告で緩められる形（バケット容量の guest 指定等）は設計段階で禁じる。
 
 ### 3.3 依存を増やすときの規律
 

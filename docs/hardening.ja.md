@@ -89,8 +89,15 @@ host/port・window・limit・cost 取得元、そして**必須**の `on_backend
 **Demo-only であり、単独では production の主張にならない。** 現行の `filter-ratelimit-redis` は
 `AUTH`・ACL・TLS のいずれも実装しておらず、trusted network 限定である。[ADR 000081](ADR/000081.md)
 が定める昇格条件——ACL user + `AUTH`（または同等の認証）、TLS（または同等の検証可能な暗号化）、
-secret-file capability 経由の資格情報配布——を満たすまでは、technical preview・学習用途の補助として
+manifest 直書きではない経路での資格情報配布——を満たすまでは、technical preview・学習用途の補助として
 扱い、フリート全体の production クォータの根拠にはしないこと。
+
+このうち三つ目には機構が入った: **`[filter.config_files]`**（[ADR 000095](ADR/000095.md)）は
+`host-config` のキーをファイルへ向け、ロード時と各リロード時に読む。よって資格情報は mount された
+シークレットとして届き、ローテーションは manifest の編集ではなく `SIGHUP` で拾われる。解決は trust 鍵や
+TLS 証明書と同じ fail-closed 検査群の一部で、欠落・二重宣言・非 UTF-8・サイズ超過は最初のリクエストでは
+なく `plecto validate` で落ちる。配布の半分はこれで閉じたが、トランスポートの半分（backend 接続での
+`AUTH` / ACL / TLS）は未了なので、上の demo-only の位置づけは変わらない。
 
 local floor と併用するのが本ガイドが上で推奨する二層モデルである: local バケットが Redis への
 round trip を払う前にバーストを吸収し、filter が通過分の実際のフリート全体の数を守る。実 N-replica

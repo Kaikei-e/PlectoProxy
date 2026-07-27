@@ -93,8 +93,15 @@ rather than a per-request 503 (see the filter's own doc comments and `docs/writi
 `AUTH`, ACL, or TLS — trusted-network-only. Treat it as a technical-preview / learning aid, not
 evidence for a fleet-wide production quota, until it is upgraded per the promotion checklist in
 [ADR 000081](ADR/000081.md): ACL user + `AUTH` (or equivalent), TLS (or equivalent verifiable
-encryption), and credentials delivered through a secret-file capability rather than inline
-manifest config.
+encryption), and credentials delivered out of band rather than inlined in the manifest.
+
+The third of those now has its mechanism: **`[filter.config_files]`** ([ADR 000095](ADR/000095.md))
+points a `host-config` key at a file, read at load and at every reload, so a credential arrives as
+a mounted secret and a rotation is picked up by `SIGHUP` rather than by editing the manifest. It is
+resolved by the same fail-closed check set as trust keys and TLS certificates — a missing,
+doubly-declared, non-UTF-8, or oversized file fails `plecto validate`, not the first request. That
+closes the delivery half of the checklist; the transport half (`AUTH` / ACL / TLS on the backend
+connection) is still open, so the demo-only stance above stands.
 
 Deploying it alongside the local floor is the two-layer model this guide recommends above: the
 local bucket sheds bursts before they cost a Redis round trip, and the filter enforces the actual

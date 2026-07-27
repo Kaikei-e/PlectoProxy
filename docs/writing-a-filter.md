@@ -5,17 +5,61 @@ fast path handles connections, TLS, HTTP, routing, and load balancing; it hands 
 filter, which **inspects it and returns one typed decision**. This guide takes you from an empty
 directory to a running filter.
 
-New to the model? Read the [README](../README.md) first — the architecture, the three decisions, and
-the trusted/untrusted execution split. This guide is the practical how-to.
+New to the model? Read the [README](../README.md) first — the architecture and the three decisions.
+This guide is the practical how-to.
 
 ## 1. The contract in one minute
 
-A filter implements one of two `plecto:filter` worlds (see
+A filter implements one of two `plecto:filter` worlds (the authoritative text is
 [`plecto/wit/world.wit`](../plecto/wit/world.wit)): the header-only `filter` world, or `filter-body`
 if it also needs the request body. `filter-body` is `filter` plus one export — the **absence** of
 that export in the base world is itself the signal the host uses to skip buffering the body and
 stream it straight through, at no cost to a header-only filter (ADR 000038). Target `filter-body`
 only when your filter actually reads the body.
+
+```wit
+package plecto:filter@0.3.0;
+
+interface types {
+  // Header values are raw bytes (ADR 000071) — not lossy UTF-8 strings.
+  record header { name: string, value: list<u8>, }
+
+  // The typed outcome of a request-side filter. Never a bare flag.
+  variant request-decision {
+    %continue,                       // pass unchanged to the next filter
+    modified(request-edit),          // apply the edit, then continue
+    short-circuit(http-response),    // stop the chain; synthesise a response now
+  }
+
+  // The response side (ADR 000073): `replace` supplants the upstream response with a
+  // synthesised one (the upstream body is dropped unread — zero-copy stays intact).
+  variant response-decision { %continue, modified(response-edit), replace(http-response) }
+}
+
+// deny-by-default: one capability per interface; a filter imports only what it is lent.
+interface host-kv      { get: func(key: string) -> option<list<u8>>; set: func(key: string, value: list<u8>); /* … */ }
+interface host-counter { increment: func(key: string, delta: s64) -> s64; /* atomic named counter */ }
+interface host-log     { log: func(level: level, message: string); }
+interface host-config  { get: func(key: string) -> option<string>; }  // manifest [filter.config]
+// host-ratelimit keeps the token bucket host-native — the hot-path refill/counting never crosses
+// the WASM boundary. The bucket spec (capacity/refill) is host-configured in the manifest; the
+// filter passes only (key, cost), so an untrusted filter cannot widen its own limit
+// (ADR 000005 / 000026).
+
+world filter {
+  import host-log;  import host-clock;  import host-kv;  import host-counter;
+  import host-ratelimit;  import host-config;
+  export init: func();                                                // heavy, once per instance
+  export on-request:  func(req: http-request)  -> request-decision;   // hot path (headers)
+  export on-response: func(req: http-request, resp: http-response) -> response-decision;
+}
+
+world filter-body {
+  // …the same imports and exports as `filter`, plus the hook whose PRESENCE makes the host
+  // buffer the request body at all (buffer-then-decide, ADR 000025):
+  export on-request-body: func(body: list<u8>) -> request-body-decision;
+}
+```
 
 | Export | World | When it runs | Returns |
 | --- | --- | --- | --- |
@@ -429,7 +473,7 @@ One more language, for completeness:
   passes the zero-WASI gate but is heavy for a per-request filter; no bundled example.
 
 First-class polyglot SDKs and reference filters (auth, rate limit, WAF) remain on the
-[roadmap](../README.md#roadmap) (M6).
+[roadmap](ROADMAP.md) (M6).
 
 ## 8. Contract distribution and compatibility policy
 

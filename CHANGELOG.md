@@ -27,6 +27,56 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-29
+
+Patch release: a dependency refresh with **no source change** to the fast path, the host, or the
+control plane, and no WIT contract, manifest schema, or CLI change. `cargo semver-checks` is
+clean against 0.6.0 (196 checks on each of `plecto-host` / `plecto-control` / `plecto-server`,
+default features). Unlike 0.6.0, every bump here stays inside the major its `Cargo.toml` already
+declares, so no public signature changes the type it exposes and the patch stays "always safe to
+take" under the versioning policy above.
+
+The reference-filter shelf republishes: the guest lockfile refresh changes the built component
+bytes, and filter tags are immutable (ADR 000080), so each entry takes a new version with this
+release rather than tripping the publish guard the way 0.4.1 and 0.5.1 did.
+
+### Changed
+
+- **Workspace lockfile refresh**: `schemars` 1.2.2 (`serde_derive_internals` 0.30 — the manifest
+  JSON Schema derive), `toml` 1.1.4 / `toml_parser` 1.1.3, `tokio-macros` 2.7.2, `displaydoc`
+  0.2.7, `clang-sys` 1.9.1. No dependency *requirement* moves; these are the resolved versions.
+- **Guest lockfile refresh** across the Rust example filters, the filter template, the compat
+  fixture, and the streaming spike guest: `serde` / `serde_derive` 1.0.229 (which moves the
+  derive onto `syn` 3), `serde_json` 1.0.151, `anyhow` 1.0.104, `proc-macro2` 1.0.107, `quote`
+  1.0.47.
+- **`filter-jwt` guest: `base64` 0.22 → 0.23**, the version `plecto-host` and `plecto-server`
+  already declare — the guest was the last place in the tree still a major behind.
+- **Reference-filter shelf republished**: `filters/jwt` 0.1.4 → 0.1.5; `filters/cors`,
+  `filters/apikey`, `filters/extauthz` 0.1.3 → 0.1.4. All four stripped-component hashes change
+  under the refreshed guest lockfiles (verified against a baseline build of the pre-refresh
+  ones). No filter source changes beyond the jwt `base64` bump; the compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
+- **CI / release toolchain: `wasm-tools` CLI 1.252.0 → 1.254.0.** The shelf encode path
+  (`wasm-tools component new`) is meant to be the CLI face of the `wit-component` encoder
+  `crates/host/build.rs` uses, and that reached 0.254 with wasmtime 47 while the CLI pin stayed a
+  release behind. Shelf output is byte-identical across the two CLI versions, so this restores
+  the intended parity without moving any published component.
+- **Benchmark harnesses**: the load generator picks up `hyper` 1.11.0, `tokio` 1.53.1,
+  `hdrhistogram` 7.6.0 and `cc` 1.4.0; the streaming spike host follows the wasm-tools family
+  253 → 254, in step with the production wasmtime pin.
+
+### Deferred
+
+- **`wkg` stays at 0.15.1** (0.16.0 is released). `wkg publish` and `wkg oci push` are the
+  release workflow's only path to ghcr.io, so the bump does not ride along inside a release-prep
+  change — it wants its own change, with a dry run behind it.
+- **`generic-array` stays at 0.14.7**: `crypto-common` 0.1.7 requires it *exactly*, and that
+  arrives through `sigstore` → `crypto_secretbox`. 0.14.9 is unreachable until that chain moves.
+- The `filter-jwt` guest stays on `p256` 0.13 / `signature` 2 / `sha2` 0.10, unchanged from
+  0.6.0: `rsa` 0.10 is still pre-release, and taking `p256` 0.14 without it would put two
+  `signature` majors inside one filter.
+- `rsa` 0.10, `libc` 1.0 and `rustls` 0.24 are still pre-release and are not taken.
+
 ## [0.6.0] - 2026-07-27
 
 Minor release: a dependency refresh across the workspace, the guest-adjacent tooling, and the

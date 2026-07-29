@@ -44,8 +44,9 @@ build_one() {
 
   if [ "${kind}" = "core" ]; then
     (cd "${guest}" && cargo build --target wasm32-unknown-unknown --release --locked)
-    # CLI face of the wit-component encoder crates/host/build.rs uses (wasm-tools 1.252 ↔
-    # wit-component 0.252). No WASI adapter: the guest imports only granted plecto caps.
+    # CLI face of the wit-component encoder crates/host/build.rs uses (wasm-tools 1.254 ↔
+    # wit-component 0.254, the version plecto/Cargo.lock resolves through wasmtime 47).
+    # No WASI adapter: the guest imports only granted plecto caps.
     wasm-tools component new \
       "${guest}/target/wasm32-unknown-unknown/release/${stem}.wasm" \
       -o "${component}"

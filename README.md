@@ -101,7 +101,7 @@ prerequisite:
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.6.0   # pick the latest release: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.6.1   # pick the latest release: https://github.com/Kaikei-e/PlectoProxy/releases
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
 docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \

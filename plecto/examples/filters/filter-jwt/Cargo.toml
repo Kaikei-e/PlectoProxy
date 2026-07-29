@@ -8,7 +8,7 @@
 # the outbound-http host's wasmtime-wasi grant. Declares its own [workspace].
 [package]
 name = "filter-jwt"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -20,7 +20,7 @@ wit-bindgen = "0.60"
 wasi = "0.14"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
 rsa = { version = "0.9", default-features = false, features = ["sha2"] }

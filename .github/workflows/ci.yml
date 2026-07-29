@@ -243,14 +243,14 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
-          echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
+          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.254.0/wasm-tools-1.254.0-x86_64-linux.tar.gz
+          echo "d0efb16c9c859137b7ab3e99151c299cd47caee106ed4594561002f7a04945bd  wasm-tools.tar.gz" | sha256sum -c -
           curl -sSL -o wit-bindgen.tar.gz https://github.com/bytecodealliance/wit-bindgen/releases/download/v0.60.0/wit-bindgen-0.60.0-x86_64-linux.tar.gz
           echo "6dc887e6d66a183d196885ff611e7f0a7db64db189f95c18f2a65fcf65d3651b  wit-bindgen.tar.gz" | sha256sum -c -
           curl -sSL -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz
           echo "0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce  wasi-sdk.tar.gz" | sha256sum -c -
           tar xzf wasm-tools.tar.gz && tar xzf wit-bindgen.tar.gz && tar xzf wasi-sdk.tar.gz
-          echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wasm-tools-1.254.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "${{ runner.temp }}/wit-bindgen-0.60.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "WASI_SDK_PATH=${{ runner.temp }}/wasi-sdk-33.0-x86_64-linux" >> "$GITHUB_ENV"
       - name: Install MoonBit
@@ -387,10 +387,10 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz
-          echo "097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  wasm-tools.tar.gz" | sha256sum -c -
+          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.254.0/wasm-tools-1.254.0-x86_64-linux.tar.gz
+          echo "d0efb16c9c859137b7ab3e99151c299cd47caee106ed4594561002f7a04945bd  wasm-tools.tar.gz" | sha256sum -c -
           tar xzf wasm-tools.tar.gz
-          echo "${{ runner.temp }}/wasm-tools-1.252.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wasm-tools-1.254.0-x86_64-linux" >> "$GITHUB_PATH"
       - name: Reference filter release-parity build (ADR 000080)
         working-directory: .
         run: ./scripts/build-reference-filters.sh "${{ runner.temp }}/shelf"

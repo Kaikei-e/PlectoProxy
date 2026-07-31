@@ -267,8 +267,8 @@ jobs:
           set -euo pipefail
           curl -sSL -o tinygo.tar.gz https://github.com/tinygo-org/tinygo/releases/download/v0.41.1/tinygo0.41.1.linux-amd64.tar.gz
           echo "e156d1d93a376eef639a4143d13be07e8c463fb6cf2d7d447698ed4474d23e91  tinygo.tar.gz" | sha256sum -c -
-          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
-          echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
+          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.16.0/wkg-x86_64-unknown-linux-gnu
+          echo "8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a  wkg" | sha256sum -c -
           chmod +x wkg
           mkdir -p wkg-bin && mv wkg wkg-bin/
           tar xzf tinygo.tar.gz

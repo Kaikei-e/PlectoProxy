@@ -413,8 +413,8 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
-          echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
+          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.16.0/wkg-x86_64-unknown-linux-gnu
+          echo "8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a  wkg" | sha256sum -c -
           chmod +x wkg
           mkdir -p wkg-bin && mv wkg wkg-bin/
           echo "${{ runner.temp }}/wkg-bin" >> "$GITHUB_PATH"
@@ -521,8 +521,8 @@ jobs:
           curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.254.0/wasm-tools-1.254.0-x86_64-linux.tar.gz
           echo "d0efb16c9c859137b7ab3e99151c299cd47caee106ed4594561002f7a04945bd  wasm-tools.tar.gz" | sha256sum -c -
           tar xzf wasm-tools.tar.gz
-          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-x86_64-unknown-linux-gnu
-          echo "994cfcfac2d31e3514f4d30f5f7fabf8f7916458753cf81bec37464d41ec2a38  wkg" | sha256sum -c -
+          curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.16.0/wkg-x86_64-unknown-linux-gnu
+          echo "8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a  wkg" | sha256sum -c -
           chmod +x wkg
           mkdir -p wkg-bin && mv wkg wkg-bin/
           echo "${{ runner.temp }}/wasm-tools-1.254.0-x86_64-linux" >> "$GITHUB_PATH"

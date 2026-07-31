@@ -10,7 +10,7 @@ members = ["crates/host", "crates/control", "crates/server", "crates/plecto"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
@@ -37,18 +37,18 @@ unsafe_op_in_unsafe_fn = "deny"
 # packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
 # package at all without one). Bump `version` here in lockstep with `workspace.package.version`
 # above at release time.
-plecto-host = { path = "crates/host", version = "0.6.1" }
-plecto-control = { path = "crates/control", version = "0.6.1" }
-plecto-server = { path = "crates/server", version = "0.6.1" }
+plecto-host = { path = "crates/host", version = "0.6.2" }
+plecto-control = { path = "crates/control", version = "0.6.2" }
+plecto-server = { path = "crates/server", version = "0.6.2" }
 # wasmtime 47.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
 # WASI 0.3). 47 enables the GC and exception-handling proposals by default — the engine turns both
 # back off explicitly (deny-by-default, crates/host/src/engine.rs). The async / bindgen API is
 # still moving on this line, so we track the latest 47 patch (Cargo.lock pins the resolved build).
-wasmtime = "47.0.2"
+wasmtime = "47.0.3"
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "47.0.2"
-wasmtime-wasi-http = "47.0.2"
+wasmtime-wasi = "47.0.3"
+wasmtime-wasi-http = "47.0.3"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"

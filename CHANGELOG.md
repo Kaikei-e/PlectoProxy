@@ -27,6 +27,40 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-01
+
+Security patch release: wasmtime 47.0.2 → 47.0.3, taken the day upstream shipped it. There is
+**no source change** to the fast path, the host, or the control plane, and no WIT contract,
+manifest schema, or CLI change. The bump stays inside the major the workspace already declares,
+`cargo semver-checks` is clean against 0.6.1 (196 checks on each of `plecto-host` /
+`plecto-control` / `plecto-server`, default features), and — unlike 0.6.1 — no guest lockfile
+moves, so
+the built filter components are byte-identical and the reference-filter shelf does not
+republish. The patch is "always safe to take" under the versioning policy above, and given what
+it fixes, it should be.
+
+### Security
+
+- **Runtime: wasmtime 47.0.2 → 47.0.3** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep,
+  per the workspace's single-declaration rule). 47.0.3 fixes two advisories:
+  - [GHSA-2hw9-mc66-jc2q](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-2hw9-mc66-jc2q)
+    — *preemption and traps during bulk operations enable breaking internal VM state*. This is
+    the one Plecto is directly exposed to: every engine runs with epoch interruption on (the
+    ADR 000006 metering path — 1 ms tick, per-request deadlines), untrusted isolation is the
+    manifest default, and the bulk-memory proposal is default-on in wasmtime, so any ordinary
+    compiled guest emits `memory.copy` / `memory.fill` that a deadline can preempt mid-operation.
+    On the trusted pooling engine the same window exists across reused slots. An
+    attacker-supplied filter needs nothing beyond a large copy loop to sit in it.
+  - [GHSA-hgjw-h833-99q9](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-hgjw-h833-99q9)
+    — *stores can mix up type indices between engines*. Latent here rather than reachable: the
+    host does hold two engines in one process (trusted pooling / untrusted on-demand), but every
+    `Component` / `InstancePre` / `Store` pairing is built from the one engine chosen at load
+    time, there is no component cache, and hot reload recompiles from bytes — no code path hands
+    an object from one engine to the other's store. The fix turns that convention into an
+    upstream-enforced check.
+- **Streaming spike host follows in step** (its own workspace): wasmtime / wasmtime-wasi
+  47.0.3 in `spike/streaming-async/host`.
+
 ## [0.6.1] - 2026-07-29
 
 Patch release: a dependency refresh with **no source change** to the fast path, the host, or the

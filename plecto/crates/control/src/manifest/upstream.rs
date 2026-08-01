@@ -91,8 +91,9 @@ pub struct Upstream {
 pub struct UpstreamTls {
     /// Manifest-relative path to a PEM bundle of CA certificates that REPLACES the webpki
     /// (Mozilla) roots for this upstream — the internal-CA / self-signed deployment shape.
-    /// `None` = verify against the webpki roots. Only the path rides the content hash, like
-    /// `[[tls]]` cert paths (ADR 000014).
+    /// `None` = verify against the webpki roots. Both the path and the bundle's BYTES ride the
+    /// public config version, like `[[tls]]` certs — an in-place CA rotation reloads under a bare
+    /// SIGHUP (`manifest::content_hash`).
     #[serde(default)]
     pub ca_path: Option<String>,
     /// Verification-name override (ADR 000050): when set, every TLS leg to this upstream uses
@@ -108,12 +109,15 @@ pub struct UpstreamTls {
     /// (upstream mTLS, ADR 000078) — for backends that require client authentication. Must be
     /// set together with `client_key_path`; one without the other fails the build closed.
     /// Every TLS leg to this upstream presents it — forwarded requests AND health probes,
-    /// which share one connector (ADR 000042 decision 5). `None` = no client certificate.
+    /// which share one connector (ADR 000042 decision 5). `None` = no client certificate. Its
+    /// bytes ride the public config version, like `ca_path`.
     #[serde(default)]
     pub client_cert_path: Option<String>,
     /// Manifest-relative path to the PEM private key for `client_cert_path`. The file must be
     /// owner-only on unix (group/other-readable fails the build closed, the STEK file
-    /// discipline of ADR 000062 (d) applied to this slice's new key material).
+    /// discipline of ADR 000062 (d) applied to this slice's new key material). Being key
+    /// material, its bytes ride the never-logged reload fingerprint rather than the public config
+    /// version — an in-place rotation still reloads (`manifest::content_hash`).
     #[serde(default)]
     pub client_key_path: Option<String>,
 }

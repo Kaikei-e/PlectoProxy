@@ -10,8 +10,10 @@ use crate::error::ControlError;
 /// any other behind the same LB — WITHOUT weakening the cross-listener story: keys are derived
 /// per cert set (HKDF binding, `tls.rs`), so deployments serving different certs cannot accept
 /// each other's tickets even when they share the file. Rotation is an external operator step
-/// (write a fresh 64-byte random file in place); `max_age_hours` bounds how long stale key
-/// material keeps resuming before the proxy fail-closes to full handshakes.
+/// (write a fresh 64-byte random file in place); being key material, the file's bytes ride the
+/// reload gate's never-logged fingerprint (`manifest::content_hash`), so a bare SIGHUP re-derives
+/// from the new material. `max_age_hours` bounds how long stale key material keeps resuming
+/// before the proxy fail-closes to full handshakes.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resumption {

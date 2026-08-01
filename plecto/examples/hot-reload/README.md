@@ -36,7 +36,10 @@ refused, the proxy keeps serving the last good config, and never goes down.
 `Control::from_manifest_path` remembers the path; a background `serve_reloads` loop
 re-reads it on every SIGHUP and swaps the compiled config in with an atomic pointer
 swap. Reloads are reconciled by the manifest's **semantic content hash** — a whitespace
-or comment edit is a no-op, not a config change. The real `plecto` binary wires exactly
+or comment edit is a no-op, not a config change. The files the manifest *points at* are
+digested too, so rewriting a TLS certificate, an upstream CA, the shared STEK, or a
+`[filter.config_files]` secret in place and sending SIGHUP reloads without any manifest
+edit (a certbot deploy hook needs nothing else). The real `plecto` binary wires exactly
 this loop (plus SIGTERM graceful drain — see [`production`](../production)).
 
 ## Next

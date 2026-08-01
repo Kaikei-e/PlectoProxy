@@ -30,8 +30,19 @@ _Avoid_: version tag（タグは非固定で再現性が壊れる）
 
 **Config version**:
 マニフェストの意味的な content-hash——表記（コメント・空白・キー順・明示デフォルト）に依らず、設定の*意味*の
-同一性を表す単一の値。reload の冪等判定単位であり、監査単位であり、将来の分散合意（config consensus）が合意する単位。
+同一性を表す単一の値。マニフェスト本体に加え、**公開素材**として参照ファイルの中身も混ぜる（`[listen.client_auth]`
+の `ca_path`、`[[tls]]` の `cert_path`、`[upstream.tls]` の `ca_path` / `client_cert_path`）——ビルドが読むものは
+その場でのローテーションで reload ゲートを動かさねばならない、という規則の公開側。ログに出る値であり、監査単位であり、
+将来の分散合意（config consensus）が合意する単位。
 _Avoid_: config hash（生テキストのハッシュと混同）, revision（連番の含意）
+
+**Reload fingerprint（reload 指紋）**:
+config version と対になる、**決してログに出さない**もう半分。ビルドが読む**秘密素材**——`[[tls]]` の `key_path`、
+`[upstream.tls]` の `client_key_path`、`[resumption]` の `stek_file`、`[filter.config_files]` の解決値——の digest を、
+config version を前置入力として取る。秘密を config version 側に混ぜないのは、ログに出た digest が manifest 保持者に
+とって低エントロピー秘密のオフライン総当たりオラクルになるため。reload の冪等判定はこの対（config version ×
+reload fingerprint）で行い、どちらかが動けば再ビルドする。
+_Avoid_: secret hash（ログ・API に出してよい値だと誤解させる）, config version の一部（監査値と混同）
 
 **Hot-reload（無停止リロード）**:
 新しいフィルタ集合を並行生成し、アトミックに切替え、旧集合を drain する設定差し替え。

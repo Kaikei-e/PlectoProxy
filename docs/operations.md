@@ -129,3 +129,14 @@ Configuration changes do not need this machinery at all: `SIGHUP` re-reads the m
 swaps it atomically, fail-closed, with zero connection impact ([ADR 000039](ADR/000039.md)).
 Reach for the shutdown sequence only when the *binary or host* must go away — deploys, node
 drains — and let rolling replicas + the readiness contract make that invisible to clients.
+
+**Rotating a file the manifest points at counts as a config change.** The reload gate digests
+the referenced files' bytes, not just their paths, so overwriting a `[[tls]]` certificate and
+key, an `[upstream.tls]` CA or client identity, the `[resumption]` STEK, or a
+`[filter.config_files]` secret **in place** and sending `SIGHUP` rebuilds and swaps — no manifest
+edit needed. A certbot deploy hook is therefore just `cp` (or the renewal itself) followed by
+`kill -HUP`. Two halves back that: public material (certificates, CA bundles) rides the logged
+config version, while secret material (private keys, the STEK, config-file values) rides a
+separate fingerprint that is deliberately never logged — a logged digest over a low-entropy
+secret would be an offline brute-force oracle. Two things still need a restart rather than a
+reload: `[trust]` and `[state]`, both rejected fail-closed by `SIGHUP`.

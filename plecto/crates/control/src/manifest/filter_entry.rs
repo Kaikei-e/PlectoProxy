@@ -187,8 +187,10 @@ pub struct FilterEntry {
     /// both ends, ≤ 1 MiB) is served through the same `host-config::get` keys. The shape
     /// container secrets arrive in (`/run/secrets/<name>` mounts, credential directories):
     /// the manifest stays a static, checked-in single source while the secret material never
-    /// appears in it. Resolved at load/reload time, so a SIGHUP picks up a rotated secret
-    /// file; symlinks are followed (orchestrator secret mounts rotate via symlink swaps). A
+    /// appears in it. Resolved at load/reload time, and the resolved values ride the reload
+    /// gate's never-logged fingerprint (`manifest::content_hash`), so a bare SIGHUP picks up a
+    /// rotated secret file with the manifest untouched — and the secret never rides the *logged*
+    /// config version; symlinks are followed (orchestrator secret mounts rotate via symlink swaps). A
     /// key set in both `config` and `config_files` is a validate/load error, and a missing or
     /// unreadable file fails the load — same fail-closed posture as trust keys and TLS certs.
     #[serde(default)]

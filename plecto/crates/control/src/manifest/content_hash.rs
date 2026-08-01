@@ -1,11 +1,51 @@
-//! The manifest's semantic content hash (ADR 000008 `config version`).
+//! The manifest's semantic content hash (ADR 000008 `config version`) and its unlogged twin,
+//! the reload fingerprint.
+//!
+//! One rule governs both: **if `build_active` reads it, an in-place rotation must flip the reload
+//! gate.** A manifest edit is not the only way the config changes — every file the manifest
+//! *points at* is re-read on every rebuild, so its bytes are part of the running config's
+//! identity. The two values split by sensitivity:
+//!
+//! * **public bytes ride the config version** — the manifest itself plus `[listen.client_auth]`
+//!   `ca_path`, `[[tls]]` `cert_path`, and `[upstream.tls]` `ca_path` / `client_cert_path`.
+//!   Certificates and CA bundles travel the wire in the clear; digesting them into the logged,
+//!   audited version costs nothing and gains an honest audit identity.
+//! * **secret bytes ride the reload fingerprint** — `[[tls]]` `key_path`, `[upstream.tls]`
+//!   `client_key_path`, `[resumption]` `stek_file`, and every `[filter.config_files]` value.
+//!   These must NOT move the logged version: a logged digest over a low-entropy secret hands
+//!   anyone holding the manifest and one log line an offline brute-force oracle.
+//!
+//! Adding a new file reference to the manifest therefore means adding it to one of the two —
+//! whichever side of that line it falls on.
 
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use super::Manifest;
 use crate::error::ControlError;
+
+/// Mix one referenced file's digest into `hasher`, domain-separated by `label` (which section /
+/// field it came from) and by a length-prefixed `identity` (which entry within that section).
+/// Both are needed: without the label a cert digest and a CA digest could swap places, and
+/// without a length-prefixed identity two entries' `(identity, digest)` pairs could be re-cut at
+/// a different boundary and hash the same.
+fn mix_file(hasher: &mut Sha256, label: &str, identity: &str, bytes: &[u8]) {
+    hasher.update(b"\0");
+    hasher.update(label.as_bytes());
+    hasher.update(b"\0");
+    hasher.update((identity.len() as u64).to_le_bytes());
+    hasher.update(identity.as_bytes());
+    hasher.update(Sha256::digest(bytes));
+}
+
+/// A `[[tls]]` entry's identity for [`mix_file`]. The index alone would do (the manifest's entry
+/// order is fixed and already rides the semantic hash); the SNI host rides along so the digest
+/// stream stays readable against the manifest it came from.
+fn tls_identity(index: usize, host: Option<&str>) -> String {
+    format!("{index}:{}", host.unwrap_or(""))
+}
 
 impl Manifest {
     /// The **semantic** content hash of this manifest — `sha256:<hex>` over a canonical
@@ -19,22 +59,28 @@ impl Manifest {
     /// `serde_json` over the derived `Serialize` — deterministic because the struct field order
     /// is fixed and the manifest holds no maps (only ordered `Vec`s).
     ///
-    /// Does **not** read referenced files. The load/reload path uses [`content_hash_at`] /
-    /// [`content_hash_with_ca`] so an in-place client-auth CA renewal flips the version.
+    /// Does **not** read referenced files, so it cannot see an in-place rotation. The load/reload
+    /// path uses [`content_hash_at`] / [`content_hash_with_ca_at`], which digest the referenced
+    /// PUBLIC files too (module docs: if `build_active` reads it, rotation must flip the gate).
     pub fn content_hash(&self) -> Result<String, ControlError> {
         self.content_hash_with_ca(None)
     }
 
-    /// [`content_hash`] with referenced files resolved against `base_dir` (when `Some`): reads
-    /// `[listen.client_auth].ca_path` and mixes its digest in. Same path + different bytes must
-    /// flip the config version; otherwise SIGHUP reports `Unchanged` and the new trust roots
-    /// never load (fail-closed: an unreadable CA is an error, not a silently CA-less hash).
+    /// [`content_hash`] with referenced files resolved against `base_dir` (when `Some`): the
+    /// digests of the PUBLIC material every rebuild re-reads — `[listen.client_auth].ca_path`,
+    /// `[[tls]].cert_path`, and `[upstream.tls]`'s `ca_path` / `client_cert_path` — are mixed in.
+    /// Same path + different bytes must flip the config version; otherwise SIGHUP reports
+    /// `Unchanged` and the renewed certificate never loads (fail-closed: an unreadable file is an
+    /// error, not a silently file-less hash).
+    ///
+    /// The SECRET half of the same rule (private keys, STEK, `[filter.config_files]`) lives in
+    /// [`reload_fingerprint`] and deliberately does NOT move this value — see the module docs.
     pub fn content_hash_at(&self, base_dir: Option<&Path>) -> Result<String, ControlError> {
         let ca = match base_dir {
             Some(base) => self.read_client_auth_ca(base)?,
             None => None,
         };
-        self.content_hash_with_ca(ca.as_deref())
+        self.content_hash_with_ca_at(ca.as_deref(), base_dir)
     }
 
     /// Read `[listen.client_auth].ca_path`, or `None` when no client auth is configured. The
@@ -54,10 +100,25 @@ impl Manifest {
     }
 
     /// The semantic hash, with the client-auth CA bundle's digest mixed in when supplied
-    /// (callers obtain the bytes from [`read_client_auth_ca`]).
+    /// (callers obtain the bytes from [`read_client_auth_ca`]). Reads no other referenced file —
+    /// a caller that has a `base_dir` wants [`content_hash_with_ca_at`], which also digests the
+    /// remaining PUBLIC material, so its version matches the reload gate's.
     pub fn content_hash_with_ca(
         &self,
         client_auth_ca: Option<&[u8]>,
+    ) -> Result<String, ControlError> {
+        self.content_hash_with_ca_at(client_auth_ca, None)
+    }
+
+    /// [`content_hash_with_ca`] plus the remaining PUBLIC file digests, resolved against
+    /// `base_dir` when `Some`. This is the value `build_active` and `validate_manifest` record:
+    /// it takes the client-auth CA bytes the caller ALREADY read (one read shared with the
+    /// verifier) and re-reads only the certificates, so the recorded config version is exactly
+    /// what [`content_hash_at`] computes at the reload gate.
+    pub(crate) fn content_hash_with_ca_at(
+        &self,
+        client_auth_ca: Option<&[u8]>,
+        base_dir: Option<&Path>,
     ) -> Result<String, ControlError> {
         let mut hasher = Sha256::new();
         hasher.update(serde_json::to_vec(self)?);
@@ -65,7 +126,60 @@ impl Manifest {
             hasher.update(b"\0listen.client_auth.ca\0");
             hasher.update(Sha256::digest(bytes));
         }
+        if let Some(base) = base_dir {
+            self.mix_public_material(base, &mut hasher)?;
+        }
         Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    }
+
+    /// Digest the certificates and CA bundles a rebuild re-reads: `[[tls]].cert_path` and, per
+    /// `[upstream.tls]`, `ca_path` + `client_cert_path`. Public material only — the private keys
+    /// beside them belong to [`reload_fingerprint`]. Errors reuse each section's own variant so a
+    /// file that disappears mid-rotation reports the same way it would from the build itself.
+    fn mix_public_material(
+        &self,
+        base_dir: &Path,
+        hasher: &mut Sha256,
+    ) -> Result<(), ControlError> {
+        for (index, entry) in self.tls.iter().enumerate() {
+            let bytes = std::fs::read(base_dir.join(&entry.cert_path)).map_err(|e| {
+                ControlError::TlsCert {
+                    host: entry.host.clone(),
+                    path: entry.cert_path.clone(),
+                    reason: format!("read failed: {e}"),
+                }
+            })?;
+            mix_file(
+                hasher,
+                "tls.cert",
+                &tls_identity(index, entry.host.as_deref()),
+                &bytes,
+            );
+        }
+        for upstream in &self.upstreams {
+            let Some(tls) = &upstream.tls else { continue };
+            if let Some(ca_path) = &tls.ca_path {
+                let bytes = std::fs::read(base_dir.join(ca_path)).map_err(|e| {
+                    ControlError::UpstreamTlsCa {
+                        upstream: upstream.name.clone(),
+                        path: ca_path.clone(),
+                        reason: format!("read failed: {e}"),
+                    }
+                })?;
+                mix_file(hasher, "upstream.tls.ca", &upstream.name, &bytes);
+            }
+            if let Some(cert_path) = &tls.client_cert_path {
+                let bytes = std::fs::read(base_dir.join(cert_path)).map_err(|e| {
+                    ControlError::UpstreamClientCert {
+                        upstream: upstream.name.clone(),
+                        path: cert_path.clone(),
+                        reason: format!("read failed: {e}"),
+                    }
+                })?;
+                mix_file(hasher, "upstream.tls.client_cert", &upstream.name, &bytes);
+            }
+        }
+        Ok(())
     }
 
     /// The **reload fingerprint**: the second, deliberately UNLOGGED half of the reload gate,
@@ -78,13 +192,82 @@ impl Manifest {
     /// an operator's manifest plus one log line would then be an offline brute-force oracle for
     /// low-entropy secrets (an API key in `[filter.config_files]`). This value must therefore
     /// never reach a tracing event, an error message, or a public accessor — see
-    /// `ActiveConfig::reload_fingerprint`.
+    /// `ActiveConfig::reload_fingerprint`. Read errors carry the PATH only, never file content,
+    /// for the same reason.
     pub(crate) fn reload_fingerprint(
         &self,
-        _base_dir: &Path,
+        base_dir: &Path,
         config_version: &str,
     ) -> Result<String, ControlError> {
-        Ok(config_version.to_string())
+        let mut hasher = Sha256::new();
+        hasher.update(b"plecto.reload-fingerprint.v1\0");
+        hasher.update(config_version.as_bytes());
+        for (index, entry) in self.tls.iter().enumerate() {
+            // `Zeroizing` for every key read here, the same discipline the real loads apply
+            // (`tls::read_key`, `stek::read_and_derive`): the freed buffer must not retain key
+            // material just because this read only wanted a digest.
+            let bytes =
+                Zeroizing::new(std::fs::read(base_dir.join(&entry.key_path)).map_err(|e| {
+                    ControlError::TlsCert {
+                        host: entry.host.clone(),
+                        path: entry.key_path.clone(),
+                        reason: format!("read failed: {e}"),
+                    }
+                })?);
+            mix_file(
+                &mut hasher,
+                "tls.key",
+                &tls_identity(index, entry.host.as_deref()),
+                &bytes,
+            );
+        }
+        for upstream in &self.upstreams {
+            let Some(tls) = &upstream.tls else { continue };
+            let Some(key_path) = &tls.client_key_path else {
+                continue;
+            };
+            let bytes = Zeroizing::new(std::fs::read(base_dir.join(key_path)).map_err(|e| {
+                ControlError::UpstreamClientCert {
+                    upstream: upstream.name.clone(),
+                    path: key_path.clone(),
+                    reason: format!("read failed: {e}"),
+                }
+            })?);
+            mix_file(
+                &mut hasher,
+                "upstream.tls.client_key",
+                &upstream.name,
+                &bytes,
+            );
+        }
+        if let Some(resumption) = &self.resumption {
+            let bytes =
+                Zeroizing::new(std::fs::read(base_dir.join(&resumption.stek_file)).map_err(
+                    |e| ControlError::Stek {
+                        path: resumption.stek_file.clone(),
+                        reason: format!("read failed: {e}"),
+                    },
+                )?);
+            mix_file(&mut hasher, "resumption.stek", "", &bytes);
+        }
+        for entry in &self.filters {
+            // The RESOLVED map, not the raw files: it is what the rebuild lends the filter, and
+            // reusing `resolved_config` keeps the fingerprint on the same bounded, fail-closed
+            // read path (size cap, UTF-8, key-collision refusal) as the load itself. `None` =
+            // no `[filter.config_files]`, so nothing to cover.
+            let Some(resolved) = entry.resolved_config(base_dir)? else {
+                continue;
+            };
+            for (key, value) in &resolved {
+                mix_file(
+                    &mut hasher,
+                    "filter.config",
+                    &format!("{}\0{key}", entry.id),
+                    value.as_bytes(),
+                );
+            }
+        }
+        Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
     }
 }
 

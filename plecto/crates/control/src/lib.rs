@@ -110,11 +110,11 @@ pub use plecto_host::{
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.
 pub use plecto_host::otlp;
 
-/// The atomically-swappable active configuration: the loaded filters, the chain order, and
-/// the `content_hash` of the manifest that produced them. Held behind an `ArcSwap`; never
-/// mutated in place — `reload` replaces it wholesale. The hash rides with the config it
-/// describes so `reload_from_disk` can compare the running `config version` without a
-/// separate lock.
+/// The atomically-swappable active configuration: the loaded filters, the chain order, and the
+/// identity of the manifest that produced them. Held behind an `ArcSwap`; never mutated in place
+/// — `reload` replaces it wholesale. That identity is a PAIR — the public `hash` (config version)
+/// and the unlogged `reload_fingerprint` — and both ride with the config they describe, so
+/// `reload_from_disk` can compare the running config without a separate lock.
 pub(crate) struct ActiveConfig {
     pub(crate) filters: HashMap<String, Arc<LoadedFilter>>,
     /// The manifest's default `[chain]`, resolved to the loaded filter in order — built once per
@@ -403,7 +403,8 @@ pub fn validate_manifest(
     // A throwaway registry runs the full upstream validation (names, LB, `[upstream.tls]` CA
     // loads) without touching any live state.
     UpstreamRegistry::new().reconcile(&manifest.upstreams, base_dir)?;
-    let config_version = manifest.content_hash_with_ca(client_auth_ca.as_deref())?;
+    let config_version =
+        manifest.content_hash_with_ca_at(client_auth_ca.as_deref(), Some(base_dir))?;
     Ok(ValidateOutcome {
         config_version,
         warnings,
@@ -654,9 +655,11 @@ fn build_active(
     // is the step that MUTATES persistent state (the health registry, which survives reloads), so
     // every other fallible step — including this hash — must run before it for the "after reconcile
     // the build is infallible" / all-or-nothing invariant to hold literally, not just in practice.
-    let hash = manifest.content_hash_with_ca(client_auth_ca.as_deref())?;
-    // The gate's secret half, computed from the SAME reads this build made (same rationale as
-    // the CA above). Fallible, so it also belongs before the reconcile.
+    let hash = manifest.content_hash_with_ca_at(client_auth_ca.as_deref(), Some(base_dir))?;
+    // The gate's SECOND half (module docs in `manifest::content_hash`): the never-logged digest
+    // over the secret files this build also consumed — `[[tls]]` keys, `[upstream.tls]` client
+    // keys, the `[resumption]` STEK, `[filter.config_files]`. Fallible, so it belongs here, before
+    // the reconcile, with every other fallible step.
     let reload_fingerprint = manifest.reload_fingerprint(base_dir, &hash)?;
 
     // Reconcile the upstream registry LAST among the fallible steps (ADR 000017): this validates

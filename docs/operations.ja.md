@@ -127,3 +127,13 @@ fail-closed のまま検出される。この検査に供給する authoring 側
 スワップする — 接続影響ゼロ（[ADR 000039](ADR/000039.md)）。shutdown シーケンスに頼るのは
 **バイナリまたはホスト**が入れ替わるとき（デプロイ・ノード drain）だけで、その不可視化は
 ローリングレプリカ + 本 readiness 契約の仕事。
+
+**マニフェストが指すファイルのローテーションも設定変更である。** reload ゲートはパスだけでなく
+参照ファイルの**中身**を digest するので、`[[tls]]` の証明書・鍵、`[upstream.tls]` の CA や
+client identity、`[resumption]` の STEK、`[filter.config_files]` のシークレットを**その場で**
+上書きして `SIGHUP` を送れば、マニフェストを一切編集せずに再ビルド＆スワップされる。certbot の
+deploy hook は「配置（あるいは更新そのもの）＋ `kill -HUP`」だけで済む。これを支えるのは二層構成で、
+公開素材（証明書・CA バンドル）はログに出る config version に乗り、秘密素材（秘密鍵・STEK・
+設定ファイルの値）は**意図的にログへ出さない**別の fingerprint に乗る——低エントロピーな秘密の
+digest がログに出れば、それはオフライン総当たりのオラクルになるため。reload ではなく restart が
+必要なのは `[trust]` と `[state]` の 2 つで、どちらも `SIGHUP` が fail-closed で拒否する。

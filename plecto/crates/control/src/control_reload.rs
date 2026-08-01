@@ -52,11 +52,16 @@ impl Control {
         Ok(())
     }
 
-    /// Re-read the on-disk manifest and reload if its `config version` changed. The trigger
-    /// (SIGHUP, `serve_reloads`) is content-free, so this is where the new config is actually
-    /// read. Idempotent: an unchanged manifest (same semantic `content_hash`) is a no-op —
-    /// no rebuild, no drain. A changed one is built fully and swapped atomically; on any
-    /// build failure the running set is left untouched (fail-closed) and the error returned.
+    /// Re-read the on-disk manifest and reload if the running config's identity changed. The
+    /// trigger (SIGHUP, `serve_reloads`) is content-free, so this is where the new config is
+    /// actually read. Idempotent: a manifest whose meaning AND whose referenced files are
+    /// unchanged is a no-op — no rebuild, no drain. Anything else is built fully and swapped
+    /// atomically; on any build failure the running set is left untouched (fail-closed) and the
+    /// error returned.
+    ///
+    /// "Identity" is the pair `(config version, reload fingerprint)`, so an in-place rotation of
+    /// a file the manifest points at flips the gate without a manifest edit — a certbot deploy
+    /// hook or a remounted secret plus a bare SIGHUP is enough (see `manifest::content_hash`).
     ///
     /// Errors with `NoManifestPath` if this plane was not built from an on-disk manifest
     /// (`load` / `from_manifest`); use `from_manifest_path` / `load_at` for a reloadable plane.
@@ -72,12 +77,24 @@ impl Control {
         // the content hash below.
         self.ensure_trust_unchanged(&manifest)?;
         self.ensure_state_unchanged(&manifest)?;
-        // Cheap idempotency gate: skip the rebuild + drain entirely when neither half of the
-        // active config's identity moved (a comment-only edit, or a spurious trigger) — the
-        // public `config version` and the never-logged reload fingerprint. A half that cannot be
-        // computed (a referenced file momentarily unreadable, e.g. mid-rotation) falls through to
-        // the full build instead of failing a possibly-idempotent SIGHUP outright — the build
-        // re-reads and fails closed with the precise error if the problem persists.
+        // Cheap idempotency gate: skip the rebuild + drain entirely when NEITHER half of the
+        // active config's identity moved (a comment-only edit, or a spurious trigger). Two halves,
+        // because every file `build_active` re-reads must flip the gate when its BYTES change,
+        // while secret bytes must not ride the logged config version:
+        //   * the public `config version` digests the manifest plus the public material —
+        //     `[listen.client_auth].ca_path`, `[[tls]]` certs, `[upstream.tls]` CA + client certs;
+        //   * the never-logged reload fingerprint digests the secret material — `[[tls]]` keys,
+        //     `[upstream.tls]` client keys, the `[resumption]` STEK, `[filter.config_files]`.
+        // So the ADR 000014 sharp edge is gone for referenced files: an in-place TLS renewal,
+        // upstream-TLS rotation, STEK rotation, or secret-file refresh rebuilds under a bare
+        // SIGHUP. What is still NOT re-read on an unchanged pair: the OCI artifact behind a
+        // `[[filter]]` digest pin (pinned BY content — different bytes are a different digest,
+        // i.e. a manifest edit) and the `[trust]` key files (fixed at construction; changing them
+        // needs a restart, rejected above).
+        // A half that cannot be computed (a referenced file momentarily unreadable, e.g.
+        // mid-rotation) falls through to the full build instead of failing a possibly-idempotent
+        // SIGHUP outright — the build re-reads and fails closed with the precise error if the
+        // problem persists.
         let active = self.active.load();
         match manifest.content_hash_at(Some(&self.base_dir)) {
             Ok(new_hash) if new_hash == active.hash => {

@@ -11,7 +11,9 @@ use plecto_control::{
     ReloadSource, ResolvedArtifact, serve_reloads,
 };
 use plecto_host::Header;
-use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
+use plecto_host::test_support::{
+    TestSigner, bound_sbom, filter_cors_component, filter_hello_component,
+};
 use tempfile::tempdir;
 
 fn req(headers: &[(&str, &str)]) -> HttpRequest {
@@ -262,6 +264,142 @@ fn snapshot_pins_config_across_a_reload() {
         ),
         "a fresh request through Control sees the reloaded config"
     );
+}
+
+/// An operator rotates a `[filter.config_files]` secret in place (a mounted-secret refresh) and
+/// fires SIGHUP without touching the manifest. The config version is unchanged by construction —
+/// only the referenced file's BYTES moved — so the reload must still rebuild, and the filter must
+/// see the NEW value. `filter-cors` makes that observable: its `allowed-origins` config decides
+/// which preflight gets CORS headers back.
+#[test]
+fn reload_from_disk_detects_an_in_place_config_file_rotation() {
+    let dir = tempdir().unwrap();
+    let manifest_path = dir.path().join("plecto.toml");
+    let origins_path = dir.path().join("allowed-origins");
+
+    let component = filter_cors_component();
+    let signer = TestSigner::new().unwrap();
+    let artifact = ResolvedArtifact {
+        component_signature: signer.sign(&component).unwrap(),
+        sbom_signature: signer.sign(&bound_sbom(&component)).unwrap(),
+        sbom: bound_sbom(&component),
+        component,
+    };
+    let mut store = MemoryStore::new();
+    let digest = store.insert("cors", artifact);
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+
+    let toml = format!(
+        r#"
+[[filter]]
+id = "cors"
+source = "cors"
+digest = "{digest}"
+
+[filter.config_files]
+allowed-origins = "allowed-origins"
+
+[chain]
+filters = ["cors"]
+"#
+    );
+    std::fs::write(&manifest_path, &toml).unwrap();
+    std::fs::write(&origins_path, "https://a.example\n").unwrap();
+    let control = Control::load_at(host, &manifest_path, Box::new(store)).unwrap();
+
+    assert_eq!(
+        preflight_allow_origin(&control, "https://a.example"),
+        Some("https://a.example".to_string()),
+        "the originally resolved allowlist admits a.example"
+    );
+    assert_eq!(
+        preflight_allow_origin(&control, "https://b.example"),
+        None,
+        "b.example is not in the originally resolved allowlist"
+    );
+
+    // The secret file is rewritten in place; the manifest itself is untouched.
+    std::fs::write(&origins_path, "https://b.example\n").unwrap();
+    match control.reload_from_disk().unwrap() {
+        ReloadOutcome::Reloaded { hash } => assert!(hash.starts_with("sha256:")),
+        ReloadOutcome::Unchanged => {
+            panic!("an in-place [filter.config_files] rotation must rebuild, not report Unchanged")
+        }
+    }
+    assert_eq!(
+        preflight_allow_origin(&control, "https://b.example"),
+        Some("https://b.example".to_string()),
+        "the reloaded chain must serve the NEWLY resolved allowlist"
+    );
+    assert_eq!(
+        preflight_allow_origin(&control, "https://a.example"),
+        None,
+        "the old allowlist value is gone"
+    );
+
+    // Idempotency is preserved: nothing rotated, nothing edited → still a no-op.
+    assert_eq!(
+        control.reload_from_disk().unwrap(),
+        ReloadOutcome::Unchanged,
+        "an unrotated, unedited manifest still reloads to Unchanged"
+    );
+}
+
+/// The public half of the same rule: a certbot-style deploy hook overwrites `[[tls]]`
+/// `cert_path` / `key_path` in place and sends SIGHUP. The manifest is byte-identical, so only
+/// the certificate's own bytes can flip the gate.
+#[test]
+fn reload_from_disk_detects_an_in_place_tls_cert_rotation() {
+    let dir = tempdir().unwrap();
+    let manifest_path = dir.path().join("plecto.toml");
+    let (host, store, digest) = setup();
+
+    let write_cert = || {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(dir.path().join("cert.pem"), generated.cert.pem()).unwrap();
+        std::fs::write(
+            dir.path().join("key.pem"),
+            generated.signing_key.serialize_pem(),
+        )
+        .unwrap();
+    };
+    write_cert();
+    let toml = format!(
+        "[[tls]]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n{}",
+        manifest_toml(&digest, &["fh"])
+    );
+    std::fs::write(&manifest_path, &toml).unwrap();
+    let control = Control::load_at(host, &manifest_path, Box::new(store)).unwrap();
+    assert!(control.tls_config().is_some(), "the [[tls]] entry loaded");
+
+    // No manifest edit, no SIGHUP-visible change other than the renewed certificate itself.
+    write_cert();
+    match control.reload_from_disk().unwrap() {
+        ReloadOutcome::Reloaded { hash } => assert!(hash.starts_with("sha256:")),
+        ReloadOutcome::Unchanged => {
+            panic!("an in-place [[tls]] cert renewal must rebuild, not report Unchanged")
+        }
+    }
+    assert_eq!(
+        control.reload_from_disk().unwrap(),
+        ReloadOutcome::Unchanged,
+        "a second reload with the same certificate on disk is a no-op"
+    );
+}
+
+/// Drive one CORS preflight through the chain and return the `access-control-allow-origin` the
+/// filter answered with, or `None` when the origin was refused (no CORS headers at all).
+fn preflight_allow_origin(control: &Control, origin: &str) -> Option<String> {
+    let mut request = req(&[("origin", origin), ("access-control-request-method", "GET")]);
+    request.method = "OPTIONS".to_string();
+    match control.on_request(request) {
+        ChainOutcome::Respond(response) => response
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("access-control-allow-origin"))
+            .map(|h| String::from_utf8(h.value.clone()).unwrap()),
+        ChainOutcome::Forward(_) => panic!("a CORS preflight must short-circuit, not forward"),
+    }
 }
 
 #[test]

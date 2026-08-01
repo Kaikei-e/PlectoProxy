@@ -67,6 +67,25 @@ impl Manifest {
         }
         Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
     }
+
+    /// The **reload fingerprint**: the second, deliberately UNLOGGED half of the reload gate,
+    /// digesting the SECRET files `build_active` re-reads on every rebuild — `[[tls]]` private
+    /// keys, `[upstream.tls]` client keys, the `[resumption]` STEK, and every
+    /// `[filter.config_files]` value. `config_version` (the public hash) is mixed in as a prefix
+    /// input, so the fingerprint covers everything the version covers plus the secret material.
+    ///
+    /// Why a SEPARATE value instead of extending the config version: the version is logged, and
+    /// an operator's manifest plus one log line would then be an offline brute-force oracle for
+    /// low-entropy secrets (an API key in `[filter.config_files]`). This value must therefore
+    /// never reach a tracing event, an error message, or a public accessor — see
+    /// `ActiveConfig::reload_fingerprint`.
+    pub(crate) fn reload_fingerprint(
+        &self,
+        _base_dir: &Path,
+        config_version: &str,
+    ) -> Result<String, ControlError> {
+        Ok(config_version.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +189,131 @@ isolation = "untrusted"   # the default, written explicitly
             "path-only content_hash stays stable (no file read)"
         );
     }
+
+    /// Every file `[[tls]]` / `[upstream.tls]` reference that is PUBLIC material (certificates and
+    /// CA bundles — they travel the wire in the clear) rides the logged config version, so an
+    /// in-place renewal flips the reload gate. This is the certbot deploy-hook shape: the hook
+    /// overwrites `fullchain.pem` in place and sends SIGHUP without touching the manifest.
+    #[test]
+    fn public_tls_material_rides_the_config_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let write =
+            |name: &str, bytes: &[u8]| std::fs::write(dir.path().join(name), bytes).unwrap();
+        write("cert.pem", b"cert-A");
+        write("key.pem", b"key-A");
+        write("ca.pem", b"ca-A");
+        write("client.pem", b"client-cert-A");
+        write("client.key", b"client-key-A");
+        let m = Manifest::from_toml(FULL_FILE_REFS).unwrap();
+        let version = || m.content_hash_at(Some(dir.path())).unwrap();
+
+        let base = version();
+        write("cert.pem", b"cert-B");
+        let after_cert = version();
+        assert_ne!(
+            base, after_cert,
+            "an in-place [[tls]] cert renewal must flip the config version"
+        );
+
+        write("ca.pem", b"ca-B");
+        let after_ca = version();
+        assert_ne!(
+            after_cert, after_ca,
+            "an in-place [upstream.tls] ca_path rotation must flip the config version"
+        );
+
+        write("client.pem", b"client-cert-B");
+        assert_ne!(
+            after_ca,
+            version(),
+            "an in-place [upstream.tls] client_cert_path rotation must flip the config version"
+        );
+    }
+
+    /// The other half of the two-tier rule: SECRET files `build_active` re-reads must NOT move the
+    /// logged config version (a logged digest over a low-entropy secret is an offline
+    /// brute-force oracle for anyone holding the manifest and one log line) — they ride the
+    /// never-logged reload fingerprint instead.
+    #[test]
+    fn secret_material_rides_the_reload_fingerprint_not_the_config_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let write =
+            |name: &str, bytes: &[u8]| std::fs::write(dir.path().join(name), bytes).unwrap();
+        write("cert.pem", b"cert-A");
+        write("key.pem", b"key-A");
+        write("ca.pem", b"ca-A");
+        write("client.pem", b"client-cert-A");
+        write("client.key", b"client-key-A");
+        write("stek.key", b"stek-A");
+        write("token.txt", b"token-A");
+        let m = Manifest::from_toml(FULL_FILE_REFS).unwrap();
+        // The gate's pair: the public version, and the fingerprint computed over it.
+        let pair = || {
+            let version = m.content_hash_at(Some(dir.path())).unwrap();
+            let fingerprint = m.reload_fingerprint(dir.path(), &version).unwrap();
+            (version, fingerprint)
+        };
+
+        let mut previous = pair();
+        for (name, bytes) in [
+            ("key.pem", b"key-B".as_slice()),
+            ("client.key", b"client-key-B".as_slice()),
+            ("stek.key", b"stek-B".as_slice()),
+            ("token.txt", b"token-B".as_slice()),
+        ] {
+            write(name, bytes);
+            let current = pair();
+            assert_eq!(
+                previous.0, current.0,
+                "{name} is secret material — it must NOT move the logged config version"
+            );
+            assert_ne!(
+                previous.1, current.1,
+                "an in-place {name} rotation must flip the reload fingerprint"
+            );
+            previous = current;
+        }
+
+        // The fingerprint takes the public version as a prefix input, so it also covers
+        // everything the version covers — one comparison can never pass while the other fails.
+        write("cert.pem", b"cert-B");
+        let current = pair();
+        assert_ne!(previous.0, current.0, "the cert is public material");
+        assert_ne!(
+            previous.1, current.1,
+            "the fingerprint must cover the public version too"
+        );
+    }
+
+    /// A manifest that references one file of every kind `build_active` consumes.
+    const FULL_FILE_REFS: &str = r#"
+[[tls]]
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[resumption]
+stek_file = "stek.key"
+
+[[filter]]
+id = "f"
+source = "artifacts/f"
+digest = "sha256:abc"
+
+[filter.config_files]
+token = "token.txt"
+
+[[upstream]]
+name = "api"
+addresses = ["127.0.0.1:9000"]
+
+[upstream.health]
+path = "/healthz"
+
+[upstream.tls]
+ca_path = "ca.pem"
+client_cert_path = "client.pem"
+client_key_path = "client.key"
+"#;
 
     #[test]
     fn content_hash_changes_on_meaningful_edit() {

@@ -72,24 +72,38 @@ impl Control {
         // the content hash below.
         self.ensure_trust_unchanged(&manifest)?;
         self.ensure_state_unchanged(&manifest)?;
-        // Cheap idempotency gate: skip the rebuild + drain entirely when the config version is
-        // unchanged (a comment-only edit, or a spurious trigger). A version that cannot be
-        // computed (the client-auth CA momentarily unreadable, e.g. mid-rotation) falls through
-        // to the full build instead of failing a possibly-idempotent SIGHUP outright — the build
-        // re-reads the CA and fails closed with the precise error if the problem persists.
+        // Cheap idempotency gate: skip the rebuild + drain entirely when neither half of the
+        // active config's identity moved (a comment-only edit, or a spurious trigger) — the
+        // public `config version` and the never-logged reload fingerprint. A half that cannot be
+        // computed (a referenced file momentarily unreadable, e.g. mid-rotation) falls through to
+        // the full build instead of failing a possibly-idempotent SIGHUP outright — the build
+        // re-reads and fails closed with the precise error if the problem persists.
+        let active = self.active.load();
         match manifest.content_hash_at(Some(&self.base_dir)) {
-            Ok(new_hash) if new_hash == self.active.load().hash => {
-                // Deliberate ADR 000014 sharp edge for paths that are NOT file-digested yet
-                // (e.g. [[tls]] cert/key in-place renewals): an unchanged version does not
-                // re-read those files. `[listen.client_auth].ca_path` bytes ARE mixed into the
-                // version, so in-place CA rotation does flip and rebuild.
-                tracing::info!(
-                    config_version = %new_hash,
-                    "reload: config version unchanged — no rebuild; note that referenced files \
-                     without a content digest in the version (TLS certs/keys) are not re-read \
-                     on an unchanged version (ADR 000014); client_auth CA bytes are digested"
-                );
-                return Ok(ReloadOutcome::Unchanged);
+            Ok(new_hash) if new_hash == active.hash => {
+                match manifest.reload_fingerprint(&self.base_dir, &new_hash) {
+                    // The fingerprint stays out of the event on purpose (see `ActiveConfig`).
+                    Ok(fingerprint) if fingerprint == active.reload_fingerprint => {
+                        tracing::info!(
+                            config_version = %new_hash,
+                            "reload: config version and referenced files unchanged — no rebuild"
+                        );
+                        return Ok(ReloadOutcome::Unchanged);
+                    }
+                    Ok(_) => {
+                        tracing::info!(
+                            config_version = %new_hash,
+                            "reload: config version unchanged but a referenced file rotated — \
+                             rebuilding"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "reload: referenced files unreadable — attempting the full rebuild"
+                        );
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -99,6 +113,7 @@ impl Control {
                 );
             }
         }
+        drop(active);
         // Build the new set fully before swapping; on failure the running set is untouched. The
         // outcome carries the hash the build computed (from the SAME CA read as its verifier),
         // not the gate's — the two could differ if the CA file changed in between.

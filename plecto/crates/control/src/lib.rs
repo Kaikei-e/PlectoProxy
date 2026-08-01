@@ -132,6 +132,14 @@ pub(crate) struct ActiveConfig {
     /// as `tls`. `None` whenever `tls` is `None` (h3 requires TLS). Rides the same `ArcSwap`.
     pub(crate) quic_tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) hash: String,
+    /// The reload gate's second, **never-logged** half (`Manifest::reload_fingerprint`): a digest
+    /// over the SECRET files this build read — `[[tls]]` private keys, `[upstream.tls]` client
+    /// keys, the `[resumption]` STEK, and every `[filter.config_files]` value — with `hash` mixed
+    /// in as a prefix input. It exists so an in-place secret rotation flips the gate without the
+    /// secrets riding the *logged* config version: a logged digest over a low-entropy secret
+    /// would hand anyone with the manifest and one log line an offline brute-force oracle. Never
+    /// emit it in a tracing event, an error message, or a public accessor.
+    pub(crate) reload_fingerprint: String,
 }
 
 /// The control plane: owns the `Host` (and thus the trust policy + epoch ticker) and the
@@ -647,6 +655,9 @@ fn build_active(
     // every other fallible step — including this hash — must run before it for the "after reconcile
     // the build is infallible" / all-or-nothing invariant to hold literally, not just in practice.
     let hash = manifest.content_hash_with_ca(client_auth_ca.as_deref())?;
+    // The gate's secret half, computed from the SAME reads this build made (same rationale as
+    // the CA above). Fallible, so it also belongs before the reconcile.
+    let reload_fingerprint = manifest.reload_fingerprint(base_dir, &hash)?;
 
     // Reconcile the upstream registry LAST among the fallible steps (ADR 000017): this validates
     // duplicate names / empty address lists and preserves health for unchanged `(name, address)`
@@ -695,5 +706,6 @@ fn build_active(
         tls,
         quic_tls,
         hash,
+        reload_fingerprint,
     })
 }

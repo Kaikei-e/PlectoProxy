@@ -27,6 +27,50 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-01
+
+Patch release: the SIGHUP reload gate now notices an in-place rotation of every file the
+manifest references, closing the window where an ACME deploy-hook rotated a certificate on
+disk and the proxy silently kept serving the expiring one (ADR 000097), plus a routine
+workspace lockfile refresh. The source change is confined to the control plane; there is no
+WIT contract, manifest schema, or CLI change, and no public API change — `cargo semver-checks`
+reports no semver update required against 0.6.2 (196 checks on each of `plecto-host` /
+`plecto-control` / `plecto-server`, default features). No guest lockfile moves, so the built
+filter components are byte-identical and the reference-filter shelf does not republish.
+
+Two decisions are recorded alongside the fix: ADR 000097 promotes ACME (automatic HTTPS) from
+outside the deferred order to its head, fixing this two-tier content hash as the floor any
+future ACME implementation builds on; ADR 000098 fixes the contract shape of
+`on-response-body` (buffer-then-decide) for `plecto:filter@0.4.0` — contract decision only,
+no implementation in this release.
+
+### Fixed
+
+- **Control: the reload gate detects an in-place rotation of any referenced file.** The gate
+  compared only `content_hash_at`, which digested `[listen.client_auth].ca_path` alone — so
+  overwriting a `[[tls]]` cert/key, an `[upstream.tls]` CA or client identity, the
+  `[resumption]` STEK, or a `[filter.config_files]` secret in place left the config version
+  untouched and the reload reported `Unchanged`; the rotated material never loaded. The gate
+  now compares a pair split by sensitivity: the public config version additionally digests
+  `[[tls]]` cert bytes and `[upstream.tls]` CA / client-cert bytes (each domain-separated by a
+  label plus a length-prefixed entry identity), and a new **never-logged reload fingerprint**
+  digests the secret bytes — `[[tls]]` private keys, `[upstream.tls]` client keys, the STEK,
+  every resolved `[filter.config_files]` value — taking the public version as a prefix input.
+  Secrets stay off the logged version deliberately: a logged digest over a low-entropy secret
+  would hand a manifest-plus-log holder an offline brute-force oracle, so the fingerprint
+  never reaches a tracing event, an error message, or a public accessor. Error semantics are
+  unchanged — either half failing to compute at the gate logs a warning and falls through to
+  the full rebuild, which re-reads and fails closed with the precise error — and
+  `config_version()` keeps its exact previous meaning. (ADR 000097)
+
+### Changed
+
+- **Workspace lockfile refresh**: clap 4.6.5, http 1.5.0, hybrid-array 0.4.14, rustls 0.23.43,
+  wast 255.0.0 / wat 1.255.0 (the wast family adds a second `wasm-encoder` / `wasmparser` at
+  0.255 next to the wit-component 0.254 encoder `crates/host/build.rs` pins; cargo-deny's
+  `multiple-versions = "warn"` records the duplication). Every move stays inside the major its
+  requirement already declares. Guest, bench, and spike lockfiles are untouched.
+
 ## [0.6.2] - 2026-08-01
 
 Security patch release: wasmtime 47.0.2 → 47.0.3, taken the day upstream shipped it. There is

@@ -27,6 +27,24 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-08-06
+
+Patch release: routine dependency maintenance. `wit-component` moves 0.254 → 0.255 (the only
+out-of-date dependency crossing a semver boundary), which unifies the wasm-tools family
+(`wasm-encoder` / `wasmparser` / `wasm-metadata` / `wit-parser`) onto a single 0.255 line instead
+of straddling 0.254/0.255 — the duplication `cargo-deny`'s `multiple-versions = "warn"` flagged
+since 0.6.3 is gone. No source change. `cargo semver-checks` reports no semver update required
+against 0.6.3 (196 checks on each of `plecto-host` / `plecto-control` / `plecto-server`, default
+features).
+
+### Changed
+
+- **Workspace lockfile refresh**: `wit-component` 0.254 → 0.255 (declared bump in `crates/host`
+  and `crates/plecto`), pulling `wasm-encoder` / `wasmparser` / `wasm-metadata` / `wit-parser`
+  along to 0.255. `filter-jwt`'s example lockfile picks up `base64` 0.23.1 and `zerocopy` 0.8.56
+  patch bumps. Every other guest lockfile is untouched, so the built filter components are
+  byte-identical and the reference-filter shelf does not republish.
+
 ## [0.6.3] - 2026-08-01
 
 Patch release: the SIGHUP reload gate now notices an in-place rotation of every file the

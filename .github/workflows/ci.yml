@@ -42,6 +42,14 @@
 # pushes, so no job needs the GITHUB_TOKEN left behind in .git/config), and the workflow-lint
 # job below gates all of .github/workflows/ with zizmor — the same blocking posture cargo-deny
 # applies to the crate graph.
+#
+# dtolnay/rust-toolchain carve-out: that repo doesn't tag releases — each version lands as its
+# own commit, which upstream automation periodically rewrites/orphans (we hit this directly: a
+# prior pin to 46511b1c failed zizmor's impostor-commit check once dtolnay's history moved).
+# Every pin below targets the permanent "Add X.Y.Z patch release" merge commit on master
+# instead, which stays reachable — but that means the ref-version-mismatch heuristic (which
+# expects the ephemeral per-version commit) can never be satisfied here, so it's suppressed
+# inline per occurrence.
 
 name: CI
 
@@ -84,10 +92,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
-          # SHA-pinned (A08) to the 1.97.1-branch tip, which hardcodes its own toolchain version —
-          # this action.yml revision doesn't declare a `toolchain` input at all, so don't pass one.
+          toolchain: "1.97.1"
           components: rustfmt
       - run: cargo fmt --all -- --check
       # Every example filter guest is a SEPARATE workspace; loop them all so a new guest
@@ -132,11 +139,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
+          toolchain: "1.97.1"
           components: clippy
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: plecto-clippy
           cache-on-failure: true
@@ -174,11 +182,12 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
+          toolchain: "1.97.1"
           # Default features build only the zero-WASI guests (build.rs) — no wasip2 here.
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: plecto-test
           cache-on-failure: true
@@ -218,10 +227,11 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
+          toolchain: "1.97.1"
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: plecto-features
           cache-on-failure: true
@@ -328,10 +338,11 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
+          toolchain: "1.97.1"
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: plecto-release
           cache-on-failure: true
@@ -370,10 +381,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
+          toolchain: "1.97.1"
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: plecto-shelf
           cache-on-failure: true
@@ -410,11 +422,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 (branch tip; no `toolchain` input to restate)
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
         with:
+          toolchain: "1.97.1"
           components: clippy
           targets: wasm32-unknown-unknown,wasm32-wasip2
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: plecto-guest
           workspaces: |

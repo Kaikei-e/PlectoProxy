@@ -42,8 +42,21 @@ features).
 - **Workspace lockfile refresh**: `wit-component` 0.254 → 0.255 (declared bump in `crates/host`
   and `crates/plecto`), pulling `wasm-encoder` / `wasmparser` / `wasm-metadata` / `wit-parser`
   along to 0.255. `filter-jwt`'s example lockfile picks up `base64` 0.23.1 and `zerocopy` 0.8.56
-  patch bumps. Every other guest lockfile is untouched, so the built filter components are
-  byte-identical and the reference-filter shelf does not republish.
+  patch bumps, which change its compiled component bytes. Every other guest lockfile is
+  untouched, so `filters/cors` / `filters/apikey` / `filters/extauthz` are byte-identical and do
+  not republish.
+- **Reference-filter shelf republished**: `filters/jwt` 0.1.5 → 0.1.6 (ADR 000080 — filter tags
+  are immutable, and the `base64`/`zerocopy` bump above changed the stripped-component hash, so
+  the existing `0.1.5` tag can't carry the new bytes). No filter source change. The compatibility
+  matrix (`docs/reference-filters.md`) is updated to match.
+- **CI hardening**: `dtolnay/rust-toolchain`'s pinned commit was orphaned by an upstream history
+  rewrite (zizmor's `impostor-commit` audit caught it) — repinned to the permanent
+  `2c7215f132e9` ("Add 1.97.1 patch release") merge commit across `ci.yml` / `bench.yml` /
+  `release.yml`, with the now-required `toolchain` input restored. `Swatinem/rust-cache` moved
+  off a since-advanced `v2` branch-tip SHA to the tagged `v2.9.2` commit. Separately,
+  `.github/zizmor-requirements.txt` pinned zizmor 1.27.0, since yanked from PyPI for
+  GHSA-f42p-wjw5-97qh (a debug-logging defect that prints configured GitHub credentials) —
+  bumped to 1.29.0.
 
 ## [0.6.3] - 2026-08-01
 

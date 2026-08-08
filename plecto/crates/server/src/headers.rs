@@ -453,7 +453,7 @@ mod tests {
         headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
         headers.insert("cf-connecting-ip", HeaderValue::from_static("8.8.8.8"));
         headers.insert("x-keep", HeaderValue::from_static("1"));
-        set_forwarded(&mut headers, "203.0.113.5".parse().unwrap(), "https");
+        set_forwarded(&mut headers, "203.0.113.5".parse().unwrap(), "https", None);
 
         let xff: Vec<&HeaderValue> = headers.get_all("x-forwarded-for").iter().collect();
         assert_eq!(
@@ -493,7 +493,12 @@ mod tests {
         // (`::ffff:a.b.c.d`); X-Forwarded-For / X-Real-IP must carry the dotted IPv4 form so a
         // backend all-listing on the IPv4 address matches (ADR 000022).
         let mut headers = hyper::HeaderMap::new();
-        set_forwarded(&mut headers, "::ffff:203.0.113.5".parse().unwrap(), "https");
+        set_forwarded(
+            &mut headers,
+            "::ffff:203.0.113.5".parse().unwrap(),
+            "https",
+            None,
+        );
         for name in ["x-forwarded-for", "x-real-ip"] {
             assert_eq!(
                 headers.get(name).and_then(|v| v.to_str().ok()),
@@ -504,12 +509,222 @@ mod tests {
 
         // A genuine IPv6 peer is preserved verbatim (no brackets in XFF).
         let mut headers = hyper::HeaderMap::new();
-        set_forwarded(&mut headers, "2001:db8::1".parse().unwrap(), "https");
+        set_forwarded(&mut headers, "2001:db8::1".parse().unwrap(), "https", None);
         assert_eq!(
             headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
             Some("2001:db8::1"),
             "a real IPv6 peer is kept as-is"
         );
+    }
+
+    /// The parsed `[listen.trusted_proxy]` trust for `cidrs`, built through the manifest — the
+    /// one parse entrypoint, so these tests share the CIDR canonicalisation the fast path uses.
+    fn trusted(cidrs: &str) -> plecto_control::TrustedProxyTrust {
+        plecto_control::Manifest::from_toml(&format!(
+            "[listen.trusted_proxy]\ntrusted = [{cidrs}]\n"
+        ))
+        .unwrap()
+        .listen
+        .trusted_proxy_trust()
+        .unwrap()
+        .expect("the section is declared")
+    }
+
+    fn xff(headers: &hyper::HeaderMap) -> Option<&str> {
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+    }
+
+    #[test]
+    fn set_forwarded_restores_the_client_named_by_a_trusted_proxy() {
+        // ADR 000103: a peer inside the declared CIDRs may name the client. The list is read
+        // right to left — each element was appended by the hop that received the request — so
+        // the first address no declared proxy vouched for is the client.
+        let trust = trusted(r#""10.0.0.0/8", "192.0.2.0/24""#);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.7, 192.0.2.5, 10.0.0.1"),
+        );
+        headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
+
+        let client = set_forwarded(
+            &mut headers,
+            "10.0.0.1".parse().unwrap(),
+            "https",
+            Some(&trust),
+        );
+
+        assert_eq!(client, "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            xff(&headers),
+            Some("198.51.100.7"),
+            "the re-issued XFF carries the restored client, not the inbound list"
+        );
+        assert_eq!(
+            headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
+            Some("198.51.100.7"),
+            "X-Real-IP is re-issued from the same restored client (ADR 000022 stays)"
+        );
+    }
+
+    #[test]
+    fn set_forwarded_reads_repeated_forwarded_headers_as_one_list() {
+        // A list split across several header lines is one list (RFC 9110 §5.3): the rightmost
+        // element of the LAST line is the newest hop, so the scan starts there.
+        let trust = trusted(r#""10.0.0.0/8""#);
+        let mut headers = hyper::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.7, 10.0.0.2"),
+        );
+
+        let client = set_forwarded(
+            &mut headers,
+            "10.0.0.1".parse().unwrap(),
+            "http",
+            Some(&trust),
+        );
+
+        assert_eq!(client, "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(xff(&headers), Some("198.51.100.7"));
+    }
+
+    #[test]
+    fn set_forwarded_falls_back_to_the_peer_when_every_element_is_trusted() {
+        // Nothing outside the declared set means nobody named a client — fall back to the peer,
+        // the side that cannot be forged (ADR 000103 decision 5).
+        let trust = trusted(r#""10.0.0.0/8""#);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.9, 10.0.0.1"),
+        );
+
+        let client = set_forwarded(
+            &mut headers,
+            "10.0.0.1".parse().unwrap(),
+            "http",
+            Some(&trust),
+        );
+
+        assert_eq!(client, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(xff(&headers), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn set_forwarded_falls_back_to_the_peer_on_a_malformed_or_absent_list() {
+        // Untrusted input on the trusted path: an unparseable element, an empty value, a bare
+        // trailing separator, a port-suffixed element, and a missing header all fall back to the
+        // peer rather than guessing — and none of them panics (data-plane discipline).
+        let trust = trusted(r#""10.0.0.0/8""#);
+        for value in [
+            Some("not-an-ip"),
+            Some(""),
+            Some("198.51.100.7,"),
+            Some("198.51.100.7, , 10.0.0.1"),
+            Some("198.51.100.7:443"),
+            Some("for=198.51.100.7"),
+            None,
+        ] {
+            let mut headers = hyper::HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+            }
+            let client = set_forwarded(
+                &mut headers,
+                "10.0.0.1".parse().unwrap(),
+                "http",
+                Some(&trust),
+            );
+            assert_eq!(
+                client,
+                "10.0.0.1".parse::<IpAddr>().unwrap(),
+                "{value:?} must fall back to the peer"
+            );
+            assert_eq!(xff(&headers), Some("10.0.0.1"), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn set_forwarded_bounds_the_elements_it_scans() {
+        // The one untrusted parse surface the trusted path opens is bounded (ADR 000103): a
+        // stuffed list runs the scan out of budget, which falls back to the peer.
+        let trust = trusted(r#""10.0.0.0/8""#);
+        let stuffed = std::iter::repeat_n("10.0.0.1", MAX_FORWARDED_ELEMENTS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_str(&format!("198.51.100.7,{stuffed}")).unwrap(),
+        );
+
+        let client = set_forwarded(
+            &mut headers,
+            "10.0.0.1".parse().unwrap(),
+            "http",
+            Some(&trust),
+        );
+
+        assert_eq!(client, "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn set_forwarded_ignores_x_forwarded_for_from_an_untrusted_peer() {
+        // The security half of ADR 000103: the declaration decides who may speak. A peer outside
+        // the CIDRs gets the unchanged edge behaviour — the forged list is dropped, the peer
+        // re-issued — no matter how plausible the claim looks.
+        let trust = trusted(r#""10.0.0.0/8""#);
+        for trust_arg in [Some(&trust), None] {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                "x-forwarded-for",
+                HeaderValue::from_static("198.51.100.7, 10.0.0.1"),
+            );
+            headers.insert("x-real-ip", HeaderValue::from_static("198.51.100.7"));
+
+            let client = set_forwarded(
+                &mut headers,
+                "203.0.113.5".parse().unwrap(),
+                "https",
+                trust_arg,
+            );
+
+            assert_eq!(client, "203.0.113.5".parse::<IpAddr>().unwrap());
+            assert_eq!(
+                xff(&headers),
+                Some("203.0.113.5"),
+                "an untrusted peer cannot name its own client"
+            );
+            assert_eq!(
+                headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
+                Some("203.0.113.5")
+            );
+        }
+    }
+
+    #[test]
+    fn set_forwarded_normalises_an_ipv4_mapped_restored_client() {
+        // The same canonicalisation the peer gets (ADR 000022) applies to a restored client, and
+        // a v4 CIDR matches an IPv4-mapped hop — otherwise a dual-stack chain would silently
+        // stop matching the declared set.
+        let trust = trusted(r#""10.0.0.0/8""#);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("::ffff:198.51.100.7, ::ffff:10.0.0.2"),
+        );
+
+        let client = set_forwarded(
+            &mut headers,
+            "::ffff:10.0.0.1".parse().unwrap(),
+            "https",
+            Some(&trust),
+        );
+
+        assert_eq!(client, "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(xff(&headers), Some("198.51.100.7"));
     }
 
     #[test]

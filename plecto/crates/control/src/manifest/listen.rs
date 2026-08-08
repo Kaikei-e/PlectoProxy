@@ -166,13 +166,19 @@ mod tests {
 
     fn listen(trusted: &[&str]) -> Listen {
         Listen {
-            addr: None,
-            advertised_port: None,
             proxy_protocol: Some(ProxyProtocol {
                 trusted: trusted.iter().map(|s| (*s).to_string()).collect(),
             }),
-            drain: None,
-            client_auth: None,
+            ..Listen::default()
+        }
+    }
+
+    fn trusted_proxy_listen(trusted: &[&str]) -> Listen {
+        Listen {
+            trusted_proxy: Some(TrustedProxy {
+                trusted: trusted.iter().map(|s| (*s).to_string()).collect(),
+            }),
+            ..Listen::default()
         }
     }
 
@@ -221,6 +227,79 @@ mod tests {
         // a dual-stack accept reports an IPv4 LB as ::ffff:10.1.2.3 — the v4 CIDR must match it
         assert!(trust.contains("::ffff:10.1.2.3".parse().unwrap()));
         assert!(!trust.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_absent_section_means_off() {
+        let parsed = Listen::default().trusted_proxy_trust().unwrap();
+        assert!(parsed.is_none(), "no section → no restoration path");
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_an_empty_or_unusable_trusted_list() {
+        // Same fail-closed shape as `[listen.proxy_protocol]`: declaring the section without
+        // naming the front proxies would let any peer name its own client address, and a bare
+        // IP is rejected with the explicit-prefix hint rather than guessed at.
+        let err = trusted_proxy_listen(&[]).validate().unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidListenConfig(_)),
+            "empty trusted must fail closed, got: {err}"
+        );
+
+        let msg = trusted_proxy_listen(&["192.0.2.1"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("/32"),
+            "a bare IP must be rejected with an explicit-prefix hint, got: {msg}"
+        );
+
+        let err = trusted_proxy_listen(&["not-a-cidr"])
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidListenConfig(_)),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_contains_matches_v4_v6_and_mapped_peers() {
+        let trust = trusted_proxy_listen(&["10.0.0.0/8", "2001:db8::/32"])
+            .trusted_proxy_trust()
+            .unwrap()
+            .expect("section present");
+        assert!(trust.contains("10.1.2.3".parse().unwrap()));
+        assert!(trust.contains("2001:db8::9".parse().unwrap()));
+        assert!(trust.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!trust.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_round_trips_through_the_manifest() {
+        let manifest =
+            crate::Manifest::from_toml("[listen.trusted_proxy]\ntrusted = [\"10.0.0.0/8\"]\n")
+                .unwrap();
+        let tp = manifest
+            .listen
+            .trusted_proxy
+            .as_ref()
+            .expect("section parsed");
+        assert_eq!(tp.trusted, vec!["10.0.0.0/8".to_string()]);
+
+        let bad = crate::Manifest::from_toml("[listen.trusted_proxy]\ntrusted = []\n").unwrap();
+        let err = crate::validate_manifest(&bad, std::path::Path::new(".")).unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidListenConfig(_)),
+            "plecto validate must reject an empty trusted list, got: {err}"
+        );
+
+        // unknown fields stay rejected (deny_unknown_fields, like every section)
+        assert!(
+            crate::Manifest::from_toml("[listen.trusted_proxy]\ncidrs = [\"10.0.0.0/8\"]\n")
+                .is_err()
+        );
     }
 
     #[test]

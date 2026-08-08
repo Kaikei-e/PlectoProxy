@@ -260,11 +260,14 @@ async fn proxy_core_inner(
         // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a
         // retryable failure (ADR 000019 timeout / 000023 retry). Per-attempt invariants once. ---
         let upstream_path = route.rewrite_path(&forward.path);
-        let timeout = group.request_timeout();
+        // Both bounds are the ROUTE's (ADR 000102): its `[route.timeouts]` override when it
+        // declares one, else the default declared by the upstream this request is going to. Routes
+        // with different latency budgets can therefore share one upstream.
+        let timeout = route.request_timeout(&group);
         // Overall request deadline across all attempts + backoff (ADR 000031); `None` = no overall
         // bound (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries
         // consume it.
-        let overall = group.overall_timeout();
+        let overall = route.overall_timeout(&group);
         let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
         // The retry loop's view of the body (ADR 000058): bodyless and buffered bodies are
         // replayable, an opaque streamed body (ADR 000013) moves into its single attempt.

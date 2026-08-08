@@ -387,15 +387,13 @@ impl TimeoutConfig {
     /// The effective per-try bound (ADR 000019 / 000102): this route's override, else the
     /// upstream's declared default. `Duration::ZERO` (either source) disables the bound.
     pub fn request_timeout(&self, upstream_default: Duration) -> Duration {
-        let _ = upstream_default;
-        todo!("resolve the route override against the upstream default")
+        self.request.unwrap_or(upstream_default)
     }
 
     /// The effective overall bound (ADR 000031 / 000102): this route's override, else the
     /// upstream's declared default. `Duration::ZERO` (either source) means no overall bound.
     pub fn overall_timeout(&self, upstream_default: Duration) -> Duration {
-        let _ = upstream_default;
-        todo!("resolve the route override against the upstream default")
+        self.overall.unwrap_or(upstream_default)
     }
 }
 

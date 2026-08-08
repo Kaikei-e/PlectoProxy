@@ -191,6 +191,70 @@ reload rather than being dropped at request time. So does naming a hop-by-hop he
 the transport, and the length belongs to the body Plecto actually sends — a declared one would be a
 response-desync primitive.
 
+## Request timeouts: which value actually applies
+
+Two bounds govern a forwarded request, and an upstream declares the default for both:
+
+| Knob | What it bounds | Default | `0` means |
+| --- | --- | --- | --- |
+| `request_timeout_ms` (per-try) | one attempt's time to the response **headers**; the body then streams without a deadline | `30000` | no per-try bound — the long-poll / streaming opt-out |
+| `overall_timeout_ms` | the whole transaction: every attempt **plus** the backoff between them | `0` | no overall bound |
+
+A route can override either of them for its own traffic, so routes with genuinely different latency
+budgets share one upstream instead of forcing a duplicate `[[upstream]]` (which would duplicate its
+health prober and split its circuit-breaker state):
+
+```toml
+[[upstream]]
+name = "app"
+addresses = ["127.0.0.1:9000"]
+request_timeout_ms = 5000     # the default every route to this upstream inherits
+[upstream.health]
+path = "/healthz"
+
+[[route]]                     # inherits 5000
+upstream = "app"
+[route.match]
+path_prefix = "/api"
+
+[[route]]                     # same upstream, a longer budget
+upstream = "app"
+[route.match]
+path_prefix = "/images/resize"
+[route.timeouts]
+request_timeout_ms = 30000
+overall_timeout_ms = 45000
+
+[[route]]                     # same upstream, no per-try bound at all
+upstream = "app"
+[route.match]
+path_prefix = "/events"
+[route.timeouts]
+request_timeout_ms = 0
+```
+
+**The resolution order is one rule: the route's value if it declares one, otherwise the upstream's**
+— per knob, independently. A route that sets only `overall_timeout_ms` still runs on the upstream's
+per-try value.
+
+**Omitting a field and writing `0` are different things.** Omitted takes the upstream's value; `0`
+disables that bound for this route. `[route.timeouts] request_timeout_ms = 0` is therefore how a
+streaming route opts out of a short upstream default — it is not the same as leaving the block out.
+
+**Both bounds apply together, and the tighter one wins.** Each attempt is bounded by the per-try
+value *and* by whatever is left of the overall budget, whichever is smaller; the overall budget keeps
+shrinking as attempts and backoff spend it. An `overall_timeout_ms` smaller than the per-try value is
+not rejected — the runtime simply applies the smaller one, so a single attempt may be cut short.
+
+Exceeding either fails closed with **504**, and the fault marker says which one:
+`x-plecto-fault: upstream-timeout` for a per-try expiry, `request-timeout` for the overall deadline.
+
+Two things this deliberately does not do. Nothing renders the *resolved* value: to know what a route
+runs under, read its `[route.timeouts]` and then its upstream's fields. And `max_retries`,
+`[upstream.circuit_breaker]`, and `[upstream.outlier_detection]` stay per-upstream — they describe
+the backend (how much load it may take, whether it is broken), not this route's time budget
+([ADR 000102](ADR/000102.md)).
+
 ## Upgrading: two independent version series
 
 Plecto ships **two version series, and they move independently**:

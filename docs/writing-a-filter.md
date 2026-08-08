@@ -243,6 +243,7 @@ addresses = ["127.0.0.1:9000", "127.0.0.1:9001"]  # required: host:port instance
 resolve_interval_ms = 0               # optional (default 0 = off): re-resolve hostname addresses
                                        # on this interval, each A/AAAA record its own LB endpoint
 request_timeout_ms = 30000            # optional (default 30000; 0 disables — long-poll/streaming)
+overall_timeout_ms = 0                # optional (default 0 = none): bounds every attempt + backoff
 max_retries = 1                       # optional (default 1; 0 disables retry onto another instance)
 [upstream.health]                     # required: instances start unhealthy, a probe admits them
 path = "/healthz"                     # required
@@ -272,6 +273,9 @@ upstream = "app"         # required: the [[upstream]] name to forward a passing 
 filters = ["my-filter"]  # optional: filter ids run in order (empty = pure pass-through)
 host = "example.com"     # optional: match only this authority (case-insensitive); omit = any host
 strip_prefix = "/api"    # optional: strip this prefix before forwarding (the chain saw the original)
+[route.timeouts]         # optional: absent = the upstream's own timeouts apply, unchanged
+request_timeout_ms = 30000 # optional: overrides the upstream's per-try bound; 0 disables it here
+overall_timeout_ms = 45000 # optional: overrides the upstream's overall bound; 0 = no overall bound
 [route.upgrade]          # optional: absent = deny-by-default, no HTTP/1.1 Upgrade tunnelled
 protocols = ["websocket"] # required if the section is present; token allowlist, `h2c` rejected
 idle_timeout_ms = 300000  # optional (default 300000 = 5 min); 0 disables the idle timer
@@ -283,6 +287,13 @@ remove = ["server"]                             # dropped from every response th
 `[route.upgrade]` opts a route into tunnelling `HTTP/1.1 Upgrade` (e.g. WebSocket): a listed token
 re-issues the handshake upstream and, on a verified `101`, splices a bidirectional byte tunnel with
 an activity-reset idle timeout (ADR 000048).
+
+`[route.timeouts]` overrides the two timeouts the upstream declares as defaults (ADR 000102), per
+knob and independently: the route's value wins where it declares one, the upstream's stands
+everywhere else. Omitting a field is **not** the same as writing `0` — `0` disables that bound for
+this route, which is how a streaming route opts out of a short upstream default. Details and the
+per-try/overall interaction are in the
+[operations guide](operations.md#request-timeouts-which-value-actually-applies).
 
 `[route.headers]` is the constant-header case that does **not** need a filter (ADR 000100): literal
 values only, applied after the response chain to every response the route answers — a filter's

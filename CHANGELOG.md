@@ -34,6 +34,21 @@ All notable changes to Plecto are documented here. The format follows
 
 ### Added
 
+- **Per-route timeout overrides** (`[route.timeouts]`, ADR 000102). A route can now declare
+  `request_timeout_ms` (per-try) and `overall_timeout_ms` of its own, overriding the defaults its
+  upstream declares. One rule governs both, per knob and independently: **the upstream declares the
+  default, the route overrides it.** Routes whose latency budgets genuinely differ — a resize
+  endpoint that needs 30 s and a plain REST call that should fail in 2 — can therefore share one
+  upstream, instead of declaring a second `[[upstream]]` at the same address purely to change a
+  timeout, which duplicated its health prober and split its circuit-breaker state across two states
+  for one backend. Omitting a field and writing `0` remain different: omitted takes the upstream's
+  value, `0` disables that bound for this route, so `request_timeout_ms = 0` is the per-route
+  streaming opt-out. The per-try and overall bounds still apply together with the tighter one
+  winning, the fault markers still distinguish them (`upstream-timeout` / `request-timeout`), and
+  `max_retries` / `[upstream.circuit_breaker]` / `[upstream.outlier_detection]` stay per-upstream —
+  they describe the backend, not a route's time budget. Absent section, unchanged behavior. See the
+  [operations guide](docs/operations.md#request-timeouts-which-value-actually-applies).
+
 - **Declarative per-route response headers** (`[route.headers]`, ADR 000100). A route can now
   declare `set = { … }` / `remove = [ … ]` and get constant response headers without writing a
   filter — the case that previously cost an operator a Rust toolchain, a vendored WIT copy, a

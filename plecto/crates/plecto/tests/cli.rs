@@ -71,6 +71,24 @@ fn version_flag_names_the_compiled_capability_profile() {
 }
 
 #[test]
+fn version_flag_lists_the_loadable_filter_contract_versions() {
+    // ADR 000099: `--version` answers "what does this binary accept?" — the set of
+    // `plecto:filter` contract versions it can load — which is a different question from "what
+    // did each filter bind in this configuration?" (the per-filter startup line). An operator
+    // deciding whether a proxy bump forces a filter rebuild reads this one.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["--version"], dir.path());
+    assert!(out.status.success(), "--version exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for version in ["plecto:filter@0.1.0", "plecto:filter@0.2.0", "plecto:filter@0.3.0"] {
+        assert!(
+            stdout.contains(version),
+            "--version lists {version} as loadable, got: {stdout:?}"
+        );
+    }
+}
+
+#[test]
 fn schema_emits_a_draft07_json_schema_describing_the_manifest() {
     // `plecto schema` (ADR 000049): the manifest's JSON Schema on stdout, derived from the same
     // serde model `from_toml` parses with. draft-07 is the level taplo / Even Better TOML

@@ -106,6 +106,9 @@ async fn admin_handle(
                 &state.control.filter_metrics(),
                 state.otlp.as_ref().map(|b| (b.dropped_spans(), b.len())),
                 state.control.pool_residency(),
+                // Walked at scrape time (ADR 000099), never tallied into a persistent counter —
+                // so the gauge cannot carry stale state across a reload.
+                &state.control.upstream_groups(),
             ),
         ),
         "/healthz" => (

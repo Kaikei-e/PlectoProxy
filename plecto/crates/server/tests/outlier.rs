@@ -162,4 +162,19 @@ path_prefix = "/"
         ejections >= 1,
         "the misbehaving instance was ejected at least once, got {ejections}"
     );
+    // ADR 000099: the CURRENT rotation is readable too, not just the cumulative ejection count.
+    // The ejected instance is still probe-healthy (its `/healthz` keeps returning 200), so this is
+    // the independent-axes fold in the field: it must be counted `ejected`, not `healthy`.
+    assert!(
+        metrics.contains("plecto_upstream_instances{upstream=\"u\",state=\"ejected\"} 1"),
+        "the ejected instance is counted in the ejected series:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("plecto_upstream_instances{upstream=\"u\",state=\"healthy\"} 1"),
+        "only the other instance is left in rotation:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("plecto_upstream_instances{upstream=\"u\",state=\"unhealthy\"} 0"),
+        "neither instance failed its probe — ejection is not a health demotion:\n{metrics}"
+    );
 }

@@ -177,201 +177,267 @@ async fn proxy_core_inner(
     };
     let idx = route.index;
 
-    // Native rate limit (ADR 000033): a coarse token-bucket baseline consulted at the front door —
-    // BEFORE the route's filter chain — so a flood is shed without spending any WASM CPU. The
-    // client-keyed (or route-keyed) bucket math is host-native and never crosses the WASM boundary.
-    // Over the limit fails closed with 429 + `Retry-After`, distinct from the breaker's 503
-    // (`circuit-open`, upstream saturated): this is the client over its inbound rate floor. The
-    // per-filter `host-ratelimit` capability (ADR 000026) is a separate, policy-shaped limiter.
-    if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(client) {
-        state.metrics.inc_rate_limited();
-        return Ok(with_error_code(
-            synth_retry_after(
-                StatusCode::TOO_MANY_REQUESTS,
-                &fault::RATE_LIMITED,
-                b"rate limit exceeded",
-                retry_after_ms.div_ceil(1000),
-            ),
-            &plecto_control::QUOTA_EXCEEDED,
-        ));
-    }
-
-    let upgrade = upgrade_intent(&route, &mut parts, bodyless);
-
-    // The chain view the remaining phases share (request body hook, upgrade switch, response
-    // side): the pinned snapshot + the selected route's chain identity.
-    let chain = ChainRef {
-        snapshot: &snapshot,
-        idx,
-        has_filters: route.has_filters,
-    };
-
-    // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
-    // A route with no filters skips the hop entirely — an empty chain is the identity, and the
-    // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax. ---
-    let forward = if route.has_filters {
-        let snap_req = snapshot.clone();
-        match tokio::task::spawn_blocking(move || snap_req.dispatch_request(idx, http_req)).await? {
-            ChainOutcome::Respond(resp) => return Ok(http_response(resp)),
-            ChainOutcome::Forward(req) => req,
+    // From here on the route is chosen, so EVERY response this transaction can produce is that
+    // route's to answer. They funnel through the single exit below, where the operator's declared
+    // `[route.headers]` (ADR 000100) is stamped on — "every route-attributed response" is then a
+    // property of the control flow, not a checklist over a dozen scattered `return`s.
+    let routed: Result<Routed, ServerError> = async {
+        // Native rate limit (ADR 000033): a coarse token-bucket baseline consulted at the front
+        // door — BEFORE the route's filter chain — so a flood is shed without spending any WASM
+        // CPU. The client-keyed (or route-keyed) bucket math is host-native and never crosses the
+        // WASM boundary. Over the limit fails closed with 429 + `Retry-After`, distinct from the
+        // breaker's 503 (`circuit-open`, upstream saturated): this is the client over its inbound
+        // rate floor. The per-filter `host-ratelimit` capability (ADR 000026) is a separate,
+        // policy-shaped limiter.
+        if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(client) {
+            state.metrics.inc_rate_limited();
+            return Ok(Routed::Synthesised(with_error_code(
+                synth_retry_after(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &fault::RATE_LIMITED,
+                    b"rate limit exceeded",
+                    retry_after_ms.div_ceil(1000),
+                ),
+                &plecto_control::QUOTA_EXCEEDED,
+            )));
         }
-    } else {
-        http_req
-    };
 
-    // Weighted traffic split (ADR 000034): pick which backend upstream group to forward to, in the
-    // route's weighted proportion, skipping any backend with no eligible instance (renormalize over
-    // healthy). `None` = no backend has a healthy instance → fail closed 503 (the no-healthy fault,
-    // ADR 000017 / 000024). The chosen group then drives the existing instance LB / retry / breaker /
-    // health below; a single-upstream route is a one-element split, so this is uniform.
-    let Some(group) = route.pick_upstream() else {
-        return Ok(synth(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &fault::NO_HEALTHY_UPSTREAM,
-            b"no healthy upstream",
-        ));
-    };
+        let upgrade = upgrade_intent(&route, &mut parts, bodyless);
 
-    // Maglev consistent-hashing key (ADR 000035): for a `maglev` upstream, project the request's
-    // hash key — a named header's value (borrowed bytes) or the client's IP (hashed as canonical
-    // octets; the resolved client, never a claim Plecto did not authorise). `None` for the other
-    // algorithms, or when the configured header is absent (the group then falls back to
-    // round-robin). Borrowed from `parts`, which outlives the retry loop, and `Copy`, so each
-    // attempt reuses it unchanged.
-    let hash_key: Option<HashInput<'_>> = group.hash_key_source().and_then(|src| match src {
-        HashKeySource::Header(name) => parts
-            .headers
-            .get(name)
-            .map(|v| HashInput::Bytes(v.as_bytes())),
-        HashKeySource::SourceIp => Some(HashInput::Ip(client)),
-    });
-
-    // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a retryable
-    // failure (ADR 000019 timeout / 000023 retry). The per-attempt invariants are computed once. ---
-    let upstream_path = route.rewrite_path(&forward.path);
-    let timeout = group.request_timeout();
-    // Overall request deadline across all attempts + backoff (ADR 000031); `None` = no overall bound
-    // (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries consume it.
-    let overall = group.overall_timeout();
-    let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
-    // The retry loop's view of the body (ADR 000058): bodyless and buffered bodies are
-    // replayable, an opaque streamed body (ADR 000013) moves into its single attempt.
-    let mut real_body = if bodyless {
-        ForwardBody::Bodyless
-    } else {
-        ForwardBody::OneShot(body)
-    };
-
-    // The buffer permit must outlive the BUFFER, not just the read: the buffered bytes live on in
-    // `ForwardBody::Replayable` through the whole forward/retry/response phase, so a permit
-    // dropped inside the hook would bound concurrent *reads* while resident buffered-body memory
-    // grew past `MAX_INFLIGHT_BODY_BUFFERS × MAX_REQUEST_BODY_BUFFER` under slow upstreams.
-    // Bound at function scope so it drops with the transaction.
-    let _buf_permit =
-        match request_body_hook(&state, &chain, route.reads_body, &mut real_body).await? {
-            BodyHookOutcome::Proceed(permit) => permit,
-            BodyHookOutcome::Respond(resp) => return Ok(resp),
+        // The chain view the remaining phases share (request body hook, upgrade switch, response
+        // side): the pinned snapshot + the selected route's chain identity.
+        let chain = ChainRef {
+            snapshot: &snapshot,
+            idx,
+            has_filters: route.has_filters,
         };
 
-    // Circuit breaker (ADR 000028): take an in-flight slot under this upstream's `max_requests` cap
-    // before forwarding. At the cap, shed load with a fast-fail 503 rather than queueing work onto a
-    // saturated backend. One slot per request, held across the retry loop and released by RAII on
-    // every return path; an unlimited breaker (the default) is a zero-cost no-op permit. The breaker
-    // is overload protection, NOT a health signal — a shed request never demotes an instance.
-    let permit = match group.try_acquire() {
-        Some(permit) => permit,
-        None => {
-            state.metrics.inc_circuit_open();
-            return Ok(synth(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &fault::CIRCUIT_OPEN,
-                b"upstream overloaded",
-            ));
-        }
-    };
-
-    // First pick per the upstream's LB algorithm (ADR 000035): round-robin, least-request (P2C), or
-    // maglev (by `hash_key`). Fail closed (503) if no instance is eligible (ADR 000017). The `Pick`
-    // carries the least-request load guard (a no-op otherwise) and is held across the retry loop, so
-    // an instance's active-request count is decremented on every exit and on each retry hand-off.
-    let Some(pick) = group.pick(hash_key) else {
-        return Ok(synth(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &fault::NO_HEALTHY_UPSTREAM,
-            b"no healthy upstream",
-        ));
-    };
-
-    let forward_req = ForwardRequest {
-        method: forward.method.as_str(),
-        // The filterless fast path forwards the inbound headers directly (no contract re-parse
-        // per attempt) — `set_forwarded` already corrected them on `parts.headers`, and the
-        // hop-by-hop strip applies at copy time either way. A filtered route forwards the
-        // chain-edited contract bytes.
-        headers: if route.has_filters {
-            crate::forward::AttemptHeaders::Chain(&forward.headers)
+        // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
+        // A route with no filters skips the hop entirely — an empty chain is the identity, and the
+        // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax.
+        let forward = if route.has_filters {
+            let snap_req = snapshot.clone();
+            match tokio::task::spawn_blocking(move || snap_req.dispatch_request(idx, http_req))
+                .await?
+            {
+                ChainOutcome::Respond(resp) => {
+                    return Ok(Routed::Synthesised(http_response(resp)));
+                }
+                ChainOutcome::Forward(req) => req,
+            }
         } else {
-            crate::forward::AttemptHeaders::Direct(&parts.headers)
-        },
-        original_headers: &parts.headers,
-        authority: &forward.authority,
-        upstream_path: &upstream_path,
-        traceparent: &snapshot.traceparent(),
-        upgrade_token: upgrade.as_ref().map(|(t, _, _)| t.as_str()),
-    };
-    // The client for this group's security context (ADR 000042): the shared plain client, or the
-    // pooled TLS client for its `[upstream.tls]` config. A cheap clone (shared pool inside).
-    let client = state.clients.for_group(&group);
-    let (upstream_resp, upstream_pick) = match forward_with_retry(
-        &client,
-        &state.metrics,
-        &group,
-        pick,
-        hash_key,
-        forward_req,
-        real_body,
-        timeout,
-        overall_deadline,
-        group.max_retries(),
-    )
-    .await
-    {
-        ForwardOutcome::Response(resp, pick) => (resp, pick),
-        ForwardOutcome::OverallTimeout => {
-            return Ok(synth(
-                StatusCode::GATEWAY_TIMEOUT,
-                &fault::REQUEST_TIMEOUT,
-                b"request timeout",
-            ));
-        }
-        ForwardOutcome::PerTryTimeout => {
-            return Ok(synth(
-                StatusCode::GATEWAY_TIMEOUT,
-                &fault::UPSTREAM_TIMEOUT,
-                b"upstream timeout",
-            ));
-        }
-        ForwardOutcome::SendFailed(e) => return Err(e.into()),
-        ForwardOutcome::BuildFailed(e) => return Err(e.into()),
-    };
+            http_req
+        };
 
-    // --- upgrade switch (ADR 000048): a verified 101 splices the two connections into an opaque
-    // tunnel; any other status falls through to the normal response path (the handshake was
-    // simply refused — the upstream's answer is a legitimate response). ---
-    if upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        return upgrade_switch(
-            &state,
-            &chain,
-            forward,
-            upgrade,
-            upstream_resp,
-            permit,
-            upstream_pick,
+        // Weighted traffic split (ADR 000034): pick which backend upstream group to forward to, in
+        // the route's weighted proportion, skipping any backend with no eligible instance
+        // (renormalize over healthy). `None` = no backend has a healthy instance → fail closed 503
+        // (the no-healthy fault, ADR 000017 / 000024). The chosen group then drives the existing
+        // instance LB / retry / breaker / health below; a single-upstream route is a one-element
+        // split, so this is uniform.
+        let Some(group) = route.pick_upstream() else {
+            return Ok(Routed::Synthesised(synth(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &fault::NO_HEALTHY_UPSTREAM,
+                b"no healthy upstream",
+            )));
+        };
+
+        // Maglev consistent-hashing key (ADR 000035): for a `maglev` upstream, project the
+        // request's hash key — a named header's value (borrowed bytes) or the client's IP (hashed
+        // as canonical octets; the resolved client, never a claim Plecto did not authorise).
+        // `None` for the other algorithms, or when the configured header is absent (the group then
+        // falls back to round-robin). Borrowed from `parts`, which outlives the retry loop, and
+        // `Copy`, so each attempt reuses it unchanged.
+        let hash_key: Option<HashInput<'_>> = group.hash_key_source().and_then(|src| match src {
+            HashKeySource::Header(name) => parts
+                .headers
+                .get(name)
+                .map(|v| HashInput::Bytes(v.as_bytes())),
+            HashKeySource::SourceIp => Some(HashInput::Ip(client)),
+        });
+
+        // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a
+        // retryable failure (ADR 000019 timeout / 000023 retry). Per-attempt invariants once. ---
+        let upstream_path = route.rewrite_path(&forward.path);
+        let timeout = group.request_timeout();
+        // Overall request deadline across all attempts + backoff (ADR 000031); `None` = no overall
+        // bound (only the per-try `timeout` applies). Pinned once, so the budget shrinks as retries
+        // consume it.
+        let overall = group.overall_timeout();
+        let overall_deadline = (!overall.is_zero()).then(|| Instant::now() + overall);
+        // The retry loop's view of the body (ADR 000058): bodyless and buffered bodies are
+        // replayable, an opaque streamed body (ADR 000013) moves into its single attempt.
+        let mut real_body = if bodyless {
+            ForwardBody::Bodyless
+        } else {
+            ForwardBody::OneShot(body)
+        };
+
+        // The buffer permit must outlive the BUFFER, not just the read: the buffered bytes live on
+        // in `ForwardBody::Replayable` through the whole forward/retry/response phase, so a permit
+        // dropped inside the hook would bound concurrent *reads* while resident buffered-body
+        // memory grew past `MAX_INFLIGHT_BODY_BUFFERS × MAX_REQUEST_BODY_BUFFER` under slow
+        // upstreams. Bound at transaction scope so it drops with the transaction.
+        let _buf_permit =
+            match request_body_hook(&state, &chain, route.reads_body, &mut real_body).await? {
+                BodyHookOutcome::Proceed(permit) => permit,
+                BodyHookOutcome::Respond(resp) => return Ok(Routed::Synthesised(resp)),
+            };
+
+        // Circuit breaker (ADR 000028): take an in-flight slot under this upstream's
+        // `max_requests` cap before forwarding. At the cap, shed load with a fast-fail 503 rather
+        // than queueing work onto a saturated backend. One slot per request, held across the retry
+        // loop and released by RAII on every return path; an unlimited breaker (the default) is a
+        // zero-cost no-op permit. The breaker is overload protection, NOT a health signal — a shed
+        // request never demotes an instance.
+        let permit = match group.try_acquire() {
+            Some(permit) => permit,
+            None => {
+                state.metrics.inc_circuit_open();
+                return Ok(Routed::Synthesised(synth(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &fault::CIRCUIT_OPEN,
+                    b"upstream overloaded",
+                )));
+            }
+        };
+
+        // First pick per the upstream's LB algorithm (ADR 000035): round-robin, least-request
+        // (P2C), or maglev (by `hash_key`). Fail closed (503) if no instance is eligible (ADR
+        // 000017). The `Pick` carries the least-request load guard (a no-op otherwise) and is held
+        // across the retry loop, so an instance's active-request count is decremented on every exit
+        // and on each retry hand-off.
+        let Some(pick) = group.pick(hash_key) else {
+            return Ok(Routed::Synthesised(synth(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &fault::NO_HEALTHY_UPSTREAM,
+                b"no healthy upstream",
+            )));
+        };
+
+        let forward_req = ForwardRequest {
+            method: forward.method.as_str(),
+            // The filterless fast path forwards the inbound headers directly (no contract re-parse
+            // per attempt) — `set_forwarded` already corrected them on `parts.headers`, and the
+            // hop-by-hop strip applies at copy time either way. A filtered route forwards the
+            // chain-edited contract bytes.
+            headers: if route.has_filters {
+                crate::forward::AttemptHeaders::Chain(&forward.headers)
+            } else {
+                crate::forward::AttemptHeaders::Direct(&parts.headers)
+            },
+            original_headers: &parts.headers,
+            authority: &forward.authority,
+            upstream_path: &upstream_path,
+            traceparent: &snapshot.traceparent(),
+            upgrade_token: upgrade.as_ref().map(|(t, _, _)| t.as_str()),
+        };
+        // The client for this group's security context (ADR 000042): the shared plain client, or
+        // the pooled TLS client for its `[upstream.tls]` config. A cheap clone (shared pool
+        // inside).
+        let client = state.clients.for_group(&group);
+        let (upstream_resp, upstream_pick) = match forward_with_retry(
+            &client,
+            &state.metrics,
+            &group,
+            pick,
+            hash_key,
+            forward_req,
+            real_body,
+            timeout,
+            overall_deadline,
+            group.max_retries(),
         )
-        .await;
-    }
+        .await
+        {
+            ForwardOutcome::Response(resp, pick) => (resp, pick),
+            ForwardOutcome::OverallTimeout => {
+                return Ok(Routed::Synthesised(synth(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &fault::REQUEST_TIMEOUT,
+                    b"request timeout",
+                )));
+            }
+            ForwardOutcome::PerTryTimeout => {
+                return Ok(Routed::Synthesised(synth(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &fault::UPSTREAM_TIMEOUT,
+                    b"upstream timeout",
+                )));
+            }
+            ForwardOutcome::SendFailed(e) => return Err(e.into()),
+            ForwardOutcome::BuildFailed(e) => return Err(e.into()),
+        };
 
-    respond_through_chain(&chain, &route, &parts, forward, upstream_resp).await
+        // --- upgrade switch (ADR 000048): a verified 101 splices the two connections into an
+        // opaque tunnel; any other status falls through to the normal response path (the handshake
+        // was simply refused — the upstream's answer is a legitimate response). ---
+        if upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return upgrade_switch(
+                &state,
+                &chain,
+                forward,
+                upgrade,
+                upstream_resp,
+                permit,
+                upstream_pick,
+            )
+            .await
+            .map(Routed::Synthesised);
+        }
+
+        respond_through_chain(&chain, forward, upstream_resp).await
+    }
+    .await;
+
+    // A transport fault raised AFTER the route was chosen is still that route's response — the
+    // same 502 the transports synthesise for an escaping error, built here so the declaration
+    // below reaches it too.
+    let routed = routed.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "fast-path error");
+        Routed::Synthesised(synth(
+            StatusCode::BAD_GATEWAY,
+            &fault::UPSTREAM,
+            b"upstream error",
+        ))
+    });
+
+    // The single exit (ADR 000100 decision 2). The declaration lands AFTER the response chain, so
+    // neither a filter's `replace` nor a fail-closed fault can drop it, and BEFORE compression, so
+    // the codec's own `Vary` / `Content-Encoding` stay the last word on the representation. Only a
+    // forwarded upstream stream is a compression candidate — a synthesised response is host-framed
+    // and never transformed (ADR 000075 decision 1).
+    Ok(match routed {
+        Routed::Synthesised(resp) => with_declared_headers(resp, &route),
+        Routed::Forwarded(resp) => {
+            crate::compression::apply(with_declared_headers(resp, &route), &route, &parts)
+        }
+    })
+}
+
+/// What the routed half of a transaction settled on. The split is the compression rule (ADR 000075
+/// decision 1): only a FORWARDED upstream stream is a candidate for `[route.compression]`, while a
+/// response Plecto synthesised is host-framed and never transformed. Both carry the route's
+/// declared `[route.headers]` (ADR 000100).
+enum Routed {
+    /// A response Plecto built for this route: a filter's short-circuit or `replace`, the chain's
+    /// fail-closed 5xx, the native 429, a forward-side 5xx, or an upgrade handshake.
+    Synthesised(Response<ResponseBody>),
+    /// The upstream's response, streamed back through the (possibly empty) response chain.
+    Forwarded(Response<ResponseBody>),
+}
+
+/// Stamp a route's declared `[route.headers]` (ADR 000100) onto an about-to-be-sent response.
+/// A route with no declaration is a no-op.
+fn with_declared_headers(
+    mut resp: Response<ResponseBody>,
+    route: &RouteInfo,
+) -> Response<ResponseBody> {
+    if let Some(declared) = route.response_headers.as_deref() {
+        declared.apply(resp.headers_mut());
+    }
+    resp
 }
 
 /// One transaction's pinned view of the filter chain — the config snapshot plus the selected
@@ -606,21 +672,23 @@ async fn upgrade_switch(
     Ok(resp101)
 }
 
-/// Response side: the route's chain in reverse (status / headers only), then compression LAST
-/// (ADR 000074 — filters always see identity, and a synthesised `Respond` is deliberately never
-/// compressed). A filterless route skips the blocking-pool hop and the contract projection;
-/// the hop-by-hop strip still applies, directly on the original header bytes.
+/// Response side: the route's chain in reverse (status / headers only). What comes out is either
+/// the forwarded upstream stream — which the caller's single exit then stamps and compresses (ADR
+/// 000074: filters always see identity) — or a synthesised response, which is never compressed.
+/// A filterless route skips the blocking-pool hop and the contract projection; the hop-by-hop
+/// strip still applies, directly on the original header bytes.
 async fn respond_through_chain(
     chain: &ChainRef<'_>,
-    route: &RouteInfo,
-    parts: &hyper::http::request::Parts,
     forward: HttpRequest,
     upstream_resp: Response<ResponseBody>,
-) -> Result<Response<ResponseBody>, ServerError> {
+) -> Result<Routed, ServerError> {
     let (uparts, ubody) = upstream_resp.into_parts();
     if !chain.has_filters {
-        let resp = stream_response_direct(uparts.status, &uparts.headers, ubody);
-        return Ok(crate::compression::apply(resp, route, parts));
+        return Ok(Routed::Forwarded(stream_response_direct(
+            uparts.status,
+            &uparts.headers,
+            ubody,
+        )));
     }
     let http_resp = HttpResponse {
         status: uparts.status.as_u16(),
@@ -646,12 +714,16 @@ async fn respond_through_chain(
         ResponseOutcome::Forward(edited) => {
             // The upstream's original headers ride along so framing stays host-owned (the chain
             // cannot desync `Content-Length` from the streamed body).
-            let resp = stream_response(edited.status, &edited.headers, &uparts.headers, ubody);
-            Ok(crate::compression::apply(resp, route, parts))
+            Ok(Routed::Forwarded(stream_response(
+                edited.status,
+                &edited.headers,
+                &uparts.headers,
+                ubody,
+            )))
         }
         ResponseOutcome::Respond(resp) => {
             discard_upstream_body(ubody);
-            Ok(http_response(resp))
+            Ok(Routed::Synthesised(http_response(resp)))
         }
     }
 }

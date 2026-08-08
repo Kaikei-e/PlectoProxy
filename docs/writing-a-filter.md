@@ -275,11 +275,20 @@ strip_prefix = "/api"    # optional: strip this prefix before forwarding (the ch
 [route.upgrade]          # optional: absent = deny-by-default, no HTTP/1.1 Upgrade tunnelled
 protocols = ["websocket"] # required if the section is present; token allowlist, `h2c` rejected
 idle_timeout_ms = 300000  # optional (default 300000 = 5 min); 0 disables the idle timer
+[route.headers]          # optional: literal response headers, no filter needed
+set = { "X-Content-Type-Options" = "nosniff" }  # replaces any same-named header on the way out
+remove = ["server"]                             # dropped from every response this route answers
 ```
 
 `[route.upgrade]` opts a route into tunnelling `HTTP/1.1 Upgrade` (e.g. WebSocket): a listed token
 re-issues the handshake upstream and, on a verified `101`, splices a bidirectional byte tunnel with
 an activity-reset idle timeout (ADR 000048).
+
+`[route.headers]` is the constant-header case that does **not** need a filter (ADR 000100): literal
+values only, applied after the response chain to every response the route answers — a filter's
+`replace` and the fail-closed 5xx included. A header whose value depends on the request is a
+per-request decision and stays a filter's job. Details and the one gap (a response returned before
+a route is chosen) are in the [operations guide](operations.md#declared-response-headers-which-responses-they-land-on).
 
 ### `[[tls]]`
 

@@ -68,6 +68,10 @@ pub(crate) struct CompiledRoute {
     pub(crate) upgrade: Option<Arc<UpgradeConfig>>,
     /// This route's compression opt-in (ADR 000074), or `None` for never-transform (the default).
     pub(crate) compression: Option<Arc<CompressionConfig>>,
+    /// This route's declared response headers (ADR 000100), or `None` for no declaration. Named
+    /// `response_headers` here because `headers` above is already the request-side MATCH
+    /// dimension — one is what the route matches on, the other what it stamps on the way out.
+    pub(crate) response_headers: Option<Arc<ResponseHeaders>>,
 }
 
 impl CompiledRoute {
@@ -133,6 +137,11 @@ impl CompiledRoute {
                 .compression
                 .as_ref()
                 .map(|c| Arc::new(CompressionConfig::new(c))),
+            // Compile the response-header declaration (ADR 000100) — names / values validated.
+            response_headers: r
+                .headers
+                .as_ref()
+                .map(|h| Arc::new(ResponseHeaders::new(h))),
         }
     }
 }
@@ -156,6 +165,7 @@ impl std::fmt::Debug for CompiledRoute {
             .field("rate_limit", &self.rate_limit)
             .field("upgrade", &self.upgrade)
             .field("compression", &self.compression)
+            .field("response_headers", &self.response_headers)
             .finish()
     }
 }
@@ -257,10 +267,27 @@ pub struct ResponseHeaders {
 impl ResponseHeaders {
     /// Compile a manifest `[route.headers]` block. Public because the fast-path server's unit
     /// tests build configs directly, without a manifest parse.
-    pub fn new(_rh: &RouteHeaders) -> Self {
+    ///
+    /// `validate_response_headers` already parsed every name and value, so `filter_map` stays
+    /// total here rather than asserting an invariant enforced one step earlier (the same
+    /// discipline `resolved_chain` follows above).
+    pub fn new(rh: &RouteHeaders) -> Self {
         Self {
-            set: Vec::new(),
-            remove: Vec::new(),
+            set: rh
+                .set
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        HeaderName::from_bytes(name.as_bytes()).ok()?,
+                        HeaderValue::from_str(value).ok()?,
+                    ))
+                })
+                .collect(),
+            remove: rh
+                .remove
+                .iter()
+                .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
         }
     }
 
@@ -275,6 +302,53 @@ impl ResponseHeaders {
             headers.insert(name.clone(), value.clone());
         }
     }
+}
+
+/// Parse one declared header name (ADR 000100), rejecting anything the operator must not name.
+/// The reserved set is the hop-by-hop headers (RFC 9110 §7.6.1 — connection management belongs to
+/// the transport, not to a declaration) plus `content-length`, which the host computes for the
+/// body it actually sends: a manifest-set length is a response-desync primitive (CWE-444). Both
+/// fail the BUILD rather than being dropped per response, where nobody would see it.
+fn declared_header_name(name: &str) -> Result<HeaderName, String> {
+    let parsed = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("headers names `{name}`, which is not a valid HTTP header name"))?;
+    let reserved = parsed == http::header::CONTENT_LENGTH
+        || plecto_host::HOP_BY_HOP_GUEST_HEADERS
+            .iter()
+            .any(|h| parsed.as_str() == *h);
+    if reserved {
+        return Err(format!(
+            "headers names `{name}`, a hop-by-hop / framing header the host owns"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Validate a route's `[route.headers]` declaration (ADR 000100), fail-closed. The declaration
+/// lands on every response the route answers, so an unusable name or value must stop startup /
+/// reload; an empty block is a config typo (it declares nothing) and is rejected the same way.
+fn validate_response_headers(h: &crate::manifest::RouteHeaders) -> Result<(), String> {
+    if h.set.is_empty() && h.remove.is_empty() {
+        return Err("headers declares neither `set` nor `remove`".to_string());
+    }
+    let mut seen = HashSet::new();
+    for (name, value) in &h.set {
+        let parsed = declared_header_name(name)?;
+        if !seen.insert(parsed) {
+            return Err(format!(
+                "headers.set declares `{name}` twice (header names are case-insensitive)"
+            ));
+        }
+        if HeaderValue::from_str(value).is_err() {
+            return Err(format!(
+                "headers.set gives `{name}` a value that is not a valid HTTP header value"
+            ));
+        }
+    }
+    for name in &h.remove {
+        declared_header_name(name)?;
+    }
+    Ok(())
 }
 
 /// A manifest route validated against the (already-loaded) filter set and upstream names, carrying
@@ -413,6 +487,13 @@ pub(crate) fn validate_routes<'a>(
                 }
             }
         }
+        // Validate the declarative response headers (ADR 000100) before anything can serve them.
+        if let Some(h) = &r.headers {
+            validate_response_headers(h).map_err(|reason| ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason,
+            })?;
+        }
         validated.push(ValidatedRoute { route: r, targets });
     }
     Ok(validated)
@@ -453,6 +534,10 @@ pub struct RouteInfo {
     /// This route's compression opt-in (ADR 000074), or `None` for never-transform. The fast path
     /// negotiates and compresses AFTER the response chain, on the streamed body filters never see.
     pub compression: Option<Arc<CompressionConfig>>,
+    /// This route's declared response headers (ADR 000100), or `None` for no declaration. The
+    /// fast path stamps them on every response it answers for this route — after the chain, so no
+    /// filter can drop them, and before compression, so the codec still owns the representation.
+    pub response_headers: Option<Arc<ResponseHeaders>>,
 }
 
 impl RouteInfo {
@@ -777,6 +862,7 @@ mod tests {
             rate_limit: None,
             upgrade: None,
             compression: None,
+            response_headers: None,
         }
     }
 
@@ -975,26 +1061,40 @@ mod tests {
         // primitive (CWE-444).
         let filters = HashSet::new();
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
-        let cases: &[(&[(&str, &str)], &[&str])] = &[
-            (&[], &[]),
-            (&[("x bad", "v")], &[]),
-            (&[("", "v")], &[]),
-            (&[("x-ok", "line\r\ninjected")], &[]),
-            (&[("content-length", "0")], &[]),
-            (&[("connection", "close")], &[]),
-            (&[("x-ok", "v")], &["transfer-encoding"]),
-            (&[("x-ok", "v")], &["bad name"]),
-            (&[("X-Dup", "a"), ("x-dup", "b")], &[]),
-        ];
-        for (set, remove) in cases {
-            assert!(
-                matches!(
-                    validate_routes(&route_with_headers(set, remove), &filters, &upstream_names),
-                    Err(ControlError::InvalidRoute { .. })
-                ),
-                "set={set:?} remove={remove:?} must be rejected"
-            );
-        }
+        let rejected = |set: &[(&str, &str)], remove: &[&str]| {
+            matches!(
+                validate_routes(&route_with_headers(set, remove), &filters, &upstream_names),
+                Err(ControlError::InvalidRoute { .. })
+            )
+        };
+
+        assert!(rejected(&[], &[]), "an empty block declares nothing");
+        assert!(rejected(&[("x bad", "v")], &[]), "a non-token name");
+        assert!(rejected(&[("", "v")], &[]), "an empty name");
+        assert!(
+            rejected(&[("x-ok", "line\r\ninjected")], &[]),
+            "a CRLF-bearing value"
+        );
+        assert!(
+            rejected(&[("content-length", "0")], &[]),
+            "framing belongs to the host, not to a declaration"
+        );
+        assert!(
+            rejected(&[("connection", "close")], &[]),
+            "connection management is hop-by-hop"
+        );
+        assert!(
+            rejected(&[("x-ok", "v")], &["transfer-encoding"]),
+            "the same reservation applies to a removal"
+        );
+        assert!(
+            rejected(&[("x-ok", "v")], &["bad name"]),
+            "a name to remove"
+        );
+        assert!(
+            rejected(&[("X-Dup", "a"), ("x-dup", "b")], &[]),
+            "the same name declared twice is ambiguous"
+        );
 
         assert!(
             validate_routes(

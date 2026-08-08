@@ -147,6 +147,50 @@ removing a field is a change to a published interface: it is listed under **Chan
 there. Pin your ingestion mapping to the field names above rather than to field order or to the
 line's overall shape.
 
+## Declared response headers: which responses they land on
+
+A route can declare the response headers it always wants, without a filter:
+
+```toml
+[[route]]
+upstream = "app"
+[route.match]
+path_prefix = "/"
+[route.headers]
+set = { "X-Content-Type-Options" = "nosniff", "Referrer-Policy" = "no-referrer" }
+remove = ["server"]
+```
+
+Both keys are optional, but the block must declare at least one of them. **Values are literals** —
+no conditionals, no interpolation from the request, no patterns. A header whose value depends on
+the request is a per-request decision, which is a filter's job
+([ADR 000029](ADR/000029.md) · [ADR 000100](ADR/000100.md)).
+
+**The declaration is a floor, not a suggestion.** It is applied after the response filter chain and
+before compression, so:
+
+- `set` **replaces** any same-named header the upstream or a filter produced (every copy of it, if
+  there were several), and `remove` drops the name entirely. `remove` runs first, so a name in both
+  lists ends up set.
+- Header names are matched case-insensitively — `X-Frame-Options` and `x-frame-options` are the same
+  declaration, and declaring both in one `set` is rejected as ambiguous.
+- It lands on **every response the route answers**, including the ones you cannot see coming: a
+  filter's `replace`, a filter's short-circuit, a chain's fail-closed 5xx, the native rate limit's
+  429, and the forward-side 502 / 503 / 504. A security header whose whole value is that it does
+  not disappear when things break therefore does not disappear when things break.
+
+**One gap, deliberate.** A response returned **before** a route is chosen carries no declaration,
+because there is no route to take it from. That is the no-route **404** and the path-normalization
+**400** (an ambiguous or root-escaping request target, rejected at ingress). If you need a header on
+those too, terminate elsewhere or accept the gap — a listener-wide declaration is not offered.
+
+**Validation is fail-closed.** An invalid header name or value fails `plecto validate`, startup, and
+reload rather than being dropped at request time. So does naming a hop-by-hop header
+(`connection`, `transfer-encoding`, `upgrade`, `te`, `trailer`, `keep-alive`, `proxy-connection`,
+`proxy-authorization`, `proxy-authenticate`) or `content-length`: connection management belongs to
+the transport, and the length belongs to the body Plecto actually sends — a declared one would be a
+response-desync primitive.
+
 ## Upgrading: two independent version series
 
 Plecto ships **two version series, and they move independently**:

@@ -66,6 +66,7 @@ impl ConfigSnapshot {
             rate_limit: r.rate_limit.clone(),
             upgrade: r.upgrade.clone(),
             compression: r.compression.clone(),
+            response_headers: r.response_headers.clone(),
         })
     }
 

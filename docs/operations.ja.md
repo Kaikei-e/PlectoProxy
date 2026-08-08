@@ -144,6 +144,45 @@ access_log = true
 [`CHANGELOG.md`](../CHANGELOG.md) の **Changed** に移行注記つきで載る。取り込み設定は行の順序や
 全体の形ではなく、上表のフィールド名に対して固定すること。
 
+## 宣言したレスポンスヘッダ: どの応答に乗るか
+
+ルートは、常に付けたいレスポンスヘッダをフィルタ無しで宣言できる:
+
+```toml
+[[route]]
+upstream = "app"
+[route.match]
+path_prefix = "/"
+[route.headers]
+set = { "X-Content-Type-Options" = "nosniff", "Referrer-Policy" = "no-referrer" }
+remove = ["server"]
+```
+
+どちらのキーも省略できるが、ブロックには少なくとも一方が要る。**値はリテラルのみ**——条件分岐も、
+リクエスト値の補間も、パターンも無い。値がリクエストによって変わるヘッダは per-request の判断であり、
+それはフィルタの仕事である（[ADR 000029](ADR/000029.md) · [ADR 000100](ADR/000100.md)）。
+
+**この宣言は「フロア」であって提案ではない。** レスポンスフィルタチェーンの後、圧縮の前に適用される:
+
+- `set` は upstream やフィルタが付けた同名ヘッダを**置き換える**（複数あればすべて）。`remove` は
+  その名前を丸ごと落とす。`remove` が先に走るので、両方に載せた名前は最終的に set される。
+- ヘッダ名は大文字小文字を区別せずに照合する——`X-Frame-Options` と `x-frame-options` は同じ宣言で
+  あり、ひとつの `set` に両方書くと曖昧として拒否される。
+- **そのルートが返す全応答**に乗る。想定しづらい経路も含む: フィルタの `replace`、フィルタの
+  short-circuit、チェーンの fail-closed 5xx、native レートリミットの 429、転送側の 502 / 503 / 504。
+  「壊れたときに消えないこと」が価値そのものであるセキュリティヘッダは、壊れたときにも消えない。
+
+**穴はひとつ、意図的なもの。** route が決まる**前**に返る応答には宣言が乗らない。取ってくる route が
+無いからである。該当するのは no-route の **404** と、パス正規化の **400**（曖昧またはルート脱出を
+する request target を ingress で拒否したもの）。これらにもヘッダが要る場合は別の場所で終端するか、
+穴として受け入れること——listener 単位の宣言は提供していない。
+
+**検証は fail-closed。** 不正なヘッダ名・値は、リクエスト時に黙って落とされるのではなく
+`plecto validate`・起動・reload を落とす。hop-by-hop ヘッダ（`connection` / `transfer-encoding` /
+`upgrade` / `te` / `trailer` / `keep-alive` / `proxy-connection` / `proxy-authorization` /
+`proxy-authenticate`）や `content-length` を名指しした場合も同じ: 接続管理はトランスポートのもので
+あり、長さは Plecto が実際に送る body のものである——宣言された長さは response desync の材料になる。
+
 ## アップグレード: 独立した二つのバージョン系列
 
 Plecto は**二つのバージョン系列**を持ち、**両者は独立に動く**:

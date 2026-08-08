@@ -34,6 +34,22 @@ All notable changes to Plecto are documented here. The format follows
 
 ### Added
 
+- **Declarative per-route response headers** (`[route.headers]`, ADR 000100). A route can now
+  declare `set = { … }` / `remove = [ … ]` and get constant response headers without writing a
+  filter — the case that previously cost an operator a Rust toolchain, a vendored WIT copy, a
+  signing key, an OCI layout, and a `sha256:` digest to re-pin on every build. Values are literals:
+  no conditionals, no interpolation from the request, no patterns; a header whose value depends on
+  the request is a per-request decision and stays a filter's job. The declaration is a **floor** —
+  applied after the response filter chain and before compression, `set` replaces every same-named
+  header the upstream or a filter produced and `remove` drops the name, on **every** response the
+  route answers: a filter's `replace`, a filter's short-circuit, a chain's fail-closed 5xx, the
+  native rate limit's 429, and the forward-side 502 / 503 / 504. One gap is deliberate: a response
+  returned before a route is chosen (the no-route 404, the path-normalization 400) carries no
+  declaration, because there is no route to take it from. Header names are matched
+  case-insensitively, and validation is fail-closed — an invalid name or value, a duplicate name, an
+  empty block, or a hop-by-hop / `content-length` name fails `plecto validate`, startup, and reload
+  rather than being dropped at request time. Absent section, unchanged behavior. See the
+  [operations guide](docs/operations.md#declared-response-headers-which-responses-they-land-on).
 - **Client identity behind a trusted L7 proxy** (`[listen.trusted_proxy]`, ADR 000103). Declaring
   `trusted = ["<CIDR>", ...]` lets a request whose already-resolved address falls inside those
   CIDRs have its client read out of the inbound `X-Forwarded-For`: the list is walked right to

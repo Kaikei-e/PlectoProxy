@@ -29,7 +29,8 @@ interface types {
         headers: list<header>,
     }
 
-    // A response a filter synthesises when it short-circuits the chain.
+    // A response a filter authors itself, status / headers / body all of its own choosing: the
+    // payload of a request-side `short-circuit` or a response-side `replace`.
     record http-response {
         status: u16,
         headers: list<header>,
@@ -63,12 +64,18 @@ interface types {
     variant response-decision {
         %continue,
         modified(response-edit),
-        // Stop the chain and send this SYNTHESISED response instead of the upstream one
-        // (the upstream body stream is dropped, never read — ADR 000038 stays intact).
-        // Distinct from the request side's `short-circuit`: nothing is short-circuited
-        // here — a response that already arrived is being replaced (P12). The host
-        // validates the returned headers fail-closed, exactly like a `short-circuit`
-        // output (ADR 000071 rules).
+        // Answer with THIS response — status, headers, AND body, all authored by the filter —
+        // in place of the one upstream returned. This is the arm that carries a body: an error
+        // page keyed on the upstream's status, a maintenance notice, a cached payload.
+        // `modified` above retouches the upstream's status and headers, but `response-edit` has
+        // no body field; whole-response authoring lives here.
+        // What `replace` does NOT do is read the upstream body: that stream is dropped unread,
+        // so the zero-copy passthrough is intact (ADR 000038) — the body it sends is
+        // SYNTHESISED, never a rewrite of the upstream's. Distinct from the request side's
+        // `short-circuit`: nothing is short-circuited here — a response that already arrived is
+        // being replaced (P12). It is terminal (the remaining filters of the reverse walk are
+        // skipped), and the host validates the returned headers fail-closed, exactly like a
+        // `short-circuit` output (ADR 000071 rules).
         replace(http-response),
     }
 
@@ -178,14 +185,20 @@ world filter {
 
     // hot path — one call per request / response.
     //
+    // `on-response` can answer with a response of its OWN: `replace` sends a filter-authored
+    // status, headers, AND body in place of the upstream's, so an error page keyed on
+    // `resp.status`, a maintenance notice, or any other synthesised payload is expressible
+    // here; `modified` retouches the upstream's status and headers instead. What a filter
+    // cannot do is READ the upstream body — `resp.body` is always empty (header-only) because
+    // that body streams zero-copy past the chain (ADR 000038). The body a `replace` sends is
+    // synthesised, never a rewrite of the upstream's.
+    //
     // `req` on `on-response` is the AS-FORWARDED request snapshot (Declared Semantics,
     // ADR 000073): the header-only request as it left the request-side chain — filter
     // edits applied (e.g. an auth filter's `x-authenticated-user` stamp), before the
     // host's egress transforms (hop-by-hop strip, upstream path rewrite, traceparent
     // injection). Untouched inbound headers such as `Origin` are still present. It is a
     // value-passed view: editing it does nothing — respond with a `response-decision`.
-    // `resp.body` is always empty (header-only): the upstream body streams zero-copy
-    // past the chain (ADR 000038); `replace` SYNTHESISES a body, it never reads one.
     export on-request: func(req: http-request) -> request-decision;
     export on-response: func(req: http-request, resp: http-response) -> response-decision;
 }

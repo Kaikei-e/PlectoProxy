@@ -31,8 +31,9 @@ interface types {
     short-circuit(http-response),    // stop the chain; synthesise a response now
   }
 
-  // The response side (ADR 000073): `replace` supplants the upstream response with a
-  // synthesised one (the upstream body is dropped unread — zero-copy stays intact).
+  // The response side (ADR 000073): `replace` answers with a filter-authored response —
+  // status, headers, AND body — in place of the upstream's (whose body is dropped unread,
+  // so zero-copy stays intact).
   variant response-decision { %continue, modified(response-edit), replace(http-response) }
 }
 
@@ -97,6 +98,62 @@ capabilities the host explicitly lends it — **deny-by-default**:
 
 Nothing else — no network, no filesystem, no sockets — is reachable. That is enforced by the
 Component Model sandbox, not by convention.
+
+### Recipe: answer with a body of your own (`replace`)
+
+`replace` is how a filter authors a whole response — status, headers, **and body**. `modified`
+retouches what upstream sent, but `response-edit` carries no body field, so a filter that must
+return content of its own returns `replace`. Either way the upstream body is never read: on a
+`replace` that stream is dropped unread, keeping the zero-copy passthrough intact (ADR 000038).
+The body you send is synthesised, not a rewrite of the upstream's.
+
+The canonical case is an error page keyed on what upstream actually returned:
+
+```rust
+use crate::plecto::filter::host_config;
+use crate::plecto::filter::types::Header;
+
+fn on_response(req: HttpRequest, resp: HttpResponse) -> ResponseDecision {
+    // Which requests this policy covers is the FILTER's decision. A route's `path_prefix` is a
+    // routing bound and is often wider than the condition a policy cares about, so match here.
+    if resp.status < 500 || !req.path.starts_with("/api/") {
+        return ResponseDecision::Continue;
+    }
+
+    // The page text is operator-owned config (`[filter.config]`, ADR 000066) rather than a
+    // constant compiled into the component: editing it is a manifest change, not a rebuild,
+    // re-sign, and re-pin of the digest.
+    let page = host_config::get("upstream_error_page")
+        .unwrap_or_else(|| "the service is temporarily unavailable".to_string());
+
+    ResponseDecision::Replace(HttpResponse {
+        status: 503,
+        headers: vec![
+            Header {
+                name: "content-type".to_string(),
+                value: b"text/plain; charset=utf-8".to_vec(),
+            },
+            Header {
+                name: "retry-after".to_string(),
+                value: b"5".to_vec(),
+            },
+        ],
+        body: page.into_bytes(),
+    })
+}
+```
+
+```toml
+[filter.config]                # on this filter's [[filter]] entry (§4)
+upstream_error_page = "the service is temporarily unavailable"
+```
+
+`resp.status` is the upstream's own status, and `req` is the as-forwarded snapshot, so the same
+hook can key on a request-chain stamp (`x-authenticated-user`) as readily as on the status. The
+returned headers pass exactly the fail-closed validation a request-side `short-circuit` output
+passes (ADR 000071), and a route's `[route.headers]` declaration (§4) is applied afterwards, to
+this synthesised response as much as to a forwarded one. Keep the chain order above in mind: a
+`replace` is terminal, so filters earlier in the route's `filters` list never see this response.
 
 ## 2. Scaffold
 

@@ -125,6 +125,19 @@ All notable changes to Plecto are documented here. The format follows
   absent `[chain]` keeps validating, and config versions (manifest content hashes) are unchanged.
   **Migration**: move each filter id from `[chain] filters` into the `filters` of the `[[route]]`
   that needs it.
+- **The response-side contract documents its capability first** (docs only, ADR 000104). The WIT
+  doc comments on `on-response`, `response-decision::replace`, and `http-response` opened with
+  what the mechanism is *not* — "`resp.body` is always empty (header-only)", "nothing is
+  short-circuited here" — so a reader asking "can a filter change the response body?" met those
+  invariants before reaching the arm that answers yes, and could conclude the contract had no
+  answer at all. They now lead with the capability — `replace` authors a whole response, status
+  and headers **and body** — and every invariant that followed is kept, unchanged, after it.
+  [docs/writing-a-filter.md](docs/writing-a-filter.md#recipe-answer-with-a-body-of-your-own-replace)
+  gains the worked recipe that arm exists for: an error page keyed on the upstream's status, its
+  text injected through `[filter.config]` rather than compiled in, and the path condition matched
+  in the filter because a route's `path_prefix` is a wider, routing-level bound. Comments and
+  prose only — the contract's types, signatures, and `plecto:filter@0.3.0` package version are
+  untouched, so no filter needs rebuilding.
 
 ### Removed
 

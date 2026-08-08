@@ -19,6 +19,47 @@ of quietly depending on an external coordination service.
 None of these are shared across replicas. A counter, bucket, or cached ticket key on instance A is
 invisible to instance B.
 
+## Client identity behind a front proxy
+
+Every per-client claim below — the per-client-IP token bucket, `source_ip` Maglev hashing, the
+access log's `client` field — is only as good as the address Plecto Proxy believes the client has.
+Put another proxy or load balancer in front and, by default, that address is the front tier's: as
+an edge proxy, Plecto Proxy drops the inbound forwarding headers and re-issues its own from the
+connection peer ([ADR 000018](ADR/000018.md) / [ADR 000022](ADR/000022.md)), because an inbound
+`X-Forwarded-For` is a client-supplied string.
+
+**Prefer PROXY protocol v2.** When the front tier can speak it, `[listen.proxy_protocol]`
+([ADR 000057](ADR/000057.md)) restores the client address *below* HTTP — before the TLS handshake,
+before a single header is parsed. Nothing in the request can influence it, which makes it the
+stronger of the two answers and the first choice whenever it is available.
+
+**Second choice: `[listen.trusted_proxy]`**, for an L7 front tier that cannot speak PROXY v2
+([ADR 000103](ADR/000103.md)):
+
+```toml
+[listen.trusted_proxy]
+trusted = ["10.0.0.0/8"]   # CIDRs of the front proxies; a single host is "10.1.2.3/32"
+```
+
+A request is eligible only when the address Plecto Proxy has already resolved for it — the
+connection peer, or the PROXY v2 address when both sections are declared — falls inside `trusted`.
+For those requests the inbound `X-Forwarded-For` is read right to left, declared hops are dropped,
+and the first address no declared proxy vouched for becomes the client. Everything else falls back
+to the peer: an absent, malformed, or entirely-declared list, and every request from outside the
+CIDRs. Only `X-Forwarded-For` is a restoration source — the rest of the client-IP header family
+stays dropped — and the scheme stays the wire truth, so an inbound `X-Forwarded-Proto` is never
+honored.
+
+Downstream nothing changes: Plecto Proxy still issues its own `X-Forwarded-For` / `X-Real-IP` /
+`X-Forwarded-Proto`, so filters and upstreams keep seeing exactly one authoritative value. The
+restoration decides *who the client is*, not what gets forwarded.
+
+Two operational notes. `trusted` is a trust grant, and it is asymmetric: too narrow only loses the
+restoration, too wide lets anyone who can reach that range name their own client address — when in
+doubt, narrow. And switching the mode on or off moves every per-client key (buckets, hash
+assignments) into a different key space; the change is not disruptive, but the counters do not
+carry over.
+
 ## Multi-replica rate limiting
 
 **Recommended: run both layers together** ([ADR 000061](ADR/000061.md)). The native token bucket
@@ -125,6 +166,9 @@ for the underlying single-node measurements.
   half of that decision.
 - [ADR 000033](ADR/000033.md), [ADR 000026](ADR/000026.md), [ADR 000041](ADR/000041.md),
   [ADR 000052](ADR/000052.md) — the node-local state this guide covers.
+- [ADR 000057](ADR/000057.md), [ADR 000103](ADR/000103.md) — the two ways to restore the client
+  identity behind a front tier, qualifying the edge default in [ADR 000018](ADR/000018.md) /
+  [ADR 000022](ADR/000022.md).
 - [ADR 000061](ADR/000061.md) — the local floor × global filter two-tier rate-limit model and the
   `filter-ratelimit-redis` reference filter this guide recommends.
 - [ADR 000060](ADR/000060.md) — the `outbound-tcp` capability the reference filter uses to reach a

@@ -4,7 +4,7 @@
 //! backoff + retriable-5xx retry in ADR 000030) and the `on-request-body` hook (ADR 000025) live in
 //! `forward`/`retry`; this module wires routing, rate-limiting, and the chain around that call.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,7 +37,7 @@ pub(crate) async fn proxy_core(
     state: Arc<ServerState>,
     scheme: &'static str,
     peer: SocketAddr,
-    parts: hyper::http::request::Parts,
+    mut parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
     /// Decrements the in-flight gauge on drop: hyper drops this future when the client
@@ -54,6 +54,21 @@ pub(crate) async fn proxy_core(
     let start = Instant::now();
     state.metrics.inc_in_flight();
     let in_flight = InFlight(&state.metrics);
+
+    // Client-IP propagation, edge model (ADR 000018 / review f000005 P2#3): strip any inbound
+    // `X-Forwarded-*` / `Forwarded` (which an untrusted client can forge) and set them afresh —
+    // directly on the inbound `HeaderMap`, BEFORE the contract projection, so the chain (IP-based
+    // rate-limit / auth filters), route matching, the filterless direct forward path, and the
+    // upstream all see the same trusted values. The address it settles on is the client every
+    // per-client observation point below uses (access log, rate-limit bucket, source-IP hash):
+    // the connection peer, or — behind a declared front proxy (ADR 000103) — the client that
+    // proxy named.
+    let client = set_forwarded(
+        &mut parts.headers,
+        peer.ip(),
+        scheme,
+        state.trusted_proxy.as_ref(),
+    );
 
     // Capture the access-log fields BEFORE the core consumes `parts`, and only when logging is on —
     // a disabled access log allocates nothing on the hot path.
@@ -89,7 +104,7 @@ pub(crate) async fn proxy_core(
         )
     });
 
-    let result = proxy_core_inner(state.clone(), scheme, peer, trace, parts, body).await;
+    let result = proxy_core_inner(state.clone(), scheme, client, trace, parts, body).await;
 
     drop(in_flight);
     let status = match &result {
@@ -100,7 +115,7 @@ pub(crate) async fn proxy_core(
     let elapsed = start.elapsed();
     state.metrics.record_request(status, elapsed);
     if let Some(access) = access {
-        access_log::record(scheme, peer, &access, status, elapsed);
+        access_log::record(scheme, client, &access, status, elapsed);
     }
     // One SERVER span per sampled transaction (ADR 000040): the root the filter spans (and the
     // upstream's own trace, via the propagated traceparent) nest under. Push is a bounded-queue
@@ -119,18 +134,11 @@ pub(crate) async fn proxy_core(
 async fn proxy_core_inner(
     state: Arc<ServerState>,
     scheme: &'static str,
-    peer: SocketAddr,
+    client: IpAddr,
     trace: RequestTrace,
     mut parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
-    // Client-IP propagation, edge model (ADR 000018 / review f000005 P2#3): strip any inbound
-    // `X-Forwarded-*` / `Forwarded` (which an untrusted client can forge) and set them afresh from
-    // the connection's real peer + scheme — directly on the inbound `HeaderMap`, BEFORE the
-    // contract projection, so the chain (IP-based rate-limit / auth filters), route matching, the
-    // filterless direct forward path, and the upstream all see the same trusted values.
-    set_forwarded(&mut parts.headers, peer.ip(), scheme);
-
     let mut http_req = to_http_request(&parts, scheme);
     // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
     // body moves: only a bodyless request can be an Upgrade handshake (ADR 000048), and bodyless
@@ -171,11 +179,11 @@ async fn proxy_core_inner(
 
     // Native rate limit (ADR 000033): a coarse token-bucket baseline consulted at the front door —
     // BEFORE the route's filter chain — so a flood is shed without spending any WASM CPU. The
-    // peer-keyed (or route-keyed) bucket math is host-native and never crosses the WASM boundary.
+    // client-keyed (or route-keyed) bucket math is host-native and never crosses the WASM boundary.
     // Over the limit fails closed with 429 + `Retry-After`, distinct from the breaker's 503
     // (`circuit-open`, upstream saturated): this is the client over its inbound rate floor. The
     // per-filter `host-ratelimit` capability (ADR 000026) is a separate, policy-shaped limiter.
-    if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(peer.ip()) {
+    if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(client) {
         state.metrics.inc_rate_limited();
         return Ok(with_error_code(
             synth_retry_after(
@@ -225,16 +233,17 @@ async fn proxy_core_inner(
     };
 
     // Maglev consistent-hashing key (ADR 000035): for a `maglev` upstream, project the request's
-    // hash key — a named header's value (borrowed bytes) or the connection peer's IP (hashed as
-    // canonical octets, NOT a spoofable forwarding header). `None` for the other algorithms, or when
-    // the configured header is absent (the group then falls back to round-robin). Borrowed from
-    // `parts`, which outlives the retry loop, and `Copy`, so each attempt reuses it unchanged.
+    // hash key — a named header's value (borrowed bytes) or the client's IP (hashed as canonical
+    // octets; the resolved client, never a claim Plecto did not authorise). `None` for the other
+    // algorithms, or when the configured header is absent (the group then falls back to
+    // round-robin). Borrowed from `parts`, which outlives the retry loop, and `Copy`, so each
+    // attempt reuses it unchanged.
     let hash_key: Option<HashInput<'_>> = group.hash_key_source().and_then(|src| match src {
         HashKeySource::Header(name) => parts
             .headers
             .get(name)
             .map(|v| HashInput::Bytes(v.as_bytes())),
-        HashKeySource::SourceIp => Some(HashInput::Ip(peer.ip())),
+        HashKeySource::SourceIp => Some(HashInput::Ip(client)),
     });
 
     // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a retryable

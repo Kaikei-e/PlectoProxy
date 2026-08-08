@@ -72,7 +72,8 @@ pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, CompressionAlgorithm, FilterEntry, HealthConfig, IsolationKind,
     Manifest, Observability, OutlierDetection, ProxyProtocolTrust, RateLimitKeyKind, Route,
-    RouteCompression, RouteRateLimit, State, StateBackendKind, TlsCert, Trust, Upstream,
+    RouteCompression, RouteRateLimit, State, StateBackendKind, TlsCert, Trust, TrustedProxyTrust,
+    Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
@@ -181,6 +182,10 @@ pub struct Control {
     /// `listen` itself: the TCP listener consults it once at startup, so a reload does not
     /// change it. `None` = PROXY v2 reception off (the default).
     proxy_protocol: Option<manifest::ProxyProtocolTrust>,
+    /// The parsed `[listen.trusted_proxy]` trust (ADR 000103), captured at construction like
+    /// `proxy_protocol`: the request path consults it per request but a reload does not change
+    /// it. `None` = no restoration path (the default).
+    trusted_proxy: Option<manifest::TrustedProxyTrust>,
     /// The OTLP span buffer (ADR 000040), present iff `[observability] otlp_endpoint` is set:
     /// fanned in beside the sinks above at `Host` construction, drained by the fast path's
     /// export pump. Like the admin listener, it binds once at startup — a reload swaps only the
@@ -218,6 +223,7 @@ impl Control {
             observability: manifest.observability.clone(),
             listen: manifest.listen.clone(),
             proxy_protocol: manifest.listen.proxy_protocol_trust()?,
+            trusted_proxy: manifest.listen.trusted_proxy_trust()?,
             otlp,
         })
     }

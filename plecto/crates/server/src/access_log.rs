@@ -4,7 +4,7 @@
 //! operator can route the `plecto::access` target wherever they like. Disabled by default; the
 //! per-request fields are only captured when it is on, so a disabled log costs nothing.
 
-use std::net::SocketAddr;
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// The request fields captured (in `crate::proxy`) BEFORE the transaction core consumes the request
@@ -18,16 +18,20 @@ pub(crate) struct Access {
 /// Emit one access-log event. Deliberately carries no secrets (no Authorization / Cookie value, and
 /// the path without its query string — bp-rust): only method, authority, path, status, duration,
 /// client IP and the connection scheme.
+///
+/// `client` is the address the transaction is attributed to — the connection peer, or the client
+/// a declared front proxy named (ADR 000103). It is the same address the re-issued
+/// `X-Forwarded-For` and the per-client rate-limit bucket use, so the log agrees with enforcement.
 pub(crate) fn record(
     scheme: &str,
-    peer: SocketAddr,
+    client: IpAddr,
     access: &Access,
     status: u16,
     elapsed: Duration,
 ) {
     tracing::info!(
         target: "plecto::access",
-        client = %peer.ip(),
+        client = %client,
         scheme = scheme,
         method = %access.method,
         authority = %access.authority,

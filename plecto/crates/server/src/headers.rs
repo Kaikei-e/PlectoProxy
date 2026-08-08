@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use hyper::header::{HeaderName, HeaderValue};
-use plecto_control::{Header, HttpRequest};
+use plecto_control::{Header, HttpRequest, TrustedProxyTrust};
 
 /// Hop-by-hop headers a proxy must not forward (RFC 9110 §7.6.1). Stripped both ways so the
 /// upstream's framing (`transfer-encoding`) and connection management never collide with the
@@ -105,43 +105,84 @@ const FORWARDED_HEADERS: &[&str] = &[
     "x-cluster-client-ip",
 ];
 
+/// The most `X-Forwarded-For` elements the trusted-proxy path reads before giving up (ADR 000103).
+/// A real chain is one or two hops, so the bound only ever bites on a client-stuffed list — where
+/// falling back to the peer is the right answer anyway. It keeps the one untrusted parse surface
+/// this path opens bounded regardless of what a client sends.
+const MAX_FORWARDED_ELEMENTS: usize = 32;
+
+/// The client address a trusted front proxy named in `X-Forwarded-For` (ADR 000103), or `None`
+/// when the header is absent, malformed, or names only declared hops.
+///
+/// Read right to left: each element was appended by the hop that received the request, so the
+/// rightmost address outside `trusted` is the first one no declared proxy vouched for. Anything
+/// the scan cannot classify — a non-UTF-8 value, an element that is not a bare IP, more elements
+/// than the bound — returns `None`, and the caller falls back to the peer (the side a client
+/// cannot forge).
+fn forwarded_client(headers: &hyper::HeaderMap, trusted: &TrustedProxyTrust) -> Option<IpAddr> {
+    let mut budget = MAX_FORWARDED_ELEMENTS;
+    // A list split across several header lines is one list (RFC 9110 §5.3), newest hop last.
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        for element in value.to_str().ok()?.rsplit(',') {
+            budget = budget.checked_sub(1)?;
+            let ip: IpAddr = element.trim().parse().ok()?;
+            if !trusted.contains(ip) {
+                return Some(ip.to_canonical());
+            }
+        }
+    }
+    None
+}
+
 /// Edge-proxy client-IP propagation: drop any client-supplied forwarding / client-IP headers
-/// (`FORWARDED_HEADERS`), then set `X-Forwarded-For` and `X-Real-IP` (the real connection peer) and
-/// `X-Forwarded-Proto` (the wire scheme) afresh. `X-Real-IP` is re-issued — not just stripped — so a
-/// backend reading the nginx convention rather than `XFF` still gets Plecto's authoritative peer
-/// (ADR 000022 widens ADR 000018's "issue For+Proto only"). The chain (so IP-based rate-limit / auth
-/// filters can trust them) and the upstream then see only Plecto's values, never the client's claim.
-/// A trusted-proxy *append* mode (Plecto behind another LB) is a manifest knob deferred to a later
-/// slice; overwrite is the safe default.
+/// (`FORWARDED_HEADERS`), then set `X-Forwarded-For` and `X-Real-IP` (the client) and
+/// `X-Forwarded-Proto` (the wire scheme) afresh, and return the client this transaction is
+/// attributed to. `X-Real-IP` is re-issued — not just stripped — so a backend reading the nginx
+/// convention rather than `XFF` still gets Plecto's authoritative value (ADR 000022 widens
+/// ADR 000018's "issue For+Proto only"). The chain (so IP-based rate-limit / auth filters can
+/// trust them) and the upstream then see only Plecto's values, never the client's claim.
+///
+/// `trusted` is the declared `[listen.trusted_proxy]` set (ADR 000103), and `Some` only changes
+/// WHICH address is issued: when `peer` is itself one of the declared front proxies, the inbound
+/// `X-Forwarded-For` may name the client and is read (see [`forwarded_client`]); otherwise the
+/// overwrite is unconditional, exactly as before. `peer` is the already-resolved client candidate
+/// — PROXY v2 (ADR 000057) has run by the time this is called — so one rule covers both fronting
+/// shapes: an L4 front restores the client below HTTP and its restored address is (correctly) not
+/// a declared proxy, an L7 front leaves its own address and is. `X-Forwarded-Proto` is never taken
+/// from the inbound request: the scheme stays the wire truth.
 ///
 /// Operates directly on the inbound hyper `HeaderMap`, BEFORE the contract projection: the
 /// corrected headers then flow to the chain via `to_http_request` and to the filterless direct
 /// forward path verbatim — one application, both consumers.
-pub(crate) fn set_forwarded(headers: &mut hyper::HeaderMap, peer: IpAddr, scheme: &str) {
+pub(crate) fn set_forwarded(
+    headers: &mut hyper::HeaderMap,
+    peer: IpAddr,
+    scheme: &str,
+    trusted: Option<&TrustedProxyTrust>,
+) -> IpAddr {
+    // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 address
+    // (`::ffff:a.b.c.d`); `to_canonical` normalises it to dotted IPv4 so backends/filters that
+    // all-list on the IPv4 form match — the same rule the trust containment check applies. A
+    // genuine IPv6 address is kept verbatim (no brackets — XFF carries a bare address).
+    let client = trusted
+        .filter(|trusted| trusted.contains(peer))
+        .and_then(|trusted| forwarded_client(headers, trusted))
+        .unwrap_or_else(|| peer.to_canonical());
+
     for name in FORWARDED_HEADERS {
         // `HeaderName` lookups are case-insensitive; the constants are already lowercase.
         headers.remove(*name);
     }
-    // An IPv4 client on a dual-stack ([::]) listener arrives as an IPv4-mapped IPv6 address
-    // (`::ffff:a.b.c.d`); normalise it to dotted IPv4 so backends/filters that all-list on the IPv4
-    // form match, and the value matches what nginx/Envoy would emit. A genuine IPv6 peer is kept
-    // verbatim (no brackets — XFF carries a bare address).
-    let client_ip = match peer {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.to_string(),
-            None => v6.to_string(),
-        },
-        IpAddr::V4(v4) => v4.to_string(),
-    };
     // An IP address in decimal/hex-free ASCII is always a valid header value; stay total on the
     // data plane regardless (drop rather than panic if that were ever not the case).
-    if let Ok(ip_value) = HeaderValue::from_str(&client_ip) {
+    if let Ok(ip_value) = HeaderValue::from_str(&client.to_string()) {
         headers.insert("x-forwarded-for", ip_value.clone());
         headers.insert("x-real-ip", ip_value);
     }
     if let Ok(proto) = HeaderValue::from_str(scheme) {
         headers.insert("x-forwarded-proto", proto);
     }
+    client
 }
 
 /// Build a header-only `HttpRequest` (the chain's view) from the inbound request parts. The body

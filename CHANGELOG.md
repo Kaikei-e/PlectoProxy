@@ -27,6 +27,26 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Client identity behind a trusted L7 proxy** (`[listen.trusted_proxy]`, ADR 000103). Declaring
+  `trusted = ["<CIDR>", ...]` lets a request whose already-resolved address falls inside those
+  CIDRs have its client read out of the inbound `X-Forwarded-For`: the list is walked right to
+  left, declared hops are dropped, and the first address no declared proxy vouched for becomes the
+  client — feeding the per-client-IP rate limit, `source_ip` Maglev hashing, the access log's
+  `client` field, and the re-issued `X-Forwarded-For` / `X-Real-IP`. This closes the gap for a
+  fronting L7 tier that cannot speak PROXY protocol v2; where v2 is available it remains the first
+  choice, since it restores the address below HTTP. Absent section, unchanged behavior — the
+  restoration path does not exist unless declared, and a request from outside the CIDRs always
+  keeps the edge default (inbound forwarding headers dropped, the peer re-issued). Every
+  unresolvable case falls back to that peer: an absent, malformed, or entirely-declared list, and
+  any list longer than the scan bound. `X-Forwarded-For` is the only restoration source — the rest
+  of the client-IP header family stays dropped — and the scheme still comes from the wire, so an
+  inbound `X-Forwarded-Proto` is never honored. `trusted` takes CIDR notation only (a single host
+  is `"10.1.2.3/32"`) and must list at least one entry; an empty or unparsable list fails
+  `plecto validate` and startup. See the
+  [hardening guide](docs/hardening.md#client-identity-behind-a-front-proxy).
+
 ### Changed
 
 - **Manifest: a declared `[chain]` is now rejected** (breaking, ADR 000101). The section was

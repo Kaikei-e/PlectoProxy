@@ -89,6 +89,13 @@ impl Control {
         self.proxy_protocol.clone()
     }
 
+    /// The parsed `[listen.trusted_proxy]` networks (ADR 000103), or `None` when no front proxy
+    /// is declared — the deny-by-default case, where inbound `X-Forwarded-For` is dropped
+    /// unconditionally. Captured at construction like `proxy_protocol_trust`.
+    pub fn trusted_proxy(&self) -> Option<crate::manifest::TrustedProxyTrust> {
+        self.trusted_proxy.clone()
+    }
+
     /// The readiness grace (`[listen.drain] readiness_grace_ms`, ADR 000059): how long `/readyz`
     /// reports not-ready — while connections are still accepted — before the drain starts, so a
     /// front load balancer can take the replica out of rotation first. Zero (the default) starts

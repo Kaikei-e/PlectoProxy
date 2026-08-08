@@ -303,6 +303,9 @@ advertised_port = 443    # optional: the port Alt-Svc advertises for h3 when the
 
 [listen.proxy_protocol]  # optional: PROXY protocol v2 reception (ADR 000057); absent = off
 trusted = ["10.0.0.0/8"] # required when present: CIDRs of the L4 LBs allowed to speak PROXY v2
+
+[listen.trusted_proxy]   # optional: client identity from X-Forwarded-For (ADR 000103); absent = off
+trusted = ["10.0.0.0/8"] # required when present: CIDRs of the L7 front proxies allowed to name it
 ```
 
 `[listen]` is captured at startup — a reload does not re-bind or change it; restart to apply.
@@ -315,6 +318,16 @@ any non-TCP/IPv4/IPv6 `PROXY` command. `trusted` takes CIDR notation only (a sin
 `"192.0.2.1/32"`), and the h3 (QUIC/UDP) listener is out of scope — front it with a QUIC-aware
 LB only if that LB can pass the client address another way (e.g. Kubernetes
 `externalTrafficPolicy: Local`).
+
+`[listen.trusted_proxy]` answers the same question one layer up, for an L7 front proxy that cannot
+speak PROXY v2. When the address already resolved for a request falls inside `trusted`, its inbound
+`X-Forwarded-For` is read right to left, declared hops are dropped, and the first address no
+declared proxy vouched for becomes the client — feeding the same consumers as above. Anything else
+falls back to that resolved address: an absent, malformed, or entirely-declared list, and every
+request from outside the CIDRs. Only `X-Forwarded-For` is a restoration source, and the scheme
+stays the wire truth (an inbound `X-Forwarded-Proto` is never honored). Prefer PROXY v2 when the
+front tier can speak it — it restores the client below HTTP, where the request cannot reach.
+See the [hardening guide](hardening.md#client-identity-behind-a-front-proxy).
 
 ## 5. Package, sign, and run
 

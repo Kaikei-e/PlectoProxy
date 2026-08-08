@@ -227,6 +227,11 @@ pub(crate) struct ServerState {
     /// pooled TLS client per distinct `[upstream.tls]` config.
     clients: UpstreamClients,
     alt_svc: Option<HeaderValue>,
+    /// The declared `[listen.trusted_proxy]` networks (ADR 000103), captured at startup like the
+    /// rest of `[listen]`. `None` — the default — means inbound `X-Forwarded-For` is dropped
+    /// unconditionally; `Some` lets a request whose resolved peer is one of those proxies name
+    /// its client. Held here so the request path reads it without a per-request clone.
+    trusted_proxy: Option<plecto_control::TrustedProxyTrust>,
     /// Global connection cap across TCP + QUIC: a permit is held for each connection's
     /// lifetime, so the server never serves more than `MAX_CONNECTIONS` at once.
     conn_limit: Arc<Semaphore>,

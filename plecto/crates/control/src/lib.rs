@@ -1,12 +1,12 @@
 //! plecto-control — the control plane (ADR 000007 / 000008).
 //!
-//! A single declarative TOML manifest pins filters by OCI digest and declares one chain. An
-//! `ArtifactStore` resolves each filter from a local, offline OCI image-layout (remote
-//! registry fetch via `wkg` is an out-of-band operator step, kept out of the runtime), the
-//! `Host` loads it through the ADR 000006 provenance gate, and a chain dispatcher drives a
-//! request through the loaded filters. `reload` rebuilds the set and swaps it **atomically**
-//! (ArcSwap): new requests see the new set, in-flight holders keep the old one until it
-//! drops. Single-node-first (ADR 000008).
+//! A single declarative TOML manifest pins filters by OCI digest and declares the `[[route]]`s
+//! that chain them. An `ArtifactStore` resolves each filter from a local, offline OCI
+//! image-layout (remote registry fetch via `wkg` is an out-of-band operator step, kept out of
+//! the runtime), the `Host` loads it through the ADR 000006 provenance gate, and a chain
+//! dispatcher drives a request through the matched route's filters. `reload` rebuilds the set
+//! and swaps it **atomically** (ArcSwap): new requests see the new set, in-flight holders keep
+//! the old one until it drops. Single-node-first (ADR 000008).
 //!
 //! The trust policy lives on the `Host` and is fixed at construction; changing trust roots
 //! requires a new `Control`. `reload` swaps only the filter set + chain (same `Host`, same
@@ -110,20 +110,15 @@ pub use plecto_host::{
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.
 pub use plecto_host::otlp;
 
-/// The atomically-swappable active configuration: the loaded filters, the chain order, and the
-/// identity of the manifest that produced them. Held behind an `ArcSwap`; never mutated in place
-/// — `reload` replaces it wholesale. That identity is a PAIR — the public `hash` (config version)
-/// and the unlogged `reload_fingerprint` — and both ride with the config they describe, so
-/// `reload_from_disk` can compare the running config without a separate lock.
+/// The atomically-swappable active configuration: the loaded filters, the compiled routes that
+/// order them, and the identity of the manifest that produced them. Held behind an `ArcSwap`;
+/// never mutated in place — `reload` replaces it wholesale. That identity is a PAIR — the public
+/// `hash` (config version) and the unlogged `reload_fingerprint` — and both ride with the config
+/// they describe, so `reload_from_disk` can compare the running config without a separate lock.
 pub(crate) struct ActiveConfig {
     pub(crate) filters: HashMap<String, Arc<LoadedFilter>>,
-    /// The manifest's default `[chain]`, resolved to the loaded filter in order — built once per
-    /// reload so the default-chain convenience (`ConfigSnapshot::on_request` / `on_response`)
-    /// never re-hashes a filter id against `filters` on every request (mirrors
-    /// `CompiledRoute::resolved_chain`).
-    pub(crate) resolved_chain: Vec<Arc<LoadedFilter>>,
     /// Compiled routing table (ADR 000013): empty unless the manifest declares `[[route]]`.
-    /// The fast-path server matches against these; the chain-only `on_request` ignores them.
+    /// The fast-path server matches against these, then runs the matched route's chain.
     pub(crate) routes: Vec<route::CompiledRoute>,
     /// TLS server config built from `[[tls]]` (ADR 000014), or `None` for plain HTTP/1.1. Rides
     /// the `ArcSwap` with the rest, so a reload swaps certs atomically (new conns get new certs).
@@ -247,7 +242,7 @@ impl Control {
 
     /// Build from a pre-constructed `Host` (carrying its `TrustPolicy`) and an artifact store
     /// — the testable core. Each manifest filter is resolved through `store` (digest pin),
-    /// loaded through the host's ADR 000006 gate (signature + SBOM), and the chain order is
+    /// loaded through the host's ADR 000006 gate (signature + SBOM), and every route's chain is
     /// validated against the loaded set. Any failure aborts the build (nothing is loaded
     /// half-way into a live set).
     pub fn load(
@@ -563,10 +558,15 @@ fn add_otlp_buffer(
 }
 
 /// The pure filter/chain-semantics checks shared by [`validate_manifest`] (the `nginx -t` core)
-/// and [`build_active`] (the load path): duplicate filter ids, per-entry metering / rate-limit
-/// ranges, and default-chain references. ONE function so a check added for one caller cannot be
+/// and [`build_active`] (the load path): the inert `[chain]` section, duplicate filter ids, and
+/// per-entry metering / rate-limit ranges. ONE function so a check added for one caller cannot be
 /// silently missed by the other (the two previously re-implemented this sequence in parallel).
 fn validate_filters_and_chain(manifest: &Manifest) -> Result<HashSet<&str>, ControlError> {
+    // Unconditional (ADR 000101): the serving binary runs a route's inline chain and nothing
+    // else, so filters declared here would be silently dropped whether or not routes exist.
+    if !manifest.chain.filters.is_empty() {
+        return Err(ControlError::InertChainSection);
+    }
     let mut filter_ids: HashSet<&str> = HashSet::with_capacity(manifest.filters.len());
     for entry in &manifest.filters {
         if !filter_ids.insert(entry.id.as_str()) {
@@ -574,11 +574,6 @@ fn validate_filters_and_chain(manifest: &Manifest) -> Result<HashSet<&str>, Cont
         }
         // Reject out-of-range metering / rate-limit values before they reach the host.
         entry.validate()?;
-    }
-    for id in &manifest.chain.filters {
-        if !filter_ids.contains(id.as_str()) {
-            return Err(ControlError::UnknownChainFilter(id.clone()));
-        }
     }
     Ok(filter_ids)
 }
@@ -594,7 +589,7 @@ fn build_active(
     registry: &UpstreamRegistry,
 ) -> Result<ActiveConfig, ControlError> {
     // The pure semantic checks run FIRST (shared with `validate_manifest`), so the load loop
-    // below never sees a duplicate id or an unreferenced chain filter.
+    // below never sees a duplicate id or a manifest whose filters no route would run.
     let filter_ids = validate_filters_and_chain(manifest)?;
     let mut filters: HashMap<String, Arc<LoadedFilter>> = HashMap::new();
     for entry in &manifest.filters {
@@ -695,16 +690,8 @@ fn build_active(
         routes.push(route::CompiledRoute::compile(r, backends, &filters));
     }
 
-    let resolved_chain = manifest
-        .chain
-        .filters
-        .iter()
-        .filter_map(|id| filters.get(id).cloned())
-        .collect();
-
     Ok(ActiveConfig {
         filters,
-        resolved_chain,
         routes,
         tls,
         quic_tls,

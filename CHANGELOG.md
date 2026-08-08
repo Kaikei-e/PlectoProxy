@@ -27,6 +27,33 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Manifest: a declared `[chain]` is now rejected** (breaking, ADR 000101). The section was
+  validated (its filter ids were checked against the declared set) and resolved into the active
+  config, but no serving path ever ran it — the fast path runs the matched `[[route]]`'s inline
+  `filters` and nothing else, and a manifest with no routes answers 404. A manifest could
+  therefore validate green, start clean, and apply zero filters. A non-empty `[chain] filters`
+  now fails closed in `plecto validate`, at startup, and on reload, with a diagnostic that names
+  where the filters belong. The rejection is unconditional — it does not depend on whether
+  `[[route]]` is also declared — so there is no "sometimes live" case to remember. An empty or
+  absent `[chain]` keeps validating, and config versions (manifest content hashes) are unchanged.
+  **Migration**: move each filter id from `[chain] filters` into the `filters` of the `[[route]]`
+  that needs it.
+
+### Removed
+
+- **The chain-only convenience API** (breaking, ADR 000101): `Control::on_request` /
+  `Control::on_response`, `ConfigSnapshot::on_request` / `ConfigSnapshot::on_response`, and the
+  `ControlError::UnknownChainFilter` variant that reported against the section above. The
+  manifest `[chain]` was their only input — the config they read is crate-private and cannot be
+  built from outside — so rejecting the section leaves them unreachable rather than merely
+  unused. **Migration**: `ConfigSnapshot::find_route` plus `dispatch_request` /
+  `dispatch_request_body` / `dispatch_response` — the calls the fast path itself drives — run a
+  route's chain against one snapshot pinned for the whole transaction. `plecto-control` is
+  published to crates.io, so this is a public-API removal and rides a pre-1.0 **minor** bump per
+  the versioning policy above; `cargo semver-checks` detects it.
+
 ## [0.6.4] - 2026-08-06
 
 Patch release: routine dependency maintenance. `wit-component` moves 0.254 → 0.255 (the only

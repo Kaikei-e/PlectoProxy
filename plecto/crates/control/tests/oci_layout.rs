@@ -52,10 +52,29 @@ source = "fh"
 digest = "{digest}"
 isolation = "untrusted"
 
-[chain]
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
 filters = ["fh"]
+upstream = "be"
+[route.match]
+path_prefix = "/"
 "#
     )
+}
+
+/// Drive a request through the matched route's chain the way the fast path does — `find_route`,
+/// then `dispatch_request` on the same snapshot.
+fn run_request(control: &Control, request: HttpRequest) -> ChainOutcome {
+    let snap = control.snapshot();
+    let route = snap
+        .find_route(&request)
+        .expect("the fixture manifest declares a catch-all route");
+    snap.dispatch_request(route.index, request)
 }
 
 #[test]
@@ -73,11 +92,11 @@ fn loads_and_runs_filter_from_offline_oci_layout() {
     // The filter, loaded entirely from the OCI layout (digest pin + bundled signature/SBOM),
     // actually runs through the chain.
     assert!(matches!(
-        control.on_request(req(&[])),
+        run_request(&control, req(&[])),
         ChainOutcome::Forward(_)
     ));
     assert!(
-        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403)
+        matches!(run_request(&control, req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403)
     );
 }
 
@@ -133,25 +152,14 @@ fn from_manifest_reads_trust_keys_and_loads_end_to_end() {
     std::fs::write(dir.path().join("cosign.pub"), signer.public_key_pem()).unwrap();
 
     let toml = format!(
-        r#"
-[trust]
-keys = ["cosign.pub"]
-
-[[filter]]
-id = "fh"
-source = "fh"
-digest = "{digest}"
-isolation = "untrusted"
-
-[chain]
-filters = ["fh"]
-"#
+        "[trust]\nkeys = [\"cosign.pub\"]\n{}",
+        manifest_toml(&digest)
     );
     let manifest = Manifest::from_toml(&toml).unwrap();
     let control = Control::from_manifest(&manifest, dir.path()).unwrap();
 
     assert!(
-        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        matches!(run_request(&control, req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
         "the manifest-built control plane loads and runs the filter"
     );
 }
@@ -182,8 +190,17 @@ digest = "{digest}"
 isolation = "untrusted"
 ratelimit = {{ capacity = 2, refill_tokens = 0, refill_interval_ms = 0 }}
 
-[chain]
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
 filters = ["fh"]
+upstream = "be"
+[route.match]
+path_prefix = "/"
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();
@@ -193,22 +210,22 @@ filters = ["fh"]
         let control = Control::from_manifest(&manifest, dir.path()).unwrap();
         // Drain the one-shot bucket (capacity 2, no refill).
         assert!(matches!(
-            control.on_request(req(&rl)),
+            run_request(&control, req(&rl)),
             ChainOutcome::Forward(_)
         ));
         assert!(matches!(
-            control.on_request(req(&rl)),
+            run_request(&control, req(&rl)),
             ChainOutcome::Forward(_)
         ));
         assert!(
-            matches!(control.on_request(req(&rl)), ChainOutcome::Respond(r) if r.status == 429),
+            matches!(run_request(&control, req(&rl)), ChainOutcome::Respond(r) if r.status == 429),
             "the bucket is drained before the restart"
         );
     } // drop = the process restart (also releases the redb file lock)
 
     let control = Control::from_manifest(&manifest, dir.path()).unwrap();
     assert!(
-        matches!(control.on_request(req(&rl)), ChainOutcome::Respond(r) if r.status == 429),
+        matches!(run_request(&control, req(&rl)), ChainOutcome::Respond(r) if r.status == 429),
         "a drained bucket stays drained across a restart (redb persisted it)"
     );
 }

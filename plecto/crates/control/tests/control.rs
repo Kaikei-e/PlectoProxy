@@ -1,6 +1,6 @@
-//! E2E (tdd-workflow Phase 0) for the control plane: a TOML manifest declares a chain of
-//! real `plecto:filter` components (filter-hello), resolved through an `ArtifactStore` and
-//! loaded through the ADR 000006 provenance gate; the chain dispatcher drives requests; and
+//! E2E (tdd-workflow Phase 0) for the control plane: a TOML manifest declares a route whose
+//! chain runs real `plecto:filter` components (filter-hello), resolved through an `ArtifactStore`
+//! and loaded through the ADR 000006 provenance gate; the chain dispatcher drives requests; and
 //! `reload` swaps the active set atomically. Uses the in-memory store so these tests need no
 //! OCI layout (the offline OCI store is covered separately).
 
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use plecto_control::{
     ChainOutcome, Control, ControlError, Host, HttpRequest, HttpResponse, InMemorySink, Manifest,
-    MemoryStore, ResolvedArtifact,
+    MemoryStore, ResolvedArtifact, ResponseOutcome,
 };
 use plecto_host::Header;
 use plecto_host::test_support::{
@@ -47,7 +47,8 @@ fn signed_filter_hello() -> (TestSigner, ResolvedArtifact) {
     (signer, artifact)
 }
 
-/// A manifest declaring one filter `fh` pinned at `digest`, with the given chain order.
+/// A manifest declaring one filter `fh` pinned at `digest`, and a catch-all route running the
+/// given chain order.
 fn manifest_toml(digest: &str, chain: &[&str]) -> String {
     let chain_list = chain
         .iter()
@@ -62,10 +63,42 @@ source = "fh"
 digest = "{digest}"
 isolation = "untrusted"
 
-[chain]
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
 filters = [{chain_list}]
+upstream = "be"
+[route.match]
+path_prefix = "/"
 "#
     )
+}
+
+/// Drive a request through the matched route's chain the way the fast path does — `find_route`,
+/// then `dispatch_request` on the same snapshot.
+fn run_request(control: &Control, request: HttpRequest) -> ChainOutcome {
+    let snap = control.snapshot();
+    let route = snap
+        .find_route(&request)
+        .expect("the fixture manifest declares a catch-all route");
+    snap.dispatch_request(route.index, request)
+}
+
+/// The response half of [`run_request`]: match, then run the route's chain in reverse.
+fn run_response(
+    control: &Control,
+    request: &HttpRequest,
+    response: HttpResponse,
+) -> ResponseOutcome {
+    let snap = control.snapshot();
+    let route = snap
+        .find_route(request)
+        .expect("the fixture manifest declares a catch-all route");
+    snap.dispatch_response(route.index, request, response)
 }
 
 /// Sign arbitrary component bytes into a self-consistent `ResolvedArtifact` (bytes + bound SBOM +
@@ -169,12 +202,12 @@ fn signed_control(chain: &[&str]) -> Control {
 fn chain_forwards_unblocked_and_short_circuits_blocked() {
     let control = signed_control(&["fh"]);
 
-    match control.on_request(req(&[])) {
+    match run_request(&control, req(&[])) {
         ChainOutcome::Forward(_) => {}
         ChainOutcome::Respond(_) => panic!("an unblocked request should forward upstream"),
     }
 
-    match control.on_request(req(&[("x-plecto-block", "1")])) {
+    match run_request(&control, req(&[("x-plecto-block", "1")])) {
         ChainOutcome::Respond(resp) => assert_eq!(resp.status, 403, "blocked request → 403"),
         ChainOutcome::Forward(_) => panic!("a blocked request must short-circuit"),
     }
@@ -186,7 +219,7 @@ fn chain_applies_modified_edit_before_forwarding() {
     // forwarded request (and any later filter / upstream) sees it (ADR 000007).
     let control = signed_control(&["fh"]);
 
-    match control.on_request(req(&[("x-plecto-addheader", "1")])) {
+    match run_request(&control, req(&[("x-plecto-addheader", "1")])) {
         ChainOutcome::Forward(forwarded) => assert!(
             forwarded
                 .headers
@@ -210,16 +243,16 @@ fn response_chain_applies_edit() {
         }],
         body: vec![],
     };
-    let out = control.on_response(&req(&[]), resp);
+    let out = run_response(&control, &req(&[]), resp);
     match out {
-        plecto_control::ResponseOutcome::Forward(edited) => assert!(
+        ResponseOutcome::Forward(edited) => assert!(
             edited
                 .headers
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case("x-plecto-respadded")),
             "the response-side chain must apply the filter's response edit"
         ),
-        plecto_control::ResponseOutcome::Respond(_) => {
+        ResponseOutcome::Respond(_) => {
             panic!("a modified (not replace) response should forward")
         }
     }
@@ -244,7 +277,8 @@ fn replace_stops_the_response_chain_and_yields_the_synthesised_response() {
     // The replace marker rides the REQUEST — reaching the replace arm at all also proves the
     // as-forwarded snapshot flowed into the response phase.
     let marked = req(&[("x-plecto-resp-replace", "1")]);
-    let out = control.on_response(
+    let out = run_response(
+        &control,
         &marked,
         HttpResponse {
             status: 200,
@@ -253,7 +287,7 @@ fn replace_stops_the_response_chain_and_yields_the_synthesised_response() {
         },
     );
     match out {
-        plecto_control::ResponseOutcome::Respond(resp) => {
+        ResponseOutcome::Respond(resp) => {
             assert_eq!(resp.status, 418);
             assert_eq!(resp.body, b"replaced by filter-hello");
             assert!(
@@ -262,7 +296,7 @@ fn replace_stops_the_response_chain_and_yields_the_synthesised_response() {
                     .any(|h| h.name == "x-plecto-replaced" && h.value == b"1")
             );
         }
-        plecto_control::ResponseOutcome::Forward(_) => {
+        ResponseOutcome::Forward(_) => {
             panic!("a replace must yield the synthesised response")
         }
     }
@@ -274,7 +308,8 @@ fn replace_stops_the_response_chain_and_yields_the_synthesised_response() {
 
     // Control: a modified edit does NOT stop the chain — both filters run.
     let echoed = req(&[("x-plecto-resp-echo", "1")]);
-    let out = control.on_response(
+    let out = run_response(
+        &control,
         &echoed,
         HttpResponse {
             status: 200,
@@ -282,7 +317,7 @@ fn replace_stops_the_response_chain_and_yields_the_synthesised_response() {
             body: vec![],
         },
     );
-    assert!(matches!(out, plecto_control::ResponseOutcome::Forward(_)));
+    assert!(matches!(out, ResponseOutcome::Forward(_)));
     assert_eq!(
         sink.spans().len(),
         3,
@@ -302,7 +337,7 @@ fn reload_swaps_chain_atomically() {
     let v1 = Manifest::from_toml(&manifest_toml(&digest, &["fh"])).unwrap();
     let control = Control::load(host, &v1, Box::new(store)).unwrap();
     assert!(
-        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        matches!(run_request(&control, req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
         "v1 chain blocks"
     );
 
@@ -310,7 +345,7 @@ fn reload_swaps_chain_atomically() {
     control.reload(&v2).unwrap();
     assert!(
         matches!(
-            control.on_request(req(&[("x-plecto-block", "1")])),
+            run_request(&control, req(&[("x-plecto-block", "1")])),
             ChainOutcome::Forward(_)
         ),
         "after reload the chain is empty → the same request now forwards"
@@ -367,8 +402,10 @@ fn request_and_response_spans_share_one_trace_via_snapshot() {
     let control = Control::load(host, &manifest, Box::new(store)).unwrap();
 
     let snap = control.snapshot();
-    let _ = snap.on_request(req(&[]));
-    let _ = snap.on_response(
+    let route = snap.find_route(&req(&[])).expect("the catch-all route");
+    let _ = snap.dispatch_request(route.index, req(&[]));
+    let _ = snap.dispatch_response(
+        route.index,
         &req(&[]),
         HttpResponse {
             status: 200,
@@ -402,19 +439,8 @@ fn otlp_endpoint_wires_the_span_buffer_beside_the_callers_sink() {
         .unwrap()
         .with_telemetry_sink(sink.clone());
     let toml = format!(
-        r#"
-[observability]
-otlp_endpoint = "http://127.0.0.1:4318"
-
-[[filter]]
-id = "fh"
-source = "fh"
-digest = "{digest}"
-isolation = "untrusted"
-
-[chain]
-filters = ["fh"]
-"#
+        "[observability]\notlp_endpoint = \"http://127.0.0.1:4318\"\n{}",
+        manifest_toml(&digest, &["fh"])
     );
     let manifest = Manifest::from_toml(&toml).unwrap();
     let control = Control::load(host, &manifest, Box::new(store)).unwrap();
@@ -424,8 +450,7 @@ filters = ["fh"]
         .otlp_buffer()
         .expect("the buffer exists iff the endpoint is set");
 
-    let snap = control.snapshot();
-    let _ = snap.on_request(req(&[]));
+    let _ = run_request(&control, req(&[]));
 
     assert_eq!(sink.len(), 1, "the caller's sink still sees the span");
     let exported = buffer.drain(16);
@@ -466,9 +491,6 @@ digest = "{digest}"
 id = "fh"
 source = "fh"
 digest = "{digest}"
-
-[chain]
-filters = ["fh"]
 "#
     );
     let manifest = Manifest::from_toml(&toml).unwrap();
@@ -480,8 +502,8 @@ filters = ["fh"]
 }
 
 #[test]
-fn chain_referencing_unknown_filter_is_rejected() {
-    // A manifest whose chain names a filter that is not declared is a config error.
+fn route_chain_referencing_unknown_filter_is_rejected() {
+    // A manifest whose route chain names a filter that is not declared is a config error.
     let (signer, artifact) = signed_filter_hello();
     let mut store = MemoryStore::new();
     let digest = store.insert("fh", artifact);
@@ -490,7 +512,10 @@ fn chain_referencing_unknown_filter_is_rejected() {
 
     match Control::load(host, &manifest, Box::new(store)) {
         Ok(_) => panic!("a chain referencing an undeclared filter must be rejected"),
-        Err(e) => assert!(matches!(e, ControlError::UnknownChainFilter(_)), "got {e}"),
+        Err(e) => assert!(
+            matches!(e, ControlError::UnknownRouteFilter { .. }),
+            "got {e}"
+        ),
     }
 }
 
@@ -520,8 +545,7 @@ fn validate_rejects_a_declared_chain_and_names_the_route_migration() {
     let manifest = Manifest::from_toml(&chain_manifest_toml("sha256:abc")).unwrap();
 
     let err = plecto_control::validate_manifest(&manifest, dir.path())
-        .err()
-        .expect("a declared [chain] must fail validation");
+        .expect_err("a declared [chain] must fail validation");
 
     let message = err.to_string();
     assert!(

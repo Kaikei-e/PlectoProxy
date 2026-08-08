@@ -291,8 +291,8 @@ host = "example.com"          # optional SNI host; omit = the default cert
 ```
 
 With no `[[tls]]`, the fast path serves plain HTTP/1.1; one or more certs enable TLS termination
-(rustls, ADR 000014). `[chain]` exists for the single-chain convenience API, but the fast-path server
-uses `[[route]]`.
+(rustls, ADR 000014). Filters run only as part of a `[[route]]`'s `filters`; a manifest that still
+declares the older global `[chain]` is rejected at validation, with a diagnostic naming that move.
 
 ### `[listen]`
 

@@ -1,8 +1,8 @@
 //! `ConfigSnapshot` — a pinned view of one `ActiveConfig` for the span of a single request
-//! transaction (f000004 #2). `Control::on_request` and `on_response` each load the active
-//! config independently, so a reload landing *between* a request's two halves would run the
-//! request side against config A and the response side against config B — only the in-flight
-//! request at the reload instant, but asymmetric filtering nonetheless.
+//! transaction (f000004 #2). A caller loading the active config once per half would run the
+//! request side against config A and the response side against config B whenever a reload lands
+//! *between* them — only the in-flight request at the reload instant, but asymmetric filtering
+//! nonetheless.
 //!
 //! A snapshot closes that: the fast-path server takes one snapshot per request and drives both
 //! halves through it. The snapshot holds its `Arc<ActiveConfig>` until dropped, so a concurrent
@@ -39,18 +39,6 @@ impl ConfigSnapshot {
         Self { config, trace }
     }
 
-    /// Drive a request through the **default** `[chain]` (the chain-only convenience). The
-    /// fast-path server uses [`ConfigSnapshot::find_route`] + [`ConfigSnapshot::dispatch_request`].
-    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        chain::dispatch_request(&self.config.resolved_chain, request, &self.trace)
-    }
-
-    /// Drive a response back through the default `[chain]` in reverse. `request` is the
-    /// as-forwarded request snapshot every response hook sees (ADR 000073).
-    pub fn on_response(&self, request: &HttpRequest, response: HttpResponse) -> ResponseOutcome {
-        chain::dispatch_response(&self.config.resolved_chain, request, response, &self.trace)
-    }
-
     /// Match a request to a route by its `[route.match]` dimensions — host, path prefix, method,
     /// headers, query (ADR 000013 / 000034) — or `None` when no route matches (the server responds
     /// 404). The most specific match wins (see [`route::select`]). Pure config lookup — cheap and
@@ -82,9 +70,9 @@ impl ConfigSnapshot {
     }
 
     /// Drive a request through a matched route's chain (request side). `route` is the index from
-    /// [`ConfigSnapshot::find_route`] on this same snapshot. Returns forward-or-respond just like
-    /// `on_request`. Out-of-range (a stale index from another snapshot) responds with a
-    /// fail-closed 404 rather than panicking (data-plane no-panic, bp-rust).
+    /// [`ConfigSnapshot::find_route`] on this same snapshot. Returns forward-or-respond.
+    /// Out-of-range (a stale index from another snapshot) responds with a fail-closed 404 rather
+    /// than panicking (data-plane no-panic, bp-rust).
     pub fn dispatch_request(&self, route: usize, request: HttpRequest) -> ChainOutcome {
         match self.config.routes.get(route) {
             Some(r) => chain::dispatch_request(&r.resolved_chain, request, &self.trace),
@@ -144,21 +132,6 @@ impl crate::Control {
     /// starting a fresh root.
     pub fn snapshot_with_trace(&self, trace: RequestTrace) -> ConfigSnapshot {
         ConfigSnapshot::new(self.active.load_full(), trace)
-    }
-
-    /// Drive a request through the chain. Returns whether to forward the (possibly edited)
-    /// request upstream, or to respond now (a filter short-circuited, or the chain failed
-    /// closed on a trap / deadline). Convenience for a one-shot caller; a request transaction
-    /// that also runs a response should use [`Control::snapshot`] to pin one config.
-    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        self.snapshot().on_request(request)
-    }
-
-    /// Drive a response back through the chain in reverse, applying response edits. A trapped
-    /// filter yields a fail-closed 5xx; a `replace` yields the synthesised response (both as
-    /// [`ResponseOutcome::Respond`]). See [`Control::snapshot`] for the transaction-pinned form.
-    pub fn on_response(&self, request: &HttpRequest, response: HttpResponse) -> ResponseOutcome {
-        self.snapshot().on_response(request, response)
     }
 }
 

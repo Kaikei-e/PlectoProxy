@@ -21,6 +21,17 @@ _Avoid_: plugin layer, middleware layer
 fast path と extension plane の対。相補関係にあり、両者を WIT 型契約で結ぶ。
 _Avoid_: 二つの半身（身体比喩で生硬・"two halves" の直訳調）, より合わせる糸（比喩過多）
 
+**宣言（declaration）**:
+マニフェスト上でリテラルとして尽き、リクエストの内容に依存しない設定。適用はその宣言の機械的な反映であって
+判断ではないので、fast path に置ける。prefix strip・レスポンスヘッダの set/remove がこれに当たる。
+_Avoid_: static config（何が static かが曖昧）, rule（判断を含む語なので rewrite ロジックと混ざる）
+
+**Rewrite ロジック**:
+リクエストの内容に依存して出力が変わる per-request の計算。ユーザのポリシーで形が変わるので extension plane に
+置く。宣言との境界は「リテラルで尽きるか、入力を読んで計算するか」であり、語の見た目（"rewrite"）ではない。
+_Avoid_: rewrite（単独では宣言的な prefix strip と紛れる）, transformation（compression のような host-native な
+表現変換と混ざる）
+
 ## Contexts
 
 - [Extension plane / host runtime](./plecto/crates/host/CONTEXT.md) — `plecto:filter` 契約・フィルタ実行モデル・

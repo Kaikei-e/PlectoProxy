@@ -1,0 +1,47 @@
+# DocDag configuration for Plecto's Architecture Decision Records.
+#
+# Plecto's decision history is an append-only graph: a later ADR `amends` an earlier one to refine
+# or correct it (the Decision body of the earlier ADR is never rewritten in place), and `supersedes`
+# replaces it entirely. Both edge types are declared in frontmatter and both must stay acyclic.
+#
+# Identifiers are six digits (`docs/ADR/NNNNNN.md`). Wikilinks `[[NNNNNN]]` in bodies stay in the
+# reference layer — prose can never fail this check.
+#
+# `docdag new` is NOT used here: it writes `<id>-<kebab-title>.md`, while this repository's
+# convention is the bare `NNNNNN.md`. Author from `docs/ADR/template.md` instead and run
+# `docdag validate`.
+
+preset: adr
+dir: docs/ADR
+id_width: 6
+status_field: status
+status_values: [proposed, accepted, superseded]
+
+edges:
+  - name: supersedes
+    key: supersedes
+    acyclic: true
+    direction: forward
+  - name: amends
+    key: amends
+    acyclic: true
+    direction: forward
+
+# A superseding ADR names its predecessor in frontmatter, so no status-string parsing is needed.
+derived_edges: []
+
+rules:
+  - name: status_drift
+    severity: error
+    when:
+      inbound: supersedes
+      attr:
+        status: { not: superseded }
+    message: "has inbound supersedes but status is not superseded"
+  - name: superseded_orphan
+    severity: warn
+    when:
+      not_inbound: supersedes
+      attr:
+        status: { eq: superseded }
+    message: "status is superseded but no document supersedes it"

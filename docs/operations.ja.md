@@ -96,6 +96,88 @@ admin `/metrics` は RED シグナルに加えて次を出す:
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — トンネルが中継した
   バイト数（down = upstream → client、up = client → upstream）。各トンネルの close 時に加算。
 
+## アクセスログ: フィールド契約
+
+アクセスログは opt-in で、既定では**無効**。`[observability] access_log` で有効にする:
+
+```toml
+[observability]
+access_log = true
+```
+
+有効にすると、リクエストごとに `plecto::access` ターゲットへ `tracing` イベントが 1 本出て、
+バイナリの JSON サブスクライバがそれを 1 行として描画する。イベントのフィールドはその行の
+**top-level** に——`timestamp` / `level` / `target` と同じ深さに——並ぶ。取り込み層はネストした
+オブジェクトを展開せずに、そのまま型付きスロットへ写せる。
+
+```json
+{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
+```
+
+> **平坦化前のリリースからの移行:** 同じフィールドはかつて `fields` オブジェクトの中にあった
+> （`fields.method` / `fields.status` …）。名前は変わっておらず、ネストが無くなっただけ。
+> 取り込み設定を行の直下へ向け直すこと。
+
+| フィールド | 型 | 意味 |
+| --- | --- | --- |
+| `client` | string | このトランザクションを帰属させるアドレス。接続 peer、または宣言済み `[listen.trusted_proxy]` 配下ならその proxy が名指ししたクライアント（[ADR 000103](ADR/000103.md)）。再発行される `X-Forwarded-For` と per-client rate limit が使うアドレスと同一なので、ログと強制は一致する。 |
+| `scheme` | string | `http` / `https`。ワイヤから取る値であり、inbound の `X-Forwarded-Proto` は決して尊重しない。 |
+| `method` | string | 受信したままのリクエストメソッド。 |
+| `authority` | string | リクエストの host authority。 |
+| `path` | string | リクエストパス。**クエリ文字列は落とす**。 |
+| `status` | number | クライアントへ返したステータス。プロキシが応答できなかった転送エラーは `502` として記録する。 |
+| `duration_ms` | number | トランザクション開始から応答ヘッダまでのミリ秒（整数）。 |
+| `trace_id` | string | W3C trace id（小文字 hex 32 桁）。呼び出し元が `traceparent` を送っていればその値、なければ Plecto が採番した値。 |
+| `span_id` | string | Plecto 自身の request span の W3C span id（小文字 hex 16 桁）。upstream へ伝播するのもこの id。 |
+
+この行が守る性質は 2 つ:
+
+- **秘密を持たない。** `Authorization` も `Cookie` も——そもそもヘッダ値を一切——出さず、path は
+  クエリ文字列を落として出す。したがってアクセスログをトラフィック本体より低信頼な宛先へ送ること
+  自体は、それだけでは開示にならない。
+- **`trace_id` / `span_id` はサンプリングの有無にかかわらず常に出る。** 下流でサンプリングされて
+  残った何かとこの行を結合でき、サンプリングされなかったトランザクションについては、この行が
+  唯一の手がかりになる。遅いリクエストとそのトレースを結ぶのは両側の `trace_id`。
+
+**このフィールド集合は契約であり、manifest スキーマと同じ扱いをする。** フィールドの追加・改名・
+削除は公開インターフェースの変更であり、そこに記された pre-1.0 バージョニング方針のもとで
+[`CHANGELOG.md`](../CHANGELOG.md) の **Changed** に移行注記つきで載る。取り込み設定は行の順序や
+全体の形ではなく、上表のフィールド名に対して固定すること。
+
+## アップグレード: 独立した二つのバージョン系列
+
+Plecto は**二つのバージョン系列**を持ち、**両者は独立に動く**:
+
+| 系列 | 何のバージョンか | どこで見えるか |
+| --- | --- | --- |
+| バイナリ / イメージ / ライブラリクレート | プロキシ自身: manifest スキーマ・CLI・データプレーン・ホスト | `plecto --version`、イメージタグ、クレートのバージョン |
+| `plecto:filter@<version>` | プロキシとフィルタの間の WIT 契約 | `plecto --version` の `filter contracts:` 行と、起動時のフィルタごとの 1 行 |
+
+**プロキシのバンプにフィルタの再ビルドが必要になることは決してない。** ホストはサポートする全
+契約版をロードし続けるので、古い契約版に対して作られたフィルタはプロキシのアップグレードを
+またいで動き続ける——セキュリティ修正を含むパッチアップグレードも同様。取ってよい。
+
+別の問いに答える 2 つのコマンド:
+
+```console
+$ plecto --version
+plecto 0.6.4 (profile: minimal)
+filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0
+```
+
+これは**このバイナリが受け付ける集合**。**手元のフィルタ**が実際に何にバインドしたかは別の問い
+で、起動時（および reload のたび）にフィルタごとの 1 行が答える:
+
+```json
+{"timestamp":"...","level":"INFO","filter":"hello","contract":"plecto:filter@0.3.0","isolation":"trusted","message":"filter loaded","target":"plecto_control"}
+```
+
+アップグレード前に、そこに出ている `contract` がすべて新バイナリの `filter contracts:` に残って
+いることを確認する。残っていれば——リリースノートがある契約版の廃止を宣言していない限り残る
+——そのアップグレードにフィルタ側の作業は一切要らない。major 契約版は最低 2 リリース系列は
+ロード可能なまま維持され、その廃止は単独の ADR で宣言される（互換ポリシーは
+[ADR 000085](ADR/000085.md)）。黙って消えることはない。
+
 ## CI プリフライト: `plecto validate --resolve`
 
 manifest の編集やフィルタ digest の更新は、reload 時ではなく CI で落ちるべきもの。`plecto validate

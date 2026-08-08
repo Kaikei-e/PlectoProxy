@@ -49,6 +49,29 @@ pub enum ContractVersion {
     V03,
 }
 
+impl ContractVersion {
+    /// The WIT package id this version names — the same string the world, the published OCI
+    /// artifact and the operator-facing output all use, so the three never drift into different
+    /// spellings of one version.
+    pub fn package(self) -> &'static str {
+        match self {
+            ContractVersion::V01 => "plecto:filter@0.1.0",
+            ContractVersion::V02 => "plecto:filter@0.2.0",
+            ContractVersion::V03 => "plecto:filter@0.3.0",
+        }
+    }
+}
+
+/// Every `plecto:filter` contract version this build can load, oldest first (ADR 000071 /
+/// 000073): the frozen tracks reached through load-time adapters, then the current one. The
+/// binary reports this set so an operator can tell what a proxy upgrade accepts WITHOUT reading
+/// a changelog — the answer to "does this bump force a filter rebuild?".
+pub const SUPPORTED_CONTRACT_VERSIONS: &[ContractVersion] = &[
+    ContractVersion::V01,
+    ContractVersion::V02,
+    ContractVersion::V03,
+];
+
 /// Detect the contract version from the component's decoded import names (wasmtime's own
 /// validated type information, not a byte scan — a scan can false-positive on a string the
 /// guest embeds in a data segment). Keyed on ANY `plecto:filter/…@0.N.` import, not one

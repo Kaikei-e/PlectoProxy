@@ -80,7 +80,11 @@ fn version_flag_lists_the_loadable_filter_contract_versions() {
     let out = run(&["--version"], dir.path());
     assert!(out.status.success(), "--version exits 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for version in ["plecto:filter@0.1.0", "plecto:filter@0.2.0", "plecto:filter@0.3.0"] {
+    for version in [
+        "plecto:filter@0.1.0",
+        "plecto:filter@0.2.0",
+        "plecto:filter@0.3.0",
+    ] {
         assert!(
             stdout.contains(version),
             "--version lists {version} as loadable, got: {stdout:?}"

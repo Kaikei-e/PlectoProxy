@@ -21,7 +21,8 @@
 //!   otherwise. The self-probe a shell-less (distroless) image needs to drive a Docker/Compose
 //!   `healthcheck:` (field report §3.6) — exit code 2 is never produced (Docker reserves it).
 //! - `plecto schema` — print the manifest's JSON Schema (draft-07) for editor completion / CI
-//! - `plecto --version` — print the version and exit
+//! - `plecto --version` — print the version, the compiled capability profile, and the
+//!   `plecto:filter` contract versions this binary can load, then exit
 
 use std::path::Path;
 use std::sync::Arc;
@@ -51,8 +52,13 @@ async fn run() -> anyhow::Result<()> {
     // (`plecto::access`) and the host diagnostics render as machine-parseable lines. `try_init` is
     // idempotent — a failure means a global subscriber is already installed (e.g. a test harness),
     // which we intentionally keep.
+    //
+    // Flattened (ADR 000099): each event's fields sit beside `timestamp` / `level` / `target`
+    // rather than nested under `fields`, which is what a log-ingestion layer maps into typed
+    // slots. A field named like one of those three would collide, so adding one is a check.
     let _logging = tracing_subscriber::fmt()
         .json()
+        .flatten_event(true)
         .with_target(true)
         .try_init();
 
@@ -65,6 +71,10 @@ async fn run() -> anyhow::Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 capability_profile()
             );
+            // What this binary ACCEPTS (ADR 000099) — the answer to "does taking this upgrade
+            // force me to rebuild my filters?", which is not what the startup log answers (that
+            // one says what each filter bound in the running configuration).
+            println!("filter contracts: {}", loadable_contracts());
             return Ok(());
         }
         // The manifest's JSON Schema (ADR 000049), derived from the same serde model `validate`
@@ -155,6 +165,17 @@ async fn run() -> anyhow::Result<()> {
     serve_with_shutdown(control, listener, shutdown_signal()).await?;
     tracing::info!("plecto fast path stopped");
     Ok(())
+}
+
+/// Every `plecto:filter` package version this binary can load (ADR 000071 / 000073), oldest
+/// first. The two version series are independent: a proxy bump never obsoletes a filter built
+/// against a version still on this list.
+fn loadable_contracts() -> String {
+    plecto_control::SUPPORTED_CONTRACT_VERSIONS
+        .iter()
+        .map(|v| v.package())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The named runtime capability profile this binary was compiled as (ADR 000079). The two

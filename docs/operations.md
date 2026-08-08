@@ -98,6 +98,89 @@ The admin `/metrics` endpoint exposes, alongside the RED signals:
   downstream (upstream → client) and upstream (client → upstream) by tunnels, recorded as
   each tunnel closes.
 
+## The access log: field contract
+
+The access log is opt-in and **off by default**. Turn it on with `[observability] access_log`:
+
+```toml
+[observability]
+access_log = true
+```
+
+Plecto then emits one `tracing` event per request on the `plecto::access` target, and the binary's
+JSON subscriber renders it as one line. The event's fields sit at the **top level** of that line,
+beside `timestamp` / `level` / `target` — an ingestion layer can map them straight into typed
+slots without unwrapping a nested object first.
+
+```json
+{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
+```
+
+> **Migrating from a release before this line was flattened:** the same fields used to sit inside
+> a `fields` object (`fields.method`, `fields.status`, …). The names are unchanged; only the
+> nesting is gone. Point your ingestion mapping at the line root.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `client` | string | The address the transaction is attributed to: the connection peer, or — behind a declared `[listen.trusted_proxy]` ([ADR 000103](ADR/000103.md)) — the client that proxy named. The same address the re-issued `X-Forwarded-For` and the per-client rate limit use, so the log agrees with enforcement. |
+| `scheme` | string | `http` or `https` — taken from the wire, never from an inbound `X-Forwarded-Proto`. |
+| `method` | string | The request method as received. |
+| `authority` | string | The request's host authority. |
+| `path` | string | The request path **without its query string**. |
+| `status` | number | The status Plecto returned to the client. A transport error the proxy could not answer is recorded as `502`. |
+| `duration_ms` | number | Whole milliseconds from the start of the transaction to the response head. |
+| `trace_id` | string | W3C trace id (32 lowercase hex chars) — the caller's, when it sent a `traceparent`, otherwise one Plecto minted. |
+| `span_id` | string | W3C span id (16 lowercase hex chars) of Plecto's own request span — the id it propagates upstream. |
+
+Two properties this line is meant to keep:
+
+- **It carries no secrets.** No `Authorization`, no `Cookie`, no header values at all, and the path
+  is logged without its query string. Sending an access log to a lower-trust destination than the
+  traffic itself is therefore not, on its own, a disclosure.
+- **`trace_id` / `span_id` are always present, sampled or not.** They join the line to whatever
+  sampling kept downstream, and for an unsampled transaction the line is the only handle on it.
+  Correlating a slow request with its trace is `trace_id` on both sides.
+
+**The field set is a contract, on the same footing as the manifest schema.** Adding, renaming, or
+removing a field is a change to a published interface: it is listed under **Changed** in
+[`CHANGELOG.md`](../CHANGELOG.md) with a migration note, under the pre-1.0 versioning policy stated
+there. Pin your ingestion mapping to the field names above rather than to field order or to the
+line's overall shape.
+
+## Upgrading: two independent version series
+
+Plecto ships **two version series, and they move independently**:
+
+| Series | What it versions | Where you see it |
+| --- | --- | --- |
+| Binary / image / library crates | The proxy itself: manifest schema, CLI, data plane, host | `plecto --version`, the image tag, the crate versions |
+| `plecto:filter@<version>` | The WIT contract between the proxy and your filters | `plecto --version`'s `filter contracts:` line, and one startup log line per filter |
+
+**Bumping the proxy never requires rebuilding a filter.** The host keeps loading every contract
+version it ships support for, so a filter built against an older contract keeps running across
+proxy upgrades — including patch upgrades that carry security fixes. Take them.
+
+The two places that answer the two different questions:
+
+```console
+$ plecto --version
+plecto 0.6.4 (profile: minimal)
+filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0
+```
+
+That is what **this binary accepts**. What each of **your** filters actually bound is a separate
+question, answered at startup (and on every reload) by one line per filter:
+
+```json
+{"timestamp":"...","level":"INFO","filter":"hello","contract":"plecto:filter@0.3.0","isolation":"trusted","message":"filter loaded","target":"plecto_control"}
+```
+
+Before an upgrade, check that every `contract` you see there is still on the new binary's
+`filter contracts:` list. If it is — and it will be, unless the release notes declare a contract
+version retired — the upgrade needs no filter work at all. A major contract version stays loadable
+for at least two release series and its retirement is declared in its own ADR, per the
+compatibility policy in [ADR 000085](ADR/000085.md); it is never dropped silently.
+
 ## CI pre-flight: `plecto validate --resolve`
 
 A manifest edit or a filter digest bump should fail in CI, not at reload time. `plecto validate

@@ -27,6 +27,17 @@ pub enum Isolation {
     Untrusted,
 }
 
+impl Isolation {
+    /// The stable name this mode is reported under — the `plecto.isolation` span attribute and
+    /// the per-filter load line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Isolation::Trusted => "trusted",
+            Isolation::Untrusted => "untrusted",
+        }
+    }
+}
+
 /// Generous default budget for the heavy once-per-instance `init` of a **trusted** filter
 /// (Tenet 4): regex compile, schema build, config parse. Trusted init runs once per instance
 /// and is then reused, so a large budget is paid once — separate from, and much larger than,

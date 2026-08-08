@@ -103,6 +103,13 @@ impl UpstreamInstance {
         self.outlier_ejected_until_ms.load(Ordering::Acquire) > now_ms
     }
 
+    /// [`is_outlier_ejected`](Self::is_outlier_ejected) against the current wall clock, for a
+    /// caller with no reason to hold a clock of its own (an admin scrape). The ejection window is
+    /// wall-clock by construction, so reading it here keeps that choice in one place.
+    pub fn is_outlier_ejected_now(&self) -> bool {
+        self.is_outlier_ejected(super::now_millis())
+    }
+
     /// Record a successful active probe (a 2xx within the timeout). Promotes a pessimistic / ejected
     /// instance once it reaches its threshold — one success the first time ever, `healthy_threshold`
     /// after a later eject — and resets the consecutive-failure streak.

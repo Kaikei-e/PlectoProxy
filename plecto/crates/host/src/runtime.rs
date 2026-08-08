@@ -102,6 +102,16 @@ pub(crate) struct WasmtimeRuntime {
 }
 
 impl WasmtimeRuntime {
+    /// The `plecto:filter` version this filter actually bound at load. Read off the binding
+    /// itself, so it can never disagree with the version dispatch takes.
+    pub(crate) fn contract_version(&self) -> crate::ContractVersion {
+        match &self.pre {
+            FilterPreBinding::V01(_) => crate::ContractVersion::V01,
+            FilterPreBinding::V02(_) => crate::ContractVersion::V02,
+            FilterPreBinding::V03(_) => crate::ContractVersion::V03,
+        }
+    }
+
     /// Drive a guest call to completion. A filter without outbound uses the no-reactor `pollster`
     /// (its host-API imports never block); an outbound-using filter uses the tokio runtime so its
     /// `wasi:http` / `wasi:sockets` I/O is serviced (ADR 000036 / 000060).

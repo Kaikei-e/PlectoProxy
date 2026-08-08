@@ -6,8 +6,8 @@ use crate::observe;
 use crate::pool::{HookResult, LoadedInner, TrustedPool};
 use crate::runtime::{WasmtimeInstance, WasmtimeRuntime};
 use crate::{
-    Hook, HttpRequest, HttpResponse, Isolation, LogLine, RequestBodyDecision, RequestDecision,
-    RequestTrace, ResponseDecision, RunError, SpanOutcome,
+    ContractVersion, Hook, HttpRequest, HttpResponse, Isolation, LogLine, RequestBodyDecision,
+    RequestDecision, RequestTrace, ResponseDecision, RunError, SpanOutcome,
 };
 
 /// A loaded filter, ready to run per request. Trusted filters reuse instances from a
@@ -26,6 +26,13 @@ pub struct LoadedFilter {
 impl LoadedFilter {
     pub fn isolation(&self) -> Isolation {
         self.inner.isolation
+    }
+
+    /// The `plecto:filter` version this component bound at load (ADR 000071 / 000073). Distinct
+    /// from the set the binary can load: this is what THIS filter, in THIS configuration, is
+    /// actually being driven through.
+    pub fn contract_version(&self) -> ContractVersion {
+        self.inner.runtime.contract_version()
     }
 
     /// Whether this filter reads the request body — i.e. it exports `on-request-body` (world

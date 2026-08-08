@@ -191,8 +191,11 @@ async fn access_log_lines_are_flat_and_carry_the_trace_ids() {
     let lines = json_lines(&raw);
     assert!(!lines.is_empty(), "the binary logs JSON lines:\n{raw}");
 
+    // The LAST access line is the request driven above; the readiness poll before it legitimately
+    // logged 503s while the upstream had not yet passed a probe.
     let access = lines
         .iter()
+        .rev()
         .find(|l| l.get("target").and_then(|t| t.as_str()) == Some("plecto::access"))
         .unwrap_or_else(|| panic!("an access-log line is present:\n{raw}"));
 

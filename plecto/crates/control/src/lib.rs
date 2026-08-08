@@ -104,8 +104,9 @@ pub use plecto_host::{
 // production dependency; a plain (non-`test-support`) `plecto-host` build needs no wasm32
 // toolchain, so this widens no dependency edge, just this crate's existing re-export list.
 pub use plecto_host::{
-    ConformanceCheck, ConformanceReport, DEV_KEY_MARKER, DevKeyError, DevSigner, FILTER_WIT,
-    PemSigner, bound_sbom, public_key_path_for, run_conformance,
+    ConformanceCheck, ConformanceReport, ContractVersion, DEV_KEY_MARKER, DevKeyError, DevSigner,
+    FILTER_WIT, PemSigner, SUPPORTED_CONTRACT_VERSIONS, bound_sbom, public_key_path_for,
+    run_conformance,
 };
 // The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.
@@ -619,6 +620,14 @@ fn build_active(
                 id: entry.id.clone(),
                 err,
             })?;
+        // What this filter, in THIS configuration, actually bound (ADR 000099) — the
+        // per-configuration counterpart to the version set `plecto --version` reports.
+        tracing::info!(
+            filter = %entry.id,
+            contract = %loaded.contract_version().package(),
+            isolation = %loaded.isolation().as_str(),
+            "filter loaded"
+        );
         filters.insert(entry.id.clone(), Arc::new(loaded));
     }
 

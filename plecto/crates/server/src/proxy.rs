@@ -115,7 +115,7 @@ pub(crate) async fn proxy_core(
     let elapsed = start.elapsed();
     state.metrics.record_request(status, elapsed);
     if let Some(access) = access {
-        access_log::record(scheme, client, &access, status, elapsed);
+        access_log::record(scheme, client, &access, status, elapsed, &trace);
     }
     // One SERVER span per sampled transaction (ADR 000040): the root the filter spans (and the
     // upstream's own trace, via the propagated traceparent) nest under. Push is a bounded-queue

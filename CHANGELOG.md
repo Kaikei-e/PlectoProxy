@@ -15,12 +15,17 @@ All notable changes to Plecto are documented here. The format follows
   error type of a dependency re-surfaced through a public enum. `cargo semver-checks` runs on
   every release, but it compares type paths, so a dependency's major bump behind an unchanged
   path is a gap it cannot see; that judgement stays manual.
-- **WIT contract**: the filter contract is versioned independently as `plecto:filter@<version>`.
-  A manifest declares which contract its filters target; the host keeps loading every contract
-  version it ships support for, so a proxy upgrade never silently breaks deployed filters. The
-  contract is published as a CNCF Wasm OCI Artifact to `ghcr.io` on every tagged release (`wkg
-  publish`, ADR 000064); the published digest is recorded in that tag's release notes, the
-  contract-side counterpart of the binary/image supply-chain record below.
+- **WIT contract**: the filter contract is versioned independently as `plecto:filter@<version>`,
+  and **bumping the proxy never requires rebuilding a filter**. The upgrade rule now lives where
+  the decision is made — [README](README.md#upgrading-two-independent-version-series) and
+  [docs/operations.md](docs/operations.md#upgrading-two-independent-version-series) — rather than
+  only here. The contract is published as a CNCF Wasm OCI Artifact to `ghcr.io` on every tagged
+  release (`wkg publish`, ADR 000064); the published digest is recorded in that tag's release
+  notes, the contract-side counterpart of the binary/image supply-chain record below.
+- **Access log**: the field set of the `plecto::access` line is a contract on the same footing as
+  the manifest schema. Adding, renaming, or removing a field is listed under **Changed** with a
+  migration note; the typed field list is in
+  [docs/operations.md](docs/operations.md#the-access-log-field-contract).
 - **Release artifacts**: binaries and images are cosign-signed (keyless) with SBOMs attached —
   the same supply-chain bar Plecto's own filter loading enforces. Verify commands are in the
   release notes of each release.
@@ -46,9 +51,38 @@ All notable changes to Plecto are documented here. The format follows
   is `"10.1.2.3/32"`) and must list at least one entry; an empty or unparsable list fails
   `plecto validate` and startup. See the
   [hardening guide](docs/hardening.md#client-identity-behind-a-front-proxy).
+- **`plecto_upstream_instances{upstream,state}`** (ADR 000099): a gauge counting each upstream's
+  instances by state — `healthy`, `unhealthy`, `ejected` — so a fail-closed 503 from an empty
+  rotation (ADR 000017) has an externally visible explanation. Rendered by walking the live
+  upstream groups at scrape time, with no persistent counter behind it, so a reload can never
+  leave it stale. Probe health (ADR 000017) and outlier ejection (ADR 000032) are independent
+  axes, and the label folds them by severity (`ejected` > `unhealthy` > `healthy`) so each
+  instance is counted in exactly one series: the per-upstream series sum back to its instance
+  count, and cardinality is bounded by declared upstreams × 3. The combination "probe-healthy but
+  ejected" is therefore not recoverable from this metric — `plecto_outlier_ejections_total`
+  remains the cumulative ejection signal.
+- **Filter contract versions in `plecto --version`** (ADR 000099): a `filter contracts:` line
+  listing every `plecto:filter` version this binary can load. Alongside it, each filter now logs
+  one line at load (startup and every reload) naming the contract version it actually bound and
+  its isolation — the version set the binary accepts and the version a given filter uses are
+  different questions, and an upgrade decision needs both.
 
 ### Changed
 
+- **Log lines are flattened JSON** (ADR 000099). The binary's JSON subscriber now writes each
+  event's fields at the top level of the line — beside `timestamp` / `level` / `target` — instead
+  of nesting them under a `fields` object. The nesting was the JSON layer's default, never a
+  chosen shape, and it left ingestion layers unable to map `method` / `status` / `duration_ms`
+  into typed slots without unwrapping first. This changes every log line the binary emits, not
+  only the access log. **Migration**: read the access log's fields from the line root rather than
+  from `fields.*`; the field names themselves are unchanged. The full typed field list — now a
+  contract, per the versioning policy above — is in
+  [docs/operations.md](docs/operations.md#the-access-log-field-contract).
+- **The access log carries `trace_id` and `span_id`** (ADR 000099), unconditionally — not only for
+  sampled transactions. The proxy is the one hop that sees every request, so its log line is where
+  "give me the trace for this slow request" gets answered; for an unsampled transaction the ids
+  are the only handle on it at all. Both are the W3C lowercase-hex forms, and `trace_id` is the
+  caller's when the request arrived with a `traceparent`.
 - **Manifest: a declared `[chain]` is now rejected** (breaking, ADR 000101). The section was
   validated (its filter ids were checked against the declared set) and resolved into the active
   config, but no serving path ever ran it — the fast path runs the matched `[[route]]`'s inline

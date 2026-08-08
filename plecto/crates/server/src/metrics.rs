@@ -19,6 +19,41 @@ const DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// The `state` label values of `plecto_upstream_instances`, indexed by [`instance_state`].
+const UPSTREAM_STATES: [&str; 3] = ["healthy", "unhealthy", "ejected"];
+
+/// Which `UPSTREAM_STATES` slot one instance is counted in. Probe health (ADR 000017) and outlier
+/// ejection (ADR 000032) are independent axes — a probe-healthy AND ejected instance is a real
+/// state — so a mutually-exclusive label has to fold them: take the heaviest, `ejected` >
+/// `unhealthy` > `healthy`. Each instance then lands in exactly one series and the per-upstream
+/// sum equals its instance count; the cost is that the combination itself is not recoverable.
+fn instance_state(healthy: bool, ejected: bool) -> usize {
+    match (ejected, healthy) {
+        (true, _) => 2,
+        (false, true) => 0,
+        (false, false) => 1,
+    }
+}
+
+/// Escape a label value per the Prometheus text exposition format. Upstream names come from the
+/// manifest and are the only dynamic label value in this exposition; an unescaped quote in one
+/// would corrupt the whole scrape, not just its own series.
+fn escape_label_value(value: &str) -> String {
+    if !value.contains(['\\', '"', '\n']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// A lock-free latency histogram: per-bucket counts (non-cumulative; summed at render), the total
 /// observation count, and the running sum in microseconds (an integer atomic, no float CAS).
 struct Histogram {
@@ -172,7 +207,6 @@ impl ServerMetrics {
     ) -> String {
         const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
         let mut out: Vec<String> = Vec::new();
-        let _ = upstreams; // rendered by the implementation these tests are red against
 
         out.push(
             "# HELP plecto_requests_total Total client requests handled, by response status class."
@@ -249,6 +283,31 @@ impl ServerMetrics {
             "plecto_outlier_ejections_total {}",
             self.outlier_ejections.load(Ordering::Relaxed)
         ));
+
+        // --- upstream rotation (ADR 000099), walked here rather than tallied: no persistent
+        // counter means nothing survives a reload to go stale. Every state is emitted for every
+        // upstream (like the status classes above), so a transition never looks like a new series.
+        out.push(
+            "# HELP plecto_upstream_instances Upstream instances by state (ADR 000017 / 000032)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_upstream_instances gauge".to_string());
+        for group in upstreams {
+            let mut counts = [0u64; UPSTREAM_STATES.len()];
+            for instance in &group.endpoints().instances {
+                let state =
+                    instance_state(instance.is_healthy(), instance.is_outlier_ejected_now());
+                if let Some(slot) = counts.get_mut(state) {
+                    *slot += 1;
+                }
+            }
+            let name = escape_label_value(&group.name);
+            for (state, count) in UPSTREAM_STATES.iter().zip(counts) {
+                out.push(format!(
+                    "plecto_upstream_instances{{upstream=\"{name}\",state=\"{state}\"}} {count}"
+                ));
+            }
+        }
 
         out.push(
             "# HELP plecto_tunnels_active Upgrade tunnels currently open (ADR 000048/000059); each holds a breaker permit and an LB pick."

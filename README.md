@@ -191,6 +191,25 @@ The full how-to — contract, scaffold, build, manifest, signing, per-language r
 compatibility policy — is **[docs/writing-a-filter.md](docs/writing-a-filter.md)**. The current
 contract is **`plecto:filter@0.3.0`**; `0.1.0` and `0.2.0` remain loadable.
 
+## Upgrading: two independent version series
+
+The proxy and the filter contract are versioned **separately**, and the separation is the point:
+
+- **`plecto` (binary / image / library crates)** — the proxy itself: manifest schema, CLI, data
+  plane, host.
+- **`plecto:filter@<version>`** — the WIT contract between the proxy and your filters.
+
+**Bumping the proxy never requires rebuilding a filter.** The host keeps loading every contract
+version it ships support for, so a filter built against an older contract keeps running across
+proxy upgrades — patch releases carrying security fixes included. Take them.
+
+`plecto --version` prints the contract versions this binary accepts; one startup log line per
+filter reports the version each of yours actually bound. Check the first covers the second and the
+upgrade needs no filter work. A major contract version stays loadable for at least two release
+series and its retirement is declared in its own ADR ([ADR 000085](docs/ADR/000085.md)), never
+silently — the full rule, with the access log's field contract, is in
+[docs/operations.md](docs/operations.md).
+
 ## Documentation
 
 | Page | What it covers |

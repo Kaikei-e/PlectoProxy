@@ -277,13 +277,6 @@ impl Hook {
     }
 }
 
-fn isolation_str(isolation: Isolation) -> &'static str {
-    match isolation {
-        Isolation::Trusted => "trusted",
-        Isolation::Untrusted => "untrusted",
-    }
-}
-
 fn level_str(level: LogLevel) -> &'static str {
     match level {
         LogLevel::Trace => "trace",
@@ -329,7 +322,7 @@ pub(crate) fn build_filter_span(
         outcome,
         attributes: vec![
             KeyValue::new("filter.id", filter_id.to_string()),
-            KeyValue::new("plecto.isolation", isolation_str(isolation)),
+            KeyValue::new("plecto.isolation", isolation.as_str()),
             KeyValue::new("plecto.outcome", outcome.as_str()),
             KeyValue::new("plecto.hook", hook.as_str()),
         ],

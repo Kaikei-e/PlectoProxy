@@ -7,6 +7,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use plecto_control::RequestTrace;
+
 /// The request fields captured (in `crate::proxy`) BEFORE the transaction core consumes the request
 /// parts. Held only while the access log is enabled.
 pub(crate) struct Access {
@@ -22,12 +24,17 @@ pub(crate) struct Access {
 /// `client` is the address the transaction is attributed to — the connection peer, or the client
 /// a declared front proxy named (ADR 000103). It is the same address the re-issued
 /// `X-Forwarded-For` and the per-client rate-limit bucket use, so the log agrees with enforcement.
+///
+/// `trace_id` / `span_id` are emitted UNCONDITIONALLY, not only for sampled transactions (ADR
+/// 000099): the ids join this line to whatever downstream sampling did keep, and for an unsampled
+/// transaction the line is the only place the transaction is identifiable at all.
 pub(crate) fn record(
     scheme: &str,
     client: IpAddr,
     access: &Access,
     status: u16,
     elapsed: Duration,
+    trace: &RequestTrace,
 ) {
     tracing::info!(
         target: "plecto::access",
@@ -38,6 +45,8 @@ pub(crate) fn record(
         path = %access.path,
         status = status,
         duration_ms = elapsed.as_millis() as u64,
+        trace_id = %trace.trace_id(),
+        span_id = %trace.request_span_id(),
         "access"
     );
 }

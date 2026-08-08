@@ -99,7 +99,7 @@ pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_
 pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conformance};
 #[doc(hidden)]
 pub use contract::HOP_BY_HOP_GUEST_HEADERS;
-pub use contract::{ContractVersion, FILTER_WIT, header};
+pub use contract::{ContractVersion, FILTER_WIT, SUPPORTED_CONTRACT_VERSIONS, header};
 pub use dev_signer::{
     DEV_KEY_MARKER, DevKeyError, DevSigner, PemSigner, bound_sbom, public_key_path_for,
 };

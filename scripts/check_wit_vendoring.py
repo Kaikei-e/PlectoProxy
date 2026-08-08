@@ -31,6 +31,12 @@ PAIRS = [
         PLECTO / "wit-streaming/streaming.wit",
         PLECTO / "crates/host/wit-streaming/streaming.wit",
     ),
+    # The template guest carries its own copy of the contract so `plecto new-filter` output
+    # builds offline. It drifted unnoticed because only the two files below were checked.
+    (
+        PLECTO / "wit" / "world.wit",
+        PLECTO / "examples/filters/filter-template/wit/world.wit",
+    ),
     (
         PLECTO / "examples/filters/filter-template/Cargo.toml",
         PLECTO / "crates/plecto/templates/filter-template/Cargo.toml.template",

@@ -123,7 +123,7 @@ jobs:
   # checks `amended_by` reverse edges; docdag keeps body links in an unvalidated reference layer
   # by design, so prose can never fail a build there.
   docs:
-    name: ADR graph check
+    name: ADR graph check (docdag + wikilinks)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:

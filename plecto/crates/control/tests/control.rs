@@ -494,6 +494,78 @@ fn chain_referencing_unknown_filter_is_rejected() {
     }
 }
 
+/// A manifest declaring the global `[chain]` over one filter `fh` pinned at `digest`.
+fn chain_manifest_toml(digest: &str) -> String {
+    format!(
+        r#"
+[[filter]]
+id = "fh"
+source = "fh"
+digest = "{digest}"
+isolation = "untrusted"
+
+[chain]
+filters = ["fh"]
+"#
+    )
+}
+
+#[test]
+fn validate_rejects_a_declared_chain_and_names_the_route_migration() {
+    // ADR 000101: `[chain]` is never executed by the serving binary — only a `[[route]]`'s inline
+    // `filters` reach the dispatcher — so declaring one must fail closed rather than validate
+    // green while every declared filter silently does nothing. The diagnostic carries the
+    // migration (move the ids into the route's `filters`), not just the refusal.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = Manifest::from_toml(&chain_manifest_toml("sha256:abc")).unwrap();
+
+    let err = plecto_control::validate_manifest(&manifest, dir.path())
+        .err()
+        .expect("a declared [chain] must fail validation");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("[chain]"),
+        "the error names the rejected section, got: {message}"
+    );
+    assert!(
+        message.contains("[[route]]"),
+        "the error names where the filters belong, got: {message}"
+    );
+}
+
+#[test]
+fn an_empty_chain_section_still_validates() {
+    // The rejection is about DECLARED filters that would never run: an empty `[chain]` declares
+    // none, so there is nothing to migrate and nothing to fail closed on.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = Manifest::from_toml("[chain]\nfilters = []\n").unwrap();
+
+    plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
+}
+
+#[test]
+fn control_load_rejects_a_declared_chain() {
+    // The same rejection at startup / reload (not only under `plecto validate`): a manifest whose
+    // filters would never run must not build a live config.
+    let (signer, artifact) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("fh", artifact);
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let manifest = Manifest::from_toml(&chain_manifest_toml(&digest)).unwrap();
+
+    match Control::load(host, &manifest, Box::new(store)) {
+        Ok(_) => panic!("a manifest declaring [chain] must not build a live config"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("[chain]") && message.contains("[[route]]"),
+                "the startup error carries the same migration, got: {message}"
+            );
+        }
+    }
+}
+
 #[test]
 fn validate_warns_when_trust_references_a_dev_key() {
     // ADR 000065 decision 2/5: a `[trust]` key file carrying `plecto_host::DEV_KEY_MARKER`

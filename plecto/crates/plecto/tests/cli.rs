@@ -175,6 +175,44 @@ fn validate_rejects_a_route_referencing_an_unknown_upstream() {
 }
 
 #[test]
+fn validate_rejects_the_inert_chain_section_and_names_the_migration() {
+    // ADR 000101: the serving binary never runs `[chain]` — only a `[[route]]`'s inline `filters`
+    // reach the dispatcher. A manifest declaring one must fail closed here rather than start
+    // clean with zero filters applied, and the diagnostic must hand the operator the migration
+    // instead of leaving them to find it.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = format!(
+        r#"
+[[filter]]
+id = "security-headers"
+source = "oci/security-headers"
+digest = "sha256:abc"
+
+[chain]
+filters = ["security-headers"]
+{VALID_MANIFEST}"#
+    );
+    std::fs::write(dir.path().join("plecto.toml"), manifest).unwrap();
+
+    let out = run(&["validate", "plecto.toml"], dir.path());
+
+    assert!(
+        !out.status.success(),
+        "a manifest declaring [chain] must fail validate, stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[chain]"),
+        "the error names the rejected section, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("[[route]]"),
+        "the error names where the filters belong, got: {stderr:?}"
+    );
+}
+
+#[test]
 fn validate_never_creates_the_redb_state_file() {
     // `[state] backend = "redb"` opens (and CREATES) the database at startup; validate must only
     // check the section's coherence, never touch the filesystem — a CI validate run should leave

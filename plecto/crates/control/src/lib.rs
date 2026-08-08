@@ -72,14 +72,14 @@ pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, CompressionAlgorithm, FilterEntry, HealthConfig, IsolationKind,
     Manifest, Observability, OutlierDetection, ProxyProtocolTrust, RateLimitKeyKind, Route,
-    RouteCompression, RouteRateLimit, State, StateBackendKind, TlsCert, Trust, TrustedProxyTrust,
-    Upstream,
+    RouteCompression, RouteHeaders, RouteRateLimit, State, StateBackendKind, TlsCert, Trust,
+    TrustedProxyTrust, Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
-pub use route::{CompressionConfig, RouteInfo, UpgradeConfig, normalize_path};
+pub use route::{CompressionConfig, ResponseHeaders, RouteInfo, UpgradeConfig, normalize_path};
 /// The rustls TLS client config the fast path re-encrypts upstream forward legs with
 /// (ADR 000042), re-exported for the same reason as [`TlsServerConfig`].
 pub use rustls::ClientConfig as TlsClientConfig;

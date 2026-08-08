@@ -52,6 +52,31 @@ pub struct Route {
     /// enables BREACH-class chosen-plaintext attacks against TLS. Leave those routes uncompressed.
     #[serde(default)]
     pub compression: Option<RouteCompression>,
+    /// Declarative response headers (`[route.headers]`, ADR 000100): the literal `set` / `remove`
+    /// the operator wants on every response this route answers. Absent = no declaration (the
+    /// default). Values are LITERALS — no conditionals, no request interpolation, no regex: a
+    /// header whose value depends on the request is a per-request decision and stays a filter's
+    /// job (ADR 000029).
+    #[serde(default)]
+    pub headers: Option<RouteHeaders>,
+}
+
+/// A route's declarative response-header block (`[route.headers]`, ADR 000100). `remove` is
+/// applied first, then `set` — and `set` REPLACES a same-named header the upstream or a filter
+/// produced, because the operator's declaration is a floor rather than a suggestion. Names are
+/// matched case-insensitively (normalised at compile time); every name and value is validated at
+/// build, so an unusable one fails startup / reload instead of being dropped silently per
+/// response.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteHeaders {
+    /// `name = "value"` pairs set on every response this route answers. `BTreeMap` (not
+    /// `HashMap`) keeps the manifest's deterministic-serialisation invariant.
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    /// Header names dropped from every response this route answers, applied before `set`.
+    #[serde(default)]
+    pub remove: Vec<String>,
 }
 
 /// A route's Upgrade declaration (`[route.upgrade]`, ADR 000048). The allowlist shape is the
@@ -321,5 +346,60 @@ key = "client-ip"
             m3.routes[0].rate_limit.unwrap().key,
             RateLimitKeyKind::ClientIp
         );
+    }
+
+    #[test]
+    fn route_headers_default_absent_and_parse_set_and_remove() {
+        // Absent `[route.headers]` → no declaration, the default (ADR 000100).
+        let m = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+"#,
+        )
+        .unwrap();
+        assert!(m.routes[0].headers.is_none());
+
+        // Present: `set` is a name→literal table, `remove` a name list, and either may be
+        // omitted independently.
+        let m2 = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.headers]
+set = { "X-Frame-Options" = "DENY", "x-content-type-options" = "nosniff" }
+remove = ["server"]
+"#,
+        )
+        .unwrap();
+        let h = m2.routes[0].headers.as_ref().unwrap();
+        assert_eq!(
+            h.set.get("X-Frame-Options").map(String::as_str),
+            Some("DENY")
+        );
+        assert_eq!(
+            h.set.get("x-content-type-options").map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(h.remove, vec!["server".to_string()]);
+
+        let m3 = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.headers]
+remove = ["server"]
+"#,
+        )
+        .unwrap();
+        let h3 = m3.routes[0].headers.as_ref().unwrap();
+        assert!(h3.set.is_empty(), "`set` alone is optional");
+        assert_eq!(h3.remove, vec!["server".to_string()]);
     }
 }

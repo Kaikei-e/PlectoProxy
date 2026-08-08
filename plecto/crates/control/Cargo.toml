@@ -53,6 +53,11 @@ anyhow = { workspace = true }
 # outbound `[filter.outbound_http]` / `[filter.outbound_tcp]` allow_private ranges (ADR 000036/000060).
 ipnet = { workspace = true }
 thiserror = { workspace = true }
+# http: the `HeaderName` / `HeaderValue` types a `[route.headers]` declaration (ADR 000100) is
+# compiled into ONCE per reload, so stamping it onto a response is a map write and never a
+# per-response re-parse. Types only — no client, no server — and the same `http` the fast path's
+# hyper already resolves to, so the compiled declaration crosses that boundary unconverted.
+http = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # the manifest JSON Schema derive (ADR 000049): schema output that cannot drift from the structs.

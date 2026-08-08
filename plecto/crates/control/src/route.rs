@@ -10,10 +10,11 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use http::{HeaderMap, HeaderName, HeaderValue};
 use plecto_host::{Header, LoadedFilter};
 
 use crate::error::ControlError;
-use crate::manifest::{CompressionAlgorithm, Route, RouteCompression};
+use crate::manifest::{CompressionAlgorithm, Route, RouteCompression, RouteHeaders};
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 use crate::weighted::{self, WeightedBackends};
@@ -240,6 +241,39 @@ impl CompressionConfig {
         self.content_types
             .iter()
             .any(|ct| ct.eq_ignore_ascii_case(essence))
+    }
+}
+
+/// A route's compiled `[route.headers]` (ADR 000100): the operator's literal response-header
+/// declaration, parsed into `http` types once per reload so stamping it onto a response is a map
+/// write, never a re-parse. `remove` runs before `set`, and `set` REPLACES any same-named header
+/// the upstream or a filter produced — the declaration is a floor, not a suggestion.
+#[derive(Debug)]
+pub struct ResponseHeaders {
+    set: Vec<(HeaderName, HeaderValue)>,
+    remove: Vec<HeaderName>,
+}
+
+impl ResponseHeaders {
+    /// Compile a manifest `[route.headers]` block. Public because the fast-path server's unit
+    /// tests build configs directly, without a manifest parse.
+    pub fn new(_rh: &RouteHeaders) -> Self {
+        Self {
+            set: Vec::new(),
+            remove: Vec::new(),
+        }
+    }
+
+    /// Stamp the declaration onto an about-to-be-sent response.
+    pub fn apply(&self, headers: &mut HeaderMap) {
+        for name in &self.remove {
+            headers.remove(name);
+        }
+        for (name, value) in &self.set {
+            // `insert`, not `append`: the operator's declaration replaces every same-named
+            // header already on the response, duplicates included.
+            headers.insert(name.clone(), value.clone());
+        }
     }
 }
 
@@ -786,7 +820,21 @@ mod tests {
             rate_limit,
             upgrade: None,
             compression: None,
+            headers: None,
         }
+    }
+
+    /// A manifest route carrying a `[route.headers]` declaration, for the validation tests.
+    fn route_with_headers(set: &[(&str, &str)], remove: &[&str]) -> Vec<Route> {
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.headers = Some(crate::manifest::RouteHeaders {
+            set: set
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            remove: remove.iter().map(|n| (*n).to_string()).collect(),
+        });
+        vec![r]
     }
 
     #[test]
@@ -916,6 +964,101 @@ mod tests {
             None,
             "0 disables the idle timer"
         );
+    }
+
+    #[test]
+    fn validate_routes_rejects_unusable_declared_response_headers() {
+        // ADR 000100: the declaration is applied to every response the route answers, so a name
+        // or value that is not valid HTTP must fail the build — never be dropped silently at
+        // request time. Framing / connection-management names are refused outright: the host owns
+        // framing (ADR 000073 review), and a manifest-set `content-length` is a response-desync
+        // primitive (CWE-444).
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let cases: &[(&[(&str, &str)], &[&str])] = &[
+            (&[], &[]),
+            (&[("x bad", "v")], &[]),
+            (&[("", "v")], &[]),
+            (&[("x-ok", "line\r\ninjected")], &[]),
+            (&[("content-length", "0")], &[]),
+            (&[("connection", "close")], &[]),
+            (&[("x-ok", "v")], &["transfer-encoding"]),
+            (&[("x-ok", "v")], &["bad name"]),
+            (&[("X-Dup", "a"), ("x-dup", "b")], &[]),
+        ];
+        for (set, remove) in cases {
+            assert!(
+                matches!(
+                    validate_routes(&route_with_headers(set, remove), &filters, &upstream_names),
+                    Err(ControlError::InvalidRoute { .. })
+                ),
+                "set={set:?} remove={remove:?} must be rejected"
+            );
+        }
+
+        assert!(
+            validate_routes(
+                &route_with_headers(&[("X-Frame-Options", "DENY")], &["server"]),
+                &filters,
+                &upstream_names
+            )
+            .is_ok(),
+            "a well-formed declaration passes"
+        );
+    }
+
+    #[test]
+    fn response_headers_remove_first_then_set_over_any_existing_value() {
+        // The compiled declaration is a floor: `remove` drops what the upstream sent, `set`
+        // replaces every same-named value (duplicates included) rather than appending beside it,
+        // and the manifest's name casing is irrelevant.
+        let declared = ResponseHeaders::new(&crate::manifest::RouteHeaders {
+            set: [
+                ("X-Frame-Options".to_string(), "DENY".to_string()),
+                ("x-content-type-options".to_string(), "nosniff".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            remove: vec!["Server".to_string()],
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("server", HeaderValue::from_static("upstream/1.0"));
+        headers.append("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
+        headers.append("x-frame-options", HeaderValue::from_static("ALLOWALL"));
+        headers.insert("x-untouched", HeaderValue::from_static("1"));
+
+        declared.apply(&mut headers);
+
+        assert!(headers.get("server").is_none(), "a declared removal holds");
+        assert_eq!(
+            headers.get_all("x-frame-options").iter().count(),
+            1,
+            "the declaration replaces every same-named value, duplicates included"
+        );
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(
+            headers.get("x-untouched").unwrap(),
+            "1",
+            "headers the route never named are left alone"
+        );
+    }
+
+    #[test]
+    fn response_headers_set_wins_over_a_name_also_listed_for_removal() {
+        // `remove` runs first, so a name in both lists ends up SET — the more specific
+        // instruction, and the one an operator reading the block last would expect.
+        let declared = ResponseHeaders::new(&crate::manifest::RouteHeaders {
+            set: [("x-both".to_string(), "kept".to_string())]
+                .into_iter()
+                .collect(),
+            remove: vec!["x-both".to_string()],
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-both", HeaderValue::from_static("from-upstream"));
+        declared.apply(&mut headers);
+        assert_eq!(headers.get("x-both").unwrap(), "kept");
     }
 
     #[test]

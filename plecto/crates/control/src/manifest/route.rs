@@ -59,6 +59,32 @@ pub struct Route {
     /// job (ADR 000029).
     #[serde(default)]
     pub headers: Option<RouteHeaders>,
+    /// This route's timeout overrides (`[route.timeouts]`, ADR 000102): the per-try / overall
+    /// bounds it wants instead of its upstream's declared defaults. Absent = the upstream's
+    /// values apply unchanged.
+    #[serde(default)]
+    pub timeouts: Option<RouteTimeouts>,
+}
+
+/// A route's timeout overrides (`[route.timeouts]`, ADR 000102). Each field names the SAME bound
+/// its identically-named `[[upstream]]` field declares — per-try time-to-response-headers (ADR
+/// 000019) and the overall transaction deadline across retries + backoff (ADR 000031) — under one
+/// rule: **the upstream declares the default, the route overrides it**. Routes with genuinely
+/// different latency budgets can then share one upstream instead of duplicating it (which would
+/// duplicate its health prober and split its circuit-breaker state).
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTimeouts {
+    /// Per-try bound (ms) on one attempt's time-to-response-headers, overriding
+    /// `[[upstream]] request_timeout_ms`. Omitted takes the upstream's value; an explicit `0`
+    /// disables the bound for this route (the long-poll / streaming opt-out of ADR 000019).
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Overall bound (ms) on the whole transaction — every attempt plus the backoff between them —
+    /// overriding `[[upstream]] overall_timeout_ms`. Omitted takes the upstream's value; an
+    /// explicit `0` means no overall bound for this route.
+    #[serde(default)]
+    pub overall_timeout_ms: Option<u64>,
 }
 
 /// A route's declarative response-header block (`[route.headers]`, ADR 000100). `remove` is
@@ -401,5 +427,44 @@ remove = ["server"]
         let h3 = m3.routes[0].headers.as_ref().unwrap();
         assert!(h3.set.is_empty(), "`set` alone is optional");
         assert_eq!(h3.remove, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn route_timeouts_parse_absent_explicitly_zero_and_ordinary_values() {
+        let with = |block: &str| {
+            Manifest::from_toml(&format!(
+                "[[route]]\nupstream = \"a\"\n[route.match]\npath_prefix = \"/\"\n{block}"
+            ))
+            .unwrap()
+        };
+
+        // Absent `[route.timeouts]` → no override; the upstream's own values apply (ADR 000102).
+        let absent = with("");
+        assert!(absent.routes[0].timeouts.is_none());
+
+        // An explicit `0` is DECLARED-DISABLED, not un-declared: the three states (absent /
+        // explicit 0 / ordinary value) must stay distinguishable, or a streaming route could not
+        // opt out of a short upstream default.
+        let zero = with("[route.timeouts]\nrequest_timeout_ms = 0\n");
+        let t = zero.routes[0].timeouts.unwrap();
+        assert_eq!(t.request_timeout_ms, Some(0));
+        assert_eq!(
+            t.overall_timeout_ms, None,
+            "each knob is overridden independently"
+        );
+
+        let ordinary =
+            with("[route.timeouts]\nrequest_timeout_ms = 90000\noverall_timeout_ms = 120000\n");
+        let t = ordinary.routes[0].timeouts.unwrap();
+        assert_eq!(t.request_timeout_ms, Some(90_000));
+        assert_eq!(t.overall_timeout_ms, Some(120_000));
+
+        // The distinction is semantic, so it must reach the config version: an explicit `0` is a
+        // different configuration from no declaration at all.
+        assert_ne!(
+            absent.content_hash().unwrap(),
+            zero.content_hash().unwrap(),
+            "declaring a timeout must flip the config version"
+        );
     }
 }

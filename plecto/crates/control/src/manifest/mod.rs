@@ -50,6 +50,7 @@ pub use resumption::Resumption;
 pub(crate) use route::MAX_BACKEND_WEIGHT;
 pub use route::{
     CompressionAlgorithm, RateLimitKeyKind, Route, RouteCompression, RouteHeaders, RouteRateLimit,
+    RouteTimeouts,
 };
 // `Backend` / `RouteMatch` / `RouteUpgrade` are only named via `crate::manifest::X` from
 // `#[cfg(test)]` code elsewhere in the crate; re-exported for the same completeness reason.

@@ -9,12 +9,13 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use plecto_host::{Header, LoadedFilter};
 
 use crate::error::ControlError;
-use crate::manifest::{CompressionAlgorithm, Route, RouteCompression, RouteHeaders};
+use crate::manifest::{CompressionAlgorithm, Route, RouteCompression, RouteHeaders, RouteTimeouts};
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 use crate::weighted::{self, WeightedBackends};
@@ -72,6 +73,11 @@ pub(crate) struct CompiledRoute {
     /// `response_headers` here because `headers` above is already the request-side MATCH
     /// dimension — one is what the route matches on, the other what it stamps on the way out.
     pub(crate) response_headers: Option<Arc<ResponseHeaders>>,
+    /// This route's compiled `[route.timeouts]` overrides (ADR 000102). Two `Option<Duration>`s
+    /// by value, not behind an `Arc`: the per-request `RouteInfo` clone copies 32 bytes instead of
+    /// bumping a refcount, and the resolution against the chosen upstream's defaults is then a
+    /// pair of `Option::unwrap_or`.
+    pub(crate) timeouts: TimeoutConfig,
 }
 
 impl CompiledRoute {
@@ -142,6 +148,12 @@ impl CompiledRoute {
                 .headers
                 .as_ref()
                 .map(|h| Arc::new(ResponseHeaders::new(h))),
+            // Compile the timeout overrides (ADR 000102); absent = take the upstream's defaults.
+            timeouts: r
+                .timeouts
+                .as_ref()
+                .map(TimeoutConfig::new)
+                .unwrap_or_default(),
         }
     }
 }
@@ -166,6 +178,7 @@ impl std::fmt::Debug for CompiledRoute {
             .field("upgrade", &self.upgrade)
             .field("compression", &self.compression)
             .field("response_headers", &self.response_headers)
+            .field("timeouts", &self.timeouts)
             .finish()
     }
 }
@@ -349,6 +362,41 @@ fn validate_response_headers(h: &crate::manifest::RouteHeaders) -> Result<(), St
         declared_header_name(name)?;
     }
     Ok(())
+}
+
+/// A route's compiled `[route.timeouts]` (ADR 000102): the per-try / overall bounds this route
+/// declares, each resolved against the upstream's own default at forward time. `None` is "not
+/// declared" and `Some(Duration::ZERO)` is "declared disabled" — the fast path must keep the two
+/// apart, since writing `0` is how a streaming route opts out of a short upstream default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimeoutConfig {
+    request: Option<Duration>,
+    overall: Option<Duration>,
+}
+
+impl TimeoutConfig {
+    /// Compile a manifest `[route.timeouts]` block. Public because the fast-path server's unit
+    /// tests build configs directly, without a manifest parse.
+    pub fn new(t: &RouteTimeouts) -> Self {
+        Self {
+            request: t.request_timeout_ms.map(Duration::from_millis),
+            overall: t.overall_timeout_ms.map(Duration::from_millis),
+        }
+    }
+
+    /// The effective per-try bound (ADR 000019 / 000102): this route's override, else the
+    /// upstream's declared default. `Duration::ZERO` (either source) disables the bound.
+    pub fn request_timeout(&self, upstream_default: Duration) -> Duration {
+        let _ = upstream_default;
+        todo!("resolve the route override against the upstream default")
+    }
+
+    /// The effective overall bound (ADR 000031 / 000102): this route's override, else the
+    /// upstream's declared default. `Duration::ZERO` (either source) means no overall bound.
+    pub fn overall_timeout(&self, upstream_default: Duration) -> Duration {
+        let _ = upstream_default;
+        todo!("resolve the route override against the upstream default")
+    }
 }
 
 /// A manifest route validated against the (already-loaded) filter set and upstream names, carrying
@@ -538,6 +586,10 @@ pub struct RouteInfo {
     /// fast path stamps them on every response it answers for this route — after the chain, so no
     /// filter can drop them, and before compression, so the codec still owns the representation.
     pub response_headers: Option<Arc<ResponseHeaders>>,
+    /// This route's `[route.timeouts]` overrides (ADR 000102). Read through
+    /// [`RouteInfo::request_timeout`] / [`RouteInfo::overall_timeout`], which resolve them
+    /// against the upstream group the request is actually being forwarded to.
+    pub(crate) timeouts: TimeoutConfig,
 }
 
 impl RouteInfo {
@@ -555,6 +607,21 @@ impl RouteInfo {
     /// the common no-strip case allocates nothing.
     pub fn rewrite_path<'a>(&self, path: &'a str) -> Cow<'a, str> {
         rewrite_path(path, self.strip_prefix.as_deref())
+    }
+
+    /// The per-try timeout for a request this route forwards to `group` (ADR 000102): the route's
+    /// `[route.timeouts]` override when it declares one, else the upstream's own default. Bounds
+    /// ONE attempt's time-to-response-headers; `Duration::ZERO` disables it.
+    pub fn request_timeout(&self, group: &UpstreamGroup) -> Duration {
+        self.timeouts.request_timeout(group.request_timeout())
+    }
+
+    /// The overall timeout for a request this route forwards to `group` (ADR 000102), resolved the
+    /// same way. Bounds the whole transaction — every attempt plus the backoff between them;
+    /// `Duration::ZERO` means no overall bound. The tighter of this and the per-try bound governs
+    /// each attempt (ADR 000031), which the forward loop applies as it spends the budget.
+    pub fn overall_timeout(&self, group: &UpstreamGroup) -> Duration {
+        self.timeouts.overall_timeout(group.overall_timeout())
     }
 
     /// Consult this route's native rate limiter (ADR 000033) for one request, keyed on the
@@ -813,6 +880,16 @@ mod tests {
     /// A throwaway upstream group named after `upstream` — these tests exercise `select` /
     /// `rewrite_path`, which never touch the group's contents, only its identity.
     fn group(upstream: &str) -> Arc<UpstreamGroup> {
+        timed_group(upstream, 30_000, 0)
+    }
+
+    /// A throwaway upstream group declaring the per-try / overall timeout defaults a route's
+    /// `[route.timeouts]` overrides resolve against (ADR 000102).
+    fn timed_group(
+        upstream: &str,
+        request_timeout_ms: u64,
+        overall_timeout_ms: u64,
+    ) -> Arc<UpstreamGroup> {
         let reg = UpstreamRegistry::new();
         reg.reconcile(
             &[Upstream {
@@ -830,9 +907,9 @@ mod tests {
                     unhealthy_threshold: 1,
                     port: None,
                 },
-                request_timeout_ms: 30_000,
+                request_timeout_ms,
                 max_retries: 1,
-                overall_timeout_ms: 0,
+                overall_timeout_ms,
                 circuit_breaker: CircuitBreaker::default(),
                 outlier_detection: OutlierDetection::default(),
             }],
@@ -863,6 +940,7 @@ mod tests {
             upgrade: None,
             compression: None,
             response_headers: None,
+            timeouts: TimeoutConfig::default(),
         }
     }
 
@@ -907,6 +985,7 @@ mod tests {
             upgrade: None,
             compression: None,
             headers: None,
+            timeouts: None,
         }
     }
 
@@ -1159,6 +1238,89 @@ mod tests {
         headers.insert("x-both", HeaderValue::from_static("from-upstream"));
         declared.apply(&mut headers);
         assert_eq!(headers.get("x-both").unwrap(), "kept");
+    }
+
+    /// A `RouteInfo` over one upstream group, shaped like the one `find_route` builds — only the
+    /// timeout override under test is set.
+    fn route_info(group: Arc<UpstreamGroup>, timeouts: TimeoutConfig) -> RouteInfo {
+        RouteInfo {
+            index: 0,
+            backends: Arc::new(WeightedBackends::new(vec![(group, 1)]).unwrap()),
+            strip_prefix: None,
+            has_filters: false,
+            reads_body: false,
+            rate_limit: None,
+            upgrade: None,
+            compression: None,
+            response_headers: None,
+            timeouts,
+        }
+    }
+
+    #[test]
+    fn a_route_overrides_its_upstreams_timeouts_and_an_explicit_zero_disables_them() {
+        // ADR 000102: one rule — the upstream declares the default, the route overrides it. The
+        // upstream here declares both bounds, so "took the default" and "took the override" are
+        // distinguishable for each knob.
+        let upstream = timed_group("u", 30_000, 60_000);
+        let declared = |request_timeout_ms, overall_timeout_ms| {
+            TimeoutConfig::new(&RouteTimeouts {
+                request_timeout_ms,
+                overall_timeout_ms,
+            })
+        };
+
+        let inherited = route_info(upstream.clone(), TimeoutConfig::default());
+        assert_eq!(
+            inherited.request_timeout(&upstream),
+            Duration::from_secs(30),
+            "no declaration takes the upstream's per-try default"
+        );
+        assert_eq!(
+            inherited.overall_timeout(&upstream),
+            Duration::from_secs(60),
+            "no declaration takes the upstream's overall default"
+        );
+
+        let overridden = route_info(upstream.clone(), declared(Some(90_000), None));
+        assert_eq!(
+            overridden.request_timeout(&upstream),
+            Duration::from_secs(90),
+            "a declared per-try bound wins over the upstream's"
+        );
+        assert_eq!(
+            overridden.overall_timeout(&upstream),
+            Duration::from_secs(60),
+            "the knob the route left out still takes the upstream's"
+        );
+
+        // An explicit `0` is the opt-out, not "undeclared": a streaming route writes it to shed a
+        // short upstream default, so the two states must resolve differently.
+        let streaming = route_info(upstream.clone(), declared(Some(0), Some(0)));
+        assert_eq!(streaming.request_timeout(&upstream), Duration::ZERO);
+        assert_eq!(streaming.overall_timeout(&upstream), Duration::ZERO);
+    }
+
+    #[test]
+    fn compile_carries_the_manifest_timeout_overrides() {
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.timeouts = Some(RouteTimeouts {
+            request_timeout_ms: Some(0),
+            overall_timeout_ms: Some(1500),
+        });
+        let compiled = CompiledRoute::compile(
+            &r,
+            WeightedBackends::new(vec![(group("real"), 1)]).unwrap(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            compiled.timeouts.request_timeout(Duration::from_secs(30)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            compiled.timeouts.overall_timeout(Duration::ZERO),
+            Duration::from_millis(1500)
+        );
     }
 
     #[test]

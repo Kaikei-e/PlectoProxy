@@ -13,6 +13,7 @@
 //!   - `on-response-body` reads the buffered UPSTREAM body and answers on all three arms — bare
 //!     `%continue`, `modified(response-body-edit)` redacting a marker, and `replace` discarding
 //!     the buffered bytes for a synthesised response.
+//!
 //! Exporting BOTH body hooks makes this the ceiling of the acceptance lattice; `filter-respbody`
 //! is the fixture for a subset neither published world names (ADR 000098 decision 2).
 //! `init` logs once so the component keeps at least one `plecto:filter/…@0.4.0` import after

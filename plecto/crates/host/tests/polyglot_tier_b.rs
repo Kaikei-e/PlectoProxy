@@ -115,8 +115,8 @@ fn with_the_wasi_minimal_grant_the_fat_guest_satisfies_the_conformance_subset() 
         .expect("filter-hello-go must load once wasi = \"minimal\" is granted");
 
     assert!(
-        filter.reads_body(),
-        "filter-hello-go targets world filter-body-go, so reads_body() must be true"
+        filter.body_hooks().request,
+        "filter-hello-go targets world filter-body-go, so it must declare the request body hook"
     );
 
     let (decision, logs) = filter

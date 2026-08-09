@@ -112,8 +112,8 @@ fn every_language_satisfies_the_world_and_reads_body() {
     for (name, bytes) in components() {
         let (_host, filter) = signed_load(&name, &bytes, LoadOptions::untrusted());
         assert!(
-            filter.reads_body(),
-            "{name} targets world filter-body, so reads_body() must be true"
+            filter.body_hooks().request,
+            "{name} targets world filter-body, so it must declare the request body hook"
         );
     }
 }

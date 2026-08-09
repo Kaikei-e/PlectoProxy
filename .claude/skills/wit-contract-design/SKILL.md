@@ -30,7 +30,7 @@ argument-hint: "<contract or interface to design/change>"
    各言語のバインディングを生成してから実装する。host と全 component は **同じ WIT バージョン**を
    ターゲットにする（バージョン不一致はリンク不能/誤動作の元）。
 2. **独自ワールド（Fork 2）— 現行は zero-WASI・自前 http 型（ADR 000010）.** 現行契約は
-   `plecto:filter@0.3.0`（正文は `wit/`。0.1 / 0.2 は `wit/v0.1.0/` / `wit/v0.2.0/` に凍結し
+   `plecto:filter@0.4.0`（正文は `wit/`。0.1 / 0.2 / 0.3 は `wit/v0.1.0/` / `wit/v0.2.0/` / `wit/v0.3.0/` に凍結し
    ロード時アダプタで吸収、ADR 000071 / 000073）。world は二つ: base `filter`（header-only、
    body はゼロコピー素通し、ADR 000038）と `filter-body`（`on-request-body` を追加、buffered
    `list<u8>` の buffer-then-decide、ADR 000025）。`wasi:http` 型の再利用は WASIp3 GA / WIT
@@ -69,7 +69,7 @@ argument-hint: "<contract or interface to design/change>"
 
 - `wit/` に world / interface / types を置く。命名は `CONTEXT.md` 語彙に合わせる。
 - `package plecto:filter@x.y.z;` で **semver を付ける**。破壊的変更は major、後方互換な追加は minor。
-- 変更前に必ず現行の正文（`wit/`、`plecto:filter@0.3.0`）を Read する。
+- 変更前に必ず現行の正文（`wit/`、`plecto:filter@0.4.0`）を Read する。
 - 例（概念スケッチ — 現行契約そのものではない。実型は設計で確定する）:
   ```wit
   package plecto:filter@0.1.0;

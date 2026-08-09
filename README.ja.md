@@ -99,7 +99,7 @@ native（[ADR 000029](docs/ADR/000029.md)）。WASM 税は判断ロジックに�
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.6.4   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.7.0   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
 docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \
@@ -186,7 +186,7 @@ opt-in する。**Go/TinyGo** が最初の Tier B ゲスト。
 
 契約・scaffold・ビルド・manifest・署名・言語別レシピ・互換ポリシーまでの完全な手引きは
 **[docs/writing-a-filter.md](docs/writing-a-filter.md)**（英語）。現行契約は
-**`plecto:filter@0.3.0`**、`0.1.0` / `0.2.0` もロード可能。
+**`plecto:filter@0.4.0`**、`0.1.0` / `0.2.0` / `0.3.0` もロード可能。
 
 ## アップグレード: 独立した二つのバージョン系列
 

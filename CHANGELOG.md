@@ -32,6 +32,15 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-09
+
+Minor bump, not a patch: this release removes public API from the crates.io-published
+`plecto-control` / `plecto-host`, rejects a manifest section that used to parse, and moves the
+filter contract to `plecto:filter@0.4.0`. Under the pre-1.0 policy above a minor bump is where
+breaking changes live; `cargo-semver-checks` gates it. **Deployed filters do not need a
+rebuild** — the two version series stay independent, and every frozen contract track keeps its
+load-time adapter.
+
 ### Added
 
 - **Response-body inspection** (`on-response-body`, ADR 000098). A filter can now read the

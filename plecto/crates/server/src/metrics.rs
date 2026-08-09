@@ -113,7 +113,58 @@ pub(crate) struct ServerMetrics {
     tunnel_bytes_down: AtomicU64,
     /// Bytes relayed upstream (client → upstream) by upgrade tunnels, added as each closes.
     tunnel_bytes_up: AtomicU64,
+    /// Responses a route's `on-response-body` filters never got to see, indexed by
+    /// [`InspectionSkip`] (ADR 000098). Whether the host then rejected or forwarded the response
+    /// is the route's declared mode; either way the skip is counted, because the one thing a
+    /// fail-closed inspection plane must not do is skip silently.
+    inspection_skipped: [AtomicU64; InspectionSkip::COUNT],
     duration: Histogram,
+}
+
+/// Why a response body was not inspected (ADR 000098 decision 3). Each variant is a class the host
+/// cannot inspect, not a policy choice: a response outside the route's media-type allowlist is
+/// outside the declared scope of inspection and is not counted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InspectionSkip {
+    /// A streaming media type (`text/event-stream` …): buffering it would break the stream.
+    StreamingContentType,
+    /// A `Content-Encoding` other than `identity` survived the request-side `Accept-Encoding` strip.
+    ContentEncoding,
+    /// A `206` / `Content-Range` fragment: only part of the representation is present.
+    PartialContent,
+    /// The body exceeded the route's cap — including the unbounded stream that has no declared
+    /// length to reject up front.
+    OverCap,
+}
+
+impl InspectionSkip {
+    const COUNT: usize = 4;
+
+    fn index(self) -> usize {
+        match self {
+            InspectionSkip::StreamingContentType => 0,
+            InspectionSkip::ContentEncoding => 1,
+            InspectionSkip::PartialContent => 2,
+            InspectionSkip::OverCap => 3,
+        }
+    }
+
+    const ALL: [InspectionSkip; Self::COUNT] = [
+        InspectionSkip::StreamingContentType,
+        InspectionSkip::ContentEncoding,
+        InspectionSkip::PartialContent,
+        InspectionSkip::OverCap,
+    ];
+
+    /// The `reason` label / access-log value. Stable operator-facing text.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InspectionSkip::StreamingContentType => "streaming-content-type",
+            InspectionSkip::ContentEncoding => "content-encoding",
+            InspectionSkip::PartialContent => "partial-content",
+            InspectionSkip::OverCap => "over-cap",
+        }
+    }
 }
 
 /// RAII guard for the `tunnels_active` gauge: increments on creation, decrements on `Drop` —
@@ -147,7 +198,15 @@ impl ServerMetrics {
             tunnels_active: AtomicI64::new(0),
             tunnel_bytes_down: AtomicU64::new(0),
             tunnel_bytes_up: AtomicU64::new(0),
+            inspection_skipped: std::array::from_fn(|_| AtomicU64::new(0)),
             duration: Histogram::new(),
+        }
+    }
+
+    /// Record one response whose body the route's filters never inspected (ADR 000098).
+    pub(crate) fn inc_inspection_skipped(&self, reason: InspectionSkip) {
+        if let Some(slot) = self.inspection_skipped.get(reason.index()) {
+            slot.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -283,6 +342,22 @@ impl ServerMetrics {
             "plecto_outlier_ejections_total {}",
             self.outlier_ejections.load(Ordering::Relaxed)
         ));
+
+        out.push(
+            "# HELP plecto_response_body_inspection_skipped_total Responses a route's on-response-body filters did not inspect, by reason (ADR 000098)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_response_body_inspection_skipped_total counter".to_string());
+        for reason in InspectionSkip::ALL {
+            let count = self
+                .inspection_skipped
+                .get(reason.index())
+                .map_or(0, |slot| slot.load(Ordering::Relaxed));
+            out.push(format!(
+                "plecto_response_body_inspection_skipped_total{{reason=\"{}\"}} {count}",
+                reason.as_str()
+            ));
+        }
 
         // --- upstream rotation (ADR 000099), walked here rather than tallied: no persistent
         // counter means nothing survives a reload to go stale. Every state is emitted for every
@@ -453,6 +528,39 @@ mod tests {
         assert!(text.contains("plecto_requests_total{status_class=\"3xx\"} 0"));
         assert!(text.contains("plecto_request_duration_seconds_count 4"));
         assert!(text.contains("# TYPE plecto_request_duration_seconds histogram"));
+    }
+
+    #[test]
+    fn every_inspection_skip_reason_is_a_series_that_always_exists() {
+        // ADR 000098: a skip that is only visible once it has happened is one an operator cannot
+        // alert on. Every reason is emitted at zero, so a first occurrence is a change in a series
+        // that was already being scraped, not a new one appearing.
+        let m = ServerMetrics::new();
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        for reason in InspectionSkip::ALL {
+            assert!(
+                text.contains(&format!(
+                    "plecto_response_body_inspection_skipped_total{{reason=\"{}\"}} 0",
+                    reason.as_str()
+                )),
+                "{} must be exposed before it ever fires",
+                reason.as_str()
+            );
+        }
+
+        m.inc_inspection_skipped(InspectionSkip::OverCap);
+        m.inc_inspection_skipped(InspectionSkip::OverCap);
+        m.inc_inspection_skipped(InspectionSkip::ContentEncoding);
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains("plecto_response_body_inspection_skipped_total{reason=\"over-cap\"} 2")
+        );
+        assert!(text.contains(
+            "plecto_response_body_inspection_skipped_total{reason=\"content-encoding\"} 1"
+        ));
+        assert!(text.contains(
+            "plecto_response_body_inspection_skipped_total{reason=\"partial-content\"} 0"
+        ));
     }
 
     #[test]

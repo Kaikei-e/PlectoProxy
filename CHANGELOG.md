@@ -32,16 +32,46 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
-> **`plecto:filter@0.4.0` is incomplete and MUST NOT be released.** The version rails below are in
-> place, but the contract itself is only half of ADR 000098: `on-response-body` (buffer-then-decide
-> on the response plane, with its fast-path buffering, inspection semantics, per-route
-> configuration and metrics) is a separate slice and is **not** in the tree yet. Publishing
-> `plecto:filter@0.4.0` as an OCI artifact — or shipping a binary that advertises it as loadable —
-> before that slice lands would freeze a version whose declared purpose is missing, and every
-> filter that pinned it would have to be re-pinned when the rest arrives. Cut the release only
-> once `on-response-body` is exported, wired end to end, and covered.
-
 ### Added
+
+- **Response-body inspection** (`on-response-body`, ADR 000098). A filter can now read the
+  upstream's response body — the hook the "we don't build it natively, you write it as a filter"
+  answer for DLP, PII masking, and response-side guardrails was missing. It completes
+  `plecto:filter@0.4.0`, which is now releasable.
+
+  **The host holds the response headers until the body decision returns.** That is the whole
+  design: nothing has been written to the client while the filter is reading, so a filter can
+  still rewrite the body (`modified`) or answer with a different response entirely (`replace`),
+  and the host can still refuse a response it could not inspect. `%continue` is a bare arm — the
+  dominant case is pure inspection, and handing the bytes back to say "unchanged" would charge it
+  a full copy for nothing. `Content-Length` stays host-owned: a filter that names it fails the
+  decision closed rather than having it stripped, because a length that disagrees with the bytes
+  is a response-desync primitive.
+
+  **Buffering is decided per direction, from the contract.** The host probes each body hook by
+  name at load, so a route buffers the request body, the response body, both, or — the
+  overwhelmingly common case — neither. A filter that reads only one body costs the other nothing,
+  and **no existing filter starts buffering anything**: the `0.1` / `0.2` tracks cannot express the
+  response hook and the in-tree `0.3` shelf never declared it. What is accepted is the *lattice* —
+  the base `filter` exports plus any subset of the body hooks — with `filter` and `filter-body` as
+  its two ends rather than an enumeration of the legal shapes.
+
+  **Defaults are fail-closed, and nothing is skipped silently.** On a route that declares an
+  inspecting filter, the forwarded request drops `Accept-Encoding` / `Range` / `If-Range` so the
+  upstream returns a whole identity representation. A response the host cannot inspect anyway — a
+  streaming media type, a surviving content coding, a `206` fragment — is answered `502` by
+  default, and a body over the cap likewise (`502`, not `413`: that status is the request plane's
+  vocabulary). Every such case increments
+  `plecto_response_body_inspection_skipped_total{reason=…}` and names the reason on the access
+  log line, whether it was refused or forwarded.
+
+  Configured per route under `[route.response_body]`: `max_bytes` (default 1 MiB, ceiling 16 MiB —
+  the request-side cap), `over_cap` = `reject` (default) / `process-partial` / `passthrough`,
+  `uninspectable` = `reject` (default) / `passthrough`, and `content_types`, the allowlist that
+  ARMS buffering — matched against the content type **as received from the upstream**, so a filter
+  earlier in the chain cannot rewrite a header to steer a response past the filter that inspects
+  it. Every value is validated at build: an unusable one stops startup or reload rather than
+  quietly disarming the inspection the route was configured for.
 
 - **`plecto:filter@0.4.0` contract version rails** (ADR 000098 / 000104). `0.3.0` is frozen at
   [`plecto/wit/v0.3.0/`](plecto/wit/v0.3.0/world.wit) and the current contract text moves to
@@ -133,6 +163,15 @@ All notable changes to Plecto are documented here. The format follows
   different questions, and an upgrade decision needs both.
 
 ### Changed
+
+- **The access log gains a `response_body_inspection_skipped` field** (ADR 000098). It names why a
+  route that declared an `on-response-body` filter served a response that filter never saw
+  (`streaming-content-type` / `content-encoding` / `partial-content` / `over-cap`), and is `null`
+  on every other transaction. The field set is a contract, so this is listed here even though the
+  value is null for every deployment that has no such filter. **Migration**: none required —
+  existing fields are unchanged, and a mapping pinned to field names (as
+  [docs/operations.md](docs/operations.md#the-access-log-field-contract) asks) simply gains an
+  optional key.
 
 - **Log lines are flattened JSON** (ADR 000099). The binary's JSON subscriber now writes each
   event's fields at the top level of the line — beside `timestamp` / `level` / `target` — instead

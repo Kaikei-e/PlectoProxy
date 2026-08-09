@@ -10,12 +10,19 @@ This guide is the practical how-to.
 
 ## 1. The contract in one minute
 
-A filter implements one of two `plecto:filter` worlds (the authoritative text is
+A filter implements a `plecto:filter` world (the authoritative text is
 [`plecto/wit/world.wit`](../plecto/wit/world.wit)): the header-only `filter` world, or `filter-body`
-if it also needs the request body. `filter-body` is `filter` plus one export — the **absence** of
-that export in the base world is itself the signal the host uses to skip buffering the body and
-stream it straight through, at no cost to a header-only filter (ADR 000038). Target `filter-body`
-only when your filter actually reads the body.
+if it also needs a body. `filter-body` is `filter` plus the two body hooks — the **absence** of a
+hook is itself the signal the host uses to skip buffering that direction and stream it straight
+through, at no cost to a filter that does not read it (ADR 000038 / 000098). The host decides
+buffering **per direction**, so a filter that reads only the response body leaves the request body
+on the zero-copy path, and vice versa.
+
+Those two worlds are the ENDS of what is accepted, not a list of the legal shapes: a component is
+accepted when it exports all of `filter` plus **any subset** of the body hooks, and the host probes
+each hook by name at load (ADR 000098 decision 2). If you need exactly one of the two, declare a
+world of your own with just that hook — the published worlds exist to generate bindings from, and
+`crates/host/fixtures/filter-respbody` is a worked example.
 
 ```wit
 package plecto:filter@0.4.0;
@@ -67,9 +74,14 @@ world filter {
 }
 
 world filter-body {
-  // …the same imports and exports as `filter`, plus the hook whose PRESENCE makes the host
-  // buffer the request body at all (buffer-then-decide, ADR 000025):
+  // …the same imports and exports as `filter`, plus the two hooks whose PRESENCE is what makes
+  // the host buffer that direction at all (buffer-then-decide, ADR 000025 / 000098). Each is
+  // independent — export only the one you read.
   export on-request-body: func(body: list<u8>) -> request-body-decision;
+  // `resp` carries status + headers only; the bytes arrive as `body`. The host HOLDS the response
+  // headers until this returns, which is why `replace` is still expressible here.
+  export on-response-body: func(req: http-request, resp: http-response, body: list<u8>)
+      -> response-body-decision;
 }
 ```
 
@@ -77,8 +89,9 @@ world filter-body {
 | --- | --- | --- | --- |
 | `init` | both | once per instance (heavy setup) | — |
 | `on-request` | both | per request, on the headers | `continue` / `modified(edit)` / `short-circuit(response)` |
-| `on-request-body` | `filter-body` only | per request, on the buffered body | `continue` / `modified(edit)` / `short-circuit(response)` |
+| `on-request-body` | optional | per request, on the buffered request body | `continue` / `modified(edit)` / `short-circuit(response)` |
 | `on-response` | both | per response, on the headers, with the as-forwarded request snapshot (ADR 000073) | `continue` / `modified(edit)` / `replace(response)` |
+| `on-response-body` | optional | per response, on the buffered response body, after `on-response` | `continue` / `modified(edit)` / `replace(response)` |
 
 ### Response-side decisions and chain order
 
@@ -95,6 +108,38 @@ guaranteed to run and be guaranteed to see the final (possibly replaced) respons
 chain (filter stamps such as `x-authenticated-user` are visible), **before** host egress
 transforms (hop-by-hop strip, upstream path rewrite, `traceparent` injection). It is value-passed;
 editing it does nothing.
+
+### Reading the response body (`on-response-body`)
+
+Export it and the host buffers the upstream's response body for this route and hands it to you,
+**holding the response headers until your decision returns**. Nothing has been written to the
+client yet, so the arms mean what they say: `%continue` forwards what the host already holds (the
+bare arm — do not hand the bytes back to say "unchanged"), `modified` forwards your bytes plus the
+header edits a transform forces, and `replace` discards the buffered body for a response of your
+own. It runs **after** the whole `on-response` walk, and not at all if that walk produced a
+`replace` — there is no upstream body left to read. `resp.body` is always empty here; the bytes are
+the third parameter.
+
+`Content-Length` is the host's. It re-derives it from the bytes it actually sends, and a decision
+whose headers name `content-length` **fails closed** — a length that disagrees with the body is a
+response-desync primitive, so it is refused rather than stripped. Trailers are out of scope for
+v1 and are not part of what you inspect.
+
+What the operator controls, per route, is when this runs at all — `[route.response_body]`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `content_types` | `text/plain`, `text/html`, `text/xml`, `application/json` | The allowlist that ARMS buffering, matched against the content type **as received from the upstream** — so an earlier filter cannot rewrite a header to steer a response past you. Outside it, the response streams through uninspected. |
+| `max_bytes` | 1 MiB (ceiling 16 MiB) | The most the host will hold. It also bounds what YOU hand back: a larger `modified` / `replace` body fails closed. |
+| `over_cap` | `reject` | `reject` answers 502; `process-partial` inspects the head and forwards the whole body (a rewrite of a head is refused — the host cannot frame it); `passthrough` forwards uninspected. |
+| `uninspectable` | `reject` | What happens to a response the host cannot inspect at all. `passthrough` is the explicit opt-out. |
+
+On such a route the host also strips `Accept-Encoding` / `Range` / `If-Range` from the request it
+forwards, so what comes back is a whole identity representation — you always read plain bytes. A
+response that is nonetheless uninspectable (a streaming media type, a surviving content coding, a
+`206` fragment) is answered 502 by default and always leaves a reason in
+`plecto_response_body_inspection_skipped_total{reason=…}` and on the access log line. Nothing is
+skipped silently.
 
 A filter is **stateless**. Anything it must remember lives in host state, reached only through the
 capabilities the host explicitly lends it — **deny-by-default**:
@@ -639,9 +684,9 @@ normal, expected state.
   maintain", and even that requires a dedicated ADR, **at least 24 months' notice**, and a
   migration document. Cutting 1.0 is the act that brings this pledge into force (which is why 1.0
   waits for the `wasi:http` convergence major to settle first).
-- **`filter` vs. `filter-body` compatibility is part of this policy** (ADR 000038): the base
+- **`filter` vs. `filter-body` compatibility is part of this policy** (ADR 000038 / 000098): the base
   `filter` world exporting nothing new stays minor-compatible forever by construction (the
-  *absence* of `on-request-body` is itself contractual, not an oversight). Adding an export to
+  *absence* of a body hook is itself contractual, not an oversight). Adding an export to
   `filter-body` is minor; changing an existing export's signature (on either world) is major.
 
 ### Rebuilding a 0.3.0 filter against 0.4.0

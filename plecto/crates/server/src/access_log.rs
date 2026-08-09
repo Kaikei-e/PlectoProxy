@@ -28,6 +28,10 @@ pub(crate) struct Access {
 /// `trace_id` / `span_id` are emitted UNCONDITIONALLY, not only for sampled transactions (ADR
 /// 000099): the ids join this line to whatever downstream sampling did keep, and for an unsampled
 /// transaction the line is the only place the transaction is identifiable at all.
+/// `response_body_inspection_skipped` names why a route that declared an `on-response-body` filter
+/// served a response the filter never saw (ADR 000098). It is emitted ONLY on those transactions —
+/// a skip has to be attributable to a request, not just to a counter — and is absent everywhere
+/// else, which is also what keeps it off every ordinary line.
 pub(crate) fn record(
     scheme: &str,
     client: IpAddr,
@@ -35,6 +39,7 @@ pub(crate) fn record(
     status: u16,
     elapsed: Duration,
     trace: &RequestTrace,
+    inspection_skipped: Option<&'static str>,
 ) {
     tracing::info!(
         target: "plecto::access",
@@ -47,6 +52,7 @@ pub(crate) fn record(
         duration_ms = elapsed.as_millis() as u64,
         trace_id = %trace.trace_id(),
         span_id = %trace.request_span_id(),
+        response_body_inspection_skipped = inspection_skipped,
         "access"
     );
 }

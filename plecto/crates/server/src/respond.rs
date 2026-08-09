@@ -38,6 +38,23 @@ pub(crate) mod fault {
     pub(crate) static BAD_UPGRADE: HeaderValue = HeaderValue::from_static("bad-upgrade");
     pub(crate) static BAD_CONTENT_LENGTH: HeaderValue =
         HeaderValue::from_static("bad-content-length");
+    /// A response the route declared an `on-response-body` filter for, that the host could not
+    /// inspect (ADR 000098). The `reason` is in the metric and the access log; the client only
+    /// learns the response was refused.
+    pub(crate) static RESPONSE_BODY_UNINSPECTABLE: HeaderValue =
+        HeaderValue::from_static("response-body-uninspectable");
+    pub(crate) static RESPONSE_BODY_TOO_LARGE: HeaderValue =
+        HeaderValue::from_static("response-body-too-large");
+    pub(crate) static RESPONSE_BODY_READ_ERROR: HeaderValue =
+        HeaderValue::from_static("response-body-read-error");
+    pub(crate) static RESPONSE_BODY_TIMEOUT: HeaderValue =
+        HeaderValue::from_static("response-body-timeout");
+    /// A body hook rewrote a body the host only ever showed it the head of. The host cannot frame
+    /// a transform applied to a prefix, so `process-partial` accepts inspection, not rewriting.
+    pub(crate) static RESPONSE_BODY_PARTIAL_MODIFIED: HeaderValue =
+        HeaderValue::from_static("response-body-partial-modified");
+    pub(crate) static RESPONSE_BODY_BUFFER_UNAVAILABLE: HeaderValue =
+        HeaderValue::from_static("response-body-buffer-unavailable");
 }
 
 /// The total fallback for the "impossible" `Response::builder()` error paths in this module: the

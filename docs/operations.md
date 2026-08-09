@@ -131,6 +131,7 @@ slots without unwrapping a nested object first.
 | `duration_ms` | number | Whole milliseconds from the start of the transaction to the response head. |
 | `trace_id` | string | W3C trace id (32 lowercase hex chars) — the caller's, when it sent a `traceparent`, otherwise one Plecto minted. |
 | `span_id` | string | W3C span id (16 lowercase hex chars) of Plecto's own request span — the id it propagates upstream. |
+| `response_body_inspection_skipped` | string \| null | Why a route that declared an `on-response-body` filter served a response that filter never saw ([ADR 000098](ADR/000098.md)): `streaming-content-type`, `content-encoding`, `partial-content`, or `over-cap`. `null` on every other transaction, including every route with no such filter. |
 
 Two properties this line is meant to keep:
 

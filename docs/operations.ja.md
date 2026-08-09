@@ -129,6 +129,7 @@ access_log = true
 | `duration_ms` | number | トランザクション開始から応答ヘッダまでのミリ秒（整数）。 |
 | `trace_id` | string | W3C trace id（小文字 hex 32 桁）。呼び出し元が `traceparent` を送っていればその値、なければ Plecto が採番した値。 |
 | `span_id` | string | Plecto 自身の request span の W3C span id（小文字 hex 16 桁）。upstream へ伝播するのもこの id。 |
+| `response_body_inspection_skipped` | string \| null | `on-response-body` フィルタを宣言したルートで、そのフィルタが見られなかったレスポンスの理由（[ADR 000098](ADR/000098.md)）: `streaming-content-type` / `content-encoding` / `partial-content` / `over-cap`。それ以外のトランザクション（該当フィルタを持たないルートを含む）では `null`。 |
 
 この行が守る性質は 2 つ:
 

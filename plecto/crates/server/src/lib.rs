@@ -238,9 +238,11 @@ pub(crate) struct ServerState {
     /// Per-source-IP connection cap across TCP + QUIC (`MAX_CONNECTIONS_PER_IP`): a slot is held
     /// for each connection's lifetime, so one source cannot exhaust `conn_limit` alone.
     per_ip_conn_limit: Arc<conn_limit::PerIpConnLimit>,
-    /// Cap on concurrently-buffered request bodies for the `on-request-body` hook, bounding
-    /// total buffered memory.
-    body_buffer_limit: Arc<Semaphore>,
+    /// The shared BYTE budget for bodies held in memory for a body hook — request and response
+    /// alike (ADR 000098). One permit is one byte, and each buffering path reserves its own cap
+    /// for as long as the bytes stay resident, so the two directions compete for one bounded pool
+    /// instead of multiplying into two independent ceilings.
+    body_buffer_budget: Arc<Semaphore>,
     /// Native data-plane metrics (Stage A observability, ADR 000009): RED signals tallied per
     /// request and served on the admin endpoint. Always recorded (cheap atomics); whether anyone
     /// can scrape them is gated by `[observability] admin_addr`.

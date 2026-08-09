@@ -8,23 +8,28 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use bytes::Bytes;
 use hyper::body::Body;
 use hyper::header::{CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
 use plecto_control::otlp::SpanRecord;
 use plecto_control::{
-    ChainOutcome, ConfigSnapshot, HashInput, HashKeySource, HttpRequest, HttpResponse,
-    RateLimitDecision, RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseOutcome,
-    RouteInfo,
+    ChainOutcome, ConfigSnapshot, HashInput, HashKeySource, HttpRequest, HttpResponse, OverCapMode,
+    RateLimitDecision, RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseBodyOutcome,
+    ResponseOutcome, RouteInfo, UninspectableMode,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::body::{INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, buffer_request_body};
+use crate::body::{
+    INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, ResponseBufferOutcome,
+    UPSTREAM_BODY_READ_TIMEOUT, buffer_request_body, buffer_response_body, hold_budget, prefixed,
+};
 use crate::error::ServerError;
 use crate::forward::{ForwardBody, ForwardOutcome, ForwardRequest, forward_with_retry};
 use crate::headers::{
     copy_headers, copy_headers_direct, headers_to_vec, set_forwarded, to_http_request,
 };
+use crate::metrics::InspectionSkip;
 use crate::respond::{
     discard_upstream_body, fault, http_response, stream_response, stream_response_direct, synth,
     synth_retry_after, with_error_code,
@@ -106,7 +111,20 @@ pub(crate) async fn proxy_core(
         )
     });
 
-    let result = proxy_core_inner(state.clone(), scheme, client, trace, parts, body).await;
+    // Why this transaction's response body escaped the route's `on-response-body` filters, if it
+    // did (ADR 000098). The metric is tallied where the decision is made; this carries the reason
+    // out to the access log, so a skip is attributable to a request and not only to a counter.
+    let mut inspection_skipped: Option<InspectionSkip> = None;
+    let result = proxy_core_inner(
+        state.clone(),
+        scheme,
+        client,
+        trace,
+        parts,
+        body,
+        &mut inspection_skipped,
+    )
+    .await;
 
     drop(in_flight);
     let status = match &result {
@@ -117,7 +135,15 @@ pub(crate) async fn proxy_core(
     let elapsed = start.elapsed();
     state.metrics.record_request(status, elapsed);
     if let Some(access) = access {
-        access_log::record(scheme, client, &access, status, elapsed, &trace);
+        access_log::record(
+            scheme,
+            client,
+            &access,
+            status,
+            elapsed,
+            &trace,
+            inspection_skipped.map(InspectionSkip::as_str),
+        );
     }
     // One SERVER span per sampled transaction (ADR 000040): the root the filter spans (and the
     // upstream's own trace, via the propagated traceparent) nest under. Push is a bounded-queue
@@ -140,6 +166,7 @@ async fn proxy_core_inner(
     trace: RequestTrace,
     mut parts: hyper::http::request::Parts,
     body: ReqBody,
+    inspection_skipped: &mut Option<InspectionSkip>,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let mut http_req = to_http_request(&parts, scheme);
     // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
@@ -328,6 +355,16 @@ async fn proxy_core_inner(
             )));
         };
 
+        // A route that inspects response bodies asks the upstream for something inspectable: the
+        // negotiated-encoding and byte-range request headers are stripped from the FORWARDED
+        // request (ADR 000098), so an encoded or partial response becomes the anomaly the
+        // fail-closed classes are for instead of the normal case. Applied last, after the request
+        // body hook, so a filter cannot re-add one. The client's own headers are untouched —
+        // `[route.compression]` still negotiates against them on the way back.
+        if route.body_hooks.response {
+            strip_inspection_hostile_headers(&mut forward.headers);
+        }
+
         let forward_req = ForwardRequest {
             method: forward.method.as_str(),
             // The filterless fast path forwards the inbound headers directly (no contract re-parse
@@ -399,7 +436,15 @@ async fn proxy_core_inner(
             .map(Routed::Synthesised);
         }
 
-        respond_through_chain(&chain, forward, upstream_resp).await
+        respond_through_chain(
+            &state,
+            &chain,
+            &route,
+            forward,
+            upstream_resp,
+            inspection_skipped,
+        )
+        .await
     }
     .await;
 
@@ -513,11 +558,16 @@ async fn request_body_hook(
         return Ok(BodyHookOutcome::Proceed(None));
     };
     // Bound concurrent buffered-body memory and the time spent reading one body
-    // (slow-body slowloris): hold a buffer permit and read under a deadline. Over the
-    // size cap → 413, over the time budget → 408 — both fail closed (never an unbounded buffer).
-    // An acquire error (the semaphore closed) must fail closed too, not silently proceed
-    // without a permit — that would bypass the concurrency cap entirely for this request.
-    let permit = match state.body_buffer_limit.clone().acquire_owned().await {
+    // (slow-body slowloris): reserve this body's cap out of the shared byte budget and read under
+    // a deadline. Over the size cap → 413, over the time budget → 408 — both fail closed (never an
+    // unbounded buffer). An acquire error (the semaphore closed) must fail closed too, not
+    // silently proceed without a permit — that would bypass the budget entirely for this request.
+    let permit = match state
+        .body_buffer_budget
+        .clone()
+        .acquire_many_owned(budget_permits(MAX_REQUEST_BODY_BUFFER))
+        .await
+    {
         Ok(permit) => permit,
         Err(_) => {
             return Ok(BodyHookOutcome::Respond(synth(
@@ -588,41 +638,18 @@ async fn request_body_hook(
 /// representation.
 const INSPECTION_HOSTILE_REQUEST_HEADERS: [&str; 3] = ["accept-encoding", "range", "if-range"];
 
-fn strip_inspection_hostile_headers(_headers: &mut Vec<plecto_control::Header>) {
-    todo!("strip the request headers that make a response uninspectable")
+fn strip_inspection_hostile_headers(headers: &mut Vec<plecto_control::Header>) {
+    headers.retain(|h| {
+        !INSPECTION_HOSTILE_REQUEST_HEADERS
+            .iter()
+            .any(|n| h.name.eq_ignore_ascii_case(n))
+    });
 }
 
-/// Why a response body was not inspected (ADR 000098 decision 3). Each variant is a class the host
-/// cannot inspect, not a policy choice: a response outside the route's media-type allowlist is
-/// outside the declared scope of inspection and is not one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InspectionSkip {
-    StreamingContentType,
-    ContentEncoding,
-    PartialContent,
-    OverCap,
-}
-
-/// What the host can do with an upstream response on a route whose chain reads response bodies.
-enum Inspectability {
-    /// Buffer it (bounded) and run the hooks.
-    Inspect,
-    /// Outside the route's declared media-type allowlist. Streams through uninspected and
-    /// UNCOUNTED: the allowlist states what the operator asked to inspect, so a response outside
-    /// it is not a skip, it is the scope.
-    OutOfScope,
-    /// Inside the scope, but not inspectable at all. The route's `uninspectable` mode decides
-    /// whether it is refused or forwarded; either way the reason is recorded.
-    Uninspectable(InspectionSkip),
-}
-
-/// Decide what can be done with a response, from the AS-RECEIVED status and headers.
-fn classify_response(
-    _status: StatusCode,
-    _headers: &hyper::HeaderMap,
-    _cfg: &ResponseBodyConfig,
-) -> Inspectability {
-    todo!("classify an upstream response for response-body inspection")
+/// One body's reservation out of the shared byte budget. Route validation keeps every cap far
+/// inside `u32`, so the clamp is a total-function guard, not a reachable case.
+fn budget_permits(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
 /// True when the upstream's 101 names the token we offered (case-insensitive, RFC 9110 §7.8).
@@ -744,9 +771,12 @@ async fn upgrade_switch(
 /// A filterless route skips the blocking-pool hop and the contract projection; the hop-by-hop
 /// strip still applies, directly on the original header bytes.
 async fn respond_through_chain(
+    state: &ServerState,
     chain: &ChainRef<'_>,
+    route: &RouteInfo,
     forward: HttpRequest,
     upstream_resp: Response<ResponseBody>,
+    inspection_skipped: &mut Option<InspectionSkip>,
 ) -> Result<Routed, ServerError> {
     let (uparts, ubody) = upstream_resp.into_parts();
     if !chain.has_filters {
@@ -756,41 +786,299 @@ async fn respond_through_chain(
             ubody,
         )));
     }
+    // Classify BEFORE the chain runs, on the response exactly as the upstream sent it (ADR 000098
+    // decision 3). Deciding on a content-type a chain filter could have rewritten would let an
+    // earlier filter steer a response past the one that inspects it.
+    let inspectability = route
+        .body_hooks
+        .response
+        .then(|| classify_response(uparts.status, &uparts.headers, &route.response_body));
+
     let http_resp = HttpResponse {
         status: uparts.status.as_u16(),
         headers: headers_to_vec(&uparts.headers),
-        body: Vec::new(), // header-only: filters never see the streamed body
+        body: Vec::new(), // header-only: this hook never sees the body
     };
     // The response chain sees the AS-FORWARDED request snapshot (ADR 000073): `forward` is the
     // request exactly as it left the request-side chain (filter edits applied, before the
     // egress hop-by-hop strip / path rewrite / traceparent injection), moved here for free —
-    // no per-request copy is added to hold it.
+    // no per-request copy is added to hold it. It comes back out because the body hook, which
+    // runs after this one, is handed the same snapshot.
     let snap_resp = chain.snapshot.clone();
     let idx = chain.idx;
-    let outcome =
-        tokio::task::spawn_blocking(move || snap_resp.dispatch_response(idx, &forward, http_resp))
-            .await?;
+    let (outcome, forward) = tokio::task::spawn_blocking(move || {
+        let outcome = snap_resp.dispatch_response(idx, &forward, http_resp);
+        (outcome, forward)
+    })
+    .await?;
 
     // The typed successor of the old in-band signal (ADR 000073): `Forward` sends the edited
-    // status + headers and streams the upstream body through; `Respond` is a synthesised
-    // response — a filter's `replace` or the chain's fail-closed 5xx. The upstream body is
-    // discarded without blocking the client (background drain up to a cap, else socket close)
-    // so a replace does not permanently poison the upstream connection pool.
-    match outcome {
-        ResponseOutcome::Forward(edited) => {
-            // The upstream's original headers ride along so framing stays host-owned (the chain
-            // cannot desync `Content-Length` from the streamed body).
-            Ok(Routed::Forwarded(stream_response(
-                edited.status,
-                &edited.headers,
-                &uparts.headers,
-                ubody,
-            )))
-        }
+    // status + headers; `Respond` is a synthesised response — a filter's `replace` or the chain's
+    // fail-closed 5xx. The upstream body is discarded without blocking the client (background
+    // drain up to a cap, else socket close) so a replace does not permanently poison the upstream
+    // connection pool — and, per ADR 000098, a replaced response has no upstream body left to
+    // inspect, so the body hook does not run at all.
+    let edited = match outcome {
+        ResponseOutcome::Forward(edited) => edited,
         ResponseOutcome::Respond(resp) => {
             discard_upstream_body(ubody);
+            return Ok(Routed::Synthesised(http_response(resp)));
+        }
+    };
+
+    match inspectability {
+        // No response-body filter on the route, or a response outside its declared media-type
+        // scope: the body streams through untouched, exactly as before this hook existed. The
+        // upstream's original headers ride along so framing stays host-owned (the chain cannot
+        // desync `Content-Length` from the streamed body).
+        None | Some(Inspectability::OutOfScope) => Ok(Routed::Forwarded(stream_response(
+            edited.status,
+            &edited.headers,
+            &uparts.headers,
+            ubody,
+        ))),
+        Some(Inspectability::Uninspectable(reason)) => {
+            state.metrics.inc_inspection_skipped(reason);
+            *inspection_skipped = Some(reason);
+            match route.response_body.uninspectable() {
+                UninspectableMode::Passthrough => Ok(Routed::Forwarded(stream_response(
+                    edited.status,
+                    &edited.headers,
+                    &uparts.headers,
+                    ubody,
+                ))),
+                UninspectableMode::Reject => {
+                    discard_upstream_body(ubody);
+                    Ok(Routed::Synthesised(synth(
+                        StatusCode::BAD_GATEWAY,
+                        &fault::RESPONSE_BODY_UNINSPECTABLE,
+                        b"response body could not be inspected",
+                    )))
+                }
+            }
+        }
+        Some(Inspectability::Inspect) => {
+            inspect_response_body(
+                state,
+                chain,
+                route,
+                forward,
+                edited,
+                uparts.headers,
+                ubody,
+                inspection_skipped,
+            )
+            .await
+        }
+    }
+}
+
+/// What the host can do with an upstream response on a route whose chain reads response bodies
+/// (ADR 000098 decision 3).
+enum Inspectability {
+    /// Buffer it (bounded) and run the hooks.
+    Inspect,
+    /// Outside the route's declared media-type allowlist. Streams through uninspected and
+    /// UNCOUNTED: the allowlist states what the operator asked to inspect, so a response outside
+    /// it is not a skip, it is the scope.
+    OutOfScope,
+    /// Inside the scope, but not inspectable at all. The route's `uninspectable` mode decides
+    /// whether it is refused or forwarded; either way the reason is recorded.
+    Uninspectable(InspectionSkip),
+}
+
+/// Decide what can be done with a response, from the AS-RECEIVED status and headers.
+fn classify_response(
+    status: StatusCode,
+    headers: &hyper::HeaderMap,
+    cfg: &ResponseBodyConfig,
+) -> Inspectability {
+    let essence = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim())
+        .unwrap_or_default();
+    // A streaming media type is a REFUSED class, not merely an unlisted one: it is absent from the
+    // allowlist because buffering it would break the stream, and letting that absence read as
+    // "quietly skip" is the silent-skip this design exists to avoid.
+    if is_streaming_media_type(essence) {
+        return Inspectability::Uninspectable(InspectionSkip::StreamingContentType);
+    }
+    if !cfg.content_type_eligible(essence) {
+        return Inspectability::OutOfScope;
+    }
+    // A fragment of a representation cannot be inspected as the representation.
+    if status == StatusCode::PARTIAL_CONTENT || headers.contains_key(CONTENT_RANGE) {
+        return Inspectability::Uninspectable(InspectionSkip::PartialContent);
+    }
+    // An encoding that survived the request-side `Accept-Encoding` strip: the bytes are not the
+    // ones a filter would be reading. Host-side decompression is a later increment.
+    if is_content_encoded(headers) {
+        return Inspectability::Uninspectable(InspectionSkip::ContentEncoding);
+    }
+    Inspectability::Inspect
+}
+
+fn is_streaming_media_type(essence: &str) -> bool {
+    essence.eq_ignore_ascii_case("text/event-stream")
+}
+
+fn is_content_encoded(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .any(|v| match v.to_str() {
+            Ok(s) => s.split(',').any(|token| {
+                let token = token.trim();
+                !token.is_empty() && !token.eq_ignore_ascii_case("identity")
+            }),
+            // An unreadable coding is a coding we cannot rule out. Fail closed.
+            Err(_) => true,
+        })
+}
+
+/// Buffer the upstream body (bounded, reserved out of the shared byte budget) and run the route's
+/// `on-response-body` hooks over it (ADR 000098). Nothing has been written to the client yet — the
+/// whole response is still a value being built — which is what makes a `replace` here honourable
+/// and the fail-closed statuses below reachable.
+#[allow(clippy::too_many_arguments)]
+async fn inspect_response_body(
+    state: &ServerState,
+    chain: &ChainRef<'_>,
+    route: &RouteInfo,
+    forward: HttpRequest,
+    edited: HttpResponse,
+    upstream_headers: hyper::HeaderMap,
+    ubody: ResponseBody,
+    inspection_skipped: &mut Option<InspectionSkip>,
+) -> Result<Routed, ServerError> {
+    let cfg = &route.response_body;
+    let cap = cfg.max_bytes();
+    let status = edited.status;
+    let permit = match state
+        .body_buffer_budget
+        .clone()
+        .acquire_many_owned(budget_permits(cap))
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            discard_upstream_body(ubody);
+            return Ok(Routed::Synthesised(synth(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &fault::RESPONSE_BODY_BUFFER_UNAVAILABLE,
+                b"response body buffer unavailable",
+            )));
+        }
+    };
+    let buffered =
+        match tokio::time::timeout(UPSTREAM_BODY_READ_TIMEOUT, buffer_response_body(ubody, cap))
+            .await
+        {
+            Ok(outcome) => outcome,
+            // The headers are being held for this decision, so a trickling upstream would hold them
+            // forever. Bound it, and attribute the fault to the upstream (504), not to the client.
+            Err(_) => {
+                return Ok(Routed::Synthesised(synth(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &fault::RESPONSE_BODY_TIMEOUT,
+                    b"upstream response body timeout",
+                )));
+            }
+        };
+    // `Some(rest)` means only the head was inspected (`process-partial`) and the remainder still
+    // has to be forwarded behind it.
+    let (body, rest) = match buffered {
+        ResponseBufferOutcome::Buffered(body) => (body, None),
+        ResponseBufferOutcome::ReadError => {
+            return Ok(Routed::Synthesised(synth(
+                StatusCode::BAD_GATEWAY,
+                &fault::RESPONSE_BODY_READ_ERROR,
+                b"upstream response body read error",
+            )));
+        }
+        ResponseBufferOutcome::OverCap { head, rest } => {
+            // This is also where an unbounded stream lands: a body with no declared length that
+            // never ends is, at the cap, indistinguishable from one that is merely too big — and
+            // gets the same recorded reason and the same route-declared treatment.
+            state
+                .metrics
+                .inc_inspection_skipped(InspectionSkip::OverCap);
+            *inspection_skipped = Some(InspectionSkip::OverCap);
+            match cfg.over_cap() {
+                OverCapMode::Reject => {
+                    discard_upstream_body(rest);
+                    return Ok(Routed::Synthesised(synth(
+                        StatusCode::BAD_GATEWAY,
+                        &fault::RESPONSE_BODY_TOO_LARGE,
+                        b"response body too large to inspect",
+                    )));
+                }
+                OverCapMode::Passthrough => {
+                    return Ok(Routed::Forwarded(stream_response(
+                        status,
+                        &edited.headers,
+                        &upstream_headers,
+                        hold_budget(prefixed(Bytes::from(head), rest), permit),
+                    )));
+                }
+                OverCapMode::ProcessPartial => (head, Some(rest)),
+            }
+        }
+    };
+
+    let snap = chain.snapshot.clone();
+    let idx = chain.idx;
+    let outcome = tokio::task::spawn_blocking(move || {
+        snap.dispatch_response_body(idx, &forward, edited, body)
+    })
+    .await?;
+
+    match outcome {
+        ResponseBodyOutcome::Respond(resp) => {
+            if let Some(rest) = rest {
+                discard_upstream_body(rest);
+            }
             Ok(Routed::Synthesised(http_response(resp)))
         }
+        ResponseBodyOutcome::Forward {
+            body,
+            headers,
+            transformed,
+        } => match rest {
+            // The whole body was inspected: send exactly the bytes the chain settled on, framed by
+            // the host from those bytes (the upstream's own `Content-Length` is deliberately NOT
+            // carried over — it describes bytes a transform may have replaced).
+            None => {
+                let (parts, body) = http_response(HttpResponse {
+                    status,
+                    headers,
+                    body,
+                })
+                .into_parts();
+                Ok(Routed::Forwarded(Response::from_parts(
+                    parts,
+                    hold_budget(body, permit),
+                )))
+            }
+            // `process-partial`: the hooks saw a prefix. Forwarding a rewrite of a prefix followed
+            // by an untouched remainder would send a body no filter ever asked for, so a transform
+            // here fails closed; inspection alone passes through.
+            Some(rest) if transformed => {
+                discard_upstream_body(rest);
+                Ok(Routed::Synthesised(synth(
+                    StatusCode::BAD_GATEWAY,
+                    &fault::RESPONSE_BODY_PARTIAL_MODIFIED,
+                    b"filter rewrote a partially inspected response body",
+                )))
+            }
+            Some(rest) => Ok(Routed::Forwarded(stream_response(
+                status,
+                &headers,
+                &upstream_headers,
+                hold_budget(prefixed(Bytes::from(body), rest), permit),
+            ))),
+        },
     }
 }
 

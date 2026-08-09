@@ -21,7 +21,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::body::MAX_INFLIGHT_BODY_BUFFERS;
+use crate::body::MAX_INFLIGHT_BODY_BUFFER_BYTES;
 use crate::conn_limit::PerIpConnLimit;
 use crate::dispatch::handle;
 use crate::error::ServerError;
@@ -134,7 +134,7 @@ async fn serve_inner(
         trusted_proxy,
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         per_ip_conn_limit: Arc::new(PerIpConnLimit::new(MAX_CONNECTIONS_PER_IP)),
-        body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
+        body_buffer_budget: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFER_BYTES)),
         metrics: Arc::new(ServerMetrics::new()),
         otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
         drain: drain_rx.clone(),

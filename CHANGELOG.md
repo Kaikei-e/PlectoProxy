@@ -32,7 +32,41 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+> **`plecto:filter@0.4.0` is incomplete and MUST NOT be released.** The version rails below are in
+> place, but the contract itself is only half of ADR 000098: `on-response-body` (buffer-then-decide
+> on the response plane, with its fast-path buffering, inspection semantics, per-route
+> configuration and metrics) is a separate slice and is **not** in the tree yet. Publishing
+> `plecto:filter@0.4.0` as an OCI artifact — or shipping a binary that advertises it as loadable —
+> before that slice lands would freeze a version whose declared purpose is missing, and every
+> filter that pinned it would have to be re-pinned when the rest arrives. Cut the release only
+> once `on-response-body` is exported, wired end to end, and covered.
+
 ### Added
+
+- **`plecto:filter@0.4.0` contract version rails** (ADR 000098 / 000104). `0.3.0` is frozen at
+  [`plecto/wit/v0.3.0/`](plecto/wit/v0.3.0/world.wit) and the current contract text moves to
+  `0.4.0`, with two changes. **`request-body-decision` now has the same shape as the other three
+  decisions** — `%continue` / `modified(request-body-edit)` / `short-circuit(http-response)` —
+  so all four read the same way. `%continue` is a *bare* arm: the dominant body use case is
+  inspection (WAF / DLP / schema checks), and 0.3.0's `continue(list<u8>)` charged that case a
+  full copy back across the boundary just to say "unchanged". `modified` carries the new bytes
+  **plus** the header edits a body transform usually forces (content-type after a re-encode, a
+  digest stamp); `Content-Length` stays host-owned and is re-derived from the body actually
+  forwarded. **`http-request.path` is renamed `path-with-query`**, the value unchanged: the field
+  always carried the query, the operator-facing access log deliberately carries a query-*less*
+  `path`, and one name for two meanings was the only wrong part.
+
+  **No deployed filter needs a rebuild.** `0.1.0` / `0.2.0` / `0.3.0` components keep loading
+  through load-time adapters, as the compat policy promises, and every in-tree reference filter
+  stays on `0.3.0` on purpose — the shelf is the evidence, exercised on every CI run
+  (`crates/host/tests/compat_v01.rs` / `compat_v02.rs` / `compat_v03.rs`). The load-bearing
+  mapping: a frozen guest's `continue(bytes)` always meant "forward THIS body", so the adapter
+  lands it on `modified` — reading it as the new bare `%continue` would silently discard a
+  rewriting filter's transform. Rebuilding a filter's *source* against 0.4.0 is two mechanical
+  edits, described in
+  [docs/writing-a-filter.md](docs/writing-a-filter.md#rebuilding-a-030-filter-against-040).
+  `plecto new-filter` scaffolds `0.4.0`, and `plecto --version` now lists all four loadable
+  contracts.
 
 - **Per-route timeout overrides** (`[route.timeouts]`, ADR 000102). A route can now declare
   `request_timeout_ms` (per-try) and `overall_timeout_ms` of its own, overriding the defaults its

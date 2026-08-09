@@ -273,7 +273,7 @@ The two places that answer the two different questions:
 ```console
 $ plecto --version
 plecto 0.6.4 (profile: minimal)
-filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0
+filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0, plecto:filter@0.4.0
 ```
 
 That is what **this binary accepts**. What each of **your** filters actually bound is a separate

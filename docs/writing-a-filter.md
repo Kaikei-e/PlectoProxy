@@ -18,16 +18,27 @@ stream it straight through, at no cost to a header-only filter (ADR 000038). Tar
 only when your filter actually reads the body.
 
 ```wit
-package plecto:filter@0.3.0;
+package plecto:filter@0.4.0;
 
 interface types {
   // Header values are raw bytes (ADR 000071) — not lossy UTF-8 strings.
   record header { name: string, value: list<u8>, }
 
+  // The request target carries the query, and since 0.4.0 the name says so (ADR 000104).
+  record http-request { method: string, path-with-query: string, /* … */ }
+
   // The typed outcome of a request-side filter. Never a bare flag.
   variant request-decision {
     %continue,                       // pass unchanged to the next filter
     modified(request-edit),          // apply the edit, then continue
+    short-circuit(http-response),    // stop the chain; synthesise a response now
+  }
+
+  // The body side has the SAME shape since 0.4.0 (ADR 000098): `%continue` carries no
+  // payload, so a filter that only INSPECTS the body never pays to hand it back.
+  variant request-body-decision {
+    %continue,                       // forward the buffered body unchanged
+    modified(request-body-edit),     // forward these bytes, with the header edits they force
     short-circuit(http-response),    // stop the chain; synthesise a response now
   }
 
@@ -66,7 +77,7 @@ world filter-body {
 | --- | --- | --- | --- |
 | `init` | both | once per instance (heavy setup) | — |
 | `on-request` | both | per request, on the headers | `continue` / `modified(edit)` / `short-circuit(response)` |
-| `on-request-body` | `filter-body` only | per request, on the buffered body | `continue(body)` / `short-circuit(response)` |
+| `on-request-body` | `filter-body` only | per request, on the buffered body | `continue` / `modified(edit)` / `short-circuit(response)` |
 | `on-response` | both | per response, on the headers, with the as-forwarded request snapshot (ADR 000073) | `continue` / `modified(edit)` / `replace(response)` |
 
 ### Response-side decisions and chain order
@@ -116,7 +127,7 @@ use crate::plecto::filter::types::Header;
 fn on_response(req: HttpRequest, resp: HttpResponse) -> ResponseDecision {
     // Which requests this policy covers is the FILTER's decision. A route's `path_prefix` is a
     // routing bound and is often wider than the condition a policy cares about, so match here.
-    if resp.status < 500 || !req.path.starts_with("/api/") {
+    if resp.status < 500 || !req.path_with_query.starts_with("/api/") {
         return ResponseDecision::Continue;
     }
 
@@ -588,7 +599,7 @@ registry = "ghcr.io"
 metadata = { oci = { registry = "ghcr.io", namespacePrefix = "kaikei-e/wit/" } }
 EOF
 
-wkg get plecto:filter@0.3.0 --config wkg-registry.toml -o wit/ --format wit
+wkg get plecto:filter@0.4.0 --config wkg-registry.toml -o wit/ --format wit
 ```
 
 That writes the plain-text WIT to `wit/`, ready for `wit_bindgen::generate!` (or any other
@@ -610,7 +621,7 @@ disappear without a major bump. Do not depend on it outside an explicit opt-in b
 ### Compatibility policy
 
 The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
-versioning policy already says so. `plecto:filter@0.3.0` and a `plecto` binary at `0.3.0` is the
+versioning policy already says so. `plecto:filter@0.4.0` and a `plecto` binary at `0.6.x` is the
 normal, expected state.
 
 - **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional
@@ -632,6 +643,19 @@ normal, expected state.
   `filter` world exporting nothing new stays minor-compatible forever by construction (the
   *absence* of `on-request-body` is itself contractual, not an oversight). Adding an export to
   `filter-body` is minor; changing an existing export's signature (on either world) is major.
+
+### Rebuilding a 0.3.0 filter against 0.4.0
+
+An already-deployed 0.3.0 component needs **no** rebuild — it keeps loading. Rebuilding its
+*source* against 0.4.0 takes two mechanical edits:
+
+- `req.path` → `req.path_with_query` (`http-request.path` → `path-with-query`, ADR 000104). Same
+  value, query included; only the name changed, so the compiler finds every site.
+- `RequestBodyDecision::Continue(bytes)` → either `Continue` (you did not change the body) or
+  `Modified(RequestBodyEdit { body: bytes, set_headers: vec![], remove_headers: vec![] })` (you
+  did). The split is the point: `%continue` no longer carries a body, so an inspecting filter
+  stops paying to hand the bytes back (ADR 000098). When in doubt, `Modified` is always
+  behaviour-preserving — it is exactly what the host's 0.3 adapter does with your old `continue`.
 
 This is the filter-author-facing analogue of the supply-chain discipline Plecto applies to its own
 release binaries and images (ADR 000047): a digest-pinned artifact, a declared stability contract,

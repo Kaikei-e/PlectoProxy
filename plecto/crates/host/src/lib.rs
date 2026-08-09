@@ -127,8 +127,8 @@ mod bindings {
 // One canonical set of contract types for callers and tests.
 pub use bindings::plecto::filter::host_log::Level as LogLevel;
 pub use bindings::plecto::filter::types::{
-    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestDecision, RequestEdit,
-    ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestBodyEdit, RequestDecision,
+    RequestEdit, ResponseDecision, ResponseEdit,
 };
 
 pub use errors::{LoadError, RunError};

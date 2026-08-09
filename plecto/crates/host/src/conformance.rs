@@ -90,7 +90,7 @@ fn load_self_signed(component_bytes: &[u8]) -> anyhow::Result<LoadedFilter> {
 fn generic_request() -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "conformance.invalid".to_string(),
         scheme: "https".to_string(),
         headers: vec![Header {
@@ -120,6 +120,25 @@ mod tests {
             assert!(c.passed, "{}: {}", c.name, c.detail);
         }
         assert!(report.is_conformant());
+    }
+
+    #[test]
+    fn every_shipped_contract_version_passes_the_battery() {
+        // `plecto conformance` gates a filter on "loads under the plecto:filter contract", so it
+        // has to recognise every version the host ships support for — the newest one included,
+        // and the frozen ones the compat promise keeps loadable (ADR 000064).
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("0.1.0", crate::test_support::filter_compat_v01_component()),
+            ("0.2.0", crate::test_support::filter_compat_v02_component()),
+            ("0.3.0", crate::test_support::filter_hello_component()),
+            ("0.4.0", crate::test_support::filter_v04_component()),
+        ];
+        for (version, component) in cases {
+            let report = check(&component);
+            for c in &report.checks {
+                assert!(c.passed, "{version}: {}: {}", c.name, c.detail);
+            }
+        }
     }
 
     #[test]

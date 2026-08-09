@@ -1,5 +1,5 @@
-//! `plecto:filter` contract version detection and 0.1/0.2 → 0.3 adapters
-//! (ADR 000071 / 000073).
+//! `plecto:filter` contract version detection and 0.1/0.2/0.3 → 0.4 adapters
+//! (ADR 000071 / 000073 / 000098 / 000104).
 
 mod bindings_v01 {
     // Vendored copy of `plecto/wit/v0.1.0/` — see `crate::bindings`'s comment for why.
@@ -19,7 +19,16 @@ mod bindings_v02 {
     });
 }
 
-/// The canonical `plecto:filter@0.3.0` contract text, byte-identical to the vendored
+mod bindings_v03 {
+    // Vendored copy of `plecto/wit/v0.3.0/` — see `crate::bindings`'s comment for why.
+    wasmtime::component::bindgen!({
+        path: "wit/v0.3.0",
+        world: "filter",
+        exports: { default: async },
+    });
+}
+
+/// The canonical `plecto:filter@0.4.0` contract text, byte-identical to the vendored
 /// `wit/world.wit` this module's `crate::bindings` resolves — so a consumer that needs the raw
 /// WIT source (e.g. `plecto new-filter`'s scaffold, ADR 000072) can never drift from what this
 /// binary's own host actually runs. Re-exported via `plecto-control` for `plecto-server`, which
@@ -27,7 +36,7 @@ mod bindings_v02 {
 pub const FILTER_WIT: &str = include_str!("../wit/world.wit");
 
 pub(crate) use crate::bindings::{
-    Filter as FilterV03, FilterPre as FilterPreV03, plecto::filter::types as types_v03,
+    Filter as FilterV04, FilterPre as FilterPreV04, plecto::filter::types as types_v04,
 };
 pub(crate) use bindings_v01::{
     Filter as FilterV01, FilterPre as FilterPreV01, plecto::filter::types as types_v01,
@@ -35,10 +44,13 @@ pub(crate) use bindings_v01::{
 pub(crate) use bindings_v02::{
     Filter as FilterV02, FilterPre as FilterPreV02, plecto::filter::types as types_v02,
 };
+pub(crate) use bindings_v03::{
+    Filter as FilterV03, FilterPre as FilterPreV03, plecto::filter::types as types_v03,
+};
 
 use crate::{
-    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestDecision, RequestEdit,
-    ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestBodyEdit, RequestDecision,
+    RequestEdit, ResponseDecision, ResponseEdit,
 };
 
 /// Which `plecto:filter` package version a loaded component targets.
@@ -47,6 +59,7 @@ pub enum ContractVersion {
     V01,
     V02,
     V03,
+    V04,
 }
 
 impl ContractVersion {
@@ -58,18 +71,20 @@ impl ContractVersion {
             ContractVersion::V01 => "plecto:filter@0.1.0",
             ContractVersion::V02 => "plecto:filter@0.2.0",
             ContractVersion::V03 => "plecto:filter@0.3.0",
+            ContractVersion::V04 => "plecto:filter@0.4.0",
         }
     }
 }
 
 /// Every `plecto:filter` contract version this build can load, oldest first (ADR 000071 /
-/// 000073): the frozen tracks reached through load-time adapters, then the current one. The
-/// binary reports this set so an operator can tell what a proxy upgrade accepts WITHOUT reading
-/// a changelog — the answer to "does this bump force a filter rebuild?".
+/// 000073 / 000098): the frozen tracks reached through load-time adapters, then the current one.
+/// The binary reports this set so an operator can tell what a proxy upgrade accepts WITHOUT
+/// reading a changelog — the answer to "does this bump force a filter rebuild?".
 pub const SUPPORTED_CONTRACT_VERSIONS: &[ContractVersion] = &[
     ContractVersion::V01,
     ContractVersion::V02,
     ContractVersion::V03,
+    ContractVersion::V04,
 ];
 
 /// Detect the contract version from the component's decoded import names (wasmtime's own
@@ -79,8 +94,8 @@ pub const SUPPORTED_CONTRACT_VERSIONS: &[ContractVersion] = &[
 /// logs has no `host-log` import at all.
 ///
 /// Returns `None` (fail-closed at load) when the component imports no `plecto:filter/…`
-/// interface, or imports one at an unknown version (e.g. a future `@0.4.`). Only an explicit
-/// `@0.1.` / `@0.2.` / `@0.3.` match is accepted — never a silent default to the latest.
+/// interface, or imports one at an unknown version (e.g. a future `@0.5.`). Only an explicit
+/// `@0.1.` / `@0.2.` / `@0.3.` / `@0.4.` match is accepted — never a silent default to the latest.
 pub(crate) fn detect_contract_version(
     component: &wasmtime::component::Component,
     engine: &wasmtime::Engine,
@@ -98,6 +113,9 @@ pub(crate) fn detect_contract_version(
         if name.contains("@0.3.") {
             return Some(ContractVersion::V03);
         }
+        if name.contains("@0.4.") {
+            return Some(ContractVersion::V04);
+        }
         // A `plecto:filter/…` import at an unrecognised version — do not guess.
         return None;
     }
@@ -107,7 +125,7 @@ pub(crate) fn detect_contract_version(
 pub(crate) fn request_to_v01(req: &HttpRequest) -> types_v01::HttpRequest {
     types_v01::HttpRequest {
         method: req.method.clone(),
-        path: req.path.clone(),
+        path: req.path_with_query.clone(),
         authority: req.authority.clone(),
         scheme: req.scheme.clone(),
         headers: req
@@ -136,13 +154,14 @@ pub(crate) fn response_to_v01(resp: &HttpResponse) -> types_v01::HttpResponse {
     }
 }
 
-/// Project the canonical (0.3-shaped) request into the frozen 0.2 record: the same
+/// Project the canonical (0.4-shaped) request into the frozen 0.2 record: the same
 /// byte-valued shape, so this is a mechanical per-field clone, not a lossy projection
-/// (unlike [`request_to_v01`]).
+/// (unlike [`request_to_v01`]). `path_with_query` lands on the frozen `path` — the 0.4.0
+/// rename is a field NAME change, so the value a frozen guest sees is unchanged (ADR 000104).
 pub(crate) fn request_to_v02(req: &HttpRequest) -> types_v02::HttpRequest {
     types_v02::HttpRequest {
         method: req.method.clone(),
-        path: req.path.clone(),
+        path: req.path_with_query.clone(),
         authority: req.authority.clone(),
         scheme: req.scheme.clone(),
         headers: req
@@ -171,6 +190,40 @@ pub(crate) fn response_to_v02(resp: &HttpResponse) -> types_v02::HttpResponse {
     }
 }
 
+/// Project the canonical request into the frozen 0.3 record. Byte-faithful like
+/// [`request_to_v02`]; the only difference from the canonical shape is the field name.
+pub(crate) fn request_to_v03(req: &HttpRequest) -> types_v03::HttpRequest {
+    types_v03::HttpRequest {
+        method: req.method.clone(),
+        path: req.path_with_query.clone(),
+        authority: req.authority.clone(),
+        scheme: req.scheme.clone(),
+        headers: req
+            .headers
+            .iter()
+            .map(|h| types_v03::Header {
+                name: h.name.clone(),
+                value: h.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn response_to_v03(resp: &HttpResponse) -> types_v03::HttpResponse {
+    types_v03::HttpResponse {
+        status: resp.status,
+        headers: resp
+            .headers
+            .iter()
+            .map(|h| types_v03::Header {
+                name: h.name.clone(),
+                value: h.value.clone(),
+            })
+            .collect(),
+        body: resp.body.clone(),
+    }
+}
+
 fn header_from_v01(h: types_v01::Header) -> Option<Header> {
     validate_and_header(&h.name, h.value.as_bytes())
 }
@@ -180,6 +233,10 @@ fn header_from_v02(h: types_v02::Header) -> Option<Header> {
 }
 
 fn header_from_v03(h: types_v03::Header) -> Option<Header> {
+    validate_and_header(&h.name, &h.value)
+}
+
+fn header_from_v04(h: types_v04::Header) -> Option<Header> {
     validate_and_header(&h.name, &h.value)
 }
 
@@ -345,6 +402,53 @@ fn response_edit_from_v03(edit: types_v03::ResponseEdit) -> Option<ResponseEdit>
     })
 }
 
+fn request_edit_from_v04(edit: types_v04::RequestEdit) -> Option<RequestEdit> {
+    let set_headers = edit
+        .set_headers
+        .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
+        .map(header_from_v04)
+        .collect::<Option<Vec<_>>>()?;
+    Some(RequestEdit {
+        set_headers,
+        remove_headers: edit.remove_headers,
+    })
+}
+
+/// A body edit's headers are guest output bound for the upstream, so they pass the same
+/// fail-closed gate as every other guest-supplied header (ADR 000071). `body` is carried
+/// verbatim: the fast path bounds its size where it bounds the buffer it replaces.
+fn request_body_edit_from_v04(edit: types_v04::RequestBodyEdit) -> Option<RequestBodyEdit> {
+    let set_headers = edit
+        .set_headers
+        .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
+        .map(header_from_v04)
+        .collect::<Option<Vec<_>>>()?;
+    Some(RequestBodyEdit {
+        body: edit.body,
+        set_headers,
+        remove_headers: edit.remove_headers,
+    })
+}
+
+fn response_edit_from_v04(edit: types_v04::ResponseEdit) -> Option<ResponseEdit> {
+    let set_headers = edit
+        .set_headers
+        .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
+        .map(header_from_v04)
+        .collect::<Option<Vec<_>>>()?;
+    Some(ResponseEdit {
+        set_status: match edit.set_status {
+            Some(status) => Some(validated_guest_status(status)?),
+            None => None,
+        },
+        set_headers,
+        remove_headers: edit.remove_headers,
+    })
+}
+
 fn validated_guest_body(body: Vec<u8>) -> Option<Vec<u8>> {
     if body.len() > MAX_GUEST_RESPONSE_BODY_LEN {
         return None;
@@ -403,6 +507,33 @@ fn response_from_v03(resp: types_v03::HttpResponse) -> Option<HttpResponse> {
     })
 }
 
+fn response_from_v04(resp: types_v04::HttpResponse) -> Option<HttpResponse> {
+    let headers = resp
+        .headers
+        .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
+        .map(header_from_v04)
+        .collect::<Option<Vec<_>>>()?;
+    Some(HttpResponse {
+        status: validated_guest_status(resp.status)?,
+        headers,
+        body: validated_guest_body(resp.body)?,
+    })
+}
+
+/// The one arm the 0.4.0 reshape could silently lose (ADR 000098): every frozen track spelled the
+/// body decision `continue(list<u8>)`, and those bytes always meant "forward THIS body". 0.4.0's
+/// bare `%continue` means "forward what you buffered", so the frozen arm maps to `modified` —
+/// unconditionally, because "the guest returned the same bytes" and "the guest rewrote the body"
+/// were never distinguishable on those tracks, and forwarding the guest's bytes is correct for both.
+fn frozen_body_continue(body: Vec<u8>) -> RequestBodyDecision {
+    RequestBodyDecision::Modified(RequestBodyEdit {
+        body,
+        set_headers: Vec::new(),
+        remove_headers: Vec::new(),
+    })
+}
+
 /// Map a 0.1 guest decision to native byte-valued types. `Continue` does not rewrite headers.
 pub(crate) fn request_decision_from_v01(
     decision: types_v01::RequestDecision,
@@ -433,7 +564,7 @@ pub(crate) fn request_body_decision_from_v01(
     decision: types_v01::RequestBodyDecision,
 ) -> Option<RequestBodyDecision> {
     match decision {
-        types_v01::RequestBodyDecision::Continue(body) => Some(RequestBodyDecision::Continue(body)),
+        types_v01::RequestBodyDecision::Continue(body) => Some(frozen_body_continue(body)),
         types_v01::RequestBodyDecision::ShortCircuit(resp) => {
             Some(RequestBodyDecision::ShortCircuit(response_from_v01(resp)?))
         }
@@ -469,7 +600,7 @@ pub(crate) fn request_body_decision_from_v02(
     decision: types_v02::RequestBodyDecision,
 ) -> Option<RequestBodyDecision> {
     match decision {
-        types_v02::RequestBodyDecision::Continue(body) => Some(RequestBodyDecision::Continue(body)),
+        types_v02::RequestBodyDecision::Continue(body) => Some(frozen_body_continue(body)),
         types_v02::RequestBodyDecision::ShortCircuit(resp) => {
             Some(RequestBodyDecision::ShortCircuit(response_from_v02(resp)?))
         }
@@ -511,9 +642,54 @@ pub(crate) fn request_body_decision_from_v03(
     decision: types_v03::RequestBodyDecision,
 ) -> Option<RequestBodyDecision> {
     match decision {
-        types_v03::RequestBodyDecision::Continue(body) => Some(RequestBodyDecision::Continue(body)),
+        types_v03::RequestBodyDecision::Continue(body) => Some(frozen_body_continue(body)),
         types_v03::RequestBodyDecision::ShortCircuit(resp) => {
             Some(RequestBodyDecision::ShortCircuit(response_from_v03(resp)?))
+        }
+    }
+}
+
+pub(crate) fn request_decision_from_v04(
+    decision: types_v04::RequestDecision,
+) -> Option<RequestDecision> {
+    match decision {
+        types_v04::RequestDecision::Continue => Some(RequestDecision::Continue),
+        types_v04::RequestDecision::Modified(edit) => {
+            Some(RequestDecision::Modified(request_edit_from_v04(edit)?))
+        }
+        types_v04::RequestDecision::ShortCircuit(resp) => {
+            Some(RequestDecision::ShortCircuit(response_from_v04(resp)?))
+        }
+    }
+}
+
+/// Map a 0.4 guest response decision to the validated native one. `replace` output is
+/// untrusted guest data on its way to the client, so it passes the SAME fail-closed header
+/// validation as a request-side `short-circuit` (ADR 000073 decision 4).
+pub(crate) fn response_decision_from_v04(
+    decision: types_v04::ResponseDecision,
+) -> Option<ResponseDecision> {
+    match decision {
+        types_v04::ResponseDecision::Continue => Some(ResponseDecision::Continue),
+        types_v04::ResponseDecision::Modified(edit) => {
+            Some(ResponseDecision::Modified(response_edit_from_v04(edit)?))
+        }
+        types_v04::ResponseDecision::Replace(resp) => {
+            Some(ResponseDecision::Replace(response_from_v04(resp)?))
+        }
+    }
+}
+
+pub(crate) fn request_body_decision_from_v04(
+    decision: types_v04::RequestBodyDecision,
+) -> Option<RequestBodyDecision> {
+    match decision {
+        types_v04::RequestBodyDecision::Continue => Some(RequestBodyDecision::Continue),
+        types_v04::RequestBodyDecision::Modified(edit) => Some(RequestBodyDecision::Modified(
+            request_body_edit_from_v04(edit)?,
+        )),
+        types_v04::RequestBodyDecision::ShortCircuit(resp) => {
+            Some(RequestBodyDecision::ShortCircuit(response_from_v04(resp)?))
         }
     }
 }
@@ -532,9 +708,9 @@ mod v01_host {
     };
     use crate::LogLevel;
     use crate::bindings::plecto::filter::{
-        host_clock as host_clock_v03, host_config as host_config_v03,
-        host_counter as host_counter_v03, host_kv as host_kv_v03, host_log as host_log_v03,
-        host_ratelimit as host_ratelimit_v03,
+        host_clock as host_clock_v04, host_config as host_config_v04,
+        host_counter as host_counter_v04, host_kv as host_kv_v04, host_log as host_log_v04,
+        host_ratelimit as host_ratelimit_v04,
     };
     use crate::state::HostState;
 
@@ -552,40 +728,40 @@ mod v01_host {
 
     impl host_log::Host for HostState {
         fn log(&mut self, level: host_log::Level, message: String) {
-            host_log_v03::Host::log(self, log_level(level), message);
+            host_log_v04::Host::log(self, log_level(level), message);
         }
     }
 
     impl host_clock::Host for HostState {
         fn now_ms(&mut self) -> u64 {
-            host_clock_v03::Host::now_ms(self)
+            host_clock_v04::Host::now_ms(self)
         }
     }
 
     impl host_kv::Host for HostState {
         fn get(&mut self, key: String) -> Option<Vec<u8>> {
-            host_kv_v03::Host::get(self, key)
+            host_kv_v04::Host::get(self, key)
         }
         fn set(&mut self, key: String, value: Vec<u8>) {
-            host_kv_v03::Host::set(self, key, value);
+            host_kv_v04::Host::set(self, key, value);
         }
         fn delete(&mut self, key: String) {
-            host_kv_v03::Host::delete(self, key);
+            host_kv_v04::Host::delete(self, key);
         }
     }
 
     impl host_counter::Host for HostState {
         fn increment(&mut self, key: String, delta: i64) -> i64 {
-            host_counter_v03::Host::increment(self, key, delta)
+            host_counter_v04::Host::increment(self, key, delta)
         }
         fn get(&mut self, key: String) -> i64 {
-            host_counter_v03::Host::get(self, key)
+            host_counter_v04::Host::get(self, key)
         }
     }
 
     impl host_ratelimit::Host for HostState {
         fn try_acquire(&mut self, key: String, cost: u64) -> host_ratelimit::Acquire {
-            let out = host_ratelimit_v03::Host::try_acquire(self, key, cost);
+            let out = host_ratelimit_v04::Host::try_acquire(self, key, cost);
             host_ratelimit::Acquire {
                 allowed: out.allowed,
                 remaining: out.remaining,
@@ -596,7 +772,82 @@ mod v01_host {
 
     impl host_config::Host for HostState {
         fn get(&mut self, key: String) -> Option<String> {
-            host_config_v03::Host::get(self, key)
+            host_config_v04::Host::get(self, key)
+        }
+    }
+}
+
+mod v03_host {
+    use super::bindings_v03::plecto::filter::{
+        host_clock, host_config, host_counter, host_kv, host_log, host_ratelimit,
+    };
+    use crate::LogLevel;
+    use crate::bindings::plecto::filter::{
+        host_clock as host_clock_v04, host_config as host_config_v04,
+        host_counter as host_counter_v04, host_kv as host_kv_v04, host_log as host_log_v04,
+        host_ratelimit as host_ratelimit_v04,
+    };
+    use crate::state::HostState;
+
+    impl super::bindings_v03::plecto::filter::types::Host for HostState {}
+
+    fn log_level(level: host_log::Level) -> LogLevel {
+        match level {
+            host_log::Level::Trace => LogLevel::Trace,
+            host_log::Level::Debug => LogLevel::Debug,
+            host_log::Level::Info => LogLevel::Info,
+            host_log::Level::Warn => LogLevel::Warn,
+            host_log::Level::Error => LogLevel::Error,
+        }
+    }
+
+    impl host_log::Host for HostState {
+        fn log(&mut self, level: host_log::Level, message: String) {
+            host_log_v04::Host::log(self, log_level(level), message);
+        }
+    }
+
+    impl host_clock::Host for HostState {
+        fn now_ms(&mut self) -> u64 {
+            host_clock_v04::Host::now_ms(self)
+        }
+    }
+
+    impl host_kv::Host for HostState {
+        fn get(&mut self, key: String) -> Option<Vec<u8>> {
+            host_kv_v04::Host::get(self, key)
+        }
+        fn set(&mut self, key: String, value: Vec<u8>) {
+            host_kv_v04::Host::set(self, key, value);
+        }
+        fn delete(&mut self, key: String) {
+            host_kv_v04::Host::delete(self, key);
+        }
+    }
+
+    impl host_counter::Host for HostState {
+        fn increment(&mut self, key: String, delta: i64) -> i64 {
+            host_counter_v04::Host::increment(self, key, delta)
+        }
+        fn get(&mut self, key: String) -> i64 {
+            host_counter_v04::Host::get(self, key)
+        }
+    }
+
+    impl host_ratelimit::Host for HostState {
+        fn try_acquire(&mut self, key: String, cost: u64) -> host_ratelimit::Acquire {
+            let out = host_ratelimit_v04::Host::try_acquire(self, key, cost);
+            host_ratelimit::Acquire {
+                allowed: out.allowed,
+                remaining: out.remaining,
+                retry_after_ms: out.retry_after_ms,
+            }
+        }
+    }
+
+    impl host_config::Host for HostState {
+        fn get(&mut self, key: String) -> Option<String> {
+            host_config_v04::Host::get(self, key)
         }
     }
 }
@@ -607,9 +858,9 @@ mod v02_host {
     };
     use crate::LogLevel;
     use crate::bindings::plecto::filter::{
-        host_clock as host_clock_v03, host_config as host_config_v03,
-        host_counter as host_counter_v03, host_kv as host_kv_v03, host_log as host_log_v03,
-        host_ratelimit as host_ratelimit_v03,
+        host_clock as host_clock_v04, host_config as host_config_v04,
+        host_counter as host_counter_v04, host_kv as host_kv_v04, host_log as host_log_v04,
+        host_ratelimit as host_ratelimit_v04,
     };
     use crate::state::HostState;
 
@@ -627,40 +878,40 @@ mod v02_host {
 
     impl host_log::Host for HostState {
         fn log(&mut self, level: host_log::Level, message: String) {
-            host_log_v03::Host::log(self, log_level(level), message);
+            host_log_v04::Host::log(self, log_level(level), message);
         }
     }
 
     impl host_clock::Host for HostState {
         fn now_ms(&mut self) -> u64 {
-            host_clock_v03::Host::now_ms(self)
+            host_clock_v04::Host::now_ms(self)
         }
     }
 
     impl host_kv::Host for HostState {
         fn get(&mut self, key: String) -> Option<Vec<u8>> {
-            host_kv_v03::Host::get(self, key)
+            host_kv_v04::Host::get(self, key)
         }
         fn set(&mut self, key: String, value: Vec<u8>) {
-            host_kv_v03::Host::set(self, key, value);
+            host_kv_v04::Host::set(self, key, value);
         }
         fn delete(&mut self, key: String) {
-            host_kv_v03::Host::delete(self, key);
+            host_kv_v04::Host::delete(self, key);
         }
     }
 
     impl host_counter::Host for HostState {
         fn increment(&mut self, key: String, delta: i64) -> i64 {
-            host_counter_v03::Host::increment(self, key, delta)
+            host_counter_v04::Host::increment(self, key, delta)
         }
         fn get(&mut self, key: String) -> i64 {
-            host_counter_v03::Host::get(self, key)
+            host_counter_v04::Host::get(self, key)
         }
     }
 
     impl host_ratelimit::Host for HostState {
         fn try_acquire(&mut self, key: String, cost: u64) -> host_ratelimit::Acquire {
-            let out = host_ratelimit_v03::Host::try_acquire(self, key, cost);
+            let out = host_ratelimit_v04::Host::try_acquire(self, key, cost);
             host_ratelimit::Acquire {
                 allowed: out.allowed,
                 remaining: out.remaining,
@@ -671,7 +922,7 @@ mod v02_host {
 
     impl host_config::Host for HostState {
         fn get(&mut self, key: String) -> Option<String> {
-            host_config_v03::Host::get(self, key)
+            host_config_v04::Host::get(self, key)
         }
     }
 }
@@ -998,13 +1249,17 @@ mod tests {
         match request_body_decision_from_v02(types_v02::RequestBodyDecision::Continue(
             b"REWRITTEN".to_vec(),
         )) {
-            Some(RequestBodyDecision::Modified(edit)) => assert_eq!(edit.body, b"REWRITTEN".to_vec()),
+            Some(RequestBodyDecision::Modified(edit)) => {
+                assert_eq!(edit.body, b"REWRITTEN".to_vec())
+            }
             other => panic!("a 0.2 continue(bytes) must become modified, got {other:?}"),
         }
         match request_body_decision_from_v01(types_v01::RequestBodyDecision::Continue(
             b"REWRITTEN".to_vec(),
         )) {
-            Some(RequestBodyDecision::Modified(edit)) => assert_eq!(edit.body, b"REWRITTEN".to_vec()),
+            Some(RequestBodyDecision::Modified(edit)) => {
+                assert_eq!(edit.body, b"REWRITTEN".to_vec())
+            }
             other => panic!("a 0.1 continue(bytes) must become modified, got {other:?}"),
         }
     }

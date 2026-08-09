@@ -29,7 +29,7 @@
 #![allow(clippy::too_many_arguments)]
 
 wit_bindgen::generate!({
-    path: "../../../wit",
+    path: "../../../wit/v0.3.0",
     world: "filter",
 });
 

@@ -211,7 +211,7 @@ async fn send(
     client: &Client<HttpConnector, Full<Bytes>>,
     proxy: SocketAddr,
     method: &str,
-    path_with_query: &str,
+    path: &str,
     body: &'static [u8],
 ) -> (StatusCode, hyper::HeaderMap, String) {
     let req = Request::builder()
@@ -288,7 +288,9 @@ async fn a_040_guests_body_edit_reaches_the_upstream_with_its_headers() {
         "the upstream received the body the 0.4.0 guest returned in its edit"
     );
     assert_eq!(
-        headers.get("x-saw-body-edited").and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-saw-body-edited")
+            .and_then(|v| v.to_str().ok()),
         Some("1"),
         "the edit's set-headers reached the upstream"
     );

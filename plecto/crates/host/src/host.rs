@@ -9,8 +9,8 @@ use wasmtime::Engine;
 use wasmtime::component::{Component, HasSelf, Linker};
 
 use crate::contract::{
-    ContractVersion, FilterPreV01, FilterPreV02, FilterPreV03, FilterV01, FilterV02, FilterV03,
-    detect_contract_version,
+    ContractVersion, FilterPreV01, FilterPreV02, FilterPreV03, FilterPreV04, FilterV01, FilterV02,
+    FilterV03, FilterV04, detect_contract_version,
 };
 use crate::engine::{Allocation, EpochTicker, TRUSTED_POOL_MAX, build_engine};
 use crate::errors::LoadError;
@@ -200,12 +200,14 @@ impl Host {
                 if !V02_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::warn!(
                         filter = %filter_id,
-                        "plecto:filter@0.2.0 is deprecated; rebuild filters for 0.3.0 \
-                         (response request-context + replace decision)"
+                        "plecto:filter@0.2.0 is deprecated; rebuild filters for the current \
+                         contract (byte-valued headers + response request-context/replace)"
                     );
                 }
             }
-            ContractVersion::V03 => {}
+            // No 0.3 nudge: a deprecation notice is earned by a RELEASED successor, and 0.4.0 is
+            // still being assembled (ADR 000098's `on-response-body` is not in it yet).
+            ContractVersion::V03 | ContractVersion::V04 => {}
         }
         let mut linker = Linker::<HostState>::new(engine);
         // deny-by-default: lend ONLY the plecto host-API (every basic capability in one call),
@@ -213,6 +215,12 @@ impl Host {
         // distinct semver tracks and never cross-resolve. No WASI is added — unless this filter
         // has an outbound policy (below).
         match version {
+            ContractVersion::V04 => {
+                FilterV04::add_to_linker::<_, HasSelf<HostState>>(
+                    &mut linker,
+                    |s: &mut HostState| s,
+                )?;
+            }
             ContractVersion::V03 => {
                 FilterV03::add_to_linker::<_, HasSelf<HostState>>(
                     &mut linker,
@@ -328,6 +336,9 @@ impl Host {
         }
 
         let pre = match version {
+            ContractVersion::V04 => {
+                FilterPreBinding::V04(FilterPreV04::new(linker.instantiate_pre(&component)?)?)
+            }
             ContractVersion::V03 => {
                 FilterPreBinding::V03(FilterPreV03::new(linker.instantiate_pre(&component)?)?)
             }

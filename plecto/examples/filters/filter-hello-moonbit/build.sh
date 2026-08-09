@@ -7,7 +7,7 @@
 # regenerated here: gen/world/filter-body/ carries the hand-written filter.mbt and a
 # moon.pkg.json whose host-API imports wit-bindgen would reset. Regenerate only when
 # the WIT changes, then re-add those imports:
-#   wit-bindgen moonbit ../../../wit --world filter-body --out-dir .
+#   wit-bindgen moonbit ../../../wit/v0.3.0 --world filter-body --out-dir .
 #
 # MoonBit strings are UTF-16, so `component embed` must declare --encoding utf16 —
 # without it every string crossing the boundary is lifted as (wrong) UTF-8.
@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 moon build --target wasm --release
 mkdir -p dist
 core=_build/wasm/release/build/gen/gen.wasm
-wasm-tools component embed ../../../wit --world filter-body --encoding utf16 "$core" -o dist/.embedded.wasm
+wasm-tools component embed ../../../wit/v0.3.0 --world filter-body --encoding utf16 "$core" -o dist/.embedded.wasm
 wasm-tools component new dist/.embedded.wasm -o dist/filter_hello_moonbit.wasm
 rm dist/.embedded.wasm
 

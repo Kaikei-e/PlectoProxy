@@ -144,7 +144,7 @@ async fn request(
     client: &Client<HttpConnector, Empty<Bytes>>,
     proxy: SocketAddr,
     method: &str,
-    path_with_query: &str,
+    path: &str,
     headers: &[(&str, &str)],
 ) -> (hyper::http::response::Parts, Bytes) {
     let mut builder = Request::builder()

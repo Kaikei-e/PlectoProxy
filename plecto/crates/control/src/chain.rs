@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use plecto_host::{
-    Header, HttpRequest, HttpResponse, LoadedFilter, RequestBodyDecision, RequestDecision,
-    RequestEdit, RequestTrace, ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, LoadedFilter, RequestBodyDecision, RequestBodyEdit,
+    RequestDecision, RequestEdit, RequestTrace, ResponseDecision, ResponseEdit,
 };
 
 /// The result of driving a request through the chain.
@@ -24,8 +24,10 @@ pub enum RequestBodyOutcome {
     /// Respond now without reaching upstream: a body filter short-circuited, or the chain failed
     /// closed on a trap / deadline.
     Respond(HttpResponse),
-    /// The chain passed: forward this (possibly transformed) body upstream.
-    Forward(Vec<u8>),
+    /// The chain passed: forward this (possibly transformed) body upstream, with the request
+    /// headers as the body hooks left them (a `modified` decision carries header edits alongside
+    /// the new bytes, ADR 000098).
+    Forward { body: Vec<u8>, headers: Vec<Header> },
 }
 
 /// The result of driving a response back through the chain (ADR 000073): the typed successor
@@ -61,17 +63,21 @@ pub(crate) fn dispatch_request(
 }
 
 /// Drive a buffered request body through the chain's `on-request-body` hooks in order (ADR 000025),
-/// threading the possibly-transformed body from one filter to the next. A short-circuit (or a
-/// fail-closed trap / deadline) stops the chain before upstream. The host already buffered the body;
-/// this only sequences the decisions.
+/// threading the possibly-transformed body — and the header edits that came with it — from one
+/// filter to the next. A short-circuit (or a fail-closed trap / deadline) stops the chain before
+/// upstream. The host already buffered the body; this only sequences the decisions.
 pub(crate) fn dispatch_request_body(
     chain: &[Arc<LoadedFilter>],
     mut body: Vec<u8>,
+    mut headers: Vec<Header>,
     trace: &RequestTrace,
 ) -> RequestBodyOutcome {
     for filter in chain {
         match filter.on_request_body(&body, trace) {
-            Ok((RequestBodyDecision::Continue(next), _logs)) => body = next,
+            Ok((RequestBodyDecision::Continue, _logs)) => {}
+            Ok((RequestBodyDecision::Modified(edit), _logs)) => {
+                body = apply_request_body_edit(&mut headers, edit)
+            }
             Ok((RequestBodyDecision::ShortCircuit(response), _logs)) => {
                 return RequestBodyOutcome::Respond(response);
             }
@@ -79,7 +85,7 @@ pub(crate) fn dispatch_request_body(
             Err(err) => return RequestBodyOutcome::Respond(err.fail_closed_response()),
         }
     }
-    RequestBodyOutcome::Forward(body)
+    RequestBodyOutcome::Forward { body, headers }
 }
 
 pub(crate) fn dispatch_response(
@@ -114,6 +120,15 @@ pub(crate) fn dispatch_response(
 fn apply_request_edit(request: &mut HttpRequest, edit: RequestEdit) {
     remove_headers(&mut request.headers, &edit.remove_headers);
     set_headers(&mut request.headers, edit.set_headers);
+}
+
+/// Apply a body rewrite (ADR 000098): take the filter's bytes, and apply the header edits that
+/// came with them on the same set/remove rules as a request-side edit. `Content-Length` is not
+/// the filter's to set — the fast path re-derives framing from the body actually forwarded.
+fn apply_request_body_edit(headers: &mut Vec<Header>, edit: RequestBodyEdit) -> Vec<u8> {
+    remove_headers(headers, &edit.remove_headers);
+    set_headers(headers, edit.set_headers);
+    edit.body
 }
 
 fn apply_response_edit(response: &mut HttpResponse, edit: ResponseEdit) {
@@ -224,7 +239,9 @@ mod tests {
         assert_eq!(ct.len(), 1, "set replaces, not duplicates");
         assert_eq!(ct[0].value.as_slice(), b"application/json");
         assert!(
-            !headers.iter().any(|x| x.name.eq_ignore_ascii_case("x-drop")),
+            !headers
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case("x-drop")),
             "removed header gone"
         );
     }

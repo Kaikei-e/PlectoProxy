@@ -1,7 +1,7 @@
 //! The seam between pool/lifecycle-dispatch decision logic and actual wasmtime instance
 //! mechanics: [`FilterRuntime`] (the trait tests fake) and [`WasmtimeRuntime`] (its production
 //! implementation), which dispatches guest calls through versioned `plecto:filter` bindings
-//! (0.1 / 0.2 adapters + 0.3 native, ADR 000071 / 000073).
+//! (0.1 / 0.2 / 0.3 adapters + 0.4 native, ADR 000071 / 000073 / 000098).
 
 use std::sync::Arc;
 
@@ -10,11 +10,13 @@ use wasmtime::component::ComponentExportIndex;
 use wasmtime::{Engine, Store};
 
 use crate::contract::{
-    self, FilterPreV01, FilterPreV02, FilterPreV03, FilterV01, FilterV02, FilterV03,
-    request_body_decision_from_v01, request_body_decision_from_v02, request_body_decision_from_v03,
-    request_decision_from_v01, request_decision_from_v02, request_decision_from_v03,
-    request_to_v01, request_to_v02, response_decision_from_v01, response_decision_from_v02,
-    response_decision_from_v03, response_to_v01, response_to_v02,
+    self, FilterPreV01, FilterPreV02, FilterPreV03, FilterPreV04, FilterV01, FilterV02, FilterV03,
+    FilterV04, request_body_decision_from_v01, request_body_decision_from_v02,
+    request_body_decision_from_v03, request_body_decision_from_v04, request_decision_from_v01,
+    request_decision_from_v02, request_decision_from_v03, request_decision_from_v04,
+    request_to_v01, request_to_v02, request_to_v03, response_decision_from_v01,
+    response_decision_from_v02, response_decision_from_v03, response_decision_from_v04,
+    response_to_v01, response_to_v02, response_to_v03,
 };
 use crate::errors::InvalidGuestOutput;
 #[cfg(feature = "outbound-http")]
@@ -56,12 +58,13 @@ pub(crate) trait FilterRuntime: Send + Sync {
 }
 
 /// The instantiation-ready binding for whichever contract version the component targets
-/// (ADR 000071 / 000073). The variant IS the version — dispatch matches on it (and on the
-/// [`BoundFilter`] it produces), so no separate version field can disagree with it.
+/// (ADR 000071 / 000073 / 000098). The variant IS the version — dispatch matches on it (and on
+/// the [`BoundFilter`] it produces), so no separate version field can disagree with it.
 pub(crate) enum FilterPreBinding {
     V01(FilterPreV01<HostState>),
     V02(FilterPreV02<HostState>),
     V03(FilterPreV03<HostState>),
+    V04(FilterPreV04<HostState>),
 }
 
 /// The production `FilterRuntime`: everything needed to instantiate and drive a real wasmtime
@@ -109,6 +112,7 @@ impl WasmtimeRuntime {
             FilterPreBinding::V01(_) => crate::ContractVersion::V01,
             FilterPreBinding::V02(_) => crate::ContractVersion::V02,
             FilterPreBinding::V03(_) => crate::ContractVersion::V03,
+            FilterPreBinding::V04(_) => crate::ContractVersion::V04,
         }
     }
 
@@ -151,9 +155,10 @@ impl WasmtimeRuntime {
     }
 
     /// Run `on-request` through the instance's bound contract version. A 0.1 guest sees the
-    /// lossy-UTF-8 projection of the byte-valued canonical request (ADR 000071); a 0.2 guest a
-    /// shape-identical clone; each decision is mapped back through the validating adapter. A
-    /// `None` from the adapter means the guest's output failed header validation — surfaced as
+    /// lossy-UTF-8 projection of the byte-valued canonical request (ADR 000071); a 0.2 / 0.3
+    /// guest a shape-identical clone whose `path` field carries the canonical `path_with_query`
+    /// (ADR 000104); each decision is mapped back through the validating adapter. A `None` from
+    /// the adapter means the guest's output failed header validation — surfaced as
     /// [`InvalidGuestOutput`], fail-closed.
     pub(crate) fn call_on_request(
         &self,
@@ -161,8 +166,13 @@ impl WasmtimeRuntime {
         req: &HttpRequest,
     ) -> wasmtime::Result<RequestDecision> {
         match &mut inst.filter {
-            BoundFilter::V03(filter) => {
+            BoundFilter::V04(filter) => {
                 let raw = self.drive_call(filter.call_on_request(&mut inst.store, req))?;
+                request_decision_from_v04(raw).ok_or_else(invalid_guest_header_error)
+            }
+            BoundFilter::V03(filter) => {
+                let guest_req = request_to_v03(req);
+                let raw = self.drive_call(filter.call_on_request(&mut inst.store, &guest_req))?;
                 request_decision_from_v03(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V02(filter) => {
@@ -180,7 +190,7 @@ impl WasmtimeRuntime {
 
     /// Run `on-response` — same versioned dispatch and validation as
     /// [`call_on_request`](Self::call_on_request). `req` is the as-forwarded request snapshot
-    /// (ADR 000073): a 0.3 guest receives it as the first parameter; the 0.1 / 0.2 adapters
+    /// (ADR 000073): a 0.3 / 0.4 guest receives it as the first parameter; the 0.1 / 0.2 adapters
     /// simply drop it (their `on-response` has no request-context parameter).
     pub(crate) fn call_on_response(
         &self,
@@ -189,8 +199,18 @@ impl WasmtimeRuntime {
         resp: &HttpResponse,
     ) -> wasmtime::Result<ResponseDecision> {
         match &mut inst.filter {
-            BoundFilter::V03(filter) => {
+            BoundFilter::V04(filter) => {
                 let raw = self.drive_call(filter.call_on_response(&mut inst.store, req, resp))?;
+                response_decision_from_v04(raw).ok_or_else(invalid_guest_header_error)
+            }
+            BoundFilter::V03(filter) => {
+                let guest_req = request_to_v03(req);
+                let guest_resp = response_to_v03(resp);
+                let raw = self.drive_call(filter.call_on_response(
+                    &mut inst.store,
+                    &guest_req,
+                    &guest_resp,
+                ))?;
                 response_decision_from_v03(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V02(filter) => {
@@ -226,6 +246,12 @@ impl WasmtimeRuntime {
             ));
         };
         match &inst.filter {
+            BoundFilter::V04(_) => {
+                use contract::types_v04::RequestBodyDecision as Raw;
+                let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
+                let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
+                request_body_decision_from_v04(decision).ok_or_else(invalid_guest_header_error)
+            }
             BoundFilter::V03(_) => {
                 use contract::types_v03::RequestBodyDecision as Raw;
                 let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
@@ -296,6 +322,12 @@ impl FilterRuntime for WasmtimeRuntime {
         // survives for the optional body-hook lookup; the typed `Filter` binding still drives the
         // required init / on-request / on-response, at whichever contract version `pre` targets.
         let (filter, instance) = match &self.pre {
+            FilterPreBinding::V04(pre) => {
+                let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
+                let filter = FilterV04::new(&mut store, &instance)?;
+                self.drive_call(filter.call_init(&mut store))?;
+                (BoundFilter::V04(filter), instance)
+            }
             FilterPreBinding::V03(pre) => {
                 let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
                 let filter = FilterV03::new(&mut store, &instance)?;
@@ -325,6 +357,11 @@ impl FilterRuntime for WasmtimeRuntime {
                     anyhow::anyhow!("on-request-body export index did not resolve to a function")
                 })?;
                 match &filter {
+                    BoundFilter::V04(_) => {
+                        func.typed::<(&[u8],), (contract::types_v04::RequestBodyDecision,)>(
+                            &store,
+                        )?;
+                    }
                     BoundFilter::V03(_) => {
                         func.typed::<(&[u8],), (contract::types_v03::RequestBodyDecision,)>(
                             &store,
@@ -376,6 +413,7 @@ pub(crate) enum BoundFilter {
     V01(FilterV01),
     V02(FilterV02),
     V03(FilterV03),
+    V04(FilterV04),
 }
 
 /// A live, initialized filter instance (its `Store` plus the bound component instance).

@@ -150,9 +150,9 @@ async fn proxy_core_inner(
     // use the SAME normalized path, so the upstream cannot re-derive a stricter path than the
     // (possibly laxer, unfiltered) route we selected — closing the per-route-filter bypass. An
     // ambiguous (encoded-separator) or root-escaping path is rejected fail-closed.
-    match plecto_control::normalize_path(&http_req.path) {
+    match plecto_control::normalize_path(&http_req.path_with_query) {
         // Borrowed = already normalized (the common case); only a rewritten path is stored back.
-        Some(std::borrow::Cow::Owned(path)) => http_req.path = path,
+        Some(std::borrow::Cow::Owned(path)) => http_req.path_with_query = path,
         Some(std::borrow::Cow::Borrowed(_)) => {}
         None => {
             return Ok(with_error_code(
@@ -215,7 +215,7 @@ async fn proxy_core_inner(
         // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
         // A route with no filters skips the hop entirely — an empty chain is the identity, and the
         // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax.
-        let forward = if route.has_filters {
+        let mut forward = if route.has_filters {
             let snap_req = snapshot.clone();
             match tokio::task::spawn_blocking(move || snap_req.dispatch_request(idx, http_req))
                 .await?
@@ -259,7 +259,7 @@ async fn proxy_core_inner(
 
         // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a
         // retryable failure (ADR 000019 timeout / 000023 retry). Per-attempt invariants once. ---
-        let upstream_path = route.rewrite_path(&forward.path);
+        let upstream_path = route.rewrite_path(&forward.path_with_query).into_owned();
         // Both bounds are the ROUTE's (ADR 000102): its `[route.timeouts]` override when it
         // declares one, else the default declared by the upstream this request is going to. Routes
         // with different latency budgets can therefore share one upstream.
@@ -282,11 +282,18 @@ async fn proxy_core_inner(
         // dropped inside the hook would bound concurrent *reads* while resident buffered-body
         // memory grew past `MAX_INFLIGHT_BODY_BUFFERS × MAX_REQUEST_BODY_BUFFER` under slow
         // upstreams. Bound at transaction scope so it drops with the transaction.
-        let _buf_permit =
-            match request_body_hook(&state, &chain, route.reads_body, &mut real_body).await? {
-                BodyHookOutcome::Proceed(permit) => permit,
-                BodyHookOutcome::Respond(resp) => return Ok(Routed::Synthesised(resp)),
-            };
+        let _buf_permit = match request_body_hook(
+            &state,
+            &chain,
+            route.reads_body,
+            &mut real_body,
+            &mut forward.headers,
+        )
+        .await?
+        {
+            BodyHookOutcome::Proceed(permit) => permit,
+            BodyHookOutcome::Respond(resp) => return Ok(Routed::Synthesised(resp)),
+        };
 
         // Circuit breaker (ADR 000028): take an in-flight slot under this upstream's
         // `max_requests` cap before forwarding. At the cap, shed load with a fast-fail 503 rather
@@ -495,6 +502,7 @@ async fn request_body_hook(
     chain: &ChainRef<'_>,
     reads_body: bool,
     real_body: &mut ForwardBody,
+    headers: &mut Vec<plecto_control::Header>,
 ) -> Result<BodyHookOutcome, ServerError> {
     if !reads_body {
         return Ok(BodyHookOutcome::Proceed(None));
@@ -550,14 +558,24 @@ async fn request_body_hook(
     };
     let snap_body = chain.snapshot.clone();
     let idx = chain.idx;
-    match tokio::task::spawn_blocking(move || snap_body.dispatch_request_body(idx, buffered))
-        .await?
+    // The chain runs on the blocking pool, so the headers travel there and back by value — a
+    // body hook's `modified` decision can edit them (ADR 000098), and the edit has to land on the
+    // request this transaction is about to forward.
+    let chain_headers = std::mem::take(headers);
+    match tokio::task::spawn_blocking(move || {
+        snap_body.dispatch_request_body(idx, buffered, chain_headers)
+    })
+    .await?
     {
         RequestBodyOutcome::Respond(resp) => Ok(BodyHookOutcome::Respond(http_response(resp))),
         // The buffered, filter-edited bytes are replayable by definition (ADR 000058):
         // `Vec<u8>` → `Bytes` is a move, and each retry attempt shares it by reference count.
-        RequestBodyOutcome::Forward(edited) => {
+        RequestBodyOutcome::Forward {
+            body: edited,
+            headers: edited_headers,
+        } => {
             *real_body = ForwardBody::Replayable(bytes::Bytes::from(edited));
+            *headers = edited_headers;
             Ok(BodyHookOutcome::Proceed(Some(permit)))
         }
     }

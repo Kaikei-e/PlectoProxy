@@ -26,10 +26,10 @@ impl Guest for FilterNoop {
         RequestDecision::Continue
     }
 
-    fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
+    fn on_request_body(_body: Vec<u8>) -> RequestBodyDecision {
         // Pass the body through untouched (only invoked for a route with a body; the no-op ladder
         // scenario drives bodyless GETs, so this stays off the measured path).
-        RequestBodyDecision::Continue(body)
+        RequestBodyDecision::Continue
     }
 
     fn on_response(_req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {

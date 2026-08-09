@@ -97,7 +97,8 @@ impl LoadedFilter {
         let elapsed = Instant::now();
         let result = self.run_on_request_body(body);
         let outcome = match &result {
-            Ok((RequestBodyDecision::Continue(_), _)) => SpanOutcome::Continue,
+            Ok((RequestBodyDecision::Continue, _)) => SpanOutcome::Continue,
+            Ok((RequestBodyDecision::Modified(_), _)) => SpanOutcome::Modified,
             Ok((RequestBodyDecision::ShortCircuit(_), _)) => SpanOutcome::ShortCircuit,
             Err((err, _)) => SpanOutcome::from(err),
         };
@@ -117,7 +118,7 @@ impl LoadedFilter {
         // The fast path already skips buffering (`reads_body()` is false); this is the defensive
         // floor — pass the body through unchanged without instantiating anything.
         if self.inner.runtime.body_export.is_none() {
-            return Ok((RequestBodyDecision::Continue(body.to_vec()), Vec::new()));
+            return Ok((RequestBodyDecision::Continue, Vec::new()));
         }
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner.runtime.call_body_hook(inst, body)

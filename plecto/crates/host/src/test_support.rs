@@ -85,6 +85,13 @@ pub fn filter_cors_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_CORS_COMPONENT")).expect("read filter-cors component")
 }
 
+/// The compiled `filter-compat-v01` component bytes — the fixture pinned to the FROZEN
+/// `plecto:filter@0.1.0` contract, the oldest track the host still accepts (ADR 000064). Built
+/// by this crate's `build.rs`.
+pub fn filter_compat_v01_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_COMPAT_V01_COMPONENT")).expect("read filter-compat-v01 component")
+}
+
 /// The compiled `filter-compat-v02` component bytes — the fixture pinned to the FROZEN
 /// `plecto:filter@0.2.0` contract, keeping the V02 adapter rail covered now that the in-tree
 /// default is 0.3.0 (ADR 000073). Built by this crate's `build.rs`.

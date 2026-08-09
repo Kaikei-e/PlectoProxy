@@ -38,6 +38,13 @@ the package settings (same quirk as the WIT packages, ADR 000064).
 | `filters/apikey` | `filter-apikey` | 0.1.4 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
 | `filters/extauthz` | `filter-extauthz` | 0.1.4 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps | **capabilities** | `outbound-http` allowlist naming the authorization endpoint |
 
+Every shelf entry is still built against `plecto:filter@0.3.0` while the host's current contract
+is `plecto:filter@0.4.0`, and that is deliberate rather than a backlog item: the shelf IS the
+evidence for the compat promise (ADR 000064). The host keeps a load-time adapter per frozen
+track, and `crates/host/tests/compat_v0*.rs` runs these guests through it on every CI run, so
+"an older filter keeps working after a proxy upgrade" is a test result rather than a claim. A
+shelf entry moves to 0.4.0 when it needs something 0.4.0 adds, not on the version bump itself.
+
 CI asserts the import floor for every PR (`scripts/build-reference-filters.sh`): zero-WASI
 entries must not import `wasi:http`; capabilities entries must. `wkg` embeds those imports into
 the OCI wasm config on push (CNCF Wasm OCI Artifact layout).

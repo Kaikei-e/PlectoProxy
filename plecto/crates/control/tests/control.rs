@@ -118,7 +118,7 @@ fn signed(component: Vec<u8>, signer: &TestSigner) -> ResolvedArtifact {
 /// A GET request at `path` (route matching reads the path prefix; headers are irrelevant here).
 fn req_path(path: &str) -> HttpRequest {
     let mut r = req(&[]);
-    r.path = path.to_string();
+    r.path_with_query = path.to_string();
     r
 }
 

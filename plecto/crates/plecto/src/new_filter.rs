@@ -237,12 +237,16 @@ mod tests {
             std::fs::read_to_string(dir.path().join("my-filter/wit/world.wit")).unwrap();
         assert_eq!(scaffolded, FILTER_WIT);
         assert!(
-            scaffolded.contains("package plecto:filter@0.3.0;"),
+            scaffolded.contains("package plecto:filter@0.4.0;"),
             "got: {scaffolded}"
         );
         assert!(scaffolded.contains("value: list<u8>"), "got: {scaffolded}");
         assert!(
             scaffolded.contains("replace(http-response)"),
+            "got: {scaffolded}"
+        );
+        assert!(
+            scaffolded.contains("path-with-query: string"),
             "got: {scaffolded}"
         );
     }

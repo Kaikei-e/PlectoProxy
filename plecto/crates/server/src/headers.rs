@@ -199,7 +199,7 @@ pub(crate) fn to_http_request(parts: &hyper::http::request::Parts, scheme: &str)
         .unwrap_or_else(|| "/".to_string());
     HttpRequest {
         method: parts.method.as_str().to_string(),
-        path,
+        path_with_query: path,
         authority: request_authority(parts),
         scheme: scheme.to_string(),
         headers: headers_to_vec(&parts.headers),

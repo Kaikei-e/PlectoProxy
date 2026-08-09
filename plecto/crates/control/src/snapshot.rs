@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use plecto_host::{HttpRequest, HttpResponse, RequestTrace};
+use plecto_host::{Header, HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
 use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseOutcome};
@@ -50,7 +50,7 @@ impl ConfigSnapshot {
     pub fn find_route(&self, request: &HttpRequest) -> Option<RouteInfo> {
         let parts = route::RequestParts {
             authority: &request.authority,
-            path: &request.path,
+            path: &request.path_with_query,
             method: &request.method,
             headers: &request.headers,
         };
@@ -83,12 +83,19 @@ impl ConfigSnapshot {
     }
 
     /// Drive a buffered request body through a matched route's `on-request-body` chain (ADR 000025).
-    /// Same `route` index as the request side, on the same snapshot. The server calls this only for a
-    /// route with filters and a non-empty body; a stale index forwards the body unchanged.
-    pub fn dispatch_request_body(&self, route: usize, body: Vec<u8>) -> RequestBodyOutcome {
+    /// Same `route` index as the request side, on the same snapshot. `headers` is the request as the
+    /// header chain left it — a body hook's `modified` decision can edit it further (ADR 000098), so
+    /// it goes in and comes back out. The server calls this only for a route with filters and a
+    /// non-empty body; a stale index forwards both unchanged.
+    pub fn dispatch_request_body(
+        &self,
+        route: usize,
+        body: Vec<u8>,
+        headers: Vec<Header>,
+    ) -> RequestBodyOutcome {
         match self.config.routes.get(route) {
-            Some(r) => chain::dispatch_request_body(&r.resolved_chain, body, &self.trace),
-            None => RequestBodyOutcome::Forward(body),
+            Some(r) => chain::dispatch_request_body(&r.resolved_chain, body, headers, &self.trace),
+            None => RequestBodyOutcome::Forward { body, headers },
         }
     }
 

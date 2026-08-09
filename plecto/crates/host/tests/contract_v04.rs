@@ -4,6 +4,7 @@
 //!   - `http-request.path-with-query` — the query reaches the guest under the renamed field;
 //!   - the BARE `%continue` body arm — "forward what you buffered", with no bytes handed back;
 //!   - `modified(request-body-edit)` — a new body PLUS the header edits a transform forces.
+//!
 //! The frozen 0.1 / 0.2 / 0.3 rails are covered by `compat_v02.rs` / `compat_v03.rs`; together
 //! they are the four-version load-and-dispatch matrix ADR 000064's compat promise rests on.
 

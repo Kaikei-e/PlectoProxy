@@ -72,6 +72,15 @@ fn main() {
             "filter_cors",
             "FILTER_CORS_COMPONENT",
         );
+        // filter-compat-v01 is pinned to the FROZEN 0.1.0 contract (wit/v0.1.0/) — the oldest
+        // track the host still accepts. Test-only, so it lives under crates/host/fixtures/.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-compat-v01"),
+            &out_dir,
+            "filter_compat_v01",
+            "FILTER_COMPAT_V01_COMPONENT",
+        );
         // filter-compat-v02 is pinned to the FROZEN 0.2.0 contract (wit/v0.2.0/) — the V02
         // adapter rail's living fixture (ADR 000073). Test-only, so it lives under
         // crates/host/fixtures/, not examples/.

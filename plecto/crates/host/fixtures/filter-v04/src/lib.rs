@@ -9,7 +9,12 @@
 //!   - a body starting with `rewrite` returns `modified(request-body-edit)`: the transformed
 //!     body PLUS the header edits a body transform usually forces (`x-plecto-body-edited` set,
 //!     `x-drop-me` removed);
-//!   - a body carrying the `deny-body` marker short-circuits 403 before upstream.
+//!   - a body carrying the `deny-body` marker short-circuits 403 before upstream;
+//!   - `on-response-body` reads the buffered UPSTREAM body and answers on all three arms — bare
+//!     `%continue`, `modified(response-body-edit)` redacting a marker, and `replace` discarding
+//!     the buffered bytes for a synthesised response.
+//! Exporting BOTH body hooks makes this the ceiling of the acceptance lattice; `filter-respbody`
+//! is the fixture for a subset neither published world names (ADR 000098 decision 2).
 //! `init` logs once so the component keeps at least one `plecto:filter/…@0.4.0` import after
 //! componentization prunes unused ones (version detection keys on the import names, ADR 000071).
 
@@ -23,7 +28,7 @@ wit_bindgen::generate!({
 });
 
 use crate::plecto::filter::host_log;
-use crate::plecto::filter::types::{Header, RequestBodyEdit};
+use crate::plecto::filter::types::{Header, RequestBodyEdit, ResponseBodyEdit};
 
 struct FilterV04;
 
@@ -72,6 +77,45 @@ impl Guest for FilterV04 {
 
     fn on_response(_req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {
         ResponseDecision::Continue
+    }
+
+    fn on_response_body(
+        req: HttpRequest,
+        _resp: HttpResponse,
+        body: Vec<u8>,
+    ) -> ResponseBodyDecision {
+        if req.path_with_query.contains("respbody=replace") {
+            return ResponseBodyDecision::Replace(HttpResponse {
+                status: 418,
+                headers: vec![Header {
+                    name: "x-plecto-v04".to_string(),
+                    value: b"body-replaced".to_vec(),
+                }],
+                body: b"replaced by filter-v04".to_vec(),
+            });
+        }
+        if body.windows(6).any(|w| w == b"SECRET") {
+            let mut redacted = Vec::with_capacity(body.len());
+            let mut i = 0;
+            while i < body.len() {
+                if body[i..].starts_with(b"SECRET") {
+                    redacted.extend_from_slice(b"[redacted]");
+                    i += 6;
+                } else {
+                    redacted.push(body[i]);
+                    i += 1;
+                }
+            }
+            return ResponseBodyDecision::Modified(ResponseBodyEdit {
+                body: redacted,
+                set_headers: vec![Header {
+                    name: "x-plecto-redacted".to_string(),
+                    value: b"1".to_vec(),
+                }],
+                remove_headers: vec!["x-drop-me".to_string()],
+            });
+        }
+        ResponseBodyDecision::Continue
     }
 }
 

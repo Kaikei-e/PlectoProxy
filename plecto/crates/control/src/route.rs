@@ -12,10 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use plecto_host::{Header, LoadedFilter};
+use plecto_host::{BodyHooks, Header, LoadedFilter};
 
 use crate::error::ControlError;
-use crate::manifest::{CompressionAlgorithm, Route, RouteCompression, RouteHeaders, RouteTimeouts};
+use crate::manifest::{
+    CompressionAlgorithm, MAX_RESPONSE_BODY_CAP, OverCapMode, Route, RouteCompression,
+    RouteHeaders, RouteResponseBody, RouteTimeouts, UninspectableMode,
+};
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 use crate::weighted::{self, WeightedBackends};
@@ -48,10 +51,11 @@ pub(crate) struct CompiledRoute {
     /// `dispatch_request_body` / `dispatch_response` run this directly instead of doing a
     /// `HashMap::get` per filter id on every single request.
     pub(crate) resolved_chain: Vec<Arc<LoadedFilter>>,
-    /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
-    /// 000038). Precomputed at build from the loaded filters so per-request buffering is a single
-    /// bool check. `false` (all filters header-only) keeps the body on the zero-copy stream path.
-    pub(crate) reads_body: bool,
+    /// Which body directions any filter on this route reads (the OR-fold of the chain's
+    /// [`BodyHooks`], ADR 000038 / 000098). Precomputed at build from the loaded filters so
+    /// per-request buffering is a single bool check per direction. A direction no filter exports
+    /// keeps its body on the zero-copy stream path.
+    pub(crate) body_hooks: BodyHooks,
     /// The route's forwarding target: a weighted set of upstream groups (a single `upstream` is a
     /// one-element set). The fast path picks a group via [`WeightedBackends::pick`], then the group
     /// picks a healthy instance. `Arc`-shared so the split cursor persists across a config generation.
@@ -78,6 +82,9 @@ pub(crate) struct CompiledRoute {
     /// bumping a refcount, and the resolution against the chosen upstream's defaults is then a
     /// pair of `Option::unwrap_or`.
     pub(crate) timeouts: TimeoutConfig,
+    /// This route's compiled `[route.response_body]` settings (ADR 000098), or the strict defaults
+    /// when the block is absent. Only consulted when `body_hooks.response` is set.
+    pub(crate) response_body: Arc<ResponseBodyConfig>,
 }
 
 impl CompiledRoute {
@@ -111,13 +118,16 @@ impl CompiledRoute {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            // The route buffers the body iff at least one of its filters exports
-            // `on-request-body` (ADR 000038). Computed from the loaded filters here so the fast
-            // path only checks a bool.
-            reads_body: r
+            // The route buffers a direction iff at least one of its filters exports that
+            // direction's hook (ADR 000038 / 000098). Computed from the loaded filters here so
+            // the fast path only checks a bool per direction.
+            body_hooks: r
                 .filters
                 .iter()
-                .any(|id| filters.get(id).is_some_and(|f| f.reads_body())),
+                .fold(BodyHooks::NONE, |acc, id| match filters.get(id) {
+                    Some(f) => acc.union(f.body_hooks()),
+                    None => acc,
+                }),
             // present: `validate_routes` already checked every id against the loaded set, so
             // this is always `Some` — `filter_map` stays total (no indexing/unwrap panic)
             // rather than asserting an invariant that's already enforced one step earlier.
@@ -154,6 +164,13 @@ impl CompiledRoute {
                 .as_ref()
                 .map(TimeoutConfig::new)
                 .unwrap_or_default(),
+            // Compile the response-body settings (ADR 000098); absent = the strict defaults.
+            response_body: Arc::new(
+                r.response_body
+                    .as_ref()
+                    .map(ResponseBodyConfig::new)
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -171,7 +188,7 @@ impl std::fmt::Debug for CompiledRoute {
             .field("query", &self.query)
             .field("filters", &self.filters)
             .field("resolved_chain_len", &self.resolved_chain.len())
-            .field("reads_body", &self.reads_body)
+            .field("body_hooks", &self.body_hooks)
             .field("backends", &self.backends)
             .field("strip_prefix", &self.strip_prefix)
             .field("rate_limit", &self.rate_limit)
@@ -179,6 +196,7 @@ impl std::fmt::Debug for CompiledRoute {
             .field("compression", &self.compression)
             .field("response_headers", &self.response_headers)
             .field("timeouts", &self.timeouts)
+            .field("response_body", &self.response_body)
             .finish()
     }
 }
@@ -364,6 +382,102 @@ fn validate_response_headers(h: &crate::manifest::RouteHeaders) -> Result<(), St
     Ok(())
 }
 
+/// A route's compiled `[route.response_body]` (ADR 000098): the cap, the two fail-closed modes,
+/// and the content-type allowlist that arms buffering (lower-cased at build so the per-response
+/// check is an allocation-free case-insensitive scan, like `CompressionConfig`'s).
+#[derive(Debug)]
+pub struct ResponseBodyConfig {
+    max_bytes: usize,
+    over_cap: OverCapMode,
+    uninspectable: UninspectableMode,
+    content_types: Vec<String>,
+}
+
+impl Default for ResponseBodyConfig {
+    /// The settings a route with a response-body filter and no `[route.response_body]` block runs
+    /// under. Built from the manifest defaults rather than restated, so the two cannot drift.
+    fn default() -> Self {
+        Self::new(&RouteResponseBody::default())
+    }
+}
+
+impl ResponseBodyConfig {
+    /// Compile a manifest `[route.response_body]` block. Public because the fast-path server's
+    /// unit tests build configs directly, without a manifest parse.
+    pub fn new(rb: &RouteResponseBody) -> Self {
+        Self {
+            // `validate_response_body` already bounded this by `MAX_RESPONSE_BODY_CAP`, which is
+            // far inside `usize` on every target the proxy builds for; saturate rather than assert.
+            max_bytes: usize::try_from(rb.max_bytes).unwrap_or(usize::MAX),
+            over_cap: rb.over_cap,
+            uninspectable: rb.uninspectable,
+            content_types: rb
+                .content_types
+                .iter()
+                .map(|ct| ct.trim().to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    /// The most bytes of one response body the host will hold for the hook.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// What to do with a body over [`max_bytes`](Self::max_bytes).
+    pub fn over_cap(&self) -> OverCapMode {
+        self.over_cap
+    }
+
+    /// What to do with a response that cannot be inspected at all.
+    pub fn uninspectable(&self) -> UninspectableMode {
+        self.uninspectable
+    }
+
+    /// Does this `Content-Type` essence arm inspection on this route? The caller passes the
+    /// AS-RECEIVED essence (ADR 000098 decision 3): deciding on a value a chain filter could have
+    /// rewritten would let a filter earlier in the chain steer the response past the one that
+    /// inspects it.
+    pub fn content_type_eligible(&self, essence: &str) -> bool {
+        let essence = essence.trim();
+        self.content_types
+            .iter()
+            .any(|ct| ct.eq_ignore_ascii_case(essence))
+    }
+}
+
+/// Validate a route's `[route.response_body]` declaration (ADR 000098), fail-closed: a cap of zero
+/// could never hold a body, a cap over the request-side ceiling would buy the response plane more
+/// headroom than the request plane has, and an empty or malformed allowlist would silently disarm
+/// the inspection the route declared a filter for.
+fn validate_response_body(rb: &RouteResponseBody) -> Result<(), String> {
+    if rb.max_bytes == 0 {
+        return Err("response_body.max_bytes must be non-zero".to_string());
+    }
+    if rb.max_bytes > MAX_RESPONSE_BODY_CAP {
+        return Err(format!(
+            "response_body.max_bytes is {} bytes, over the {MAX_RESPONSE_BODY_CAP}-byte ceiling",
+            rb.max_bytes
+        ));
+    }
+    if rb.content_types.is_empty() {
+        return Err("response_body.content_types must be non-empty".to_string());
+    }
+    for ct in &rb.content_types {
+        let essence = ct.trim();
+        let well_formed = essence
+            .split_once('/')
+            .is_some_and(|(t, s)| !t.is_empty() && !s.is_empty())
+            && !essence.contains([';', ',', ' ']);
+        if !well_formed {
+            return Err(format!(
+                "response_body.content_types entry `{essence}` is not a type/subtype"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A route's compiled `[route.timeouts]` (ADR 000102): the per-try / overall bounds this route
 /// declares, each resolved against the upstream's own default at forward time. `None` is "not
 /// declared" and `Some(Duration::ZERO)` is "declared disabled" — the fast path must keep the two
@@ -540,6 +654,14 @@ pub(crate) fn validate_routes<'a>(
                 reason,
             })?;
         }
+        // Validate the response-body inspection settings (ADR 000098) the same way — an unusable
+        // cap or allowlist must stop startup / reload, not disarm inspection per response.
+        if let Some(rb) = &r.response_body {
+            validate_response_body(rb).map_err(|reason| ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason,
+            })?;
+        }
         validated.push(ValidatedRoute { route: r, targets });
     }
     Ok(validated)
@@ -567,10 +689,10 @@ pub struct RouteInfo {
     pub strip_prefix: Option<Arc<str>>,
     /// Whether this route has any filters (drives the header-side chain dispatch).
     pub has_filters: bool,
-    /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
-    /// 000038). The fast path buffers the body ONLY when this is `true`; a route of header-only
-    /// filters keeps the zero-copy streaming path (the real fix for the body-tax, docs/servey).
-    pub reads_body: bool,
+    /// Which body directions this route's chain reads (ADR 000038 / 000098). The fast path buffers
+    /// a direction ONLY when its flag is set; a route whose filters export neither hook keeps the
+    /// zero-copy streaming path in BOTH directions (the real fix for the body-tax, docs/servey).
+    pub body_hooks: BodyHooks,
     /// This route's native rate limiter (ADR 000033), or `None` for unlimited. `Arc`-shared with the
     /// live config so the per-request `RouteInfo` consults the route's persistent buckets.
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
@@ -588,6 +710,9 @@ pub struct RouteInfo {
     /// [`RouteInfo::request_timeout`] / [`RouteInfo::overall_timeout`], which resolve them
     /// against the upstream group the request is actually being forwarded to.
     pub(crate) timeouts: TimeoutConfig,
+    /// This route's response-body inspection settings (ADR 000098), or the strict defaults. Only
+    /// consulted when `body_hooks.response` is set.
+    pub response_body: Arc<ResponseBodyConfig>,
 }
 
 impl RouteInfo {
@@ -931,7 +1056,7 @@ mod tests {
             query: vec![],
             filters: vec![],
             resolved_chain: vec![],
-            reads_body: false,
+            body_hooks: BodyHooks::NONE,
             backends: backends(upstream),
             strip_prefix: None,
             rate_limit: None,
@@ -939,6 +1064,7 @@ mod tests {
             compression: None,
             response_headers: None,
             timeouts: TimeoutConfig::default(),
+            response_body: Arc::new(ResponseBodyConfig::default()),
         }
     }
 
@@ -984,6 +1110,7 @@ mod tests {
             compression: None,
             headers: None,
             timeouts: None,
+            response_body: None,
         }
     }
 
@@ -1184,6 +1311,105 @@ mod tests {
         );
     }
 
+    fn route_with_response_body(rb: RouteResponseBody) -> Vec<Route> {
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.response_body = Some(rb);
+        vec![r]
+    }
+
+    #[test]
+    fn validate_routes_rejects_an_unusable_response_body_declaration() {
+        // ADR 000098: the cap and the allowlist decide whether a route's declared inspection runs
+        // at all, so an unusable value must stop startup / reload rather than quietly disarm the
+        // filter the operator put on the route.
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let rejected = |rb: RouteResponseBody| {
+            matches!(
+                validate_routes(&route_with_response_body(rb), &filters, &upstream_names),
+                Err(ControlError::InvalidRoute { .. })
+            )
+        };
+
+        assert!(
+            rejected(RouteResponseBody {
+                max_bytes: 0,
+                ..Default::default()
+            }),
+            "a zero cap could never hold a body"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                max_bytes: MAX_RESPONSE_BODY_CAP + 1,
+                ..Default::default()
+            }),
+            "the response plane never buys more headroom than the request plane has"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                content_types: vec![],
+                ..Default::default()
+            }),
+            "an empty allowlist arms nothing"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                content_types: vec!["application".to_string()],
+                ..Default::default()
+            }),
+            "an entry that is not type/subtype"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                content_types: vec!["text/plain; charset=utf-8".to_string()],
+                ..Default::default()
+            }),
+            "the allowlist matches the ESSENCE, so a parameter in the entry is a typo"
+        );
+
+        assert!(
+            validate_routes(
+                &route_with_response_body(RouteResponseBody {
+                    max_bytes: MAX_RESPONSE_BODY_CAP,
+                    ..Default::default()
+                }),
+                &filters,
+                &upstream_names
+            )
+            .is_ok(),
+            "the ceiling itself is allowed"
+        );
+    }
+
+    #[test]
+    fn the_compiled_allowlist_matches_the_essence_case_insensitively() {
+        let cfg = ResponseBodyConfig::new(&RouteResponseBody {
+            content_types: vec!["Application/JSON".to_string(), " text/plain ".to_string()],
+            ..Default::default()
+        });
+
+        assert!(cfg.content_type_eligible("application/json"));
+        assert!(cfg.content_type_eligible("APPLICATION/JSON"));
+        assert!(cfg.content_type_eligible("text/plain"));
+        assert!(!cfg.content_type_eligible("text/html"));
+        assert!(!cfg.content_type_eligible(""), "no declared type, no scope");
+    }
+
+    #[test]
+    fn an_absent_response_body_block_compiles_to_the_strict_defaults() {
+        // The no-block path and the declared-block path must not drift: a route that declares an
+        // inspecting filter and nothing else runs under the same values the manifest documents.
+        let cfg = ResponseBodyConfig::default();
+        assert_eq!(cfg.max_bytes(), 1 << 20);
+        assert_eq!(cfg.over_cap(), OverCapMode::Reject);
+        assert_eq!(cfg.uninspectable(), UninspectableMode::Reject);
+        assert!(cfg.content_type_eligible("application/json"));
+        assert!(
+            !cfg.content_type_eligible("text/event-stream"),
+            "a streaming type is never in the allowlist"
+        );
+    }
+
     #[test]
     fn response_headers_remove_first_then_set_over_any_existing_value() {
         // The compiled declaration is a floor: `remove` drops what the upstream sent, `set`
@@ -1246,12 +1472,13 @@ mod tests {
             backends: Arc::new(WeightedBackends::new(vec![(group, 1)]).unwrap()),
             strip_prefix: None,
             has_filters: false,
-            reads_body: false,
+            body_hooks: BodyHooks::NONE,
             rate_limit: None,
             upgrade: None,
             compression: None,
             response_headers: None,
             timeouts,
+            response_body: Arc::new(ResponseBodyConfig::default()),
         }
     }
 

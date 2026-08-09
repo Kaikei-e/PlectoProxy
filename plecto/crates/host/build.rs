@@ -102,6 +102,16 @@ fn main() {
             "filter_v04",
             "FILTER_V04_COMPONENT",
         );
+        // filter-respbody exports `on-response-body` and NOT `on-request-body` — a body-hook
+        // subset neither published world names, so loading it is the machine check that the
+        // acceptance LATTICE is the contract (ADR 000098 decision 2). Test-only.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-respbody"),
+            &out_dir,
+            "filter_respbody",
+            "FILTER_RESPBODY_COMPONENT",
+        );
         // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API
         // calls). It is benchmark-only, so it lives under bench/filters/, not examples/.
         build_component(

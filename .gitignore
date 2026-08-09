@@ -13,6 +13,7 @@ plecto/examples/filters/filter-cors/target
 plecto/crates/host/fixtures/filter-compat-v01/target
 plecto/crates/host/fixtures/filter-compat-v02/target
 plecto/crates/host/fixtures/filter-v04/target
+plecto/crates/host/fixtures/filter-respbody/target
 bench/filters/filter-noop/target
 bench/filters/filter-resp/target
 bench/loadgen/target

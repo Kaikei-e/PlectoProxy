@@ -47,11 +47,11 @@ pub use listen::{ClientAuth, Listen, ProxyProtocolTrust, TrustedProxyTrust};
 pub use listen::{Drain, ProxyProtocol, TrustedProxy};
 pub use observability::Observability;
 pub use resumption::Resumption;
-pub(crate) use route::MAX_BACKEND_WEIGHT;
 pub use route::{
-    CompressionAlgorithm, RateLimitKeyKind, Route, RouteCompression, RouteHeaders, RouteRateLimit,
-    RouteTimeouts,
+    CompressionAlgorithm, OverCapMode, RateLimitKeyKind, Route, RouteCompression, RouteHeaders,
+    RouteRateLimit, RouteResponseBody, RouteTimeouts, UninspectableMode,
 };
+pub(crate) use route::{MAX_BACKEND_WEIGHT, MAX_RESPONSE_BODY_CAP};
 // `Backend` / `RouteMatch` / `RouteUpgrade` are only named via `crate::manifest::X` from
 // `#[cfg(test)]` code elsewhere in the crate; re-exported for the same completeness reason.
 #[allow(unused_imports)]

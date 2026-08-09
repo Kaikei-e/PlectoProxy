@@ -10,7 +10,7 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_v04_component};
 use plecto_host::{
-    ContractVersion, Header, Host, HttpRequest, HttpResponse, LoadOptions, LoadedFilter,
+    BodyHooks, ContractVersion, Header, Host, HttpRequest, HttpResponse, LoadOptions, LoadedFilter,
     RequestBodyDecision, RequestDecision, RequestTrace, ResponseDecision, SignedArtifact,
 };
 
@@ -51,9 +51,13 @@ fn a_040_guest_binds_the_040_rail() {
     let (_host, filter) = signed_load();
     assert_eq!(filter.contract_version(), ContractVersion::V04);
     assert_eq!(filter.contract_version().package(), "plecto:filter@0.4.0");
-    assert!(
-        filter.reads_body(),
-        "the fixture targets world filter-body, so the host must buffer for it"
+    assert_eq!(
+        filter.body_hooks(),
+        BodyHooks {
+            request: true,
+            response: true
+        },
+        "the fixture targets the ceiling world, so the host buffers both directions for it"
     );
 }
 

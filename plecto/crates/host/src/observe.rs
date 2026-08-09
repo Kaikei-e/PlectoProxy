@@ -265,6 +265,7 @@ pub enum Hook {
     OnRequest,
     OnRequestBody,
     OnResponse,
+    OnResponseBody,
 }
 
 impl Hook {
@@ -273,6 +274,7 @@ impl Hook {
             Hook::OnRequest => "on-request",
             Hook::OnRequestBody => "on-request-body",
             Hook::OnResponse => "on-response",
+            Hook::OnResponseBody => "on-response-body",
         }
     }
 }

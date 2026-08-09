@@ -50,7 +50,7 @@ pub(crate) use bindings_v03::{
 
 use crate::{
     Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestBodyEdit, RequestDecision,
-    RequestEdit, ResponseDecision, ResponseEdit,
+    RequestEdit, ResponseBodyDecision, ResponseBodyEdit, ResponseDecision, ResponseEdit,
 };
 
 /// Which `plecto:filter` package version a loaded component targets.
@@ -432,6 +432,36 @@ fn request_body_edit_from_v04(edit: types_v04::RequestBodyEdit) -> Option<Reques
     })
 }
 
+/// `content-length` describes the bytes the HOST decided to send, so a guest that names it is
+/// making a claim it cannot keep (ADR 000098 decision 3). Unlike the hop-by-hop names — dropped,
+/// because the observable behaviour is unchanged — a length that disagrees with the body IS the
+/// observable behaviour, and a proxy that forwards the disagreement is a response-desync
+/// primitive (CWE-444). Reject the whole decision instead.
+fn names_content_length(headers: &[types_v04::Header]) -> bool {
+    headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("content-length"))
+}
+
+/// A response body edit's headers are guest output bound for the CLIENT, so they pass the same
+/// fail-closed gate as every other guest-supplied header (ADR 000071), plus the framing guard.
+fn response_body_edit_from_v04(edit: types_v04::ResponseBodyEdit) -> Option<ResponseBodyEdit> {
+    if names_content_length(&edit.set_headers) {
+        return None;
+    }
+    let set_headers = edit
+        .set_headers
+        .into_iter()
+        .filter(|h| !is_hop_by_hop_guest_header(&h.name))
+        .map(header_from_v04)
+        .collect::<Option<Vec<_>>>()?;
+    Some(ResponseBodyEdit {
+        body: edit.body,
+        set_headers,
+        remove_headers: edit.remove_headers,
+    })
+}
+
 fn response_edit_from_v04(edit: types_v04::ResponseEdit) -> Option<ResponseEdit> {
     let set_headers = edit
         .set_headers
@@ -676,6 +706,28 @@ pub(crate) fn response_decision_from_v04(
         }
         types_v04::ResponseDecision::Replace(resp) => {
             Some(ResponseDecision::Replace(response_from_v04(resp)?))
+        }
+    }
+}
+
+/// Map a 0.4 guest response-BODY decision to the validated native one (ADR 000098). Only 0.4.0
+/// declares this hook, so there is no frozen-track twin: the adapters below stop at `on-response`.
+/// `replace` output is untrusted guest data on its way to the client, so it passes the SAME
+/// fail-closed validation as a `replace` from `on-response`, plus the content-length guard both
+/// body-carrying arms share.
+pub(crate) fn response_body_decision_from_v04(
+    decision: types_v04::ResponseBodyDecision,
+) -> Option<ResponseBodyDecision> {
+    match decision {
+        types_v04::ResponseBodyDecision::Continue => Some(ResponseBodyDecision::Continue),
+        types_v04::ResponseBodyDecision::Modified(edit) => Some(ResponseBodyDecision::Modified(
+            response_body_edit_from_v04(edit)?,
+        )),
+        types_v04::ResponseBodyDecision::Replace(resp) => {
+            if names_content_length(&resp.headers) {
+                return None;
+            }
+            Some(ResponseBodyDecision::Replace(response_from_v04(resp)?))
         }
     }
 }
@@ -1312,6 +1364,97 @@ mod tests {
         assert!(
             request_body_decision_from_v04(bad).is_none(),
             "CRLF in a body edit's header fails closed"
+        );
+    }
+
+    #[test]
+    fn a_guest_content_length_fails_the_whole_response_body_decision() {
+        // ADR 000098 decision 1: unlike the hop-by-hop names — dropped, because dropping leaves
+        // the observable behaviour unchanged — a length that disagrees with the bytes IS the
+        // observable behaviour, and forwarding the disagreement is a response-desync primitive.
+        // Both body-carrying arms are refused outright.
+        let modified = types_v04::ResponseBodyDecision::Modified(types_v04::ResponseBodyEdit {
+            body: b"five!".to_vec(),
+            set_headers: vec![types_v04::Header {
+                name: "Content-Length".to_string(),
+                value: b"9999".to_vec(),
+            }],
+            remove_headers: vec![],
+        });
+        assert!(
+            response_body_decision_from_v04(modified).is_none(),
+            "a guest content-length on `modified` fails closed (case-insensitively)"
+        );
+
+        let replace = types_v04::ResponseBodyDecision::Replace(types_v04::HttpResponse {
+            status: 200,
+            headers: vec![types_v04::Header {
+                name: "content-length".to_string(),
+                value: b"1".to_vec(),
+            }],
+            body: b"longer than one byte".to_vec(),
+        });
+        assert!(
+            response_body_decision_from_v04(replace).is_none(),
+            "a guest content-length on `replace` fails closed too"
+        );
+    }
+
+    #[test]
+    fn the_response_body_arms_map_one_to_one_and_validate_their_output() {
+        assert!(matches!(
+            response_body_decision_from_v04(types_v04::ResponseBodyDecision::Continue),
+            Some(ResponseBodyDecision::Continue)
+        ));
+
+        let ok = types_v04::ResponseBodyDecision::Modified(types_v04::ResponseBodyEdit {
+            body: b"[redacted]".to_vec(),
+            set_headers: vec![
+                types_v04::Header {
+                    name: "content-type".to_string(),
+                    value: b"text/plain".to_vec(),
+                },
+                // Hop-by-hop names keep the established treatment: dropped, not fatal.
+                types_v04::Header {
+                    name: "Connection".to_string(),
+                    value: b"close".to_vec(),
+                },
+            ],
+            remove_headers: vec!["etag".to_string()],
+        });
+        match response_body_decision_from_v04(ok) {
+            Some(ResponseBodyDecision::Modified(edit)) => {
+                assert_eq!(edit.body, b"[redacted]".to_vec());
+                assert_eq!(edit.set_headers.len(), 1);
+                assert_eq!(edit.set_headers[0].value, b"text/plain".to_vec());
+                assert_eq!(edit.remove_headers, vec!["etag".to_string()]);
+            }
+            other => panic!("expected modified, got {other:?}"),
+        }
+
+        // A `replace` here is guest data headed for the client, so it passes the same fail-closed
+        // header validation as every other guest-authored response (ADR 000071).
+        let crlf = types_v04::ResponseBodyDecision::Replace(types_v04::HttpResponse {
+            status: 200,
+            headers: vec![types_v04::Header {
+                name: "x-evil".to_string(),
+                value: b"a\r\nx-smuggled: 1".to_vec(),
+            }],
+            body: Vec::new(),
+        });
+        assert!(response_body_decision_from_v04(crlf).is_none());
+
+        let bad_headers = types_v04::ResponseBodyDecision::Modified(types_v04::ResponseBodyEdit {
+            body: Vec::new(),
+            set_headers: vec![types_v04::Header {
+                name: "x-evil".to_string(),
+                value: b"a\r\nx-smuggled: 1".to_vec(),
+            }],
+            remove_headers: vec![],
+        });
+        assert!(
+            response_body_decision_from_v04(bad_headers).is_none(),
+            "CRLF in a response body edit's header fails closed"
         );
     }
 

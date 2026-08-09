@@ -14,9 +14,9 @@ use crate::contract::{
     FilterV04, request_body_decision_from_v01, request_body_decision_from_v02,
     request_body_decision_from_v03, request_body_decision_from_v04, request_decision_from_v01,
     request_decision_from_v02, request_decision_from_v03, request_decision_from_v04,
-    request_to_v01, request_to_v02, request_to_v03, response_decision_from_v01,
-    response_decision_from_v02, response_decision_from_v03, response_decision_from_v04,
-    response_to_v01, response_to_v02, response_to_v03,
+    request_to_v01, request_to_v02, request_to_v03, response_body_decision_from_v04,
+    response_decision_from_v01, response_decision_from_v02, response_decision_from_v03,
+    response_decision_from_v04, response_to_v01, response_to_v02, response_to_v03,
 };
 use crate::errors::InvalidGuestOutput;
 #[cfg(feature = "outbound-http")]
@@ -27,7 +27,7 @@ use crate::quota::KvQuota;
 use crate::state::{HostState, HostStateInit};
 use crate::{
     Bucket, HttpRequest, HttpResponse, KvBackend, LogLine, RequestBodyDecision, RequestDecision,
-    ResponseDecision,
+    ResponseBodyDecision, ResponseDecision,
 };
 
 /// The seam between pool / lifecycle-dispatch DECISION logic (`LoadedInner`, below) and the actual
@@ -74,10 +74,13 @@ pub(crate) struct WasmtimeRuntime {
     pub(crate) kv: Arc<dyn KvBackend>,
     pub(crate) kv_prefix: String,
     pub(crate) pre: FilterPreBinding,
-    /// Export index of the guest's `on-request-body` hook (world `filter-body`), or `None` for a
-    /// header-only filter. `Some` is the ONLY signal that makes the fast path buffer the body
-    /// (ADR 000038 / ADR 000005 mechanism 2); absence keeps the body on the zero-copy stream path.
+    /// Export index of the guest's `on-request-body` hook, or `None` for a filter that does not
+    /// read the request body. `Some` is the ONLY signal that makes the fast path buffer that
+    /// direction (ADR 000038 / ADR 000005 mechanism 2); absence keeps it on the zero-copy path.
     pub(crate) body_export: Option<ComponentExportIndex>,
+    /// The same probe for `on-response-body` (ADR 000098). The two are independent: buffering is
+    /// decided per direction, so a filter that reads only one body costs the other nothing.
+    pub(crate) response_body_export: Option<ComponentExportIndex>,
     pub(crate) init_deadline_ms: u64,
     pub(crate) request_deadline_ms: u64,
     pub(crate) max_memory_bytes: u64,
@@ -273,6 +276,28 @@ impl WasmtimeRuntime {
         }
     }
 
+    /// Call the guest's optional `on-response-body` export (ADR 000098) on an already-instantiated
+    /// instance, with the buffered response body borrowed. Only 0.4.0 declares this hook, so the
+    /// dispatch has a single arm — a frozen-track guest can never have resolved the export.
+    pub(crate) fn call_response_body_hook(
+        &self,
+        inst: &mut WasmtimeInstance,
+        req: &HttpRequest,
+        resp: &HttpResponse,
+        body: &[u8],
+    ) -> wasmtime::Result<ResponseBodyDecision> {
+        let Some(func) = inst.response_body_func else {
+            // Unreachable: the caller gates on the export being present. Fail closed, never panic.
+            return Err(wasmtime::Error::msg(
+                "on-response-body called on a filter without a response-body export",
+            ));
+        };
+        use contract::types_v04::ResponseBodyDecision as Raw;
+        let func = func.typed::<(&HttpRequest, &HttpResponse, &[u8]), (Raw,)>(&inst.store)?;
+        let (decision,) = self.drive_call(func.call_async(&mut inst.store, (req, resp, body)))?;
+        response_body_decision_from_v04(decision).ok_or_else(invalid_guest_header_error)
+    }
+
     #[cfg(feature = "outbound-http")]
     pub(crate) fn outbound_hooks(&self) -> outbound_http::PlectoHttpHooks {
         match &self.outbound {
@@ -382,10 +407,25 @@ impl FilterRuntime for WasmtimeRuntime {
             }
             None => None,
         };
+        // Same once-per-instance resolution for the response-side hook (ADR 000098). Its signature
+        // only exists on the 0.4 rail, so the type-check has one arm.
+        let response_body_func = match &self.response_body_export {
+            Some(idx) => {
+                let func = instance.get_func(&mut store, idx).ok_or_else(|| {
+                    anyhow::anyhow!("on-response-body export index did not resolve to a function")
+                })?;
+                func.typed::<(&HttpRequest, &HttpResponse, &[u8]), (
+                    contract::types_v04::ResponseBodyDecision,
+                )>(&store)?;
+                Some(func)
+            }
+            None => None,
+        };
         Ok(WasmtimeInstance {
             store,
             filter,
             body_func,
+            response_body_func,
         })
     }
 
@@ -420,9 +460,11 @@ pub(crate) enum BoundFilter {
 pub(crate) struct WasmtimeInstance {
     pub(crate) store: Store<HostState>,
     pub(crate) filter: BoundFilter,
-    /// The optional `on-request-body` export (world `filter-body`, not part of the base `filter`
-    /// bindgen), resolved once at instantiation — `Some` iff the runtime's `body_export` is.
+    /// The optional `on-request-body` export (not part of the base `filter` bindgen), resolved
+    /// once at instantiation — `Some` iff the runtime's `body_export` is.
     pub(crate) body_func: Option<wasmtime::component::Func>,
+    /// The optional `on-response-body` export (ADR 000098), resolved the same way.
+    pub(crate) response_body_func: Option<wasmtime::component::Func>,
 }
 
 /// Block on `fut` under a wall-clock `deadline` (the outbound-TCP I/O bound, ADR 000060). A

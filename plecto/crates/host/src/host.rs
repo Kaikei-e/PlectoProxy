@@ -350,11 +350,18 @@ impl Host {
             }
         };
 
-        // Zero-copy body bypass (ADR 000038 / ADR 000005 mechanism 2): a filter that inspects or
-        // transforms the request body ALSO exports `on-request-body` (world `filter-body`). Detect
-        // that export ONCE here; its absence tells the fast path the body never enters guest memory,
-        // so it streams straight through instead of buffering (fail-closed: presence ⇒ buffer).
+        // Zero-copy body bypass (ADR 000038 / ADR 000005 mechanism 2, generalised per direction by
+        // ADR 000098 decision 2): a filter that inspects or transforms a body ALSO exports the hook
+        // for that direction. Probe each optional export BY NAME once here — the acceptance lattice
+        // is any subset of the two, so this is what decides the shape, not which world the guest
+        // happened to name. An absent export tells the fast path that body never enters guest
+        // memory, so it streams straight through instead of buffering (fail-closed: presence ⇒
+        // buffer). `on-response-body` exists only on the 0.4 rail, so a frozen-track guest is never
+        // probed for it — its contract cannot express the hook.
         let body_export = component.get_export_index(None, "on-request-body");
+        let response_body_export = matches!(version, ContractVersion::V04)
+            .then(|| component.get_export_index(None, "on-response-body"))
+            .flatten();
 
         let runtime = WasmtimeRuntime {
             engine: engine.clone(),
@@ -362,6 +369,7 @@ impl Host {
             kv_prefix: format!("{filter_id}{KV_NS_DELIM}"),
             pre,
             body_export,
+            response_body_export,
             init_deadline_ms: opts.init_deadline_ms,
             request_deadline_ms: opts.request_deadline_ms,
             max_memory_bytes: opts.max_memory_bytes,

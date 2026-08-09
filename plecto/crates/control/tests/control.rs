@@ -175,16 +175,21 @@ path_prefix = "/headers"
         .find_route(&req_path("/body/x"))
         .expect("the /body route must match");
     assert!(
-        body_route.reads_body,
-        "a route with a body-reading filter must set reads_body (host buffers the body)"
+        body_route.body_hooks.request,
+        "a route with a request-body-reading filter must buffer the request body"
+    );
+    assert!(
+        !body_route.body_hooks.response,
+        "and must NOT buffer the response body, which no filter on it declared"
     );
 
     let hdr_route = snap
         .find_route(&req_path("/headers/x"))
         .expect("the /headers route must match");
-    assert!(
-        !hdr_route.reads_body,
-        "a route of only header-only filters must NOT buffer the body (zero-copy passthrough)"
+    assert_eq!(
+        hdr_route.body_hooks,
+        plecto_control::BodyHooks::NONE,
+        "a route of only header-only filters buffers NEITHER direction (zero-copy passthrough)"
     );
 }
 

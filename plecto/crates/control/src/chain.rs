@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use plecto_host::{
     Header, HttpRequest, HttpResponse, LoadedFilter, RequestBodyDecision, RequestBodyEdit,
-    RequestDecision, RequestEdit, RequestTrace, ResponseDecision, ResponseEdit,
+    RequestDecision, RequestEdit, RequestTrace, ResponseBodyDecision, ResponseBodyEdit,
+    ResponseDecision, ResponseEdit,
 };
 
 /// The result of driving a request through the chain.
@@ -28,6 +29,24 @@ pub enum RequestBodyOutcome {
     /// headers as the body hooks left them (a `modified` decision carries header edits alongside
     /// the new bytes, ADR 000098).
     Forward { body: Vec<u8>, headers: Vec<Header> },
+}
+
+/// The result of driving a buffered response body through the chain's `on-response-body` hooks
+/// (ADR 000098).
+pub enum ResponseBodyOutcome {
+    /// The chain passed: send this body with the response headers as the body hooks left them.
+    /// The status is not theirs to change — `response-body-edit` has no status field, so a filter
+    /// that wants a different one replaces the whole response. `transformed` says whether any hook
+    /// took the `modified` arm: the caller may have shown the hooks only a PREFIX of the body, and
+    /// a rewrite of a prefix cannot be framed into a coherent representation.
+    Forward {
+        body: Vec<u8>,
+        headers: Vec<Header>,
+        transformed: bool,
+    },
+    /// Send this SYNTHESISED response instead, discarding the buffered body: a filter's `replace`,
+    /// a fail-closed trap / deadline, or guest output the host refused.
+    Respond(HttpResponse),
 }
 
 /// The result of driving a response back through the chain (ADR 000073): the typed successor
@@ -113,6 +132,73 @@ pub(crate) fn dispatch_response(
         }
     }
     ResponseOutcome::Forward(response)
+}
+
+/// Drive a buffered response body through the chain's `on-response-body` hooks in reverse (ADR
+/// 000098), threading the possibly-transformed body — and the header edits that came with it —
+/// from one filter to the next, exactly as the request side does. The host has held the response
+/// headers to get here, so a `replace` is still honourable: it discards the buffered body and
+/// answers with the synthesised response.
+///
+/// `max_bytes` is the route's cap, re-checked against every body a guest hands BACK: a filter that
+/// returns more than the host agreed to hold would otherwise turn the cap into a suggestion.
+pub(crate) fn dispatch_response_body(
+    chain: &[Arc<LoadedFilter>],
+    request: &HttpRequest,
+    mut response: HttpResponse,
+    mut body: Vec<u8>,
+    max_bytes: usize,
+    trace: &RequestTrace,
+) -> ResponseBodyOutcome {
+    let mut transformed = false;
+    for filter in chain.iter().rev() {
+        match filter.on_response_body(request, &response, &body, trace) {
+            Ok((ResponseBodyDecision::Continue, _logs)) => {}
+            Ok((ResponseBodyDecision::Modified(edit), _logs)) => {
+                if edit.body.len() > max_bytes {
+                    return ResponseBodyOutcome::Respond(oversize_guest_body_response());
+                }
+                transformed = true;
+                body = apply_response_body_edit(&mut response.headers, edit);
+            }
+            Ok((ResponseBodyDecision::Replace(replacement), _logs)) => {
+                if replacement.body.len() > max_bytes {
+                    return ResponseBodyOutcome::Respond(oversize_guest_body_response());
+                }
+                return ResponseBodyOutcome::Respond(replacement);
+            }
+            Err(err) => return ResponseBodyOutcome::Respond(err.fail_closed_response()),
+        }
+    }
+    ResponseBodyOutcome::Forward {
+        body,
+        headers: response.headers,
+        transformed,
+    }
+}
+
+/// The fail-closed answer when a filter hands back a body larger than the route's cap. A distinct
+/// fault from the upstream's own over-cap body: this one is guest output the host refused, the
+/// invariant a crash-class bug in a comparable extension mechanism came from trusting.
+fn oversize_guest_body_response() -> HttpResponse {
+    HttpResponse {
+        status: 502,
+        headers: vec![Header {
+            name: "x-plecto-fault".to_string(),
+            value: b"response-body-guest-oversize".to_vec(),
+        }],
+        body: b"filter returned an oversized response body".to_vec(),
+    }
+}
+
+/// Apply a response body rewrite (ADR 000098): take the filter's bytes and apply the header edits
+/// that came with them, on the same set/remove rules as every other edit. `Content-Length` is not
+/// the filter's to set — the host re-derives framing from the body actually sent, and the contract
+/// adapter already rejected a decision that named it.
+fn apply_response_body_edit(headers: &mut Vec<Header>, edit: ResponseBodyEdit) -> Vec<u8> {
+    remove_headers(headers, &edit.remove_headers);
+    set_headers(headers, edit.set_headers);
+    edit.body
 }
 
 /// Apply a request rewrite: remove the named headers, then set (replace-or-add) the given

@@ -128,11 +128,11 @@ mod bindings {
 pub use bindings::plecto::filter::host_log::Level as LogLevel;
 pub use bindings::plecto::filter::types::{
     Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestBodyEdit, RequestDecision,
-    RequestEdit, ResponseDecision, ResponseEdit,
+    RequestEdit, ResponseBodyDecision, ResponseBodyEdit, ResponseDecision, ResponseEdit,
 };
 
 pub use errors::{LoadError, RunError};
-pub use filter::LoadedFilter;
+pub use filter::{BodyHooks, LoadedFilter};
 pub use host::Host;
 pub use options::{Isolation, LoadOptions};
 // `HostState` stays crate-internal (DECREE §2: minimal pub surface) — it has no public

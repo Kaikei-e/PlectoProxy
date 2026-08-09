@@ -10,8 +10,8 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_quickstart_component};
 use plecto_host::{
-    Host, HttpRequest, HttpResponse, Isolation, LoadError, LoadOptions, RequestBodyDecision,
-    RequestTrace, ResponseDecision, SignedArtifact, TrustPolicy,
+    BodyHooks, Host, HttpRequest, HttpResponse, Isolation, LoadError, LoadOptions,
+    RequestBodyDecision, RequestTrace, ResponseDecision, SignedArtifact, TrustPolicy,
 };
 
 fn component_bytes() -> Vec<u8> {
@@ -363,28 +363,32 @@ fn request_body_hook_short_circuits_before_upstream() {
     }
 }
 
-// --- ADR 000038: export-presence zero-copy bypass (the host buffers the body ONLY when a filter
-// --- exports `on-request-body`; a header-only filter's absence keeps the body off guest memory) ---
+// --- ADR 000038 / 000098: export-presence zero-copy bypass, per direction (the host buffers a
+// --- body ONLY when a filter exports that direction's hook; absence keeps it off guest memory) ---
 
 #[test]
-fn body_reading_filter_reports_reads_body() {
-    // filter-hello targets world `filter-body` and exports `on-request-body`, so the host detects
-    // that export and must buffer the body for it: `reads_body()` is true.
+fn a_request_body_filter_reports_only_that_direction() {
+    // filter-hello exports `on-request-body`, so the host detects that export and must buffer the
+    // request body for it — and NOT the response body, which it never declared (ADR 000098).
     let fx = fixture();
     let filter = fx
         .host()
         .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
         .unwrap();
-    assert!(
-        filter.reads_body(),
-        "a filter exporting on-request-body must report reads_body() == true"
+    assert_eq!(
+        filter.body_hooks(),
+        BodyHooks {
+            request: true,
+            response: false
+        },
+        "a filter exporting only on-request-body buffers only the request direction"
     );
 }
 
 #[test]
 fn header_only_filter_reports_no_body_read_and_never_inspects_it() {
     // filter-quickstart is header-only (world `filter`, no `on-request-body` export). The host must
-    // detect the ABSENCE and report reads_body() == false, so the fast path skips buffering entirely
+    // detect the ABSENCE in BOTH directions, so the fast path skips buffering entirely
     // (the real body-tax fix, ADR 000038). If the hook is nonetheless invoked (the defensive floor),
     // it answers with the bare `%continue` — the host forwards the bytes it already holds, and a
     // header-only filter can never inspect or transform them, not even a body that WOULD trip a
@@ -405,9 +409,10 @@ fn header_only_filter_reports_no_body_read_and_never_inspects_it() {
         .load("filter-quickstart", &artifact, LoadOptions::untrusted())
         .unwrap();
 
-    assert!(
-        !filter.reads_body(),
-        "a header-only filter must report reads_body() == false"
+    assert_eq!(
+        filter.body_hooks(),
+        BodyHooks::NONE,
+        "a header-only filter must report neither body hook"
     );
 
     let (decision, _logs) = filter

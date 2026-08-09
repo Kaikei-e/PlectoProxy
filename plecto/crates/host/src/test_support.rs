@@ -107,6 +107,13 @@ pub fn filter_v04_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_V04_COMPONENT")).expect("read filter-v04 component")
 }
 
+/// The compiled `filter-respbody` component bytes — the acceptance-lattice fixture (ADR 000098
+/// decision 2): it exports `on-response-body` and NOT `on-request-body`, a subset neither
+/// published world names. Built by this crate's `build.rs`.
+pub fn filter_respbody_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_RESPBODY_COMPONENT")).expect("read filter-respbody component")
+}
+
 /// The compiled `filter-extauthz` component bytes — the outbound-HTTP example (an ext_authz-style
 /// gate), built by this crate's `build.rs` when the `outbound-http` feature is on (ADR 000036).
 #[cfg(feature = "outbound-http")]

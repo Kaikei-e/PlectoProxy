@@ -14,7 +14,7 @@ use std::sync::Arc;
 use plecto_host::{Header, HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
-use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseOutcome};
+use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseBodyOutcome, ResponseOutcome};
 use crate::route::{self, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
@@ -62,12 +62,13 @@ impl ConfigSnapshot {
             backends: r.backends.clone(),
             strip_prefix: r.strip_prefix.clone(),
             has_filters: !r.filters.is_empty(),
-            reads_body: r.reads_body,
+            body_hooks: r.body_hooks,
             rate_limit: r.rate_limit.clone(),
             upgrade: r.upgrade.clone(),
             compression: r.compression.clone(),
             response_headers: r.response_headers.clone(),
             timeouts: r.timeouts,
+            response_body: r.response_body.clone(),
         })
     }
 
@@ -96,6 +97,36 @@ impl ConfigSnapshot {
         match self.config.routes.get(route) {
             Some(r) => chain::dispatch_request_body(&r.resolved_chain, body, headers, &self.trace),
             None => RequestBodyOutcome::Forward { body, headers },
+        }
+    }
+
+    /// Drive a buffered response body through a matched route's `on-response-body` chain (ADR
+    /// 000098). Same `route` index and snapshot as the other halves. `response` carries the status
+    /// and headers as the response chain left them (its `body` stays empty — the bytes are
+    /// `body`), and comes back with whatever header edits the body hooks made. The server calls
+    /// this only for a route whose chain reads the response body; a stale index forwards both
+    /// unchanged.
+    pub fn dispatch_response_body(
+        &self,
+        route: usize,
+        request: &HttpRequest,
+        response: HttpResponse,
+        body: Vec<u8>,
+    ) -> ResponseBodyOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_response_body(
+                &r.resolved_chain,
+                request,
+                response,
+                body,
+                r.response_body.max_bytes(),
+                &self.trace,
+            ),
+            None => ResponseBodyOutcome::Forward {
+                headers: response.headers,
+                body,
+                transformed: false,
+            },
         }
     }
 

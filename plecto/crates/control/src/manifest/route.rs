@@ -64,6 +64,103 @@ pub struct Route {
     /// values apply unchanged.
     #[serde(default)]
     pub timeouts: Option<RouteTimeouts>,
+    /// This route's response-body inspection settings (`[route.response_body]`, ADR 000098).
+    /// Absent = the strict defaults. It is NOT the opt-in: inspection is armed by a filter on the
+    /// route exporting `on-response-body`, and this block only narrows what the host does at the
+    /// edges of what it can inspect (which media types arm the buffer, how big a body may get,
+    /// and what happens when a response cannot be inspected at all).
+    #[serde(default)]
+    pub response_body: Option<RouteResponseBody>,
+}
+
+/// A route's response-body inspection settings (`[route.response_body]`, ADR 000098). Every field
+/// has a safe default, so a route whose chain reads the response body and declares no block runs
+/// under the strict ones: 1 MiB, reject over-cap, reject uninspectable, textual media types only.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteResponseBody {
+    /// Cap on the buffered response body. Default 1 MiB; `MAX_RESPONSE_BODY_CAP` (16 MiB, the
+    /// request-side buffer cap) is the ceiling — the response plane never buys more headroom than
+    /// the request plane already has. Must be non-zero.
+    #[serde(default = "default_response_body_max_bytes")]
+    pub max_bytes: u64,
+    /// What to do with a response body that exceeds `max_bytes`. Default `reject`.
+    #[serde(default)]
+    pub over_cap: OverCapMode,
+    /// What to do with a response the host cannot inspect at all — an encoded body, a byte range,
+    /// a streaming media type. Default `reject`: a route that declared an inspecting filter does
+    /// not silently stop inspecting. `passthrough` is the explicit opt-out.
+    #[serde(default)]
+    pub uninspectable: UninspectableMode,
+    /// The `type/subtype` allowlist that ARMS buffering (matched against the response
+    /// `Content-Type` essence as RECEIVED from the upstream, case-insensitive, parameters
+    /// ignored). REPLACES the default when set. A response outside it is out of the declared
+    /// inspection scope and streams through untouched.
+    #[serde(default = "default_response_body_content_types")]
+    pub content_types: Vec<String>,
+}
+
+impl Default for RouteResponseBody {
+    /// The settings a route with a response-body filter and no block runs under. Built from the
+    /// serde defaults so the declared-block and no-block paths cannot drift apart.
+    fn default() -> Self {
+        Self {
+            max_bytes: default_response_body_max_bytes(),
+            over_cap: OverCapMode::default(),
+            uninspectable: UninspectableMode::default(),
+            content_types: default_response_body_content_types(),
+        }
+    }
+}
+
+/// What the host does with a response body larger than the route's cap (ADR 000098 decision 3).
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverCapMode {
+    /// Answer 502. The default: a body too large to inspect is a body the declared filter never
+    /// got to see. (502, not 413 — that status is the request plane's vocabulary.)
+    #[default]
+    Reject,
+    /// Inspect the first `max_bytes` and forward the whole body. An explicit opt-in.
+    ProcessPartial,
+    /// Forward the whole body without inspecting any of it. The explicit fail-open escape hatch.
+    Passthrough,
+}
+
+/// What the host does with a response it cannot inspect (ADR 000098 decision 3).
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UninspectableMode {
+    /// Answer 502. The default.
+    #[default]
+    Reject,
+    /// Forward it uninspected. An explicit opt-out, still audited.
+    Passthrough,
+}
+
+/// 1 MiB — the upper end of the range whole-response inspection limits are drawn from in practice
+/// (tens of KiB to ~1 MiB). Response buffering costs TTFB and resident memory on every request the
+/// route serves, so the default is the smallest number that covers ordinary API and page payloads.
+fn default_response_body_max_bytes() -> u64 {
+    1 << 20
+}
+
+/// The ceiling on `max_bytes`: the request-side buffer cap (ADR 000025 / 000027), so neither plane
+/// can be configured to hold more than the other already may.
+pub(crate) const MAX_RESPONSE_BODY_CAP: u64 = 16 << 20;
+
+/// The media types that arm response-body inspection by default: the textual payloads the
+/// inspection use cases (DLP, guardrails, response WAF) are actually about. Notably ABSENT:
+/// `text/event-stream` — buffering an event stream breaks it, so it is a rejected class rather
+/// than a silently skipped one — and every already-compressed or binary media type.
+fn default_response_body_content_types() -> Vec<String> {
+    ["text/plain", "text/html", "text/xml", "application/json"]
+        .map(str::to_string)
+        .to_vec()
 }
 
 /// A route's timeout overrides (`[route.timeouts]`, ADR 000102). Each field names the SAME bound
@@ -428,6 +525,85 @@ remove = ["server"]
         let h3 = m3.routes[0].headers.as_ref().unwrap();
         assert!(h3.set.is_empty(), "`set` alone is optional");
         assert_eq!(h3.remove, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn route_response_body_defaults_are_strict_and_every_knob_is_overridable() {
+        // Absent `[route.response_body]` → the strict defaults apply (ADR 000098): the block is
+        // not the opt-in, a filter exporting `on-response-body` is.
+        let m = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+"#,
+        )
+        .unwrap();
+        assert!(m.routes[0].response_body.is_none());
+
+        let defaults = RouteResponseBody::default();
+        assert_eq!(defaults.max_bytes, 1 << 20, "1 MiB");
+        assert_eq!(defaults.over_cap, OverCapMode::Reject);
+        assert_eq!(defaults.uninspectable, UninspectableMode::Reject);
+        assert_eq!(
+            defaults.content_types,
+            vec![
+                "text/plain".to_string(),
+                "text/html".to_string(),
+                "text/xml".to_string(),
+                "application/json".to_string()
+            ],
+            "`text/event-stream` is deliberately absent — it is a REFUSED class, not a listed one"
+        );
+
+        // A declared block: the two modes take their kebab-case spellings, and the allowlist
+        // REPLACES the default rather than extending it.
+        let m2 = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.response_body]
+max_bytes = 4096
+over_cap = "process-partial"
+uninspectable = "passthrough"
+content_types = ["application/json"]
+"#,
+        )
+        .unwrap();
+        let rb = m2.routes[0].response_body.as_ref().unwrap();
+        assert_eq!(rb.max_bytes, 4096);
+        assert_eq!(rb.over_cap, OverCapMode::ProcessPartial);
+        assert_eq!(rb.uninspectable, UninspectableMode::Passthrough);
+        assert_eq!(rb.content_types, vec!["application/json".to_string()]);
+
+        // Declaring inspection settings is a semantic change, so it must flip the config version.
+        assert_ne!(
+            m.content_hash().unwrap(),
+            m2.content_hash().unwrap(),
+            "declaring response-body settings must flip the config version"
+        );
+    }
+
+    #[test]
+    fn an_unknown_over_cap_mode_is_rejected_at_parse() {
+        // The tri-state is closed: `reject` / `process-partial` / `passthrough` and nothing else,
+        // so a typo can never read as one of the fail-open modes.
+        assert!(
+            Manifest::from_toml(
+                r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.response_body]
+over_cap = "truncate"
+"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

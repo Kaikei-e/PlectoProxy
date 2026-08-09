@@ -63,7 +63,7 @@ use arc_swap::ArcSwap;
 use plecto_host::{LoadedFilter, SignedArtifact};
 
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
-pub use chain::{ChainOutcome, RequestBodyOutcome, ResponseOutcome};
+pub use chain::{ChainOutcome, RequestBodyOutcome, ResponseBodyOutcome, ResponseOutcome};
 pub use diagnostic::{
     DEV_KEY_IN_TRUST, Diagnostic, PATH_NORMALIZATION_REJECTED, QUOTA_EXCEEDED,
     SIGNATURE_VERIFICATION_FAILED, diagnose, diagnosed_message,
@@ -71,16 +71,17 @@ pub use diagnostic::{
 pub use error::ControlError;
 pub use manifest::{
     Chain, CircuitBreaker, CompressionAlgorithm, FilterEntry, HealthConfig, IsolationKind,
-    Manifest, Observability, OutlierDetection, ProxyProtocolTrust, RateLimitKeyKind, Route,
-    RouteCompression, RouteHeaders, RouteRateLimit, RouteTimeouts, State, StateBackendKind,
-    TlsCert, Trust, TrustedProxyTrust, Upstream,
+    Manifest, Observability, OutlierDetection, OverCapMode, ProxyProtocolTrust, RateLimitKeyKind,
+    Route, RouteCompression, RouteHeaders, RouteRateLimit, RouteResponseBody, RouteTimeouts, State,
+    StateBackendKind, TlsCert, Trust, TrustedProxyTrust, UninspectableMode, Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
 pub use route::{
-    CompressionConfig, ResponseHeaders, RouteInfo, TimeoutConfig, UpgradeConfig, normalize_path,
+    CompressionConfig, ResponseBodyConfig, ResponseHeaders, RouteInfo, TimeoutConfig,
+    UpgradeConfig, normalize_path,
 };
 /// The rustls TLS client config the fast path re-encrypts upstream forward legs with
 /// (ADR 000042), re-exported for the same reason as [`TlsServerConfig`].
@@ -97,8 +98,8 @@ pub use upstream::{
 // on `plecto-host` directly for the common path — including the ADR 000009 observability
 // types (build a `Host` with a sink, then drive snapshots that carry the trace context).
 pub use plecto_host::{
-    FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse, InMemorySink, MetricsSink,
-    MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
+    BodyHooks, FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse, InMemorySink,
+    MetricsSink, MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
 };
 // Filter Dev Kit (ADR 000065): `plecto conformance` / `plecto dev` / `plecto new-filter` need
 // the generic conformance battery and the persistent dev-signing key. Re-exported the same way

@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use hyper::body::Body;
+use hyper::header::{CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
 use plecto_control::otlp::SpanRecord;
 use plecto_control::{
     ChainOutcome, ConfigSnapshot, HashInput, HashKeySource, HttpRequest, HttpResponse,
-    RateLimitDecision, RequestBodyOutcome, RequestTrace, ResponseOutcome, RouteInfo,
+    RateLimitDecision, RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseOutcome,
+    RouteInfo,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -285,7 +287,7 @@ async fn proxy_core_inner(
         let _buf_permit = match request_body_hook(
             &state,
             &chain,
-            route.reads_body,
+            route.body_hooks.request,
             &mut real_body,
             &mut forward.headers,
         )
@@ -581,6 +583,48 @@ async fn request_body_hook(
     }
 }
 
+/// The request headers a response-inspecting route strips from the request it forwards (ADR
+/// 000098): the ones that make the upstream answer with something other than a whole identity
+/// representation.
+const INSPECTION_HOSTILE_REQUEST_HEADERS: [&str; 3] = ["accept-encoding", "range", "if-range"];
+
+fn strip_inspection_hostile_headers(_headers: &mut Vec<plecto_control::Header>) {
+    todo!("strip the request headers that make a response uninspectable")
+}
+
+/// Why a response body was not inspected (ADR 000098 decision 3). Each variant is a class the host
+/// cannot inspect, not a policy choice: a response outside the route's media-type allowlist is
+/// outside the declared scope of inspection and is not one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectionSkip {
+    StreamingContentType,
+    ContentEncoding,
+    PartialContent,
+    OverCap,
+}
+
+/// What the host can do with an upstream response on a route whose chain reads response bodies.
+enum Inspectability {
+    /// Buffer it (bounded) and run the hooks.
+    Inspect,
+    /// Outside the route's declared media-type allowlist. Streams through uninspected and
+    /// UNCOUNTED: the allowlist states what the operator asked to inspect, so a response outside
+    /// it is not a skip, it is the scope.
+    OutOfScope,
+    /// Inside the scope, but not inspectable at all. The route's `uninspectable` mode decides
+    /// whether it is refused or forwarded; either way the reason is recorded.
+    Uninspectable(InspectionSkip),
+}
+
+/// Decide what can be done with a response, from the AS-RECEIVED status and headers.
+fn classify_response(
+    _status: StatusCode,
+    _headers: &hyper::HeaderMap,
+    _cfg: &ResponseBodyConfig,
+) -> Inspectability {
+    todo!("classify an upstream response for response-body inspection")
+}
+
 /// True when the upstream's 101 names the token we offered (case-insensitive, RFC 9110 §7.8).
 fn upstream_switched_to(headers: &hyper::HeaderMap, token: &str) -> bool {
     headers
@@ -747,5 +791,142 @@ async fn respond_through_chain(
             discard_upstream_body(ubody);
             Ok(Routed::Synthesised(http_response(resp)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::header::HeaderValue;
+
+    fn cfg() -> ResponseBodyConfig {
+        ResponseBodyConfig::default()
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut map = hyper::HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn the_allowlist_arms_inspection_on_the_essence_only() {
+        // Parameters and case are irrelevant to the media type; the allowlist is what the operator
+        // asked to inspect, so anything outside it is scope, not a skip.
+        assert!(matches!(
+            classify_response(
+                StatusCode::OK,
+                &headers(&[("content-type", "Application/JSON; charset=utf-8")]),
+                &cfg()
+            ),
+            Inspectability::Inspect
+        ));
+        assert!(matches!(
+            classify_response(
+                StatusCode::OK,
+                &headers(&[("content-type", "image/png")]),
+                &cfg()
+            ),
+            Inspectability::OutOfScope
+        ));
+        assert!(
+            matches!(
+                classify_response(StatusCode::OK, &headers(&[]), &cfg()),
+                Inspectability::OutOfScope
+            ),
+            "no declared type, no declared scope"
+        );
+    }
+
+    #[test]
+    fn every_uninspectable_class_is_named_rather_than_skipped() {
+        // ADR 000098 decision 3. A streaming media type is refused rather than merely unlisted:
+        // buffering it would break the stream, and reading its absence from the allowlist as
+        // "quietly skip" is exactly the silent skip this design refuses.
+        assert!(matches!(
+            classify_response(
+                StatusCode::OK,
+                &headers(&[("content-type", "text/event-stream")]),
+                &cfg()
+            ),
+            Inspectability::Uninspectable(InspectionSkip::StreamingContentType)
+        ));
+        assert!(matches!(
+            classify_response(
+                StatusCode::OK,
+                &headers(&[
+                    ("content-type", "application/json"),
+                    ("content-encoding", "gzip")
+                ]),
+                &cfg()
+            ),
+            Inspectability::Uninspectable(InspectionSkip::ContentEncoding)
+        ));
+        assert!(matches!(
+            classify_response(
+                StatusCode::PARTIAL_CONTENT,
+                &headers(&[("content-type", "application/json")]),
+                &cfg()
+            ),
+            Inspectability::Uninspectable(InspectionSkip::PartialContent)
+        ));
+        assert!(
+            matches!(
+                classify_response(
+                    StatusCode::OK,
+                    &headers(&[
+                        ("content-type", "application/json"),
+                        ("content-range", "bytes 0-99/1000")
+                    ]),
+                    &cfg()
+                ),
+                Inspectability::Uninspectable(InspectionSkip::PartialContent)
+            ),
+            "a fragment is a fragment whatever status carries it"
+        );
+        assert!(
+            matches!(
+                classify_response(
+                    StatusCode::OK,
+                    &headers(&[
+                        ("content-type", "application/json"),
+                        ("content-encoding", "identity")
+                    ]),
+                    &cfg()
+                ),
+                Inspectability::Inspect
+            ),
+            "`identity` is not an encoding to see through"
+        );
+    }
+
+    #[test]
+    fn a_response_inspecting_route_asks_the_upstream_for_a_whole_identity_representation() {
+        let mut headers = vec![
+            plecto_control::Header {
+                name: "Accept-Encoding".to_string(),
+                value: b"gzip, br".to_vec(),
+            },
+            plecto_control::Header {
+                name: "range".to_string(),
+                value: b"bytes=0-99".to_vec(),
+            },
+            plecto_control::Header {
+                name: "If-Range".to_string(),
+                value: b"\"v1\"".to_vec(),
+            },
+            plecto_control::Header {
+                name: "x-keep".to_string(),
+                value: b"1".to_vec(),
+            },
+        ];
+        strip_inspection_hostile_headers(&mut headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name, "x-keep");
     }
 }

@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 WASI_SDK_PATH="${WASI_SDK_PATH:-/opt/wasi-sdk}"
 
-wit-bindgen c ../../../wit --world filter-body --out-dir gen
+wit-bindgen c ../../../wit/v0.3.0 --world filter-body --out-dir gen
 mkdir -p dist
 "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip2 -mexec-model=reactor -O2 -Wall -Wextra -Igen \
   src/filter.c gen/filter_body.c gen/filter_body_component_type.o \

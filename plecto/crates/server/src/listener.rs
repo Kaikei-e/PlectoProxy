@@ -21,7 +21,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::body::MAX_INFLIGHT_BODY_BUFFERS;
+use crate::body::MAX_INFLIGHT_BODY_BUFFER_BYTES;
 use crate::conn_limit::PerIpConnLimit;
 use crate::dispatch::handle;
 use crate::error::ServerError;
@@ -117,13 +117,24 @@ async fn serve_inner(
     // of rotation during the readiness grace.
     let (ready_tx, ready_rx) = watch::channel(true);
 
+    // Client-identity restoration behind an L7 front proxy (ADR 000103): read once here, before
+    // `control` moves into the state, like the PROXY v2 trust below.
+    let trusted_proxy = control.trusted_proxy();
+    if trusted_proxy.is_some() {
+        tracing::info!(
+            "trusted-proxy client-identity restoration enabled: a request from a declared front \
+             proxy may name its client in X-Forwarded-For (ADR 000103)"
+        );
+    }
+
     let state = Arc::new(ServerState {
         control,
         clients: UpstreamClients::new(),
         alt_svc,
+        trusted_proxy,
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         per_ip_conn_limit: Arc::new(PerIpConnLimit::new(MAX_CONNECTIONS_PER_IP)),
-        body_buffer_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFERS)),
+        body_buffer_budget: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFER_BYTES)),
         metrics: Arc::new(ServerMetrics::new()),
         otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
         drain: drain_rx.clone(),
@@ -166,7 +177,7 @@ async fn serve_inner(
 
     // Periodic DNS re-resolution of hostname upstreams (`resolve_interval_ms`): a second
     // supervisor beside the health checks, swapping each resolving group's endpoint set in place
-    // (nginx `resolve` / Envoy STRICT_DNS shape). Idles cheaply when no upstream opts in.
+    // (the periodic-DNS endpoint-discovery shape). Idles cheaply when no upstream opts in.
     let dns_task = tokio::spawn(crate::dns::serve_dns_refresh(
         state.control.clone(),
         drain_rx.clone(),

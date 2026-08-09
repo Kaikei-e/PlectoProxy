@@ -1,0 +1,19 @@
+[package]
+name = "filter-respbody"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Test fixture for the acceptance LATTICE (ADR 000098 decision 2): it exports `on-response-body`
+# and NOT `on-request-body`, a subset neither published world names. Its world is declared inline
+# against the canonical wit/ package rather than added to it, so the public surface stays the two
+# lattice ends. Built for wasm32-unknown-unknown and componentized by crates/host/build.rs, exactly
+# like the example guests. Declares its own [workspace] so the native plecto/ workspace never
+# absorbs it into a host-target build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+[workspace]

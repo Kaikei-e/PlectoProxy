@@ -103,7 +103,7 @@ for the CLI once it was split out of `plecto-server`.
 
 Three relations: **Fast path → Extension plane** (drives the chain per request), **Control → Extension plane** (the manifest digest-pins filters and declares chain order and trust roots; reload swaps atomically), **Control → Fast path** (the manifest declares routes and targets; the fast path takes a per-request `ConfigSnapshot` to select routes). The contract `wit/` sits at the workspace root, belonging to no crate — the contract is shared property between contexts, owned by none of them.
 
-### 2.2 Contract architecture (`plecto:filter@0.3.0`)
+### 2.2 Contract architecture (`plecto:filter@0.4.0`)
 
 The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. Header values are `list<u8>` (ADR 000071); `on-response` receives the as-forwarded request snapshot and `response-decision` carries a `replace` arm, so P3 (decisions as types) holds symmetrically on the response side (ADR 000073). `0.1.0` / `0.2.0` remain loadable via frozen trees + host adapters. The current contract's structure:
 

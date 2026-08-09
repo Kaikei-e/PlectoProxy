@@ -10,8 +10,8 @@
 
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_quickstart_component};
 use plecto_host::{
-    Host, HttpRequest, HttpResponse, Isolation, LoadError, LoadOptions, RequestBodyDecision,
-    RequestTrace, ResponseDecision, SignedArtifact, TrustPolicy,
+    BodyHooks, Host, HttpRequest, HttpResponse, Isolation, LoadError, LoadOptions,
+    RequestBodyDecision, RequestTrace, ResponseDecision, SignedArtifact, TrustPolicy,
 };
 
 fn component_bytes() -> Vec<u8> {
@@ -102,7 +102,7 @@ fn response_hook_is_honoured() {
     };
     let req = HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: vec![],
@@ -336,8 +336,11 @@ fn request_body_hook_transforms_then_continues() {
         .on_request_body(b"hello world", &RequestTrace::root())
         .unwrap();
     match decision {
-        RequestBodyDecision::Continue(body) => assert_eq!(body, b"HELLO WORLD".to_vec()),
-        RequestBodyDecision::ShortCircuit(_) => panic!("expected continue with transformed body"),
+        // filter-hello is a frozen 0.3.0 guest, so it says "forward this body" the only way 0.3.0
+        // could: `continue(bytes)`. On 0.4.0 semantics that is `modified` (ADR 000098) — the
+        // adapter carries the transform across rather than dropping it (see `compat_v03.rs`).
+        RequestBodyDecision::Modified(edit) => assert_eq!(edit.body, b"HELLO WORLD".to_vec()),
+        other => panic!("expected a body transform, got {other:?}"),
     }
 }
 
@@ -356,35 +359,40 @@ fn request_body_hook_short_circuits_before_upstream() {
         .unwrap();
     match decision {
         RequestBodyDecision::ShortCircuit(resp) => assert_eq!(resp.status, 403),
-        RequestBodyDecision::Continue(_) => panic!("expected short-circuit 403 on the marker body"),
+        other => panic!("expected short-circuit 403 on the marker body, got {other:?}"),
     }
 }
 
-// --- ADR 000038: export-presence zero-copy bypass (the host buffers the body ONLY when a filter
-// --- exports `on-request-body`; a header-only filter's absence keeps the body off guest memory) ---
+// --- ADR 000038 / 000098: export-presence zero-copy bypass, per direction (the host buffers a
+// --- body ONLY when a filter exports that direction's hook; absence keeps it off guest memory) ---
 
 #[test]
-fn body_reading_filter_reports_reads_body() {
-    // filter-hello targets world `filter-body` and exports `on-request-body`, so the host detects
-    // that export and must buffer the body for it: `reads_body()` is true.
+fn a_request_body_filter_reports_only_that_direction() {
+    // filter-hello exports `on-request-body`, so the host detects that export and must buffer the
+    // request body for it — and NOT the response body, which it never declared (ADR 000098).
     let fx = fixture();
     let filter = fx
         .host()
         .load("filter-hello", &fx.artifact(), LoadOptions::untrusted())
         .unwrap();
-    assert!(
-        filter.reads_body(),
-        "a filter exporting on-request-body must report reads_body() == true"
+    assert_eq!(
+        filter.body_hooks(),
+        BodyHooks {
+            request: true,
+            response: false
+        },
+        "a filter exporting only on-request-body buffers only the request direction"
     );
 }
 
 #[test]
 fn header_only_filter_reports_no_body_read_and_never_inspects_it() {
     // filter-quickstart is header-only (world `filter`, no `on-request-body` export). The host must
-    // detect the ABSENCE and report reads_body() == false, so the fast path skips buffering entirely
+    // detect the ABSENCE in BOTH directions, so the fast path skips buffering entirely
     // (the real body-tax fix, ADR 000038). If the hook is nonetheless invoked (the defensive floor),
-    // the body passes through byte-for-byte — a header-only filter can never inspect or transform it,
-    // even a body that WOULD trip a body-reading filter's `deny-body` short-circuit.
+    // it answers with the bare `%continue` — the host forwards the bytes it already holds, and a
+    // header-only filter can never inspect or transform them, not even a body that WOULD trip a
+    // body-reading filter's `deny-body` short-circuit.
     let signer = TestSigner::new().unwrap();
     let bytes = filter_quickstart_component();
     let component_signature = signer.sign(&bytes).unwrap();
@@ -401,20 +409,17 @@ fn header_only_filter_reports_no_body_read_and_never_inspects_it() {
         .load("filter-quickstart", &artifact, LoadOptions::untrusted())
         .unwrap();
 
-    assert!(
-        !filter.reads_body(),
-        "a header-only filter must report reads_body() == false"
+    assert_eq!(
+        filter.body_hooks(),
+        BodyHooks::NONE,
+        "a header-only filter must report neither body hook"
     );
 
     let (decision, _logs) = filter
         .on_request_body(b"contains deny-body marker", &RequestTrace::root())
         .unwrap();
-    match decision {
-        RequestBodyDecision::Continue(body) => {
-            assert_eq!(body, b"contains deny-body marker".to_vec());
-        }
-        RequestBodyDecision::ShortCircuit(_) => {
-            panic!("a header-only filter must not inspect or short-circuit on the body")
-        }
-    }
+    assert!(
+        matches!(decision, RequestBodyDecision::Continue),
+        "a header-only filter must not inspect, transform or short-circuit on the body"
+    );
 }

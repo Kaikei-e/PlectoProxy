@@ -1,0 +1,19 @@
+[package]
+name = "filter-compat-v01"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Test fixture pinned to the FROZEN plecto:filter@0.1.0 contract (wit/v0.1.0/) — the oldest
+# track the host still accepts, kept covered in CI by a guest that actually loads and runs
+# (the Go fixture that used to be the only 0.1.0 component in tree needs a non-Rust toolchain
+# and is feature-gated). Built for wasm32-unknown-unknown and componentized by
+# crates/host/build.rs, exactly like the example guests. Declares its own [workspace] so the
+# native plecto/ workspace never absorbs it into a host-target build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+[workspace]

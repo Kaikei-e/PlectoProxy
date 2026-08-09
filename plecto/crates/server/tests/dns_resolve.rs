@@ -1,6 +1,6 @@
 //! E2E (tdd-workflow Phase 0) for periodic DNS re-resolution of upstream hostnames — the
-//! standard periodic-DNS endpoint-discovery technique (the shape of nginx `resolver`+`resolve` /
-//! Envoy STRICT_DNS): each address a hostname resolves to becomes a load-balancing endpoint,
+//! standard periodic-DNS endpoint-discovery technique: each address a hostname resolves to
+//! becomes a load-balancing endpoint,
 //! refreshed on `[[upstream]] resolve_interval_ms`, so a container re-creation's new IP is picked
 //! up without a restart. Interval-based (getaddrinfo carries no TTL); failed resolutions keep the
 //! last-known-good set.

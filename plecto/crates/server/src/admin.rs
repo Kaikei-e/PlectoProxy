@@ -1,7 +1,8 @@
 //! The admin endpoint (Stage A observability, ADR 000009): a small, SEPARATE HTTP/1.1 listener —
 //! never the data-plane port — exposing Prometheus metrics and liveness/readiness. Bound only when
 //! `[observability] admin_addr` is set (off by default), so proxied routes never collide with it and
-//! the metrics surface is never reachable by data-plane clients (an Envoy-style admin interface).
+//! the metrics surface is never reachable by data-plane clients (the conventional separate
+//! admin-interface shape).
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -106,6 +107,9 @@ async fn admin_handle(
                 &state.control.filter_metrics(),
                 state.otlp.as_ref().map(|b| (b.dropped_spans(), b.len())),
                 state.control.pool_residency(),
+                // Walked at scrape time (ADR 000099), never tallied into a persistent counter —
+                // so the gauge cannot carry stale state across a reload.
+                &state.control.upstream_groups(),
             ),
         ),
         "/healthz" => (

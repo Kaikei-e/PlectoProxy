@@ -148,7 +148,7 @@ fn bench_find_route(c: &mut Criterion) {
         // exercised.
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: format!("/svc{}/resource", n - 1),
+            path_with_query: format!("/svc{}/resource", n - 1),
             authority: "example.test".to_string(),
             scheme: "https".to_string(),
             headers: vec![],

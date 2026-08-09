@@ -99,7 +99,7 @@ native（[ADR 000029](docs/ADR/000029.md)）。WASM 税は判断ロジックに�
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.6.4   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.7.0   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
 docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \
@@ -186,7 +186,26 @@ opt-in する。**Go/TinyGo** が最初の Tier B ゲスト。
 
 契約・scaffold・ビルド・manifest・署名・言語別レシピ・互換ポリシーまでの完全な手引きは
 **[docs/writing-a-filter.md](docs/writing-a-filter.md)**（英語）。現行契約は
-**`plecto:filter@0.3.0`**、`0.1.0` / `0.2.0` もロード可能。
+**`plecto:filter@0.4.0`**、`0.1.0` / `0.2.0` / `0.3.0` もロード可能。
+
+## アップグレード: 独立した二つのバージョン系列
+
+プロキシとフィルタ契約は**別々に**バージョンされ、その分離自体が要点である:
+
+- **`plecto`（バイナリ / イメージ / ライブラリクレート）** — プロキシ自身。manifest スキーマ・
+  CLI・データプレーン・ホスト。
+- **`plecto:filter@<version>`** — プロキシとフィルタの間の WIT 契約。
+
+**プロキシのバンプにフィルタの再ビルドが必要になることは決してない。** ホストはサポートする全
+契約版をロードし続けるので、古い契約版に対して作られたフィルタはプロキシのアップグレードを
+またいで動き続ける——セキュリティ修正を含むパッチリリースも同じ。取ってよい。
+
+`plecto --version` はこのバイナリが受け付ける契約版を出し、起動時のフィルタごとの 1 行は手元の
+各フィルタが実際に何にバインドしたかを出す。前者が後者を覆っていれば、そのアップグレードに
+フィルタ側の作業は要らない。major 契約版は最低 2 リリース系列はロード可能なまま維持され、その
+廃止は単独の ADR で宣言される（[ADR 000085](docs/ADR/000085.md)）。黙って消えることはない——
+アクセスログのフィールド契約と併せた完全な規則は
+[docs/operations.md](docs/operations.md)（英語）にある。
 
 ## ドキュメント
 

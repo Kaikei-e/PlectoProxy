@@ -8,7 +8,7 @@ const dir = (p) => fileURLToPath(new URL(p, import.meta.url));
 
 const { component } = await componentize({
   sourcePath: dir('./filter.js'),
-  witPath: dir('../../../wit'),
+  witPath: dir('../../../wit/v0.3.0'),
   worldName: 'filter-body',
   disableFeatures: ['random', 'stdio', 'clocks', 'http', 'fetch-event'],
 });

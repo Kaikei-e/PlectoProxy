@@ -323,8 +323,11 @@ digest = "sha256:def"
 isolation = "trusted"
 request_deadline_ms = 25
 
-[chain]
+[[route]]
 filters = ["auth", "rl"]
+upstream = "app"
+[route.match]
+path_prefix = "/"
 "#,
         )
         .unwrap();
@@ -333,7 +336,10 @@ filters = ["auth", "rl"]
         assert_eq!(m.filters[0].isolation, IsolationKind::Untrusted); // default
         assert_eq!(m.filters[1].isolation, IsolationKind::Trusted);
         assert_eq!(m.filters[1].request_deadline_ms, Some(25));
-        assert_eq!(m.chain.filters, vec!["auth".to_string(), "rl".to_string()]);
+        assert_eq!(
+            m.routes[0].filters,
+            vec!["auth".to_string(), "rl".to_string()]
+        );
     }
 
     const OUTBOUND_TOML: &str = r#"

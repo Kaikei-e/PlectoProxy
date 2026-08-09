@@ -1,8 +1,8 @@
 //! `ConfigSnapshot` — a pinned view of one `ActiveConfig` for the span of a single request
-//! transaction (f000004 #2). `Control::on_request` and `on_response` each load the active
-//! config independently, so a reload landing *between* a request's two halves would run the
-//! request side against config A and the response side against config B — only the in-flight
-//! request at the reload instant, but asymmetric filtering nonetheless.
+//! transaction (f000004 #2). A caller loading the active config once per half would run the
+//! request side against config A and the response side against config B whenever a reload lands
+//! *between* them — only the in-flight request at the reload instant, but asymmetric filtering
+//! nonetheless.
 //!
 //! A snapshot closes that: the fast-path server takes one snapshot per request and drives both
 //! halves through it. The snapshot holds its `Arc<ActiveConfig>` until dropped, so a concurrent
@@ -11,10 +11,10 @@
 
 use std::sync::Arc;
 
-use plecto_host::{HttpRequest, HttpResponse, RequestTrace};
+use plecto_host::{Header, HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
-use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseOutcome};
+use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseBodyOutcome, ResponseOutcome};
 use crate::route::{self, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
@@ -39,18 +39,6 @@ impl ConfigSnapshot {
         Self { config, trace }
     }
 
-    /// Drive a request through the **default** `[chain]` (the chain-only convenience). The
-    /// fast-path server uses [`ConfigSnapshot::find_route`] + [`ConfigSnapshot::dispatch_request`].
-    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        chain::dispatch_request(&self.config.resolved_chain, request, &self.trace)
-    }
-
-    /// Drive a response back through the default `[chain]` in reverse. `request` is the
-    /// as-forwarded request snapshot every response hook sees (ADR 000073).
-    pub fn on_response(&self, request: &HttpRequest, response: HttpResponse) -> ResponseOutcome {
-        chain::dispatch_response(&self.config.resolved_chain, request, response, &self.trace)
-    }
-
     /// Match a request to a route by its `[route.match]` dimensions — host, path prefix, method,
     /// headers, query (ADR 000013 / 000034) — or `None` when no route matches (the server responds
     /// 404). The most specific match wins (see [`route::select`]). Pure config lookup — cheap and
@@ -62,7 +50,7 @@ impl ConfigSnapshot {
     pub fn find_route(&self, request: &HttpRequest) -> Option<RouteInfo> {
         let parts = route::RequestParts {
             authority: &request.authority,
-            path: &request.path,
+            path: &request.path_with_query,
             method: &request.method,
             headers: &request.headers,
         };
@@ -74,17 +62,20 @@ impl ConfigSnapshot {
             backends: r.backends.clone(),
             strip_prefix: r.strip_prefix.clone(),
             has_filters: !r.filters.is_empty(),
-            reads_body: r.reads_body,
+            body_hooks: r.body_hooks,
             rate_limit: r.rate_limit.clone(),
             upgrade: r.upgrade.clone(),
             compression: r.compression.clone(),
+            response_headers: r.response_headers.clone(),
+            timeouts: r.timeouts,
+            response_body: r.response_body.clone(),
         })
     }
 
     /// Drive a request through a matched route's chain (request side). `route` is the index from
-    /// [`ConfigSnapshot::find_route`] on this same snapshot. Returns forward-or-respond just like
-    /// `on_request`. Out-of-range (a stale index from another snapshot) responds with a
-    /// fail-closed 404 rather than panicking (data-plane no-panic, bp-rust).
+    /// [`ConfigSnapshot::find_route`] on this same snapshot. Returns forward-or-respond.
+    /// Out-of-range (a stale index from another snapshot) responds with a fail-closed 404 rather
+    /// than panicking (data-plane no-panic, bp-rust).
     pub fn dispatch_request(&self, route: usize, request: HttpRequest) -> ChainOutcome {
         match self.config.routes.get(route) {
             Some(r) => chain::dispatch_request(&r.resolved_chain, request, &self.trace),
@@ -93,12 +84,49 @@ impl ConfigSnapshot {
     }
 
     /// Drive a buffered request body through a matched route's `on-request-body` chain (ADR 000025).
-    /// Same `route` index as the request side, on the same snapshot. The server calls this only for a
-    /// route with filters and a non-empty body; a stale index forwards the body unchanged.
-    pub fn dispatch_request_body(&self, route: usize, body: Vec<u8>) -> RequestBodyOutcome {
+    /// Same `route` index as the request side, on the same snapshot. `headers` is the request as the
+    /// header chain left it — a body hook's `modified` decision can edit it further (ADR 000098), so
+    /// it goes in and comes back out. The server calls this only for a route with filters and a
+    /// non-empty body; a stale index forwards both unchanged.
+    pub fn dispatch_request_body(
+        &self,
+        route: usize,
+        body: Vec<u8>,
+        headers: Vec<Header>,
+    ) -> RequestBodyOutcome {
         match self.config.routes.get(route) {
-            Some(r) => chain::dispatch_request_body(&r.resolved_chain, body, &self.trace),
-            None => RequestBodyOutcome::Forward(body),
+            Some(r) => chain::dispatch_request_body(&r.resolved_chain, body, headers, &self.trace),
+            None => RequestBodyOutcome::Forward { body, headers },
+        }
+    }
+
+    /// Drive a buffered response body through a matched route's `on-response-body` chain (ADR
+    /// 000098). Same `route` index and snapshot as the other halves. `response` carries the status
+    /// and headers as the response chain left them (its `body` stays empty — the bytes are
+    /// `body`), and comes back with whatever header edits the body hooks made. The server calls
+    /// this only for a route whose chain reads the response body; a stale index forwards both
+    /// unchanged.
+    pub fn dispatch_response_body(
+        &self,
+        route: usize,
+        request: &HttpRequest,
+        response: HttpResponse,
+        body: Vec<u8>,
+    ) -> ResponseBodyOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_response_body(
+                &r.resolved_chain,
+                request,
+                response,
+                body,
+                r.response_body.max_bytes(),
+                &self.trace,
+            ),
+            None => ResponseBodyOutcome::Forward {
+                headers: response.headers,
+                body,
+                transformed: false,
+            },
         }
     }
 
@@ -144,21 +172,6 @@ impl crate::Control {
     /// starting a fresh root.
     pub fn snapshot_with_trace(&self, trace: RequestTrace) -> ConfigSnapshot {
         ConfigSnapshot::new(self.active.load_full(), trace)
-    }
-
-    /// Drive a request through the chain. Returns whether to forward the (possibly edited)
-    /// request upstream, or to respond now (a filter short-circuited, or the chain failed
-    /// closed on a trap / deadline). Convenience for a one-shot caller; a request transaction
-    /// that also runs a response should use [`Control::snapshot`] to pin one config.
-    pub fn on_request(&self, request: HttpRequest) -> ChainOutcome {
-        self.snapshot().on_request(request)
-    }
-
-    /// Drive a response back through the chain in reverse, applying response edits. A trapped
-    /// filter yields a fail-closed 5xx; a `replace` yields the synthesised response (both as
-    /// [`ResponseOutcome::Respond`]). See [`Control::snapshot`] for the transaction-pinned form.
-    pub fn on_response(&self, request: &HttpRequest, response: HttpResponse) -> ResponseOutcome {
-        self.snapshot().on_response(request, response)
     }
 }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use plecto_control::MetricsSnapshot;
+use plecto_control::{MetricsSnapshot, UpstreamGroup};
 
 /// Upper bounds (seconds) of the request-latency histogram buckets. Prometheus convention: each
 /// `_bucket{le=...}` is cumulative and a final `+Inf` bucket equals `_count`. The spread (1 ms…10 s)
@@ -18,6 +18,41 @@ use plecto_control::MetricsSnapshot;
 const DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+
+/// The `state` label values of `plecto_upstream_instances`, indexed by [`instance_state`].
+const UPSTREAM_STATES: [&str; 3] = ["healthy", "unhealthy", "ejected"];
+
+/// Which `UPSTREAM_STATES` slot one instance is counted in. Probe health (ADR 000017) and outlier
+/// ejection (ADR 000032) are independent axes — a probe-healthy AND ejected instance is a real
+/// state — so a mutually-exclusive label has to fold them: take the heaviest, `ejected` >
+/// `unhealthy` > `healthy`. Each instance then lands in exactly one series and the per-upstream
+/// sum equals its instance count; the cost is that the combination itself is not recoverable.
+fn instance_state(healthy: bool, ejected: bool) -> usize {
+    match (ejected, healthy) {
+        (true, _) => 2,
+        (false, true) => 0,
+        (false, false) => 1,
+    }
+}
+
+/// Escape a label value per the Prometheus text exposition format. Upstream names come from the
+/// manifest and are the only dynamic label value in this exposition; an unescaped quote in one
+/// would corrupt the whole scrape, not just its own series.
+fn escape_label_value(value: &str) -> String {
+    if !value.contains(['\\', '"', '\n']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 /// A lock-free latency histogram: per-bucket counts (non-cumulative; summed at render), the total
 /// observation count, and the running sum in microseconds (an integer atomic, no float CAS).
@@ -78,7 +113,58 @@ pub(crate) struct ServerMetrics {
     tunnel_bytes_down: AtomicU64,
     /// Bytes relayed upstream (client → upstream) by upgrade tunnels, added as each closes.
     tunnel_bytes_up: AtomicU64,
+    /// Responses a route's `on-response-body` filters never got to see, indexed by
+    /// [`InspectionSkip`] (ADR 000098). Whether the host then rejected or forwarded the response
+    /// is the route's declared mode; either way the skip is counted, because the one thing a
+    /// fail-closed inspection plane must not do is skip silently.
+    inspection_skipped: [AtomicU64; InspectionSkip::COUNT],
     duration: Histogram,
+}
+
+/// Why a response body was not inspected (ADR 000098 decision 3). Each variant is a class the host
+/// cannot inspect, not a policy choice: a response outside the route's media-type allowlist is
+/// outside the declared scope of inspection and is not counted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InspectionSkip {
+    /// A streaming media type (`text/event-stream` …): buffering it would break the stream.
+    StreamingContentType,
+    /// A `Content-Encoding` other than `identity` survived the request-side `Accept-Encoding` strip.
+    ContentEncoding,
+    /// A `206` / `Content-Range` fragment: only part of the representation is present.
+    PartialContent,
+    /// The body exceeded the route's cap — including the unbounded stream that has no declared
+    /// length to reject up front.
+    OverCap,
+}
+
+impl InspectionSkip {
+    const COUNT: usize = 4;
+
+    fn index(self) -> usize {
+        match self {
+            InspectionSkip::StreamingContentType => 0,
+            InspectionSkip::ContentEncoding => 1,
+            InspectionSkip::PartialContent => 2,
+            InspectionSkip::OverCap => 3,
+        }
+    }
+
+    const ALL: [InspectionSkip; Self::COUNT] = [
+        InspectionSkip::StreamingContentType,
+        InspectionSkip::ContentEncoding,
+        InspectionSkip::PartialContent,
+        InspectionSkip::OverCap,
+    ];
+
+    /// The `reason` label / access-log value. Stable operator-facing text.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InspectionSkip::StreamingContentType => "streaming-content-type",
+            InspectionSkip::ContentEncoding => "content-encoding",
+            InspectionSkip::PartialContent => "partial-content",
+            InspectionSkip::OverCap => "over-cap",
+        }
+    }
 }
 
 /// RAII guard for the `tunnels_active` gauge: increments on creation, decrements on `Drop` —
@@ -112,7 +198,15 @@ impl ServerMetrics {
             tunnels_active: AtomicI64::new(0),
             tunnel_bytes_down: AtomicU64::new(0),
             tunnel_bytes_up: AtomicU64::new(0),
+            inspection_skipped: std::array::from_fn(|_| AtomicU64::new(0)),
             duration: Histogram::new(),
+        }
+    }
+
+    /// Record one response whose body the route's filters never inspected (ADR 000098).
+    pub(crate) fn inc_inspection_skipped(&self, reason: InspectionSkip) {
+        if let Some(slot) = self.inspection_skipped.get(reason.index()) {
+            slot.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -168,6 +262,7 @@ impl ServerMetrics {
         filter: &MetricsSnapshot,
         otlp: Option<(u64, usize)>,
         pool: Option<plecto_control::PoolResidency>,
+        upstreams: &[Arc<UpstreamGroup>],
     ) -> String {
         const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
         let mut out: Vec<String> = Vec::new();
@@ -247,6 +342,47 @@ impl ServerMetrics {
             "plecto_outlier_ejections_total {}",
             self.outlier_ejections.load(Ordering::Relaxed)
         ));
+
+        out.push(
+            "# HELP plecto_response_body_inspection_skipped_total Responses a route's on-response-body filters did not inspect, by reason (ADR 000098)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_response_body_inspection_skipped_total counter".to_string());
+        for reason in InspectionSkip::ALL {
+            let count = self
+                .inspection_skipped
+                .get(reason.index())
+                .map_or(0, |slot| slot.load(Ordering::Relaxed));
+            out.push(format!(
+                "plecto_response_body_inspection_skipped_total{{reason=\"{}\"}} {count}",
+                reason.as_str()
+            ));
+        }
+
+        // --- upstream rotation (ADR 000099), walked here rather than tallied: no persistent
+        // counter means nothing survives a reload to go stale. Every state is emitted for every
+        // upstream (like the status classes above), so a transition never looks like a new series.
+        out.push(
+            "# HELP plecto_upstream_instances Upstream instances by state (ADR 000017 / 000032)."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_upstream_instances gauge".to_string());
+        for group in upstreams {
+            let mut counts = [0u64; UPSTREAM_STATES.len()];
+            for instance in &group.endpoints().instances {
+                let state =
+                    instance_state(instance.is_healthy(), instance.is_outlier_ejected_now());
+                if let Some(slot) = counts.get_mut(state) {
+                    *slot += 1;
+                }
+            }
+            let name = escape_label_value(&group.name);
+            for (state, count) in UPSTREAM_STATES.iter().zip(counts) {
+                out.push(format!(
+                    "plecto_upstream_instances{{upstream=\"{name}\",state=\"{state}\"}} {count}"
+                ));
+            }
+        }
 
         out.push(
             "# HELP plecto_tunnels_active Upgrade tunnels currently open (ADR 000048/000059); each holds a breaker permit and an LB pick."
@@ -385,13 +521,46 @@ mod tests {
         m.record_request(404, Duration::from_millis(1));
         m.record_request(503, Duration::from_millis(50));
 
-        let text = m.render(&snap(0, 0, 0), None, None);
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
         assert!(text.contains("plecto_requests_total{status_class=\"2xx\"} 2"));
         assert!(text.contains("plecto_requests_total{status_class=\"4xx\"} 1"));
         assert!(text.contains("plecto_requests_total{status_class=\"5xx\"} 1"));
         assert!(text.contains("plecto_requests_total{status_class=\"3xx\"} 0"));
         assert!(text.contains("plecto_request_duration_seconds_count 4"));
         assert!(text.contains("# TYPE plecto_request_duration_seconds histogram"));
+    }
+
+    #[test]
+    fn every_inspection_skip_reason_is_a_series_that_always_exists() {
+        // ADR 000098: a skip that is only visible once it has happened is one an operator cannot
+        // alert on. Every reason is emitted at zero, so a first occurrence is a change in a series
+        // that was already being scraped, not a new one appearing.
+        let m = ServerMetrics::new();
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        for reason in InspectionSkip::ALL {
+            assert!(
+                text.contains(&format!(
+                    "plecto_response_body_inspection_skipped_total{{reason=\"{}\"}} 0",
+                    reason.as_str()
+                )),
+                "{} must be exposed before it ever fires",
+                reason.as_str()
+            );
+        }
+
+        m.inc_inspection_skipped(InspectionSkip::OverCap);
+        m.inc_inspection_skipped(InspectionSkip::OverCap);
+        m.inc_inspection_skipped(InspectionSkip::ContentEncoding);
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains("plecto_response_body_inspection_skipped_total{reason=\"over-cap\"} 2")
+        );
+        assert!(text.contains(
+            "plecto_response_body_inspection_skipped_total{reason=\"content-encoding\"} 1"
+        ));
+        assert!(text.contains(
+            "plecto_response_body_inspection_skipped_total{reason=\"partial-content\"} 0"
+        ));
     }
 
     #[test]
@@ -403,7 +572,7 @@ mod tests {
         }
         // all five clamp into 1xx or 5xx — the point is simply that none panicked.
         assert!(
-            m.render(&snap(0, 0, 0), None, None)
+            m.render(&snap(0, 0, 0), None, None, &[])
                 .contains("plecto_request_duration_seconds_count 5")
         );
     }
@@ -414,7 +583,7 @@ mod tests {
         for ms in [2u64, 8, 30, 300] {
             m.record_request(200, Duration::from_millis(ms));
         }
-        let text = m.render(&snap(0, 0, 0), None, None);
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
         let counts: Vec<u64> = text
             .lines()
             .filter(|l| l.starts_with("plecto_request_duration_seconds_bucket"))
@@ -439,7 +608,7 @@ mod tests {
         m.inc_in_flight();
         m.dec_in_flight();
         assert!(
-            m.render(&snap(0, 0, 0), None, None)
+            m.render(&snap(0, 0, 0), None, None, &[])
                 .contains("plecto_requests_in_flight 1")
         );
     }
@@ -450,19 +619,19 @@ mod tests {
         let g1 = TunnelActive::new(m.clone());
         let g2 = TunnelActive::new(m.clone());
         assert!(
-            m.render(&snap(0, 0, 0), None, None)
+            m.render(&snap(0, 0, 0), None, None, &[])
                 .contains("plecto_tunnels_active 2")
         );
         drop(g1);
         m.add_tunnel_bytes(19, 7);
         m.add_tunnel_bytes(1, 2);
-        let text = m.render(&snap(0, 0, 0), None, None);
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
         assert!(text.contains("plecto_tunnels_active 1"));
         assert!(text.contains("plecto_tunnel_bytes_down_total 20"));
         assert!(text.contains("plecto_tunnel_bytes_up_total 9"));
         drop(g2);
         assert!(
-            m.render(&snap(0, 0, 0), None, None)
+            m.render(&snap(0, 0, 0), None, None, &[])
                 .contains("plecto_tunnels_active 0")
         );
     }
@@ -470,7 +639,7 @@ mod tests {
     #[test]
     fn folds_in_host_filter_metrics() {
         let m = ServerMetrics::new();
-        let text = m.render(&snap(5, 2, 1), None, None);
+        let text = m.render(&snap(5, 2, 1), None, None, &[]);
         assert!(text.contains("plecto_filter_executions_total 5"));
         assert!(text.contains("plecto_filter_errors_total 2"));
         assert!(text.contains("plecto_filter_short_circuits_total 1"));
@@ -479,12 +648,12 @@ mod tests {
     #[test]
     fn otlp_queue_telemetry_renders_only_when_export_is_configured() {
         let m = ServerMetrics::new();
-        let off = m.render(&snap(0, 0, 0), None, None);
+        let off = m.render(&snap(0, 0, 0), None, None, &[]);
         assert!(
             !off.contains("plecto_otlp_"),
             "no OTLP lines without an exporter"
         );
-        let on = m.render(&snap(0, 0, 0), Some((7, 3)), None);
+        let on = m.render(&snap(0, 0, 0), Some((7, 3)), None, &[]);
         assert!(on.contains("plecto_otlp_dropped_spans_total 7"));
         assert!(on.contains("plecto_otlp_queue_spans 3"));
     }
@@ -492,7 +661,7 @@ mod tests {
     #[test]
     fn pool_residency_gauges_render_only_when_the_host_reports_them() {
         let m = ServerMetrics::new();
-        let off = m.render(&snap(0, 0, 0), None, None);
+        let off = m.render(&snap(0, 0, 0), None, None, &[]);
         assert!(
             !off.contains("plecto_pool_"),
             "no pool lines without a pooling engine"
@@ -502,7 +671,7 @@ mod tests {
             memories: 2,
             unused_memory_bytes_resident: 4096,
         };
-        let on = m.render(&snap(0, 0, 0), None, Some(pool));
+        let on = m.render(&snap(0, 0, 0), None, Some(pool), &[]);
         assert!(
             on.contains("plecto_pool_component_instances 3"),
             "live pooled component instances:\n{on}"
@@ -511,6 +680,164 @@ mod tests {
         assert!(
             on.contains("plecto_pool_unused_memory_resident_bytes 4096"),
             "{on}"
+        );
+    }
+
+    /// Live upstream groups reconciled from `toml`, in the order `names` lists them.
+    fn groups(toml: &str, names: &[&str]) -> Vec<Arc<UpstreamGroup>> {
+        let manifest = plecto_control::Manifest::from_toml(toml).expect("the manifest parses");
+        let registry = plecto_control::UpstreamRegistry::new();
+        registry
+            .reconcile(&manifest.upstreams, std::path::Path::new("."))
+            .expect("the upstreams reconcile");
+        names
+            .iter()
+            .map(|n| registry.group(n).expect("a reconciled group"))
+            .collect()
+    }
+
+    /// The rendered `plecto_upstream_instances` count for one (upstream, state) pair.
+    fn state_count(text: &str, upstream: &str, state: &str) -> Option<u64> {
+        let prefix =
+            format!("plecto_upstream_instances{{upstream=\"{upstream}\",state=\"{state}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .and_then(|n| n.trim().parse().ok())
+    }
+
+    const TWO_INSTANCE_UPSTREAM: &str = r#"
+[[upstream]]
+name = "u"
+addresses = ["10.0.0.1:80", "10.0.0.2:80"]
+[upstream.health]
+path = "/healthz"
+[upstream.outlier_detection]
+consecutive_gateway_failures = 1
+base_ejection_time_ms = 60000
+max_ejection_percent = 100
+"#;
+
+    #[test]
+    fn upstream_instances_count_a_pessimistic_pool_as_unhealthy() {
+        // ADR 000017: a fresh instance is out of rotation until a probe passes, and that is
+        // exactly the fail-closed 503 this gauge exists to explain.
+        let g = groups(TWO_INSTANCE_UPSTREAM, &["u"]);
+        let text = ServerMetrics::new().render(&snap(0, 0, 0), None, None, &g);
+        assert!(
+            text.contains("# TYPE plecto_upstream_instances gauge"),
+            "the gauge is declared:\n{text}"
+        );
+        assert_eq!(state_count(&text, "u", "unhealthy"), Some(2), "{text}");
+        assert_eq!(state_count(&text, "u", "healthy"), Some(0), "{text}");
+        assert_eq!(state_count(&text, "u", "ejected"), Some(0), "{text}");
+    }
+
+    #[test]
+    fn upstream_instances_count_a_probed_pool_as_healthy() {
+        let g = groups(TWO_INSTANCE_UPSTREAM, &["u"]);
+        for inst in &g[0].endpoints().instances {
+            inst.record_probe_success();
+        }
+        let text = ServerMetrics::new().render(&snap(0, 0, 0), None, None, &g);
+        assert_eq!(state_count(&text, "u", "healthy"), Some(2), "{text}");
+        assert_eq!(state_count(&text, "u", "unhealthy"), Some(0), "{text}");
+        assert_eq!(state_count(&text, "u", "ejected"), Some(0), "{text}");
+    }
+
+    #[test]
+    fn upstream_instances_fold_an_ejected_but_probe_healthy_instance_as_ejected() {
+        // ADR 000032: outlier ejection is an axis INDEPENDENT of the health state machine, so a
+        // probe-healthy AND outlier-ejected instance genuinely exists. The mutually-exclusive
+        // label folds by severity (ejected > unhealthy > healthy), so it is counted exactly once.
+        let g = groups(TWO_INSTANCE_UPSTREAM, &["u"]);
+        let instances = g[0].endpoints().instances.clone();
+        for inst in &instances {
+            inst.record_probe_success();
+        }
+        assert!(
+            g[0].record_outcome(&instances[0], true),
+            "one gateway failure crosses the threshold and ejects"
+        );
+        assert!(
+            instances[0].is_healthy(),
+            "the probe bit is untouched — this is the independent-axes case the fold exists for"
+        );
+
+        let text = ServerMetrics::new().render(&snap(0, 0, 0), None, None, &g);
+        assert_eq!(state_count(&text, "u", "ejected"), Some(1), "{text}");
+        assert_eq!(state_count(&text, "u", "healthy"), Some(1), "{text}");
+        assert_eq!(state_count(&text, "u", "unhealthy"), Some(0), "{text}");
+    }
+
+    #[test]
+    fn upstream_instances_render_every_state_of_every_upstream_exactly_once() {
+        // The cardinality bound: upstream count × 3 series, and each upstream's series sum back to
+        // its instance count (no instance counted twice, none dropped).
+        let toml = r#"
+[[upstream]]
+name = "a"
+addresses = ["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"]
+[upstream.health]
+path = "/healthz"
+
+[[upstream]]
+name = "b"
+addresses = ["10.0.1.1:80"]
+[upstream.health]
+path = "/healthz"
+"#;
+        let g = groups(toml, &["a", "b"]);
+        g[0].endpoints().instances[0].record_probe_success();
+        let text = ServerMetrics::new().render(&snap(0, 0, 0), None, None, &g);
+
+        let series: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("plecto_upstream_instances{"))
+            .collect();
+        assert_eq!(
+            series.len(),
+            6,
+            "two upstreams × three states, no more:\n{text}"
+        );
+        assert_eq!(state_count(&text, "a", "healthy"), Some(1), "{text}");
+        assert_eq!(state_count(&text, "a", "unhealthy"), Some(2), "{text}");
+        assert_eq!(state_count(&text, "a", "ejected"), Some(0), "{text}");
+        assert_eq!(state_count(&text, "b", "unhealthy"), Some(1), "{text}");
+        for upstream in ["a", "b"] {
+            let sum: u64 = ["healthy", "unhealthy", "ejected"]
+                .iter()
+                .filter_map(|s| state_count(&text, upstream, s))
+                .sum();
+            let instances = g
+                .iter()
+                .find(|group| group.name == upstream)
+                .map(|group| group.endpoints().instances.len() as u64);
+            assert_eq!(
+                Some(sum),
+                instances,
+                "upstream {upstream}'s series sum to its instance count:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_label_values_are_escaped() {
+        // The first dynamic label value in this exposition comes from the manifest, and an
+        // unescaped quote would corrupt the WHOLE scrape, not just this series.
+        let toml = r#"
+[[upstream]]
+name = "we\"ird\\name"
+addresses = ["10.0.0.1:80"]
+[upstream.health]
+path = "/healthz"
+"#;
+        let g = groups(toml, &["we\"ird\\name"]);
+        let text = ServerMetrics::new().render(&snap(0, 0, 0), None, None, &g);
+        assert!(
+            text.contains(
+                "plecto_upstream_instances{upstream=\"we\\\"ird\\\\name\",state=\"unhealthy\"} 1"
+            ),
+            "the quote and backslash are escaped:\n{text}"
         );
     }
 }

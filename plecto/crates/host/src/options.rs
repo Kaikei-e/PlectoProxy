@@ -9,8 +9,8 @@ use crate::Bucket;
 use crate::outbound;
 
 /// How a filter is instantiated and isolated (ADR 000004 / 000011). Not a "trust score":
-/// it selects the **instance lifecycle**, mirroring how Fastly/Spin model per-request vs
-/// reusable sandboxes. *Who* is trusted is decided elsewhere (OCI signing, ADR 000006);
+/// it selects the **instance lifecycle**, the per-request vs reusable-sandbox split production
+/// WASM hosts model. *Who* is trusted is decided elsewhere (OCI signing, ADR 000006);
 /// this only says which lifecycle a loaded filter gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
@@ -25,6 +25,17 @@ pub enum Isolation {
     Trusted,
     /// Third-party filters: fresh instance per request, memory fresh by construction.
     Untrusted,
+}
+
+impl Isolation {
+    /// The stable name this mode is reported under — the `plecto.isolation` span attribute and
+    /// the per-filter load line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Isolation::Trusted => "trusted",
+            Isolation::Untrusted => "untrusted",
+        }
+    }
 }
 
 /// Generous default budget for the heavy once-per-instance `init` of a **trusted** filter
@@ -56,7 +67,7 @@ const DEFAULT_CHECKOUT_TIMEOUT_MS: u64 = 250;
 /// Recycle (discard + rebuild) a trusted instance after it has served this many requests
 /// (ADR 000012 / §6.6). Generous so steady-state reuse dominates (init-once still effectively
 /// holds), while still bounding accidental linear-memory state accumulation over an instance's
-/// life. Following Fastly's reusable-sandbox `max-requests`.
+/// life — the `max-requests` periodic-recycle pattern established for reusable sandboxes.
 const DEFAULT_MAX_REQUESTS_PER_INSTANCE: u64 = 1 << 16;
 /// Default ceiling for the auto-sized trusted pool (`available_parallelism`, clamped here).
 /// Modest so a multi-filter manifest does not, by default, multiply out past the engine's

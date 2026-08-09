@@ -9,11 +9,16 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use plecto_host::{Header, LoadedFilter};
+use http::{HeaderMap, HeaderName, HeaderValue};
+use plecto_host::{BodyHooks, Header, LoadedFilter};
 
 use crate::error::ControlError;
-use crate::manifest::{CompressionAlgorithm, Route, RouteCompression};
+use crate::manifest::{
+    CompressionAlgorithm, MAX_RESPONSE_BODY_CAP, OverCapMode, Route, RouteCompression,
+    RouteHeaders, RouteResponseBody, RouteTimeouts, UninspectableMode,
+};
 use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 use crate::weighted::{self, WeightedBackends};
@@ -46,10 +51,11 @@ pub(crate) struct CompiledRoute {
     /// `dispatch_request_body` / `dispatch_response` run this directly instead of doing a
     /// `HashMap::get` per filter id on every single request.
     pub(crate) resolved_chain: Vec<Arc<LoadedFilter>>,
-    /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
-    /// 000038). Precomputed at build from the loaded filters so per-request buffering is a single
-    /// bool check. `false` (all filters header-only) keeps the body on the zero-copy stream path.
-    pub(crate) reads_body: bool,
+    /// Which body directions any filter on this route reads (the OR-fold of the chain's
+    /// [`BodyHooks`], ADR 000038 / 000098). Precomputed at build from the loaded filters so
+    /// per-request buffering is a single bool check per direction. A direction no filter exports
+    /// keeps its body on the zero-copy stream path.
+    pub(crate) body_hooks: BodyHooks,
     /// The route's forwarding target: a weighted set of upstream groups (a single `upstream` is a
     /// one-element set). The fast path picks a group via [`WeightedBackends::pick`], then the group
     /// picks a healthy instance. `Arc`-shared so the split cursor persists across a config generation.
@@ -67,6 +73,18 @@ pub(crate) struct CompiledRoute {
     pub(crate) upgrade: Option<Arc<UpgradeConfig>>,
     /// This route's compression opt-in (ADR 000074), or `None` for never-transform (the default).
     pub(crate) compression: Option<Arc<CompressionConfig>>,
+    /// This route's declared response headers (ADR 000100), or `None` for no declaration. Named
+    /// `response_headers` here because `headers` above is already the request-side MATCH
+    /// dimension — one is what the route matches on, the other what it stamps on the way out.
+    pub(crate) response_headers: Option<Arc<ResponseHeaders>>,
+    /// This route's compiled `[route.timeouts]` overrides (ADR 000102). Two `Option<Duration>`s
+    /// by value, not behind an `Arc`: the per-request `RouteInfo` clone copies 32 bytes instead of
+    /// bumping a refcount, and the resolution against the chosen upstream's defaults is then a
+    /// pair of `Option::unwrap_or`.
+    pub(crate) timeouts: TimeoutConfig,
+    /// This route's compiled `[route.response_body]` settings (ADR 000098), or the strict defaults
+    /// when the block is absent. Only consulted when `body_hooks.response` is set.
+    pub(crate) response_body: Arc<ResponseBodyConfig>,
 }
 
 impl CompiledRoute {
@@ -100,13 +118,16 @@ impl CompiledRoute {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            // The route buffers the body iff at least one of its filters exports
-            // `on-request-body` (ADR 000038). Computed from the loaded filters here so the fast
-            // path only checks a bool.
-            reads_body: r
+            // The route buffers a direction iff at least one of its filters exports that
+            // direction's hook (ADR 000038 / 000098). Computed from the loaded filters here so
+            // the fast path only checks a bool per direction.
+            body_hooks: r
                 .filters
                 .iter()
-                .any(|id| filters.get(id).is_some_and(|f| f.reads_body())),
+                .fold(BodyHooks::NONE, |acc, id| match filters.get(id) {
+                    Some(f) => acc.union(f.body_hooks()),
+                    None => acc,
+                }),
             // present: `validate_routes` already checked every id against the loaded set, so
             // this is always `Some` — `filter_map` stays total (no indexing/unwrap panic)
             // rather than asserting an invariant that's already enforced one step earlier.
@@ -132,6 +153,24 @@ impl CompiledRoute {
                 .compression
                 .as_ref()
                 .map(|c| Arc::new(CompressionConfig::new(c))),
+            // Compile the response-header declaration (ADR 000100) — names / values validated.
+            response_headers: r
+                .headers
+                .as_ref()
+                .map(|h| Arc::new(ResponseHeaders::new(h))),
+            // Compile the timeout overrides (ADR 000102); absent = take the upstream's defaults.
+            timeouts: r
+                .timeouts
+                .as_ref()
+                .map(TimeoutConfig::new)
+                .unwrap_or_default(),
+            // Compile the response-body settings (ADR 000098); absent = the strict defaults.
+            response_body: Arc::new(
+                r.response_body
+                    .as_ref()
+                    .map(ResponseBodyConfig::new)
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -149,12 +188,15 @@ impl std::fmt::Debug for CompiledRoute {
             .field("query", &self.query)
             .field("filters", &self.filters)
             .field("resolved_chain_len", &self.resolved_chain.len())
-            .field("reads_body", &self.reads_body)
+            .field("body_hooks", &self.body_hooks)
             .field("backends", &self.backends)
             .field("strip_prefix", &self.strip_prefix)
             .field("rate_limit", &self.rate_limit)
             .field("upgrade", &self.upgrade)
             .field("compression", &self.compression)
+            .field("response_headers", &self.response_headers)
+            .field("timeouts", &self.timeouts)
+            .field("response_body", &self.response_body)
             .finish()
     }
 }
@@ -240,6 +282,232 @@ impl CompressionConfig {
         self.content_types
             .iter()
             .any(|ct| ct.eq_ignore_ascii_case(essence))
+    }
+}
+
+/// A route's compiled `[route.headers]` (ADR 000100): the operator's literal response-header
+/// declaration, parsed into `http` types once per reload so stamping it onto a response is a map
+/// write, never a re-parse. `remove` runs before `set`, and `set` REPLACES any same-named header
+/// the upstream or a filter produced — the declaration is a floor, not a suggestion.
+#[derive(Debug)]
+pub struct ResponseHeaders {
+    set: Vec<(HeaderName, HeaderValue)>,
+    remove: Vec<HeaderName>,
+}
+
+impl ResponseHeaders {
+    /// Compile a manifest `[route.headers]` block. Public because the fast-path server's unit
+    /// tests build configs directly, without a manifest parse.
+    ///
+    /// `validate_response_headers` already parsed every name and value, so `filter_map` stays
+    /// total here rather than asserting an invariant enforced one step earlier (the same
+    /// discipline `resolved_chain` follows above).
+    pub fn new(rh: &RouteHeaders) -> Self {
+        Self {
+            set: rh
+                .set
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        HeaderName::from_bytes(name.as_bytes()).ok()?,
+                        HeaderValue::from_str(value).ok()?,
+                    ))
+                })
+                .collect(),
+            remove: rh
+                .remove
+                .iter()
+                .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
+        }
+    }
+
+    /// Stamp the declaration onto an about-to-be-sent response.
+    pub fn apply(&self, headers: &mut HeaderMap) {
+        for name in &self.remove {
+            headers.remove(name);
+        }
+        for (name, value) in &self.set {
+            // `insert`, not `append`: the operator's declaration replaces every same-named
+            // header already on the response, duplicates included.
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+/// Parse one declared header name (ADR 000100), rejecting anything the operator must not name.
+/// The reserved set is the hop-by-hop headers (RFC 9110 §7.6.1 — connection management belongs to
+/// the transport, not to a declaration) plus `content-length`, which the host computes for the
+/// body it actually sends: a manifest-set length is a response-desync primitive (CWE-444). Both
+/// fail the BUILD rather than being dropped per response, where nobody would see it.
+fn declared_header_name(name: &str) -> Result<HeaderName, String> {
+    let parsed = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("headers names `{name}`, which is not a valid HTTP header name"))?;
+    let reserved = parsed == http::header::CONTENT_LENGTH
+        || plecto_host::HOP_BY_HOP_GUEST_HEADERS
+            .iter()
+            .any(|h| parsed.as_str() == *h);
+    if reserved {
+        return Err(format!(
+            "headers names `{name}`, a hop-by-hop / framing header the host owns"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Validate a route's `[route.headers]` declaration (ADR 000100), fail-closed. The declaration
+/// lands on every response the route answers, so an unusable name or value must stop startup /
+/// reload; an empty block is a config typo (it declares nothing) and is rejected the same way.
+fn validate_response_headers(h: &crate::manifest::RouteHeaders) -> Result<(), String> {
+    if h.set.is_empty() && h.remove.is_empty() {
+        return Err("headers declares neither `set` nor `remove`".to_string());
+    }
+    let mut seen = HashSet::new();
+    for (name, value) in &h.set {
+        let parsed = declared_header_name(name)?;
+        if !seen.insert(parsed) {
+            return Err(format!(
+                "headers.set declares `{name}` twice (header names are case-insensitive)"
+            ));
+        }
+        if HeaderValue::from_str(value).is_err() {
+            return Err(format!(
+                "headers.set gives `{name}` a value that is not a valid HTTP header value"
+            ));
+        }
+    }
+    for name in &h.remove {
+        declared_header_name(name)?;
+    }
+    Ok(())
+}
+
+/// A route's compiled `[route.response_body]` (ADR 000098): the cap, the two fail-closed modes,
+/// and the content-type allowlist that arms buffering (lower-cased at build so the per-response
+/// check is an allocation-free case-insensitive scan, like `CompressionConfig`'s).
+#[derive(Debug)]
+pub struct ResponseBodyConfig {
+    max_bytes: usize,
+    over_cap: OverCapMode,
+    uninspectable: UninspectableMode,
+    content_types: Vec<String>,
+}
+
+impl Default for ResponseBodyConfig {
+    /// The settings a route with a response-body filter and no `[route.response_body]` block runs
+    /// under. Built from the manifest defaults rather than restated, so the two cannot drift.
+    fn default() -> Self {
+        Self::new(&RouteResponseBody::default())
+    }
+}
+
+impl ResponseBodyConfig {
+    /// Compile a manifest `[route.response_body]` block. Public because the fast-path server's
+    /// unit tests build configs directly, without a manifest parse.
+    pub fn new(rb: &RouteResponseBody) -> Self {
+        Self {
+            // `validate_response_body` already bounded this by `MAX_RESPONSE_BODY_CAP`, which is
+            // far inside `usize` on every target the proxy builds for; saturate rather than assert.
+            max_bytes: usize::try_from(rb.max_bytes).unwrap_or(usize::MAX),
+            over_cap: rb.over_cap,
+            uninspectable: rb.uninspectable,
+            content_types: rb
+                .content_types
+                .iter()
+                .map(|ct| ct.trim().to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    /// The most bytes of one response body the host will hold for the hook.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// What to do with a body over [`max_bytes`](Self::max_bytes).
+    pub fn over_cap(&self) -> OverCapMode {
+        self.over_cap
+    }
+
+    /// What to do with a response that cannot be inspected at all.
+    pub fn uninspectable(&self) -> UninspectableMode {
+        self.uninspectable
+    }
+
+    /// Does this `Content-Type` essence arm inspection on this route? The caller passes the
+    /// AS-RECEIVED essence (ADR 000098 decision 3): deciding on a value a chain filter could have
+    /// rewritten would let a filter earlier in the chain steer the response past the one that
+    /// inspects it.
+    pub fn content_type_eligible(&self, essence: &str) -> bool {
+        let essence = essence.trim();
+        self.content_types
+            .iter()
+            .any(|ct| ct.eq_ignore_ascii_case(essence))
+    }
+}
+
+/// Validate a route's `[route.response_body]` declaration (ADR 000098), fail-closed: a cap of zero
+/// could never hold a body, a cap over the request-side ceiling would buy the response plane more
+/// headroom than the request plane has, and an empty or malformed allowlist would silently disarm
+/// the inspection the route declared a filter for.
+fn validate_response_body(rb: &RouteResponseBody) -> Result<(), String> {
+    if rb.max_bytes == 0 {
+        return Err("response_body.max_bytes must be non-zero".to_string());
+    }
+    if rb.max_bytes > MAX_RESPONSE_BODY_CAP {
+        return Err(format!(
+            "response_body.max_bytes is {} bytes, over the {MAX_RESPONSE_BODY_CAP}-byte ceiling",
+            rb.max_bytes
+        ));
+    }
+    if rb.content_types.is_empty() {
+        return Err("response_body.content_types must be non-empty".to_string());
+    }
+    for ct in &rb.content_types {
+        let essence = ct.trim();
+        let well_formed = essence
+            .split_once('/')
+            .is_some_and(|(t, s)| !t.is_empty() && !s.is_empty())
+            && !essence.contains([';', ',', ' ']);
+        if !well_formed {
+            return Err(format!(
+                "response_body.content_types entry `{essence}` is not a type/subtype"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A route's compiled `[route.timeouts]` (ADR 000102): the per-try / overall bounds this route
+/// declares, each resolved against the upstream's own default at forward time. `None` is "not
+/// declared" and `Some(Duration::ZERO)` is "declared disabled" — the fast path must keep the two
+/// apart, since writing `0` is how a streaming route opts out of a short upstream default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimeoutConfig {
+    request: Option<Duration>,
+    overall: Option<Duration>,
+}
+
+impl TimeoutConfig {
+    /// Compile a manifest `[route.timeouts]` block. Public because the fast-path server's unit
+    /// tests build configs directly, without a manifest parse.
+    pub fn new(t: &RouteTimeouts) -> Self {
+        Self {
+            request: t.request_timeout_ms.map(Duration::from_millis),
+            overall: t.overall_timeout_ms.map(Duration::from_millis),
+        }
+    }
+
+    /// The effective per-try bound (ADR 000019 / 000102): this route's override, else the
+    /// upstream's declared default. `Duration::ZERO` (either source) disables the bound.
+    pub fn request_timeout(&self, upstream_default: Duration) -> Duration {
+        self.request.unwrap_or(upstream_default)
+    }
+
+    /// The effective overall bound (ADR 000031 / 000102): this route's override, else the
+    /// upstream's declared default. `Duration::ZERO` (either source) means no overall bound.
+    pub fn overall_timeout(&self, upstream_default: Duration) -> Duration {
+        self.overall.unwrap_or(upstream_default)
     }
 }
 
@@ -379,6 +647,21 @@ pub(crate) fn validate_routes<'a>(
                 }
             }
         }
+        // Validate the declarative response headers (ADR 000100) before anything can serve them.
+        if let Some(h) = &r.headers {
+            validate_response_headers(h).map_err(|reason| ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason,
+            })?;
+        }
+        // Validate the response-body inspection settings (ADR 000098) the same way — an unusable
+        // cap or allowlist must stop startup / reload, not disarm inspection per response.
+        if let Some(rb) = &r.response_body {
+            validate_response_body(rb).map_err(|reason| ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason,
+            })?;
+        }
         validated.push(ValidatedRoute { route: r, targets });
     }
     Ok(validated)
@@ -406,10 +689,10 @@ pub struct RouteInfo {
     pub strip_prefix: Option<Arc<str>>,
     /// Whether this route has any filters (drives the header-side chain dispatch).
     pub has_filters: bool,
-    /// Whether any filter on this route reads the request body (exports `on-request-body`, ADR
-    /// 000038). The fast path buffers the body ONLY when this is `true`; a route of header-only
-    /// filters keeps the zero-copy streaming path (the real fix for the body-tax, docs/servey).
-    pub reads_body: bool,
+    /// Which body directions this route's chain reads (ADR 000038 / 000098). The fast path buffers
+    /// a direction ONLY when its flag is set; a route whose filters export neither hook keeps the
+    /// zero-copy streaming path in BOTH directions (the real fix for the body-tax, docs/servey).
+    pub body_hooks: BodyHooks,
     /// This route's native rate limiter (ADR 000033), or `None` for unlimited. `Arc`-shared with the
     /// live config so the per-request `RouteInfo` consults the route's persistent buckets.
     pub(crate) rate_limit: Option<Arc<NativeRateLimit>>,
@@ -419,6 +702,17 @@ pub struct RouteInfo {
     /// This route's compression opt-in (ADR 000074), or `None` for never-transform. The fast path
     /// negotiates and compresses AFTER the response chain, on the streamed body filters never see.
     pub compression: Option<Arc<CompressionConfig>>,
+    /// This route's declared response headers (ADR 000100), or `None` for no declaration. The
+    /// fast path stamps them on every response it answers for this route — after the chain, so no
+    /// filter can drop them, and before compression, so the codec still owns the representation.
+    pub response_headers: Option<Arc<ResponseHeaders>>,
+    /// This route's `[route.timeouts]` overrides (ADR 000102). Read through
+    /// [`RouteInfo::request_timeout`] / [`RouteInfo::overall_timeout`], which resolve them
+    /// against the upstream group the request is actually being forwarded to.
+    pub(crate) timeouts: TimeoutConfig,
+    /// This route's response-body inspection settings (ADR 000098), or the strict defaults. Only
+    /// consulted when `body_hooks.response` is set.
+    pub response_body: Arc<ResponseBodyConfig>,
 }
 
 impl RouteInfo {
@@ -436,6 +730,21 @@ impl RouteInfo {
     /// the common no-strip case allocates nothing.
     pub fn rewrite_path<'a>(&self, path: &'a str) -> Cow<'a, str> {
         rewrite_path(path, self.strip_prefix.as_deref())
+    }
+
+    /// The per-try timeout for a request this route forwards to `group` (ADR 000102): the route's
+    /// `[route.timeouts]` override when it declares one, else the upstream's own default. Bounds
+    /// ONE attempt's time-to-response-headers; `Duration::ZERO` disables it.
+    pub fn request_timeout(&self, group: &UpstreamGroup) -> Duration {
+        self.timeouts.request_timeout(group.request_timeout())
+    }
+
+    /// The overall timeout for a request this route forwards to `group` (ADR 000102), resolved the
+    /// same way. Bounds the whole transaction — every attempt plus the backoff between them;
+    /// `Duration::ZERO` means no overall bound. The tighter of this and the per-try bound governs
+    /// each attempt (ADR 000031), which the forward loop applies as it spends the budget.
+    pub fn overall_timeout(&self, group: &UpstreamGroup) -> Duration {
+        self.timeouts.overall_timeout(group.overall_timeout())
     }
 
     /// Consult this route's native rate limiter (ADR 000033) for one request, keyed on the
@@ -694,6 +1003,16 @@ mod tests {
     /// A throwaway upstream group named after `upstream` — these tests exercise `select` /
     /// `rewrite_path`, which never touch the group's contents, only its identity.
     fn group(upstream: &str) -> Arc<UpstreamGroup> {
+        timed_group(upstream, 30_000, 0)
+    }
+
+    /// A throwaway upstream group declaring the per-try / overall timeout defaults a route's
+    /// `[route.timeouts]` overrides resolve against (ADR 000102).
+    fn timed_group(
+        upstream: &str,
+        request_timeout_ms: u64,
+        overall_timeout_ms: u64,
+    ) -> Arc<UpstreamGroup> {
         let reg = UpstreamRegistry::new();
         reg.reconcile(
             &[Upstream {
@@ -711,9 +1030,9 @@ mod tests {
                     unhealthy_threshold: 1,
                     port: None,
                 },
-                request_timeout_ms: 30_000,
+                request_timeout_ms,
                 max_retries: 1,
-                overall_timeout_ms: 0,
+                overall_timeout_ms,
                 circuit_breaker: CircuitBreaker::default(),
                 outlier_detection: OutlierDetection::default(),
             }],
@@ -737,12 +1056,15 @@ mod tests {
             query: vec![],
             filters: vec![],
             resolved_chain: vec![],
-            reads_body: false,
+            body_hooks: BodyHooks::NONE,
             backends: backends(upstream),
             strip_prefix: None,
             rate_limit: None,
             upgrade: None,
             compression: None,
+            response_headers: None,
+            timeouts: TimeoutConfig::default(),
+            response_body: Arc::new(ResponseBodyConfig::default()),
         }
     }
 
@@ -786,7 +1108,23 @@ mod tests {
             rate_limit,
             upgrade: None,
             compression: None,
+            headers: None,
+            timeouts: None,
+            response_body: None,
         }
+    }
+
+    /// A manifest route carrying a `[route.headers]` declaration, for the validation tests.
+    fn route_with_headers(set: &[(&str, &str)], remove: &[&str]) -> Vec<Route> {
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.headers = Some(crate::manifest::RouteHeaders {
+            set: set
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            remove: remove.iter().map(|n| (*n).to_string()).collect(),
+        });
+        vec![r]
     }
 
     #[test]
@@ -915,6 +1253,298 @@ mod tests {
             UpgradeConfig::new(&["websocket".to_string()], 0).idle_timeout(),
             None,
             "0 disables the idle timer"
+        );
+    }
+
+    #[test]
+    fn validate_routes_rejects_unusable_declared_response_headers() {
+        // ADR 000100: the declaration is applied to every response the route answers, so a name
+        // or value that is not valid HTTP must fail the build — never be dropped silently at
+        // request time. Framing / connection-management names are refused outright: the host owns
+        // framing (ADR 000073 review), and a manifest-set `content-length` is a response-desync
+        // primitive (CWE-444).
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let rejected = |set: &[(&str, &str)], remove: &[&str]| {
+            matches!(
+                validate_routes(&route_with_headers(set, remove), &filters, &upstream_names),
+                Err(ControlError::InvalidRoute { .. })
+            )
+        };
+
+        assert!(rejected(&[], &[]), "an empty block declares nothing");
+        assert!(rejected(&[("x bad", "v")], &[]), "a non-token name");
+        assert!(rejected(&[("", "v")], &[]), "an empty name");
+        assert!(
+            rejected(&[("x-ok", "line\r\ninjected")], &[]),
+            "a CRLF-bearing value"
+        );
+        assert!(
+            rejected(&[("content-length", "0")], &[]),
+            "framing belongs to the host, not to a declaration"
+        );
+        assert!(
+            rejected(&[("connection", "close")], &[]),
+            "connection management is hop-by-hop"
+        );
+        assert!(
+            rejected(&[("x-ok", "v")], &["transfer-encoding"]),
+            "the same reservation applies to a removal"
+        );
+        assert!(
+            rejected(&[("x-ok", "v")], &["bad name"]),
+            "a name to remove"
+        );
+        assert!(
+            rejected(&[("X-Dup", "a"), ("x-dup", "b")], &[]),
+            "the same name declared twice is ambiguous"
+        );
+
+        assert!(
+            validate_routes(
+                &route_with_headers(&[("X-Frame-Options", "DENY")], &["server"]),
+                &filters,
+                &upstream_names
+            )
+            .is_ok(),
+            "a well-formed declaration passes"
+        );
+    }
+
+    fn route_with_response_body(rb: RouteResponseBody) -> Vec<Route> {
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.response_body = Some(rb);
+        vec![r]
+    }
+
+    #[test]
+    fn validate_routes_rejects_an_unusable_response_body_declaration() {
+        // ADR 000098: the cap and the allowlist decide whether a route's declared inspection runs
+        // at all, so an unusable value must stop startup / reload rather than quietly disarm the
+        // filter the operator put on the route.
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+        let rejected = |rb: RouteResponseBody| {
+            matches!(
+                validate_routes(&route_with_response_body(rb), &filters, &upstream_names),
+                Err(ControlError::InvalidRoute { .. })
+            )
+        };
+
+        assert!(
+            rejected(RouteResponseBody {
+                max_bytes: 0,
+                ..Default::default()
+            }),
+            "a zero cap could never hold a body"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                max_bytes: MAX_RESPONSE_BODY_CAP + 1,
+                ..Default::default()
+            }),
+            "the response plane never buys more headroom than the request plane has"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                content_types: vec![],
+                ..Default::default()
+            }),
+            "an empty allowlist arms nothing"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                content_types: vec!["application".to_string()],
+                ..Default::default()
+            }),
+            "an entry that is not type/subtype"
+        );
+        assert!(
+            rejected(RouteResponseBody {
+                content_types: vec!["text/plain; charset=utf-8".to_string()],
+                ..Default::default()
+            }),
+            "the allowlist matches the ESSENCE, so a parameter in the entry is a typo"
+        );
+
+        assert!(
+            validate_routes(
+                &route_with_response_body(RouteResponseBody {
+                    max_bytes: MAX_RESPONSE_BODY_CAP,
+                    ..Default::default()
+                }),
+                &filters,
+                &upstream_names
+            )
+            .is_ok(),
+            "the ceiling itself is allowed"
+        );
+    }
+
+    #[test]
+    fn the_compiled_allowlist_matches_the_essence_case_insensitively() {
+        let cfg = ResponseBodyConfig::new(&RouteResponseBody {
+            content_types: vec!["Application/JSON".to_string(), " text/plain ".to_string()],
+            ..Default::default()
+        });
+
+        assert!(cfg.content_type_eligible("application/json"));
+        assert!(cfg.content_type_eligible("APPLICATION/JSON"));
+        assert!(cfg.content_type_eligible("text/plain"));
+        assert!(!cfg.content_type_eligible("text/html"));
+        assert!(!cfg.content_type_eligible(""), "no declared type, no scope");
+    }
+
+    #[test]
+    fn an_absent_response_body_block_compiles_to_the_strict_defaults() {
+        // The no-block path and the declared-block path must not drift: a route that declares an
+        // inspecting filter and nothing else runs under the same values the manifest documents.
+        let cfg = ResponseBodyConfig::default();
+        assert_eq!(cfg.max_bytes(), 1 << 20);
+        assert_eq!(cfg.over_cap(), OverCapMode::Reject);
+        assert_eq!(cfg.uninspectable(), UninspectableMode::Reject);
+        assert!(cfg.content_type_eligible("application/json"));
+        assert!(
+            !cfg.content_type_eligible("text/event-stream"),
+            "a streaming type is never in the allowlist"
+        );
+    }
+
+    #[test]
+    fn response_headers_remove_first_then_set_over_any_existing_value() {
+        // The compiled declaration is a floor: `remove` drops what the upstream sent, `set`
+        // replaces every same-named value (duplicates included) rather than appending beside it,
+        // and the manifest's name casing is irrelevant.
+        let declared = ResponseHeaders::new(&crate::manifest::RouteHeaders {
+            set: [
+                ("X-Frame-Options".to_string(), "DENY".to_string()),
+                ("x-content-type-options".to_string(), "nosniff".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            remove: vec!["Server".to_string()],
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("server", HeaderValue::from_static("upstream/1.0"));
+        headers.append("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
+        headers.append("x-frame-options", HeaderValue::from_static("ALLOWALL"));
+        headers.insert("x-untouched", HeaderValue::from_static("1"));
+
+        declared.apply(&mut headers);
+
+        assert!(headers.get("server").is_none(), "a declared removal holds");
+        assert_eq!(
+            headers.get_all("x-frame-options").iter().count(),
+            1,
+            "the declaration replaces every same-named value, duplicates included"
+        );
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(
+            headers.get("x-untouched").unwrap(),
+            "1",
+            "headers the route never named are left alone"
+        );
+    }
+
+    #[test]
+    fn response_headers_set_wins_over_a_name_also_listed_for_removal() {
+        // `remove` runs first, so a name in both lists ends up SET — the more specific
+        // instruction, and the one an operator reading the block last would expect.
+        let declared = ResponseHeaders::new(&crate::manifest::RouteHeaders {
+            set: [("x-both".to_string(), "kept".to_string())]
+                .into_iter()
+                .collect(),
+            remove: vec!["x-both".to_string()],
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-both", HeaderValue::from_static("from-upstream"));
+        declared.apply(&mut headers);
+        assert_eq!(headers.get("x-both").unwrap(), "kept");
+    }
+
+    /// A `RouteInfo` over one upstream group, shaped like the one `find_route` builds — only the
+    /// timeout override under test is set.
+    fn route_info(group: Arc<UpstreamGroup>, timeouts: TimeoutConfig) -> RouteInfo {
+        RouteInfo {
+            index: 0,
+            backends: Arc::new(WeightedBackends::new(vec![(group, 1)]).unwrap()),
+            strip_prefix: None,
+            has_filters: false,
+            body_hooks: BodyHooks::NONE,
+            rate_limit: None,
+            upgrade: None,
+            compression: None,
+            response_headers: None,
+            timeouts,
+            response_body: Arc::new(ResponseBodyConfig::default()),
+        }
+    }
+
+    #[test]
+    fn a_route_overrides_its_upstreams_timeouts_and_an_explicit_zero_disables_them() {
+        // ADR 000102: one rule — the upstream declares the default, the route overrides it. The
+        // upstream here declares both bounds, so "took the default" and "took the override" are
+        // distinguishable for each knob.
+        let upstream = timed_group("u", 30_000, 60_000);
+        let declared = |request_timeout_ms, overall_timeout_ms| {
+            TimeoutConfig::new(&RouteTimeouts {
+                request_timeout_ms,
+                overall_timeout_ms,
+            })
+        };
+
+        let inherited = route_info(upstream.clone(), TimeoutConfig::default());
+        assert_eq!(
+            inherited.request_timeout(&upstream),
+            Duration::from_secs(30),
+            "no declaration takes the upstream's per-try default"
+        );
+        assert_eq!(
+            inherited.overall_timeout(&upstream),
+            Duration::from_secs(60),
+            "no declaration takes the upstream's overall default"
+        );
+
+        let overridden = route_info(upstream.clone(), declared(Some(90_000), None));
+        assert_eq!(
+            overridden.request_timeout(&upstream),
+            Duration::from_secs(90),
+            "a declared per-try bound wins over the upstream's"
+        );
+        assert_eq!(
+            overridden.overall_timeout(&upstream),
+            Duration::from_secs(60),
+            "the knob the route left out still takes the upstream's"
+        );
+
+        // An explicit `0` is the opt-out, not "undeclared": a streaming route writes it to shed a
+        // short upstream default, so the two states must resolve differently.
+        let streaming = route_info(upstream.clone(), declared(Some(0), Some(0)));
+        assert_eq!(streaming.request_timeout(&upstream), Duration::ZERO);
+        assert_eq!(streaming.overall_timeout(&upstream), Duration::ZERO);
+    }
+
+    #[test]
+    fn compile_carries_the_manifest_timeout_overrides() {
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.timeouts = Some(RouteTimeouts {
+            request_timeout_ms: Some(0),
+            overall_timeout_ms: Some(1500),
+        });
+        let compiled = CompiledRoute::compile(
+            &r,
+            WeightedBackends::new(vec![(group("real"), 1)]).unwrap(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            compiled.timeouts.request_timeout(Duration::from_secs(30)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            compiled.timeouts.overall_timeout(Duration::ZERO),
+            Duration::from_millis(1500)
         );
     }
 

@@ -287,8 +287,11 @@ id = "auth"
 source = "artifacts/auth"
 digest = "sha256:abc"
 
-[chain]
+[[route]]
 filters = ["auth"]
+upstream = "app"
+[route.match]
+path_prefix = "/"
 "#,
         )
         .unwrap();
@@ -296,8 +299,11 @@ filters = ["auth"]
         let noisy = Manifest::from_toml(
             r#"
 # a leading comment
-[chain]
-filters = ["auth"]   # chain first, with trailing comment
+[[route]]
+upstream = "app"     # route first, with trailing comment
+filters  = ["auth"]
+[route.match]
+path_prefix = "/"
 
 [[filter]]
 digest   = "sha256:abc"
@@ -507,8 +513,11 @@ id = "auth"
 source = "artifacts/auth"
 digest = "sha256:abc"
 
-[chain]
+[[route]]
 filters = ["auth"]
+upstream = "app"
+[route.match]
+path_prefix = "/"
 "#,
         )
         .unwrap();
@@ -520,8 +529,11 @@ id = "auth"
 source = "artifacts/auth"
 digest = "sha256:abc"
 
-[chain]
+[[route]]
 filters = []
+upstream = "app"
+[route.match]
+path_prefix = "/"
 "#,
         )
         .unwrap();

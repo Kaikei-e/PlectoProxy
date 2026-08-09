@@ -96,6 +96,192 @@ admin `/metrics` は RED シグナルに加えて次を出す:
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — トンネルが中継した
   バイト数（down = upstream → client、up = client → upstream）。各トンネルの close 時に加算。
 
+## アクセスログ: フィールド契約
+
+アクセスログは opt-in で、既定では**無効**。`[observability] access_log` で有効にする:
+
+```toml
+[observability]
+access_log = true
+```
+
+有効にすると、リクエストごとに `plecto::access` ターゲットへ `tracing` イベントが 1 本出て、
+バイナリの JSON サブスクライバがそれを 1 行として描画する。イベントのフィールドはその行の
+**top-level** に——`timestamp` / `level` / `target` と同じ深さに——並ぶ。取り込み層はネストした
+オブジェクトを展開せずに、そのまま型付きスロットへ写せる。
+
+```json
+{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
+```
+
+> **平坦化前のリリースからの移行:** 同じフィールドはかつて `fields` オブジェクトの中にあった
+> （`fields.method` / `fields.status` …）。名前は変わっておらず、ネストが無くなっただけ。
+> 取り込み設定を行の直下へ向け直すこと。
+
+| フィールド | 型 | 意味 |
+| --- | --- | --- |
+| `client` | string | このトランザクションを帰属させるアドレス。接続 peer、または宣言済み `[listen.trusted_proxy]` 配下ならその proxy が名指ししたクライアント（[ADR 000103](ADR/000103.md)）。再発行される `X-Forwarded-For` と per-client rate limit が使うアドレスと同一なので、ログと強制は一致する。 |
+| `scheme` | string | `http` / `https`。ワイヤから取る値であり、inbound の `X-Forwarded-Proto` は決して尊重しない。 |
+| `method` | string | 受信したままのリクエストメソッド。 |
+| `authority` | string | リクエストの host authority。 |
+| `path` | string | リクエストパス。**クエリ文字列は落とす**。 |
+| `status` | number | クライアントへ返したステータス。プロキシが応答できなかった転送エラーは `502` として記録する。 |
+| `duration_ms` | number | トランザクション開始から応答ヘッダまでのミリ秒（整数）。 |
+| `trace_id` | string | W3C trace id（小文字 hex 32 桁）。呼び出し元が `traceparent` を送っていればその値、なければ Plecto が採番した値。 |
+| `span_id` | string | Plecto 自身の request span の W3C span id（小文字 hex 16 桁）。upstream へ伝播するのもこの id。 |
+| `response_body_inspection_skipped` | string \| null | `on-response-body` フィルタを宣言したルートで、そのフィルタが見られなかったレスポンスの理由（[ADR 000098](ADR/000098.md)）: `streaming-content-type` / `content-encoding` / `partial-content` / `over-cap`。それ以外のトランザクション（該当フィルタを持たないルートを含む）では `null`。 |
+
+この行が守る性質は 2 つ:
+
+- **秘密を持たない。** `Authorization` も `Cookie` も——そもそもヘッダ値を一切——出さず、path は
+  クエリ文字列を落として出す。したがってアクセスログをトラフィック本体より低信頼な宛先へ送ること
+  自体は、それだけでは開示にならない。
+- **`trace_id` / `span_id` はサンプリングの有無にかかわらず常に出る。** 下流でサンプリングされて
+  残った何かとこの行を結合でき、サンプリングされなかったトランザクションについては、この行が
+  唯一の手がかりになる。遅いリクエストとそのトレースを結ぶのは両側の `trace_id`。
+
+**このフィールド集合は契約であり、manifest スキーマと同じ扱いをする。** フィールドの追加・改名・
+削除は公開インターフェースの変更であり、そこに記された pre-1.0 バージョニング方針のもとで
+[`CHANGELOG.md`](../CHANGELOG.md) の **Changed** に移行注記つきで載る。取り込み設定は行の順序や
+全体の形ではなく、上表のフィールド名に対して固定すること。
+
+## 宣言したレスポンスヘッダ: どの応答に乗るか
+
+ルートは、常に付けたいレスポンスヘッダをフィルタ無しで宣言できる:
+
+```toml
+[[route]]
+upstream = "app"
+[route.match]
+path_prefix = "/"
+[route.headers]
+set = { "X-Content-Type-Options" = "nosniff", "Referrer-Policy" = "no-referrer" }
+remove = ["server"]
+```
+
+どちらのキーも省略できるが、ブロックには少なくとも一方が要る。**値はリテラルのみ**——条件分岐も、
+リクエスト値の補間も、パターンも無い。値がリクエストによって変わるヘッダは per-request の判断であり、
+それはフィルタの仕事である（[ADR 000029](ADR/000029.md) · [ADR 000100](ADR/000100.md)）。
+
+**この宣言は「フロア」であって提案ではない。** レスポンスフィルタチェーンの後、圧縮の前に適用される:
+
+- `set` は upstream やフィルタが付けた同名ヘッダを**置き換える**（複数あればすべて）。`remove` は
+  その名前を丸ごと落とす。`remove` が先に走るので、両方に載せた名前は最終的に set される。
+- ヘッダ名は大文字小文字を区別せずに照合する——`X-Frame-Options` と `x-frame-options` は同じ宣言で
+  あり、ひとつの `set` に両方書くと曖昧として拒否される。
+- **そのルートが返す全応答**に乗る。想定しづらい経路も含む: フィルタの `replace`、フィルタの
+  short-circuit、チェーンの fail-closed 5xx、native レートリミットの 429、転送側の 502 / 503 / 504。
+  「壊れたときに消えないこと」が価値そのものであるセキュリティヘッダは、壊れたときにも消えない。
+
+**穴はひとつ、意図的なもの。** route が決まる**前**に返る応答には宣言が乗らない。取ってくる route が
+無いからである。該当するのは no-route の **404** と、パス正規化の **400**（曖昧またはルート脱出を
+する request target を ingress で拒否したもの）。これらにもヘッダが要る場合は別の場所で終端するか、
+穴として受け入れること——listener 単位の宣言は提供していない。
+
+**検証は fail-closed。** 不正なヘッダ名・値は、リクエスト時に黙って落とされるのではなく
+`plecto validate`・起動・reload を落とす。hop-by-hop ヘッダ（`connection` / `transfer-encoding` /
+`upgrade` / `te` / `trailer` / `keep-alive` / `proxy-connection` / `proxy-authorization` /
+`proxy-authenticate`）や `content-length` を名指しした場合も同じ: 接続管理はトランスポートのもので
+あり、長さは Plecto が実際に送る body のものである——宣言された長さは response desync の材料になる。
+
+## リクエストタイムアウト: 実際に効く値はどれか
+
+転送されるリクエストは二つの bound で区切られ、どちらも既定値は upstream が宣言する:
+
+| ノブ | 何を区切るか | 既定 | `0` の意味 |
+| --- | --- | --- | --- |
+| `request_timeout_ms`（per-try） | 1 回の試行が応答**ヘッダ**に到達するまで。ヘッダ到達後の body はデッドライン無しでストリームする | `30000` | per-try 無効——long-poll / streaming のオプトアウト |
+| `overall_timeout_ms` | トランザクション全体: 全試行**＋**その間の backoff | `0` | overall 無し |
+
+route は自分のトラフィックについてどちらも上書きできる。レイテンシ特性の異なる route が、`[[upstream]]`
+を複製せずに同一 upstream を共有できる（複製すると health プローバも複製され、ひとつのバックエンドに
+対して circuit breaker の状態が分裂する）:
+
+```toml
+[[upstream]]
+name = "app"
+addresses = ["127.0.0.1:9000"]
+request_timeout_ms = 5000     # この upstream 宛の全 route が継承する既定
+[upstream.health]
+path = "/healthz"
+
+[[route]]                     # 5000 を継承
+upstream = "app"
+[route.match]
+path_prefix = "/api"
+
+[[route]]                     # 同じ upstream、より長い予算
+upstream = "app"
+[route.match]
+path_prefix = "/images/resize"
+[route.timeouts]
+request_timeout_ms = 30000
+overall_timeout_ms = 45000
+
+[[route]]                     # 同じ upstream、per-try は掛けない
+upstream = "app"
+[route.match]
+path_prefix = "/events"
+[route.timeouts]
+request_timeout_ms = 0
+```
+
+**解決順は規則ひとつ: route が宣言していればその値、していなければ upstream の値**——ノブごとに独立
+して適用される。`overall_timeout_ms` だけを書いた route は、per-try については upstream の値で動く。
+
+**「書かない」と「`0` と書く」は別物である。** 書かなければ upstream の値を取り、`0` はその route に
+ついてその bound を無効化する。`[route.timeouts] request_timeout_ms = 0` は、短い upstream 既定から
+streaming route を外すための書き方であって、ブロックを省略するのとは意味が違う。
+
+**二つの bound は同時に効き、厳しい方が勝つ。** 各試行は per-try の値**と** overall 予算の残量の、
+小さい方で区切られる。overall 予算は試行と backoff が消費するたびに縮む。per-try より小さい
+`overall_timeout_ms` は拒否しない——runtime が小さい方を適用するだけなので、単一試行が途中で切られる
+ことはある。
+
+超過はいずれも fail-closed の **504**。どちらだったかは fault マーカーで分かる:
+per-try 超過は `x-plecto-fault: upstream-timeout`、overall 超過は `request-timeout`。
+
+意図的にやっていないことが二つある。**解決後の値をレンダリングする出力は無い**——ある route が何秒で
+動いているかは、その `[route.timeouts]` と upstream 側のフィールドを読んで判断する。そして
+`max_retries` / `[upstream.circuit_breaker]` / `[upstream.outlier_detection]` は per-upstream の
+ままである。これらは「このバックエンドにどれだけ負荷をかけてよいか」「このバックエンドは壊れているか」
+というバックエンドの性質であって、この route の時間予算ではない
+（[ADR 000102](ADR/000102.md)）。
+
+## アップグレード: 独立した二つのバージョン系列
+
+Plecto は**二つのバージョン系列**を持ち、**両者は独立に動く**:
+
+| 系列 | 何のバージョンか | どこで見えるか |
+| --- | --- | --- |
+| バイナリ / イメージ / ライブラリクレート | プロキシ自身: manifest スキーマ・CLI・データプレーン・ホスト | `plecto --version`、イメージタグ、クレートのバージョン |
+| `plecto:filter@<version>` | プロキシとフィルタの間の WIT 契約 | `plecto --version` の `filter contracts:` 行と、起動時のフィルタごとの 1 行 |
+
+**プロキシのバンプにフィルタの再ビルドが必要になることは決してない。** ホストはサポートする全
+契約版をロードし続けるので、古い契約版に対して作られたフィルタはプロキシのアップグレードを
+またいで動き続ける——セキュリティ修正を含むパッチアップグレードも同様。取ってよい。
+
+別の問いに答える 2 つのコマンド:
+
+```console
+$ plecto --version
+plecto 0.7.0 (profile: minimal)
+filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0, plecto:filter@0.4.0
+```
+
+これは**このバイナリが受け付ける集合**。**手元のフィルタ**が実際に何にバインドしたかは別の問い
+で、起動時（および reload のたび）にフィルタごとの 1 行が答える:
+
+```json
+{"timestamp":"...","level":"INFO","filter":"hello","contract":"plecto:filter@0.3.0","isolation":"trusted","message":"filter loaded","target":"plecto_control"}
+```
+
+アップグレード前に、そこに出ている `contract` がすべて新バイナリの `filter contracts:` に残って
+いることを確認する。残っていれば——リリースノートがある契約版の廃止を宣言していない限り残る
+——そのアップグレードにフィルタ側の作業は一切要らない。major 契約版は最低 2 リリース系列は
+ロード可能なまま維持され、その廃止は単独の ADR で宣言される（互換ポリシーは
+[ADR 000085](ADR/000085.md)）。黙って消えることはない。
+
 ## CI プリフライト: `plecto validate --resolve`
 
 manifest の編集やフィルタ digest の更新は、reload 時ではなく CI で落ちるべきもの。`plecto validate

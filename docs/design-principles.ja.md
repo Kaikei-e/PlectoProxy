@@ -102,7 +102,7 @@ plecto`）で、新しい文脈を持ち込まない——`plecto-server` から
 
 関係は三本: **Fast path → Extension plane**（per-request に chain を駆動）、**Control → Extension plane**（manifest が filter を digest pin し chain 順と trust root を宣言、reload が atomic に差し替え）、**Control → Fast path**（manifest が route と転送先を宣言し、fast path は per-request に `ConfigSnapshot` を取って route を選ぶ）。契約 `wit/` は workspace 直下に置かれ、どの crate にも属さない——契約は文脈間の共有財であって、どれかの所有物ではない。
 
-### 2.2 契約アーキテクチャ（`plecto:filter@0.3.0`）
+### 2.2 契約アーキテクチャ（`plecto:filter@0.4.0`）
 
 契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。ヘッダ値は `list<u8>`（ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取り、`response-decision` は `replace` arm を持つ——P3（判断は型で）が response 側にも対称に成立する（ADR 000073）。`0.1.0` / `0.2.0` は凍結ツリー＋ホストアダプタでロード可能。現行契約の構造:
 

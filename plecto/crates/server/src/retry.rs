@@ -46,8 +46,8 @@ pub(crate) fn is_retriable_5xx(status: StatusCode) -> bool {
     matches!(status.as_u16(), 502..=504)
 }
 
-/// Full-jitter exponential backoff base / cap in milliseconds (ADR 000030). Projected
-/// Envoy-reference defaults, not tuned by measurement: a retry waits a uniform-random delay in
+/// Full-jitter exponential backoff base / cap in milliseconds (ADR 000030). Conventional
+/// starting values for a proxy retry, not tuned by measurement: a retry waits a uniform-random delay in
 /// `[0, min(cap, base · 2^attempt)]`, so concurrent clients' retries spread out instead of
 /// thundering onto a recovering upstream in lockstep.
 const RETRY_BACKOFF_BASE_MS: u64 = 25;

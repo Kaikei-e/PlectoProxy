@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn wrong_length_file_is_rejected_at_build() {
         let dir = tempfile::tempdir().unwrap();
-        let path = stek_file(dir.path(), &[7u8; 48]); // nginx-sized, not ours
+        let path = stek_file(dir.path(), &[7u8; 48]); // a plausible other-implementation size, not ours
         let err = SharedStekTicketer::new(path, Duration::from_secs(3600), [1; 32], Duration::ZERO)
             .expect_err("a non-64-byte file must fail the build");
         match err {

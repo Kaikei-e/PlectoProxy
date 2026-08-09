@@ -9,7 +9,7 @@
 - **serve** — `plecto <manifest.toml> [listen_addr]`。manifest からコントロールプレーンを構築し
   fast path を起動する主経路（ADR 000013）。SIGHUP hot reload / SIGTERM graceful drain は
   ライブラリ側の実装をそのまま配線する（ADR 000008 / 000039）。
-- **operator CLI** — `validate`（`nginx -t` 型の静的検証、ADR 000046）、`schema`（manifest の
+- **operator CLI** — `validate`（設定を検証して終了する型の静的検証、ADR 000046）、`schema`（manifest の
   JSON Schema、ADR 000049）、`--version`（capability profile 表示、ADR 000079）、`healthz`
   （自己プローブ）、`package`（CI パッケージング）。
 - **healthz（自己プローブ）** — `plecto healthz [--live] [--admin-addr] [<manifest>]`。distroless

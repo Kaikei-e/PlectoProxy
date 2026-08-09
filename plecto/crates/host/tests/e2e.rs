@@ -44,7 +44,7 @@ fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
 fn request(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: headers
@@ -86,7 +86,7 @@ fn non_utf8_request_header_continues_with_native_bytes() {
     let raw: &[u8] = &[0xC3, 0x28];
     let req = HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: vec![Header {

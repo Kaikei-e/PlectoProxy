@@ -52,6 +52,154 @@ pub struct Route {
     /// enables BREACH-class chosen-plaintext attacks against TLS. Leave those routes uncompressed.
     #[serde(default)]
     pub compression: Option<RouteCompression>,
+    /// Declarative response headers (`[route.headers]`, ADR 000100): the literal `set` / `remove`
+    /// the operator wants on every response this route answers. Absent = no declaration (the
+    /// default). Values are LITERALS — no conditionals, no request interpolation, no regex: a
+    /// header whose value depends on the request is a per-request decision and stays a filter's
+    /// job (ADR 000029).
+    #[serde(default)]
+    pub headers: Option<RouteHeaders>,
+    /// This route's timeout overrides (`[route.timeouts]`, ADR 000102): the per-try / overall
+    /// bounds it wants instead of its upstream's declared defaults. Absent = the upstream's
+    /// values apply unchanged.
+    #[serde(default)]
+    pub timeouts: Option<RouteTimeouts>,
+    /// This route's response-body inspection settings (`[route.response_body]`, ADR 000098).
+    /// Absent = the strict defaults. It is NOT the opt-in: inspection is armed by a filter on the
+    /// route exporting `on-response-body`, and this block only narrows what the host does at the
+    /// edges of what it can inspect (which media types arm the buffer, how big a body may get,
+    /// and what happens when a response cannot be inspected at all).
+    #[serde(default)]
+    pub response_body: Option<RouteResponseBody>,
+}
+
+/// A route's response-body inspection settings (`[route.response_body]`, ADR 000098). Every field
+/// has a safe default, so a route whose chain reads the response body and declares no block runs
+/// under the strict ones: 1 MiB, reject over-cap, reject uninspectable, textual media types only.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteResponseBody {
+    /// Cap on the buffered response body. Default 1 MiB; `MAX_RESPONSE_BODY_CAP` (16 MiB, the
+    /// request-side buffer cap) is the ceiling — the response plane never buys more headroom than
+    /// the request plane already has. Must be non-zero.
+    #[serde(default = "default_response_body_max_bytes")]
+    pub max_bytes: u64,
+    /// What to do with a response body that exceeds `max_bytes`. Default `reject`.
+    #[serde(default)]
+    pub over_cap: OverCapMode,
+    /// What to do with a response the host cannot inspect at all — an encoded body, a byte range,
+    /// a streaming media type. Default `reject`: a route that declared an inspecting filter does
+    /// not silently stop inspecting. `passthrough` is the explicit opt-out.
+    #[serde(default)]
+    pub uninspectable: UninspectableMode,
+    /// The `type/subtype` allowlist that ARMS buffering (matched against the response
+    /// `Content-Type` essence as RECEIVED from the upstream, case-insensitive, parameters
+    /// ignored). REPLACES the default when set. A response outside it is out of the declared
+    /// inspection scope and streams through untouched.
+    #[serde(default = "default_response_body_content_types")]
+    pub content_types: Vec<String>,
+}
+
+impl Default for RouteResponseBody {
+    /// The settings a route with a response-body filter and no block runs under. Built from the
+    /// serde defaults so the declared-block and no-block paths cannot drift apart.
+    fn default() -> Self {
+        Self {
+            max_bytes: default_response_body_max_bytes(),
+            over_cap: OverCapMode::default(),
+            uninspectable: UninspectableMode::default(),
+            content_types: default_response_body_content_types(),
+        }
+    }
+}
+
+/// What the host does with a response body larger than the route's cap (ADR 000098 decision 3).
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverCapMode {
+    /// Answer 502. The default: a body too large to inspect is a body the declared filter never
+    /// got to see. (502, not 413 — that status is the request plane's vocabulary.)
+    #[default]
+    Reject,
+    /// Inspect the first `max_bytes` and forward the whole body. An explicit opt-in.
+    ProcessPartial,
+    /// Forward the whole body without inspecting any of it. The explicit fail-open escape hatch.
+    Passthrough,
+}
+
+/// What the host does with a response it cannot inspect (ADR 000098 decision 3).
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UninspectableMode {
+    /// Answer 502. The default.
+    #[default]
+    Reject,
+    /// Forward it uninspected. An explicit opt-out, still audited.
+    Passthrough,
+}
+
+/// 1 MiB — the upper end of the range whole-response inspection limits are drawn from in practice
+/// (tens of KiB to ~1 MiB). Response buffering costs TTFB and resident memory on every request the
+/// route serves, so the default is the smallest number that covers ordinary API and page payloads.
+fn default_response_body_max_bytes() -> u64 {
+    1 << 20
+}
+
+/// The ceiling on `max_bytes`: the request-side buffer cap (ADR 000025 / 000027), so neither plane
+/// can be configured to hold more than the other already may.
+pub(crate) const MAX_RESPONSE_BODY_CAP: u64 = 16 << 20;
+
+/// The media types that arm response-body inspection by default: the textual payloads the
+/// inspection use cases (DLP, guardrails, response WAF) are actually about. Notably ABSENT:
+/// `text/event-stream` — buffering an event stream breaks it, so it is a rejected class rather
+/// than a silently skipped one — and every already-compressed or binary media type.
+fn default_response_body_content_types() -> Vec<String> {
+    ["text/plain", "text/html", "text/xml", "application/json"]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// A route's timeout overrides (`[route.timeouts]`, ADR 000102). Each field names the SAME bound
+/// its identically-named `[[upstream]]` field declares — per-try time-to-response-headers (ADR
+/// 000019) and the overall transaction deadline across retries + backoff (ADR 000031) — under one
+/// rule: **the upstream declares the default, the route overrides it**. Routes with genuinely
+/// different latency budgets can then share one upstream instead of duplicating it (which would
+/// duplicate its health prober and split its circuit-breaker state).
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTimeouts {
+    /// Per-try bound (ms) on one attempt's time-to-response-headers, overriding
+    /// `[[upstream]] request_timeout_ms`. Omitted takes the upstream's value; an explicit `0`
+    /// disables the bound for this route (the long-poll / streaming opt-out of ADR 000019).
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Overall bound (ms) on the whole transaction — every attempt plus the backoff between them —
+    /// overriding `[[upstream]] overall_timeout_ms`. Omitted takes the upstream's value; an
+    /// explicit `0` means no overall bound for this route.
+    #[serde(default)]
+    pub overall_timeout_ms: Option<u64>,
+}
+
+/// A route's declarative response-header block (`[route.headers]`, ADR 000100). `remove` is
+/// applied first, then `set` — and `set` REPLACES a same-named header the upstream or a filter
+/// produced, because the operator's declaration is a floor rather than a suggestion. Names are
+/// matched case-insensitively (normalised at compile time); every name and value is validated at
+/// build, so an unusable one fails startup / reload instead of being dropped silently per
+/// response.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteHeaders {
+    /// `name = "value"` pairs set on every response this route answers. `BTreeMap` (not
+    /// `HashMap`) keeps the manifest's deterministic-serialisation invariant.
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    /// Header names dropped from every response this route answers, applied before `set`.
+    #[serde(default)]
+    pub remove: Vec<String>,
 }
 
 /// A route's Upgrade declaration (`[route.upgrade]`, ADR 000048). The allowlist shape is the
@@ -64,13 +212,14 @@ pub struct RouteUpgrade {
     /// header (e.g. `["websocket"]`). Must be non-empty; `h2c` is rejected.
     pub protocols: Vec<String>,
     /// Idle timeout for an established tunnel, in ms — a byte in EITHER direction resets it
-    /// (the activity-based form nginx/Envoy/HAProxy all share). `0` disables the timer.
+    /// (the activity-based form tunnel idle timers conventionally take). `0` disables the timer.
     #[serde(default = "default_upgrade_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
 }
 
-/// 5 minutes — Envoy's stream-idle default; long enough for ping/pong-quiet apps, short enough
-/// that an abandoned tunnel cannot hold a connection permit for hours.
+/// 5 minutes — the conventional stream-idle order of magnitude: long enough for apps whose
+/// ping/pong is minutes apart, short enough that an abandoned tunnel cannot hold a connection
+/// permit for hours.
 fn default_upgrade_idle_timeout_ms() -> u64 {
     300_000
 }
@@ -320,6 +469,179 @@ key = "client-ip"
         assert_eq!(
             m3.routes[0].rate_limit.unwrap().key,
             RateLimitKeyKind::ClientIp
+        );
+    }
+
+    #[test]
+    fn route_headers_default_absent_and_parse_set_and_remove() {
+        // Absent `[route.headers]` → no declaration, the default (ADR 000100).
+        let m = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+"#,
+        )
+        .unwrap();
+        assert!(m.routes[0].headers.is_none());
+
+        // Present: `set` is a name→literal table, `remove` a name list, and either may be
+        // omitted independently.
+        let m2 = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.headers]
+set = { "X-Frame-Options" = "DENY", "x-content-type-options" = "nosniff" }
+remove = ["server"]
+"#,
+        )
+        .unwrap();
+        let h = m2.routes[0].headers.as_ref().unwrap();
+        assert_eq!(
+            h.set.get("X-Frame-Options").map(String::as_str),
+            Some("DENY")
+        );
+        assert_eq!(
+            h.set.get("x-content-type-options").map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(h.remove, vec!["server".to_string()]);
+
+        let m3 = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.headers]
+remove = ["server"]
+"#,
+        )
+        .unwrap();
+        let h3 = m3.routes[0].headers.as_ref().unwrap();
+        assert!(h3.set.is_empty(), "`set` alone is optional");
+        assert_eq!(h3.remove, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn route_response_body_defaults_are_strict_and_every_knob_is_overridable() {
+        // Absent `[route.response_body]` → the strict defaults apply (ADR 000098): the block is
+        // not the opt-in, a filter exporting `on-response-body` is.
+        let m = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+"#,
+        )
+        .unwrap();
+        assert!(m.routes[0].response_body.is_none());
+
+        let defaults = RouteResponseBody::default();
+        assert_eq!(defaults.max_bytes, 1 << 20, "1 MiB");
+        assert_eq!(defaults.over_cap, OverCapMode::Reject);
+        assert_eq!(defaults.uninspectable, UninspectableMode::Reject);
+        assert_eq!(
+            defaults.content_types,
+            vec![
+                "text/plain".to_string(),
+                "text/html".to_string(),
+                "text/xml".to_string(),
+                "application/json".to_string()
+            ],
+            "`text/event-stream` is deliberately absent — it is a REFUSED class, not a listed one"
+        );
+
+        // A declared block: the two modes take their kebab-case spellings, and the allowlist
+        // REPLACES the default rather than extending it.
+        let m2 = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.response_body]
+max_bytes = 4096
+over_cap = "process-partial"
+uninspectable = "passthrough"
+content_types = ["application/json"]
+"#,
+        )
+        .unwrap();
+        let rb = m2.routes[0].response_body.as_ref().unwrap();
+        assert_eq!(rb.max_bytes, 4096);
+        assert_eq!(rb.over_cap, OverCapMode::ProcessPartial);
+        assert_eq!(rb.uninspectable, UninspectableMode::Passthrough);
+        assert_eq!(rb.content_types, vec!["application/json".to_string()]);
+
+        // Declaring inspection settings is a semantic change, so it must flip the config version.
+        assert_ne!(
+            m.content_hash().unwrap(),
+            m2.content_hash().unwrap(),
+            "declaring response-body settings must flip the config version"
+        );
+    }
+
+    #[test]
+    fn an_unknown_over_cap_mode_is_rejected_at_parse() {
+        // The tri-state is closed: `reject` / `process-partial` / `passthrough` and nothing else,
+        // so a typo can never read as one of the fail-open modes.
+        assert!(
+            Manifest::from_toml(
+                r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/"
+[route.response_body]
+over_cap = "truncate"
+"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn route_timeouts_parse_absent_explicitly_zero_and_ordinary_values() {
+        let with = |block: &str| {
+            Manifest::from_toml(&format!(
+                "[[route]]\nupstream = \"a\"\n[route.match]\npath_prefix = \"/\"\n{block}"
+            ))
+            .unwrap()
+        };
+
+        // Absent `[route.timeouts]` → no override; the upstream's own values apply (ADR 000102).
+        let absent = with("");
+        assert!(absent.routes[0].timeouts.is_none());
+
+        // An explicit `0` is DECLARED-DISABLED, not un-declared: the three states (absent /
+        // explicit 0 / ordinary value) must stay distinguishable, or a streaming route could not
+        // opt out of a short upstream default.
+        let zero = with("[route.timeouts]\nrequest_timeout_ms = 0\n");
+        let t = zero.routes[0].timeouts.unwrap();
+        assert_eq!(t.request_timeout_ms, Some(0));
+        assert_eq!(
+            t.overall_timeout_ms, None,
+            "each knob is overridden independently"
+        );
+
+        let ordinary =
+            with("[route.timeouts]\nrequest_timeout_ms = 90000\noverall_timeout_ms = 120000\n");
+        let t = ordinary.routes[0].timeouts.unwrap();
+        assert_eq!(t.request_timeout_ms, Some(90_000));
+        assert_eq!(t.overall_timeout_ms, Some(120_000));
+
+        // The distinction is semantic, so it must reach the config version: an explicit `0` is a
+        // different configuration from no declaration at all.
+        assert_ne!(
+            absent.content_hash().unwrap(),
+            zero.content_hash().unwrap(),
+            "declaring a timeout must flip the config version"
         );
     }
 }

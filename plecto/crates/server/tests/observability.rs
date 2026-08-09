@@ -195,3 +195,69 @@ path_prefix = "/"
     let (nstatus, _) = get(&client, admin, "/nope").await;
     assert_eq!(nstatus, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn metrics_report_upstream_instances_by_state() {
+    // ADR 000099: the fail-closed 503 an unhealthy pool produces (ADR 000017) needs an
+    // externally visible explanation. One live address and one dead one, so the scrape must show
+    // the split rather than a single opaque number.
+    let live = spawn_upstream().await;
+    let dead = free_addr().await; // reserved, then released — nothing listens there
+    let admin = free_addr().await;
+
+    let toml = format!(
+        r#"
+[observability]
+admin_addr = "{admin}"
+
+[[upstream]]
+name = "echo"
+addresses = ["{live}", "{dead}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+timeout_ms = 50
+
+[[route]]
+upstream = "echo"
+[route.match]
+path_prefix = "/"
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let control = Arc::new(Control::from_manifest(&manifest, std::path::Path::new(".")).unwrap());
+
+    let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let data_addr = data_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve(control, data_listener).await;
+    });
+
+    let client = client();
+    wait_ready(&client, data_addr).await;
+    wait_admin(&client, admin).await;
+
+    // Poll: the live instance needs one passing probe, the dead one never gets there.
+    let mut last = String::new();
+    for _ in 0..150 {
+        let (_, metrics) = get(&client, admin, "/metrics").await;
+        if metrics.contains("plecto_upstream_instances{upstream=\"echo\",state=\"healthy\"} 1") {
+            last = metrics;
+            break;
+        }
+        last = metrics;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        last.contains("plecto_upstream_instances{upstream=\"echo\",state=\"healthy\"} 1"),
+        "the live instance is counted healthy:\n{last}"
+    );
+    assert!(
+        last.contains("plecto_upstream_instances{upstream=\"echo\",state=\"unhealthy\"} 1"),
+        "the dead instance is counted unhealthy:\n{last}"
+    );
+    assert!(
+        last.contains("plecto_upstream_instances{upstream=\"echo\",state=\"ejected\"} 0"),
+        "the ejected series is present at zero (no outlier ejection here):\n{last}"
+    );
+}

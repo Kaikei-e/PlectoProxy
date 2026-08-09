@@ -19,7 +19,7 @@ use tempfile::tempdir;
 fn req(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: headers
@@ -50,7 +50,8 @@ fn signed_filter_hello() -> (TestSigner, ResolvedArtifact) {
     )
 }
 
-/// A manifest naming filter `fh` (pinned at `digest`) with the given chain order.
+/// A manifest naming filter `fh` (pinned at `digest`) and a catch-all route running the given
+/// chain order.
 fn manifest_toml(digest: &str, chain: &[&str]) -> String {
     let chain_list = chain
         .iter()
@@ -65,10 +66,29 @@ source = "fh"
 digest = "{digest}"
 isolation = "untrusted"
 
-[chain]
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
 filters = [{chain_list}]
+upstream = "be"
+[route.match]
+path_prefix = "/"
 "#
     )
+}
+
+/// Drive a request through the matched route's chain the way the fast path does — `find_route`,
+/// then `dispatch_request` on the same snapshot.
+fn run_request(control: &Control, request: HttpRequest) -> ChainOutcome {
+    let snap = control.snapshot();
+    let route = snap
+        .find_route(&request)
+        .expect("the fixture manifest declares a catch-all route");
+    snap.dispatch_request(route.index, request)
 }
 
 /// A host trusting filter-hello, an in-memory store holding it, and the pinned digest.
@@ -111,7 +131,7 @@ fn reload_from_disk_swaps_on_change_and_is_idempotent() {
     write_manifest(&manifest_path, &digest, &["fh"]);
     let control = Control::load_at(host, &manifest_path, Box::new(store)).unwrap();
     assert!(
-        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        matches!(run_request(&control, req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
         "v1 chain blocks"
     );
 
@@ -123,7 +143,7 @@ fn reload_from_disk_swaps_on_change_and_is_idempotent() {
     }
     assert!(
         matches!(
-            control.on_request(req(&[("x-plecto-block", "1")])),
+            run_request(&control, req(&[("x-plecto-block", "1")])),
             ChainOutcome::Forward(_)
         ),
         "after reload the chain is empty → the same request forwards"
@@ -153,7 +173,7 @@ fn serve_reloads_drives_reload_from_a_trigger() {
 
     assert!(
         matches!(
-            control.on_request(req(&[("x-plecto-block", "1")])),
+            run_request(&control, req(&[("x-plecto-block", "1")])),
             ChainOutcome::Forward(_)
         ),
         "serve_reloads must have re-read the manifest and swapped the chain"
@@ -170,19 +190,8 @@ fn reload_rejecting_a_trust_change_is_fail_closed() {
     let (host, store, digest) = setup();
 
     let v1 = format!(
-        r#"
-[trust]
-keys = ["a.pub"]
-
-[[filter]]
-id = "fh"
-source = "fh"
-digest = "{digest}"
-isolation = "untrusted"
-
-[chain]
-filters = ["fh"]
-"#
+        "[trust]\nkeys = [\"a.pub\"]\n{}",
+        manifest_toml(&digest, &["fh"])
     );
     std::fs::write(&manifest_path, &v1).unwrap();
     let control = Control::load_at(host, &manifest_path, Box::new(store)).unwrap();
@@ -196,7 +205,7 @@ filters = ["fh"]
 
     // The running set is untouched — the rejected reload left config A live (still blocks).
     assert!(
-        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        matches!(run_request(&control, req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
         "the live set is unchanged after a rejected trust-change reload"
     );
 }
@@ -226,7 +235,7 @@ fn reload_rejecting_a_state_change_is_fail_closed() {
 
     // The running set is untouched — the rejected reload left config A live (still blocks).
     assert!(
-        matches!(control.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        matches!(run_request(&control, req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
         "the live set is unchanged after a rejected state-change reload"
     );
 }
@@ -253,13 +262,15 @@ fn snapshot_pins_config_across_a_reload() {
     ));
 
     // The pinned snapshot still sees config A (blocks); a fresh request sees config B (forwards).
+    let blocked = req(&[("x-plecto-block", "1")]);
+    let route = snap.find_route(&blocked).expect("the catch-all route");
     assert!(
-        matches!(snap.on_request(req(&[("x-plecto-block", "1")])), ChainOutcome::Respond(r) if r.status == 403),
+        matches!(snap.dispatch_request(route.index, blocked), ChainOutcome::Respond(r) if r.status == 403),
         "the snapshot stays pinned to the pre-reload config"
     );
     assert!(
         matches!(
-            control.on_request(req(&[("x-plecto-block", "1")])),
+            run_request(&control, req(&[("x-plecto-block", "1")])),
             ChainOutcome::Forward(_)
         ),
         "a fresh request through Control sees the reloaded config"
@@ -299,8 +310,17 @@ digest = "{digest}"
 [filter.config_files]
 allowed-origins = "allowed-origins"
 
-[chain]
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
 filters = ["cors"]
+upstream = "be"
+[route.match]
+path_prefix = "/"
 "#
     );
     std::fs::write(&manifest_path, &toml).unwrap();
@@ -392,7 +412,7 @@ fn reload_from_disk_detects_an_in_place_tls_cert_rotation() {
 fn preflight_allow_origin(control: &Control, origin: &str) -> Option<String> {
     let mut request = req(&[("origin", origin), ("access-control-request-method", "GET")]);
     request.method = "OPTIONS".to_string();
-    match control.on_request(request) {
+    match run_request(control, request) {
         ChainOutcome::Respond(response) => response
             .headers
             .iter()

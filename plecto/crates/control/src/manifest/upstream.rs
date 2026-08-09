@@ -40,8 +40,8 @@ pub struct Upstream {
     /// Active-health-check policy for this upstream's instances (ADR 000017).
     pub health: HealthConfig,
     /// How often (ms) hostname addresses are re-resolved and the endpoint set refreshed — the
-    /// standard periodic-DNS endpoint-discovery technique (the shape of nginx `resolve` / Envoy
-    /// STRICT_DNS): each A/AAAA record becomes a load-balancing endpoint with its own health;
+    /// standard periodic-DNS endpoint-discovery technique: each A/AAAA record becomes a
+    /// load-balancing endpoint with its own health;
     /// a vanished record is dropped, a new one starts pessimistic (ADR 000017); a failed
     /// resolution keeps the last-known-good set. Interval-based (getaddrinfo carries no TTL) —
     /// pick a value at or below your DNS TTL. `0` disables (the default): hostnames still
@@ -206,9 +206,10 @@ fn default_instance_weight() -> u32 {
 }
 
 /// Upper bound on a per-instance weight (ADR 000035). Keeps the least-request cross-product and the
-/// Maglev populate (which interleaves a backend every `max_weight / weight` rounds) bounded; mirrors
-/// Google's documented per-instance weight range (0–1000) for weighted Maglev. Drain via address
-/// removal, not weight 0, so the floor is 1.
+/// Maglev populate (which interleaves a backend every `max_weight / weight` rounds) bounded: the
+/// populate cost scales with `max_weight / min_weight`, so the ceiling caps a 1000:1 capacity
+/// spread — the conventional per-instance weight range, and far wider than real fleets need.
+/// Drain via address removal, not weight 0, so the floor is 1.
 pub(crate) const MAX_INSTANCE_WEIGHT: u32 = 1000;
 
 /// The Maglev consistent-hashing config (ADR 000035), `[upstream.hash]`. Only valid when
@@ -244,9 +245,10 @@ fn default_hash_table_size() -> u32 {
     65537
 }
 
-/// Upper bound on the Maglev `table_size` (ADR 000035), matching Envoy's documented cap. Bounds the
-/// per-upstream table memory (`table_size × 2` bytes); the operator must opt into anything this
-/// large explicitly. The default (65537) is two orders of magnitude below it.
+/// Upper bound on the Maglev `table_size` (ADR 000035) — the conventional ceiling for a
+/// consistent-hashing lookup table, and the largest prime this implementation accepts. Bounds the
+/// per-upstream table memory (`table_size × 2` bytes, ~10 MB here); the operator must opt into
+/// anything this large explicitly. The default (65537) is two orders of magnitude below it.
 pub(crate) const MAX_HASH_TABLE_SIZE: u32 = 5_000_011;
 
 /// Per-upstream outlier-detection policy (ADR 000032). A THIRD resilience axis: active health (ADR

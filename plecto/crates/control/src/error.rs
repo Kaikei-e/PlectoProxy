@@ -1,5 +1,5 @@
 //! Typed control-plane errors (bp-rust: domain errors are `thiserror` enums, not `anyhow`).
-//! A caller can tell a config mistake (`ManifestParse`, `UnknownChainFilter`) apart from a
+//! A caller can tell a config mistake (`ManifestParse`, `UnknownRouteFilter`) apart from a
 //! supply-chain failure (`DigestMismatch`, `Load`) — both are fail-closed, but distinguishable.
 
 use thiserror::Error;
@@ -100,8 +100,13 @@ pub enum ControlError {
     #[error("filter {id:?} has invalid config: {reason}")]
     InvalidFilterConfig { id: String, reason: String },
 
-    #[error("chain references unknown filter {0:?}")]
-    UnknownChainFilter(String),
+    /// The manifest declared `[chain]` filters. No serving path runs them — only a route's inline
+    /// `filters` reach the dispatcher (ADR 000101) — so the section is rejected fail-closed at
+    /// validation and at startup instead of being accepted into a config that ignores it.
+    #[error(
+        "manifest [chain] declares filters the proxy never runs; move each filter id into the `filters` of the [[route]] that needs it"
+    )]
+    InertChainSection,
 
     #[error("duplicate filter id {0:?} in manifest")]
     DuplicateFilterId(String),

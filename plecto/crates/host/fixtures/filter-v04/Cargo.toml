@@ -1,0 +1,19 @@
+[package]
+name = "filter-v04"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Test fixture pinned to the CURRENT plecto:filter@0.4.0 contract (wit/) — the guest that
+# exercises the arms only 0.4.0 has: the bare `%continue` body arm, `modified(request-body-edit)`
+# with its header edits, and `http-request.path-with-query` under its new name. Built for
+# wasm32-unknown-unknown and componentized by crates/host/build.rs, exactly like the example
+# guests. Declares its own [workspace] so the native plecto/ workspace never absorbs it into a
+# host-target build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+[workspace]

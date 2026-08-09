@@ -99,7 +99,7 @@ pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_
 pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conformance};
 #[doc(hidden)]
 pub use contract::HOP_BY_HOP_GUEST_HEADERS;
-pub use contract::{ContractVersion, FILTER_WIT, header};
+pub use contract::{ContractVersion, FILTER_WIT, SUPPORTED_CONTRACT_VERSIONS, header};
 pub use dev_signer::{
     DEV_KEY_MARKER, DevKeyError, DevSigner, PemSigner, bound_sbom, public_key_path_for,
 };
@@ -127,12 +127,12 @@ mod bindings {
 // One canonical set of contract types for callers and tests.
 pub use bindings::plecto::filter::host_log::Level as LogLevel;
 pub use bindings::plecto::filter::types::{
-    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestDecision, RequestEdit,
-    ResponseDecision, ResponseEdit,
+    Header, HttpRequest, HttpResponse, RequestBodyDecision, RequestBodyEdit, RequestDecision,
+    RequestEdit, ResponseBodyDecision, ResponseBodyEdit, ResponseDecision, ResponseEdit,
 };
 
 pub use errors::{LoadError, RunError};
-pub use filter::LoadedFilter;
+pub use filter::{BodyHooks, LoadedFilter};
 pub use host::Host;
 pub use options::{Isolation, LoadOptions};
 // `HostState` stays crate-internal (DECREE §2: minimal pub surface) — it has no public

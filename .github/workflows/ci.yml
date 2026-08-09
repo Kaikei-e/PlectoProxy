@@ -115,8 +115,15 @@ jobs:
         working-directory: .
         run: python3 scripts/check_wit_vendoring.py
 
+  # Two checks, deliberately: they catch disjoint classes of defect and neither subsumes the other.
+  # `docdag` parses the frontmatter as real YAML and enforces the typed-edge invariants (acyclicity,
+  # references resolve, status is a projection of the graph) — it is the only one that sees a
+  # malformed scalar, and it found two that the line-based script had passed for months.
+  # `check_adr_graph.py` is the only one that resolves body wikilinks `[[NNNNNN]]` to files and
+  # checks `amended_by` reverse edges; docdag keeps body links in an unvalidated reference layer
+  # by design, so prose can never fail a build there.
   docs:
-    name: ADR graph check
+    name: ADR graph check (docdag + wikilinks)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -127,6 +134,13 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 scripts/check_adr_graph.py
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+      - name: Install docdag (version-pinned)
+        run: go install github.com/Kaikei-e/DocDag/cmd/docdag@v0.1.0
+      - name: Validate the decision graph (docdag.yaml)
+        run: docdag validate
 
   # Lint world: `--all-features` is check-mode only (rmeta, no codegen), so it stays its
   # own job — it shares no artifacts with the test jobs' codegen worlds anyway. all-features

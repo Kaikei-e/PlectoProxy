@@ -6,9 +6,40 @@ use crate::observe;
 use crate::pool::{HookResult, LoadedInner, TrustedPool};
 use crate::runtime::{WasmtimeInstance, WasmtimeRuntime};
 use crate::{
-    Hook, HttpRequest, HttpResponse, Isolation, LogLine, RequestBodyDecision, RequestDecision,
-    RequestTrace, ResponseDecision, RunError, SpanOutcome,
+    ContractVersion, Hook, HttpRequest, HttpResponse, Isolation, LogLine, RequestBodyDecision,
+    RequestDecision, RequestTrace, ResponseBodyDecision, ResponseDecision, RunError, SpanOutcome,
 };
+
+/// Which optional body hooks a loaded component exports, per direction (ADR 000098 decision 2).
+/// Read off the component's exports at load, so it is sound (fail-closed): a filter cannot read a
+/// body without declaring it in the contract. The two flags are independent — the acceptance
+/// lattice admits any subset, and the fast path decides buffering separately for each direction,
+/// so a filter that reads only one body leaves the other on the zero-copy path (ADR 000038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyHooks {
+    /// The filter exports `on-request-body`.
+    pub request: bool,
+    /// The filter exports `on-response-body`.
+    pub response: bool,
+}
+
+impl BodyHooks {
+    /// Neither direction — the base `filter` world, and the identity of the OR-fold a route does
+    /// over its chain.
+    pub const NONE: BodyHooks = BodyHooks {
+        request: false,
+        response: false,
+    };
+
+    /// Fold another filter's hooks in: a route buffers a direction when ANY of its filters reads
+    /// that direction.
+    pub fn union(self, other: BodyHooks) -> BodyHooks {
+        BodyHooks {
+            request: self.request || other.request,
+            response: self.response || other.response,
+        }
+    }
+}
 
 /// A loaded filter, ready to run per request. Trusted filters reuse instances from a
 /// `TrustedPool` (checked out per request, ADR 000012); untrusted filters instantiate fresh
@@ -28,13 +59,21 @@ impl LoadedFilter {
         self.inner.isolation
     }
 
-    /// Whether this filter reads the request body — i.e. it exports `on-request-body` (world
-    /// `filter-body`). The fast path buffers the body ONLY for a route with at least one such
-    /// filter; a route of header-only filters keeps the zero-copy streaming path (ADR 000038 /
-    /// ADR 000005 mechanism 2). Detected from the component's exports at load, so it is sound
-    /// (fail-closed): a filter cannot read the body without declaring it in the contract.
-    pub fn reads_body(&self) -> bool {
-        self.inner.runtime.body_export.is_some()
+    /// The `plecto:filter` version this component bound at load (ADR 000071 / 000073). Distinct
+    /// from the set the binary can load: this is what THIS filter, in THIS configuration, is
+    /// actually being driven through.
+    pub fn contract_version(&self) -> ContractVersion {
+        self.inner.runtime.contract_version()
+    }
+
+    /// Which body hooks this filter exports (ADR 000038 / ADR 000098). The fast path buffers a
+    /// direction ONLY for a route with at least one filter that reads it; every other route keeps
+    /// the zero-copy streaming path in that direction.
+    pub fn body_hooks(&self) -> BodyHooks {
+        BodyHooks {
+            request: self.inner.runtime.body_export.is_some(),
+            response: self.inner.runtime.response_body_export.is_some(),
+        }
     }
 
     /// Run the request-side hook under the request's trace context (`trace`, ADR 000009). The
@@ -90,7 +129,8 @@ impl LoadedFilter {
         let elapsed = Instant::now();
         let result = self.run_on_request_body(body);
         let outcome = match &result {
-            Ok((RequestBodyDecision::Continue(_), _)) => SpanOutcome::Continue,
+            Ok((RequestBodyDecision::Continue, _)) => SpanOutcome::Continue,
+            Ok((RequestBodyDecision::Modified(_), _)) => SpanOutcome::Modified,
             Ok((RequestBodyDecision::ShortCircuit(_), _)) => SpanOutcome::ShortCircuit,
             Err((err, _)) => SpanOutcome::from(err),
         };
@@ -110,7 +150,7 @@ impl LoadedFilter {
         // The fast path already skips buffering (`reads_body()` is false); this is the defensive
         // floor — pass the body through unchanged without instantiating anything.
         if self.inner.runtime.body_export.is_none() {
-            return Ok((RequestBodyDecision::Continue(body.to_vec()), Vec::new()));
+            return Ok((RequestBodyDecision::Continue, Vec::new()));
         }
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner.runtime.call_body_hook(inst, body)
@@ -187,6 +227,61 @@ impl LoadedFilter {
     ) -> HookResult<ResponseDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner.runtime.call_on_response(inst, req, resp)
+        })
+    }
+
+    /// Run the response-side BODY hook (buffer-then-decide, ADR 000098). The host has held the
+    /// response headers to get here, so the filter can still refuse what it just read: it forwards
+    /// the buffered bytes, hands back replacements, or replaces the whole response. `req` is the
+    /// as-forwarded snapshot and `resp` carries status + headers only — the bytes are `body`. Same
+    /// fail-closed contract and span emission as the other hooks.
+    pub fn on_response_body(
+        &self,
+        req: &HttpRequest,
+        resp: &HttpResponse,
+        body: &[u8],
+        trace: &RequestTrace,
+    ) -> std::result::Result<(ResponseBodyDecision, Vec<LogLine>), RunError> {
+        if !self.inner.sink.enabled() {
+            return self
+                .run_on_response_body(req, resp, body)
+                .map_err(|(err, _)| err);
+        }
+        let start = SystemTime::now();
+        let elapsed = Instant::now();
+        let result = self.run_on_response_body(req, resp, body);
+        let outcome = match &result {
+            Ok((ResponseBodyDecision::Continue, _)) => SpanOutcome::Continue,
+            Ok((ResponseBodyDecision::Modified(_), _)) => SpanOutcome::Modified,
+            Ok((ResponseBodyDecision::Replace(_), _)) => SpanOutcome::ShortCircuit,
+            Err((err, _)) => SpanOutcome::from(err),
+        };
+        self.emit_span(
+            trace,
+            Hook::OnResponseBody,
+            outcome,
+            start,
+            elapsed.elapsed(),
+            &result,
+        );
+        result.map_err(|(err, _)| err)
+    }
+
+    fn run_on_response_body(
+        &self,
+        req: &HttpRequest,
+        resp: &HttpResponse,
+        body: &[u8],
+    ) -> HookResult<ResponseBodyDecision> {
+        // No `on-response-body` export: the body never enters guest memory. The fast path already
+        // skips buffering for such a route; this is the defensive floor.
+        if self.inner.runtime.response_body_export.is_none() {
+            return Ok((ResponseBodyDecision::Continue, Vec::new()));
+        }
+        self.inner.run_hook(self.trusted.as_ref(), |inst| {
+            self.inner
+                .runtime
+                .call_response_body_hook(inst, req, resp, body)
         })
     }
 }

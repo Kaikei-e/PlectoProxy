@@ -6,6 +6,7 @@ Canonical -> vendored pairs checked:
 - plecto/wit/world.wit           -> plecto/crates/host/wit/world.wit
 - plecto/wit/v0.1.0/world.wit    -> plecto/crates/host/wit/v0.1.0/world.wit
 - plecto/wit/v0.2.0/world.wit    -> plecto/crates/host/wit/v0.2.0/world.wit
+- plecto/wit/v0.3.0/world.wit    -> plecto/crates/host/wit/v0.3.0/world.wit
 - plecto/wit-streaming/streaming.wit -> plecto/crates/host/wit-streaming/streaming.wit
 - plecto/examples/filters/filter-template/Cargo.toml
     -> plecto/crates/plecto/templates/filter-template/Cargo.toml.template
@@ -27,9 +28,16 @@ PAIRS = [
     (PLECTO / "wit" / "world.wit", PLECTO / "crates/host/wit/world.wit"),
     (PLECTO / "wit/v0.1.0/world.wit", PLECTO / "crates/host/wit/v0.1.0/world.wit"),
     (PLECTO / "wit/v0.2.0/world.wit", PLECTO / "crates/host/wit/v0.2.0/world.wit"),
+    (PLECTO / "wit/v0.3.0/world.wit", PLECTO / "crates/host/wit/v0.3.0/world.wit"),
     (
         PLECTO / "wit-streaming/streaming.wit",
         PLECTO / "crates/host/wit-streaming/streaming.wit",
+    ),
+    # The template guest carries its own copy of the contract so `plecto new-filter` output
+    # builds offline. It drifted unnoticed because only the two files below were checked.
+    (
+        PLECTO / "wit" / "world.wit",
+        PLECTO / "examples/filters/filter-template/wit/world.wit",
     ),
     (
         PLECTO / "examples/filters/filter-template/Cargo.toml",

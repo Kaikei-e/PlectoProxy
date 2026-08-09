@@ -85,11 +85,33 @@ pub fn filter_cors_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_CORS_COMPONENT")).expect("read filter-cors component")
 }
 
+/// The compiled `filter-compat-v01` component bytes — the fixture pinned to the FROZEN
+/// `plecto:filter@0.1.0` contract, the oldest track the host still accepts (ADR 000064). Built
+/// by this crate's `build.rs`.
+pub fn filter_compat_v01_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_COMPAT_V01_COMPONENT")).expect("read filter-compat-v01 component")
+}
+
 /// The compiled `filter-compat-v02` component bytes — the fixture pinned to the FROZEN
 /// `plecto:filter@0.2.0` contract, keeping the V02 adapter rail covered now that the in-tree
 /// default is 0.3.0 (ADR 000073). Built by this crate's `build.rs`.
 pub fn filter_compat_v02_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_COMPAT_V02_COMPONENT")).expect("read filter-compat-v02 component")
+}
+
+/// The compiled `filter-v04` component bytes — the fixture pinned to the CURRENT
+/// `plecto:filter@0.4.0` contract, exercising the bare `%continue` body arm,
+/// `modified(request-body-edit)` and `path-with-query` (ADR 000098 / 000104). Built by this
+/// crate's `build.rs`.
+pub fn filter_v04_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_V04_COMPONENT")).expect("read filter-v04 component")
+}
+
+/// The compiled `filter-respbody` component bytes — the acceptance-lattice fixture (ADR 000098
+/// decision 2): it exports `on-response-body` and NOT `on-request-body`, a subset neither
+/// published world names. Built by this crate's `build.rs`.
+pub fn filter_respbody_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_RESPBODY_COMPONENT")).expect("read filter-respbody component")
 }
 
 /// The compiled `filter-extauthz` component bytes — the outbound-HTTP example (an ext_authz-style

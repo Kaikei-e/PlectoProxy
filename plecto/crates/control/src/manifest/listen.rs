@@ -13,8 +13,8 @@ use crate::error::ControlError;
 /// need `0.0.0.0` binds without entrypoint gymnastics); an explicit CLI `listen_addr` still wins
 /// as the operator's override.
 /// Serialization note (the semantic content hash, ADR 000008): the startup-fixed fields —
-/// `addr` / `advertised_port` / `proxy_protocol` / `drain` are captured at construction (the
-/// listener binds once; a reload does not re-bind) — carry `skip_serializing`, keeping them OUT
+/// `addr` / `advertised_port` / `proxy_protocol` / `drain` / `trusted_proxy` are captured at
+/// construction (the listener binds once; a reload does not re-bind) — carry `skip_serializing`, keeping them OUT
 /// of the config version exactly as before. `client_auth` is the exception: `build_active`
 /// consumes it on EVERY reload (it feeds the rustls server configs), so it must ride the hash —
 /// otherwise a client_auth-only edit + SIGHUP would report `Unchanged` and silently not apply
@@ -50,6 +50,11 @@ pub struct Listen {
     /// Reload-consumed, so it rides the content hash (see the struct-level serialization note).
     #[serde(default)]
     pub client_auth: Option<ClientAuth>,
+    /// `[listen.trusted_proxy]` (ADR 000103): opt-in client-identity restoration from the inbound
+    /// `X-Forwarded-For`, for an L7 front proxy that cannot speak PROXY v2. Absent = off (the
+    /// inbound forwarding headers are dropped unconditionally, the edge default).
+    #[serde(default, skip_serializing)]
+    pub trusted_proxy: Option<TrustedProxy>,
 }
 
 impl Listen {
@@ -108,27 +113,90 @@ pub struct ProxyProtocol {
 }
 
 /// The parsed, runtime form of `[listen.proxy_protocol]`: the trusted networks behind a
-/// containment check. The fast path asks `contains(peer.ip())` and never re-parses CIDRs;
-/// keeping the match here keeps the canonicalisation rule in one place.
+/// containment check. The fast path asks `contains(peer.ip())` and never re-parses CIDRs.
 #[derive(Debug, Clone)]
 pub struct ProxyProtocolTrust {
     nets: Arc<[IpNet]>,
 }
 
 impl ProxyProtocolTrust {
-    /// Whether `ip` belongs to a trusted network. An IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`,
-    /// how a dual-stack accept reports an IPv4 client) is collapsed to its IPv4 form first, so
-    /// a v4 CIDR matches it.
+    /// Whether `ip` belongs to a trusted network (see [`nets_contain`] for the canonicalisation).
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let canonical = ip.to_canonical();
-        self.nets.iter().any(|net| net.contains(&canonical))
+        nets_contain(&self.nets, ip)
     }
 }
 
+/// `[listen.trusted_proxy]` (ADR 000103): client-identity restoration behind an L7 front proxy
+/// that cannot speak PROXY v2. Same "no trust without declaration" shape as
+/// `[listen.proxy_protocol]` — the section's presence enables it and `trusted` is required, so
+/// an undeclared deployment has no restoration path at all (deny-by-default, P4).
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedProxy {
+    /// CIDR blocks of the front proxies whose inbound `X-Forwarded-For` may name the client.
+    /// CIDR notation only (a single host is `"192.0.2.1/32"`, not a bare IP). Must list at least
+    /// one. The asymmetry is worth knowing: too narrow only loses the restoration, too wide makes
+    /// the client identity forgeable — when in doubt, narrow.
+    pub trusted: Vec<String>,
+}
+
+/// The parsed, runtime form of `[listen.trusted_proxy]`: the same containment check as
+/// [`ProxyProtocolTrust`], asked of the resolved client candidate rather than the wire peer.
+#[derive(Debug, Clone)]
+pub struct TrustedProxyTrust {
+    nets: Arc<[IpNet]>,
+}
+
+impl TrustedProxyTrust {
+    /// Whether `ip` belongs to a declared front proxy, canonicalising IPv4-mapped IPv6 first
+    /// (see [`ProxyProtocolTrust::contains`]).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        nets_contain(&self.nets, ip)
+    }
+}
+
+/// The containment rule both trust declarations share: an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`, how a dual-stack accept reports an IPv4 peer) is collapsed to its IPv4
+/// form first, so a v4 CIDR matches it.
+fn nets_contain(nets: &[IpNet], ip: IpAddr) -> bool {
+    let canonical = ip.to_canonical();
+    nets.iter().any(|net| net.contains(&canonical))
+}
+
+/// Parse a trusted-CIDR declaration into its runtime networks. Both `[listen]` trust sections go
+/// through here, so they accept and reject identically; `field` names the section for the
+/// diagnostic and `why` says what declaring nothing would cost.
+fn parse_trusted_cidrs(
+    field: &str,
+    why: &str,
+    trusted: &[String],
+) -> Result<Arc<[IpNet]>, ControlError> {
+    if trusted.is_empty() {
+        return Err(ControlError::InvalidListenConfig(format!(
+            "{field} must list at least one CIDR — {why}"
+        )));
+    }
+    let nets = trusted
+        .iter()
+        .map(|s| {
+            s.parse::<IpNet>().map_err(|e| {
+                ControlError::InvalidListenConfig(format!(
+                    "{field} has invalid CIDR {s:?}: {e} (a single host needs an explicit \
+                     prefix, e.g. \"{s}/32\")"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nets.into())
+}
+
 impl Listen {
-    /// Validate the section fail-closed at build (ADR 000057), before any listener consults it.
+    /// Validate the section fail-closed at build (ADR 000057 / 000103), before any listener or
+    /// request path consults it.
     pub(crate) fn validate(&self) -> Result<(), ControlError> {
-        self.proxy_protocol_trust().map(|_| ())
+        self.proxy_protocol_trust()?;
+        self.trusted_proxy_trust()?;
+        Ok(())
     }
 
     /// Parse `[listen.proxy_protocol]` into its runtime form — `None` when the section is
@@ -137,26 +205,29 @@ impl Listen {
         let Some(pp) = &self.proxy_protocol else {
             return Ok(None);
         };
-        if pp.trusted.is_empty() {
-            return Err(ControlError::InvalidListenConfig(
-                "proxy_protocol.trusted must list at least one CIDR — enabling PROXY v2 without \
-                 declaring the load balancers would trust every peer"
-                    .to_string(),
-            ));
-        }
-        let nets = pp
-            .trusted
-            .iter()
-            .map(|s| {
-                s.parse::<IpNet>().map_err(|e| {
-                    ControlError::InvalidListenConfig(format!(
-                        "proxy_protocol.trusted has invalid CIDR {s:?}: {e} (a single host \
-                         needs an explicit prefix, e.g. \"{s}/32\")"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(ProxyProtocolTrust { nets: nets.into() }))
+        let nets = parse_trusted_cidrs(
+            "proxy_protocol.trusted",
+            "enabling PROXY v2 without declaring the load balancers would trust every peer",
+            &pp.trusted,
+        )?;
+        Ok(Some(ProxyProtocolTrust { nets }))
+    }
+
+    /// Parse `[listen.trusted_proxy]` into its runtime form — `None` when the section is absent
+    /// (no restoration path), an error when it is present but empty or unparseable. Public
+    /// because it is the single parse entrypoint: the fast path takes the parsed trust from the
+    /// control plane and never re-reads a CIDR string.
+    pub fn trusted_proxy_trust(&self) -> Result<Option<TrustedProxyTrust>, ControlError> {
+        let Some(tp) = &self.trusted_proxy else {
+            return Ok(None);
+        };
+        let nets = parse_trusted_cidrs(
+            "trusted_proxy.trusted",
+            "restoring the client identity without declaring the front proxies would let any \
+             peer name its own client address",
+            &tp.trusted,
+        )?;
+        Ok(Some(TrustedProxyTrust { nets }))
     }
 }
 
@@ -166,13 +237,19 @@ mod tests {
 
     fn listen(trusted: &[&str]) -> Listen {
         Listen {
-            addr: None,
-            advertised_port: None,
             proxy_protocol: Some(ProxyProtocol {
                 trusted: trusted.iter().map(|s| (*s).to_string()).collect(),
             }),
-            drain: None,
-            client_auth: None,
+            ..Listen::default()
+        }
+    }
+
+    fn trusted_proxy_listen(trusted: &[&str]) -> Listen {
+        Listen {
+            trusted_proxy: Some(TrustedProxy {
+                trusted: trusted.iter().map(|s| (*s).to_string()).collect(),
+            }),
+            ..Listen::default()
         }
     }
 
@@ -221,6 +298,79 @@ mod tests {
         // a dual-stack accept reports an IPv4 LB as ::ffff:10.1.2.3 — the v4 CIDR must match it
         assert!(trust.contains("::ffff:10.1.2.3".parse().unwrap()));
         assert!(!trust.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_absent_section_means_off() {
+        let parsed = Listen::default().trusted_proxy_trust().unwrap();
+        assert!(parsed.is_none(), "no section → no restoration path");
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_an_empty_or_unusable_trusted_list() {
+        // Same fail-closed shape as `[listen.proxy_protocol]`: declaring the section without
+        // naming the front proxies would let any peer name its own client address, and a bare
+        // IP is rejected with the explicit-prefix hint rather than guessed at.
+        let err = trusted_proxy_listen(&[]).validate().unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidListenConfig(_)),
+            "empty trusted must fail closed, got: {err}"
+        );
+
+        let msg = trusted_proxy_listen(&["192.0.2.1"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("/32"),
+            "a bare IP must be rejected with an explicit-prefix hint, got: {msg}"
+        );
+
+        let err = trusted_proxy_listen(&["not-a-cidr"])
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidListenConfig(_)),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_contains_matches_v4_v6_and_mapped_peers() {
+        let trust = trusted_proxy_listen(&["10.0.0.0/8", "2001:db8::/32"])
+            .trusted_proxy_trust()
+            .unwrap()
+            .expect("section present");
+        assert!(trust.contains("10.1.2.3".parse().unwrap()));
+        assert!(trust.contains("2001:db8::9".parse().unwrap()));
+        assert!(trust.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!trust.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_round_trips_through_the_manifest() {
+        let manifest =
+            crate::Manifest::from_toml("[listen.trusted_proxy]\ntrusted = [\"10.0.0.0/8\"]\n")
+                .unwrap();
+        let tp = manifest
+            .listen
+            .trusted_proxy
+            .as_ref()
+            .expect("section parsed");
+        assert_eq!(tp.trusted, vec!["10.0.0.0/8".to_string()]);
+
+        let bad = crate::Manifest::from_toml("[listen.trusted_proxy]\ntrusted = []\n").unwrap();
+        let err = crate::validate_manifest(&bad, std::path::Path::new(".")).unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidListenConfig(_)),
+            "plecto validate must reject an empty trusted list, got: {err}"
+        );
+
+        // unknown fields stay rejected (deny_unknown_fields, like every section)
+        assert!(
+            crate::Manifest::from_toml("[listen.trusted_proxy]\ncidrs = [\"10.0.0.0/8\"]\n")
+                .is_err()
+        );
     }
 
     #[test]

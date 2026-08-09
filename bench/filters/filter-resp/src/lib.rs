@@ -32,7 +32,7 @@ impl Guest for FilterResp {
     fn on_response(req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {
         // Touch the as-forwarded snapshot — the contract surface ADR 000073 added to every
         // `on-response` crossing. Path length + header scan is the "read-only" rung.
-        let _ = core::hint::black_box(req.path.len());
+        let _ = core::hint::black_box(req.path_with_query.len());
         let _ = core::hint::black_box(req.headers.len());
 
         if has_header(&req, "x-plecto-resp-replace") {

@@ -1,7 +1,6 @@
 //! The V02 adapter rail, end to end (ADR 000073): a guest built against the FROZEN
 //! `plecto:filter@0.2.0` contract (`fixtures/filter-compat-v02`, `wit/v0.2.0/`) loads and runs
-//! on the 0.3-native host. This is the compat promise of ADR 000064 kept falsifiable in CI now
-//! that every in-tree example targets 0.3.0:
+//! on the 0.4-native host. This is the compat promise of ADR 000064 kept falsifiable in CI:
 //!   - load-time version detection picks the V02 binding from the decoded 0.2 import names;
 //!   - `on-response` runs with the request-context parameter transparently DROPPED by the
 //!     adapter (the 0.2 signature has no such parameter — nothing for the guest to see);
@@ -36,7 +35,7 @@ fn signed_load() -> (Host, LoadedFilter) {
 fn req() -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/legacy".to_string(),
+        path_with_query: "/legacy".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         // Non-UTF-8 bytes prove the 0.2 projection stays byte-faithful (it is a clone, not the
@@ -49,7 +48,7 @@ fn req() -> HttpRequest {
 }
 
 #[test]
-fn a_frozen_02_guest_loads_and_runs_both_hooks_on_the_03_host() {
+fn a_frozen_02_guest_loads_and_runs_both_hooks_on_the_04_host() {
     let (_host, filter) = signed_load();
 
     let (decision, _logs) = filter.on_request(&req(), &RequestTrace::root()).unwrap();
@@ -60,7 +59,7 @@ fn a_frozen_02_guest_loads_and_runs_both_hooks_on_the_03_host() {
         headers: vec![],
         body: vec![],
     };
-    // The 0.3 host passes the request snapshot; the V02 adapter drops it before the guest —
+    // The 0.4 host passes the request snapshot; the V02 adapter drops it before the guest —
     // this call succeeding IS the adapter working.
     let (decision, _logs) = filter
         .on_response(&req(), &resp, &RequestTrace::root())

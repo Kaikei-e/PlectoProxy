@@ -72,6 +72,15 @@ fn main() {
             "filter_cors",
             "FILTER_CORS_COMPONENT",
         );
+        // filter-compat-v01 is pinned to the FROZEN 0.1.0 contract (wit/v0.1.0/) — the oldest
+        // track the host still accepts. Test-only, so it lives under crates/host/fixtures/.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-compat-v01"),
+            &out_dir,
+            "filter_compat_v01",
+            "FILTER_COMPAT_V01_COMPONENT",
+        );
         // filter-compat-v02 is pinned to the FROZEN 0.2.0 contract (wit/v0.2.0/) — the V02
         // adapter rail's living fixture (ADR 000073). Test-only, so it lives under
         // crates/host/fixtures/, not examples/.
@@ -81,6 +90,27 @@ fn main() {
             &out_dir,
             "filter_compat_v02",
             "FILTER_COMPAT_V02_COMPONENT",
+        );
+        // filter-v04 is pinned to the CURRENT 0.4.0 contract (wit/) — the guest that exercises
+        // the arms only 0.4.0 has (bare `%continue`, `modified(request-body-edit)`,
+        // `path-with-query`), while the reference shelf stays on frozen 0.3.0. Test-only, so it
+        // lives under crates/host/fixtures/, not examples/.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-v04"),
+            &out_dir,
+            "filter_v04",
+            "FILTER_V04_COMPONENT",
+        );
+        // filter-respbody exports `on-response-body` and NOT `on-request-body` — a body-hook
+        // subset neither published world names, so loading it is the machine check that the
+        // acceptance LATTICE is the contract (ADR 000098 decision 2). Test-only.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-respbody"),
+            &out_dir,
+            "filter_respbody",
+            "FILTER_RESPBODY_COMPONENT",
         );
         // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API
         // calls). It is benchmark-only, so it lives under bench/filters/, not examples/.

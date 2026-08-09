@@ -56,7 +56,12 @@ _Avoid_: filter rewrite（フィルタ駆動の書換は別レイヤ・後続）
 upstream を構成する 1 つの `host:port`。active health check が healthy / unhealthy を切り替え、unhealthy な
 instance は分配集合から外れる（eject）。起動時は pessimistic（unhealthy）で始まり、最初の成功 probe で healthy に
 昇格する。
-_Avoid_: endpoint（Envoy 用語）, backend（曖昧）, wasmtime の instance（別 context・extension plane 側の語）
+_Avoid_: 単数の endpoint（1 インスタンスを指す語としては先行実装の語彙と衝突する。集合を指す **Endpoint set** は下記のとおり別の語として生きている）, backend（曖昧）, wasmtime の instance（別 context・extension plane 側の語）
+
+**Endpoint set**:
+ある upstream の instance 群と、そこからコンパイルした LB 状態（Maglev テーブル等）を一体で差し替えるための束。
+両者は整合していなければならないので必ず一緒に swap する。定期 DNS 再解決はこの束ごと入れ替える。
+_Avoid_: instance 群（LB 状態が含まれることが落ちる）, endpoint 単体の意味での流用（上記 Upstream instance を使う）
 
 **Active health check**:
 background タスクが各 upstream instance を health の probe path へ定期 probe し、連続成功 / 失敗が閾値に達したら
@@ -157,8 +162,9 @@ _Avoid_: XFF（family の一員に過ぎず全体を指さない）, proxy heade
 **Client-IP 伝播（edge モデル）**:
 fast path が受信した **forwarding header family を信頼せず剥がし**、自分が観測した接続 peer と接続 scheme から
 付け直す既定の姿勢。チェーン実行の**前**に行うので、IP ベースの判断をするフィルタも upstream も Plecto が
-確定した値だけを見る。前段に信頼できる LB を置く構成でも、ヘッダ層の trusted-hops 復元は採らない
-（ADR 000056 で却下）——復元は接続層の PROXY protocol v2 受信が担い、edge モデル自体は無変更（ADR 000057）。
+確定した値だけを見る。前段に信頼できる LB を置く構成でも、ホップ**数**で信頼する trusted-hops 復元は採らない
+（ADR 000056 で却下）——復元は接続層の PROXY protocol v2 受信（ADR 000057）か、宣言済み trusted CIDR に限った
+`X-Forwarded-For` 復元（ADR 000103）が担い、下流へ発行する値が Plecto の確定値である点は不変。
 _Avoid_: XFF passthrough（受信値を信頼する別姿勢）, spoof guard（機構名であって姿勢を表さない）
 
 **PROXY protocol v2 reception（接続層の peer 復元）**:
@@ -169,6 +175,15 @@ _Avoid_: XFF passthrough（受信値を信頼する別姿勢）, spoof guard（�
 fail-closed に切断。`LOCAL` コマンドは実 peer のまま（LB health check 互換）。h3（UDP）listener は対象外
 （ADR 000057）。
 _Avoid_: v1 テキスト形式（不採用）, proxy protocol passthrough（素通しはしない）, real IP header（ヘッダ層の別機構）
+
+**Trusted-proxy client identity restoration（ヘッダ層のクライアント同一性復元）**:
+PROXY v2 を喋れない L7 前段のために、`[listen.trusted_proxy]`（trusted CIDR **必須**）で宣言した前段から
+来たリクエストに限り、受信 `X-Forwarded-For` を**右から**読んで宣言済みホップを落とし、最初の非宣言アドレスを
+クライアントとする処理。判定軸は**解決済みアドレス**（PROXY v2 が走った後の値）なので、前段が L4 でも L7 でも
+規則は一つで済む。復元源は `X-Forwarded-For` の 1 family のみ、scheme はワイヤの真実のまま。復元不能
+（不在・不正・全要素が宣言済み・走査上限超過）と非宣言 peer は常に peer へ倒れる。下流へ発行する値は復元の
+有無にかかわらず Plecto の確定値（ADR 000103）。
+_Avoid_: trusted-hops（ホップ**数**で信頼する却下済みの形、ADR 000056）, XFF append（受信値に追記する別姿勢）
 
 ## TLS
 

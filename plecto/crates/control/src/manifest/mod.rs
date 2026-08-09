@@ -1,7 +1,6 @@
 //! The declarative manifest (ADR 000007 / 000008): the single, static source of truth for
-//! which filters are loaded, pinned by OCI digest, with which trust roots, in what chain
-//! order. TOML (mirrors Cargo; ADR 000008 static config). Routes are deferred until the
-//! fast-path server exists; v0.1 has a single chain.
+//! which filters are loaded, pinned by OCI digest, with which trust roots, and which
+//! `[[route]]` runs them in what order. TOML (mirrors Cargo; ADR 000008 static config).
 //!
 //! Split by concern: this module holds only `Manifest` itself + `Manifest::from_toml`. Each
 //! `[section]`'s schema (every `struct`/`enum` + its serde defaults) lives in its own sibling
@@ -40,16 +39,19 @@ pub use filter_entry::{
 // schema type (module doc above).
 #[allow(unused_imports)]
 pub use filter_entry::{AllowDest, RateLimitConfig, SchemeKind, TcpAllowDest};
-pub use listen::{ClientAuth, Listen, ProxyProtocolTrust};
-// `ProxyProtocol` / `Drain` are schema fields reached through `Listen` rather than by name
-// elsewhere in this crate; re-exported for the same schema-type completeness reason as
-// `AllowDest` below.
+pub use listen::{ClientAuth, Listen, ProxyProtocolTrust, TrustedProxyTrust};
+// `ProxyProtocol` / `Drain` / `TrustedProxy` are schema fields reached through `Listen` rather
+// than by name elsewhere in this crate; re-exported for the same schema-type completeness reason
+// as `AllowDest` below.
 #[allow(unused_imports)]
-pub use listen::{Drain, ProxyProtocol};
+pub use listen::{Drain, ProxyProtocol, TrustedProxy};
 pub use observability::Observability;
 pub use resumption::Resumption;
-pub(crate) use route::MAX_BACKEND_WEIGHT;
-pub use route::{CompressionAlgorithm, RateLimitKeyKind, Route, RouteCompression, RouteRateLimit};
+pub use route::{
+    CompressionAlgorithm, OverCapMode, RateLimitKeyKind, Route, RouteCompression, RouteHeaders,
+    RouteRateLimit, RouteResponseBody, RouteTimeouts, UninspectableMode,
+};
+pub(crate) use route::{MAX_BACKEND_WEIGHT, MAX_RESPONSE_BODY_CAP};
 // `Backend` / `RouteMatch` / `RouteUpgrade` are only named via `crate::manifest::X` from
 // `#[cfg(test)]` code elsewhere in the crate; re-exported for the same completeness reason.
 #[allow(unused_imports)]
@@ -86,8 +88,9 @@ pub struct Manifest {
     /// `[[filter]]` entries.
     #[serde(default, rename = "filter")]
     pub filters: Vec<FilterEntry>,
-    /// The default `[chain]` — driven by the chain-only `Control::on_request` convenience and
-    /// used by a route that names no filters of its own. The fast-path server uses `[[route]]`.
+    /// `[chain]`: the pre-`[[route]]` global chain. No serving path runs it, so a non-empty
+    /// `filters` is rejected at validation (ADR 000101); the section is parsed only so that
+    /// rejection can point at the `[[route]]` the filters belong on.
     #[serde(default)]
     pub chain: Chain,
     /// `[[upstream]]` entries: named backends the fast-path server forwards to (ADR 000013).

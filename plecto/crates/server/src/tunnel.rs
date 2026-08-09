@@ -2,8 +2,8 @@
 //! their connections over, bytes are copied bidirectionally and opaquely between them — the
 //! general bidirectional-relay technique every upgrade-capable proxy shares. The only policy on
 //! the tunnel is time: an activity-based idle timer (a byte in EITHER direction resets it — the
-//! form nginx `proxy_read_timeout` / Envoy `stream_idle_timeout` / HAProxy `timeout tunnel` all
-//! take) and the server's drain flag (ADR 000039), so an abandoned or indefinite tunnel can
+//! form tunnel idle timers conventionally take, as opposed to a per-read or absolute deadline)
+//! and the server's drain flag (ADR 000039), so an abandoned or indefinite tunnel can
 //! neither hold its connection permit forever nor outlive a graceful shutdown.
 
 use std::pin::Pin;

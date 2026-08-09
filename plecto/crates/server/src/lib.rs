@@ -156,8 +156,8 @@ pub(crate) const MAX_CONNECTIONS_PER_IP: u32 = 256;
 pub fn raise_nofile_limit() {
     match unix_raise_nofile_limit() {
         Ok((soft, hard)) => {
-            // 1 client fd + 1 upstream fd per proxied connection (the same accounting nginx
-            // documents for a proxying worker), doubled for headroom: the admin/health listener,
+            // 1 client fd + 1 upstream fd per proxied connection (the standard descriptor
+            // accounting for a proxying worker), doubled for headroom: the admin/health listener,
             // DNS-refresh sockets, TLS resumption file handles, and connections mid-teardown that
             // have not yet released their `MAX_CONNECTIONS` permit.
             let wanted = MAX_CONNECTIONS as u64 * 4;
@@ -227,15 +227,22 @@ pub(crate) struct ServerState {
     /// pooled TLS client per distinct `[upstream.tls]` config.
     clients: UpstreamClients,
     alt_svc: Option<HeaderValue>,
+    /// The declared `[listen.trusted_proxy]` networks (ADR 000103), captured at startup like the
+    /// rest of `[listen]`. `None` — the default — means inbound `X-Forwarded-For` is dropped
+    /// unconditionally; `Some` lets a request whose resolved peer is one of those proxies name
+    /// its client. Held here so the request path reads it without a per-request clone.
+    trusted_proxy: Option<plecto_control::TrustedProxyTrust>,
     /// Global connection cap across TCP + QUIC: a permit is held for each connection's
     /// lifetime, so the server never serves more than `MAX_CONNECTIONS` at once.
     conn_limit: Arc<Semaphore>,
     /// Per-source-IP connection cap across TCP + QUIC (`MAX_CONNECTIONS_PER_IP`): a slot is held
     /// for each connection's lifetime, so one source cannot exhaust `conn_limit` alone.
     per_ip_conn_limit: Arc<conn_limit::PerIpConnLimit>,
-    /// Cap on concurrently-buffered request bodies for the `on-request-body` hook, bounding
-    /// total buffered memory.
-    body_buffer_limit: Arc<Semaphore>,
+    /// The shared BYTE budget for bodies held in memory for a body hook — request and response
+    /// alike (ADR 000098). One permit is one byte, and each buffering path reserves its own cap
+    /// for as long as the bytes stay resident, so the two directions compete for one bounded pool
+    /// instead of multiplying into two independent ceilings.
+    body_buffer_budget: Arc<Semaphore>,
     /// Native data-plane metrics (Stage A observability, ADR 000009): RED signals tallied per
     /// request and served on the admin endpoint. Always recorded (cheap atomics); whether anyone
     /// can scrape them is gated by `[observability] admin_addr`.

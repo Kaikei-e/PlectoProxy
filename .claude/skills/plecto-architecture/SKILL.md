@@ -66,7 +66,7 @@ enforced by the Component Model sandbox, **not by convention** (Tenet 2, Fork 7)
 
 ## The contract: `plecto:filter`
 
-- A custom `plecto:filter` world (Fork 2). Current contract: `plecto:filter@0.3.0`, zero-WASI
+- A custom `plecto:filter` world (Fork 2). Current contract: `plecto:filter@0.4.0`, zero-WASI
   (ADR 000010); 0.1 / 0.2 are frozen with load-time adapters (ADR 000071 / 000073). Two worlds:
   the base `filter` world is header-only — bodies stream zero-copy past the chain (ADR 000038) —
   and `filter-body` adds `on-request-body` over a buffered `list<u8>` body (buffer-then-decide,

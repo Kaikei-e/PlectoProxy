@@ -10,19 +10,29 @@ This guide is the practical how-to.
 
 ## 1. The contract in one minute
 
-A filter implements one of two `plecto:filter` worlds (the authoritative text is
+A filter implements a `plecto:filter` world (the authoritative text is
 [`plecto/wit/world.wit`](../plecto/wit/world.wit)): the header-only `filter` world, or `filter-body`
-if it also needs the request body. `filter-body` is `filter` plus one export — the **absence** of
-that export in the base world is itself the signal the host uses to skip buffering the body and
-stream it straight through, at no cost to a header-only filter (ADR 000038). Target `filter-body`
-only when your filter actually reads the body.
+if it also needs a body. `filter-body` is `filter` plus the two body hooks — the **absence** of a
+hook is itself the signal the host uses to skip buffering that direction and stream it straight
+through, at no cost to a filter that does not read it (ADR 000038 / 000098). The host decides
+buffering **per direction**, so a filter that reads only the response body leaves the request body
+on the zero-copy path, and vice versa.
+
+Those two worlds are the ENDS of what is accepted, not a list of the legal shapes: a component is
+accepted when it exports all of `filter` plus **any subset** of the body hooks, and the host probes
+each hook by name at load (ADR 000098 decision 2). If you need exactly one of the two, declare a
+world of your own with just that hook — the published worlds exist to generate bindings from, and
+`crates/host/fixtures/filter-respbody` is a worked example.
 
 ```wit
-package plecto:filter@0.3.0;
+package plecto:filter@0.4.0;
 
 interface types {
   // Header values are raw bytes (ADR 000071) — not lossy UTF-8 strings.
   record header { name: string, value: list<u8>, }
+
+  // The request target carries the query, and since 0.4.0 the name says so (ADR 000104).
+  record http-request { method: string, path-with-query: string, /* … */ }
 
   // The typed outcome of a request-side filter. Never a bare flag.
   variant request-decision {
@@ -31,8 +41,17 @@ interface types {
     short-circuit(http-response),    // stop the chain; synthesise a response now
   }
 
-  // The response side (ADR 000073): `replace` supplants the upstream response with a
-  // synthesised one (the upstream body is dropped unread — zero-copy stays intact).
+  // The body side has the SAME shape since 0.4.0 (ADR 000098): `%continue` carries no
+  // payload, so a filter that only INSPECTS the body never pays to hand it back.
+  variant request-body-decision {
+    %continue,                       // forward the buffered body unchanged
+    modified(request-body-edit),     // forward these bytes, with the header edits they force
+    short-circuit(http-response),    // stop the chain; synthesise a response now
+  }
+
+  // The response side (ADR 000073): `replace` answers with a filter-authored response —
+  // status, headers, AND body — in place of the upstream's (whose body is dropped unread,
+  // so zero-copy stays intact).
   variant response-decision { %continue, modified(response-edit), replace(http-response) }
 }
 
@@ -55,9 +74,14 @@ world filter {
 }
 
 world filter-body {
-  // …the same imports and exports as `filter`, plus the hook whose PRESENCE makes the host
-  // buffer the request body at all (buffer-then-decide, ADR 000025):
+  // …the same imports and exports as `filter`, plus the two hooks whose PRESENCE is what makes
+  // the host buffer that direction at all (buffer-then-decide, ADR 000025 / 000098). Each is
+  // independent — export only the one you read.
   export on-request-body: func(body: list<u8>) -> request-body-decision;
+  // `resp` carries status + headers only; the bytes arrive as `body`. The host HOLDS the response
+  // headers until this returns, which is why `replace` is still expressible here.
+  export on-response-body: func(req: http-request, resp: http-response, body: list<u8>)
+      -> response-body-decision;
 }
 ```
 
@@ -65,8 +89,9 @@ world filter-body {
 | --- | --- | --- | --- |
 | `init` | both | once per instance (heavy setup) | — |
 | `on-request` | both | per request, on the headers | `continue` / `modified(edit)` / `short-circuit(response)` |
-| `on-request-body` | `filter-body` only | per request, on the buffered body | `continue(body)` / `short-circuit(response)` |
+| `on-request-body` | optional | per request, on the buffered request body | `continue` / `modified(edit)` / `short-circuit(response)` |
 | `on-response` | both | per response, on the headers, with the as-forwarded request snapshot (ADR 000073) | `continue` / `modified(edit)` / `replace(response)` |
+| `on-response-body` | optional | per response, on the buffered response body, after `on-response` | `continue` / `modified(edit)` / `replace(response)` |
 
 ### Response-side decisions and chain order
 
@@ -84,6 +109,38 @@ chain (filter stamps such as `x-authenticated-user` are visible), **before** hos
 transforms (hop-by-hop strip, upstream path rewrite, `traceparent` injection). It is value-passed;
 editing it does nothing.
 
+### Reading the response body (`on-response-body`)
+
+Export it and the host buffers the upstream's response body for this route and hands it to you,
+**holding the response headers until your decision returns**. Nothing has been written to the
+client yet, so the arms mean what they say: `%continue` forwards what the host already holds (the
+bare arm — do not hand the bytes back to say "unchanged"), `modified` forwards your bytes plus the
+header edits a transform forces, and `replace` discards the buffered body for a response of your
+own. It runs **after** the whole `on-response` walk, and not at all if that walk produced a
+`replace` — there is no upstream body left to read. `resp.body` is always empty here; the bytes are
+the third parameter.
+
+`Content-Length` is the host's. It re-derives it from the bytes it actually sends, and a decision
+whose headers name `content-length` **fails closed** — a length that disagrees with the body is a
+response-desync primitive, so it is refused rather than stripped. Trailers are out of scope for
+v1 and are not part of what you inspect.
+
+What the operator controls, per route, is when this runs at all — `[route.response_body]`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `content_types` | `text/plain`, `text/html`, `text/xml`, `application/json` | The allowlist that ARMS buffering, matched against the content type **as received from the upstream** — so an earlier filter cannot rewrite a header to steer a response past you. Outside it, the response streams through uninspected. |
+| `max_bytes` | 1 MiB (ceiling 16 MiB) | The most the host will hold. It also bounds what YOU hand back: a larger `modified` / `replace` body fails closed. |
+| `over_cap` | `reject` | `reject` answers 502; `process-partial` inspects the head and forwards the whole body (a rewrite of a head is refused — the host cannot frame it); `passthrough` forwards uninspected. |
+| `uninspectable` | `reject` | What happens to a response the host cannot inspect at all. `passthrough` is the explicit opt-out. |
+
+On such a route the host also strips `Accept-Encoding` / `Range` / `If-Range` from the request it
+forwards, so what comes back is a whole identity representation — you always read plain bytes. A
+response that is nonetheless uninspectable (a streaming media type, a surviving content coding, a
+`206` fragment) is answered 502 by default and always leaves a reason in
+`plecto_response_body_inspection_skipped_total{reason=…}` and on the access log line. Nothing is
+skipped silently.
+
 A filter is **stateless**. Anything it must remember lives in host state, reached only through the
 capabilities the host explicitly lends it — **deny-by-default**:
 
@@ -97,6 +154,62 @@ capabilities the host explicitly lends it — **deny-by-default**:
 
 Nothing else — no network, no filesystem, no sockets — is reachable. That is enforced by the
 Component Model sandbox, not by convention.
+
+### Recipe: answer with a body of your own (`replace`)
+
+`replace` is how a filter authors a whole response — status, headers, **and body**. `modified`
+retouches what upstream sent, but `response-edit` carries no body field, so a filter that must
+return content of its own returns `replace`. Either way the upstream body is never read: on a
+`replace` that stream is dropped unread, keeping the zero-copy passthrough intact (ADR 000038).
+The body you send is synthesised, not a rewrite of the upstream's.
+
+The canonical case is an error page keyed on what upstream actually returned:
+
+```rust
+use crate::plecto::filter::host_config;
+use crate::plecto::filter::types::Header;
+
+fn on_response(req: HttpRequest, resp: HttpResponse) -> ResponseDecision {
+    // Which requests this policy covers is the FILTER's decision. A route's `path_prefix` is a
+    // routing bound and is often wider than the condition a policy cares about, so match here.
+    if resp.status < 500 || !req.path_with_query.starts_with("/api/") {
+        return ResponseDecision::Continue;
+    }
+
+    // The page text is operator-owned config (`[filter.config]`, ADR 000066) rather than a
+    // constant compiled into the component: editing it is a manifest change, not a rebuild,
+    // re-sign, and re-pin of the digest.
+    let page = host_config::get("upstream_error_page")
+        .unwrap_or_else(|| "the service is temporarily unavailable".to_string());
+
+    ResponseDecision::Replace(HttpResponse {
+        status: 503,
+        headers: vec![
+            Header {
+                name: "content-type".to_string(),
+                value: b"text/plain; charset=utf-8".to_vec(),
+            },
+            Header {
+                name: "retry-after".to_string(),
+                value: b"5".to_vec(),
+            },
+        ],
+        body: page.into_bytes(),
+    })
+}
+```
+
+```toml
+[filter.config]                # on this filter's [[filter]] entry (§4)
+upstream_error_page = "the service is temporarily unavailable"
+```
+
+`resp.status` is the upstream's own status, and `req` is the as-forwarded snapshot, so the same
+hook can key on a request-chain stamp (`x-authenticated-user`) as readily as on the status. The
+returned headers pass exactly the fail-closed validation a request-side `short-circuit` output
+passes (ADR 000071), and a route's `[route.headers]` declaration (§4) is applied afterwards, to
+this synthesised response as much as to a forwarded one. Keep the chain order above in mind: a
+`replace` is terminal, so filters earlier in the route's `filters` list never see this response.
 
 ## 2. Scaffold
 
@@ -243,6 +356,7 @@ addresses = ["127.0.0.1:9000", "127.0.0.1:9001"]  # required: host:port instance
 resolve_interval_ms = 0               # optional (default 0 = off): re-resolve hostname addresses
                                        # on this interval, each A/AAAA record its own LB endpoint
 request_timeout_ms = 30000            # optional (default 30000; 0 disables — long-poll/streaming)
+overall_timeout_ms = 0                # optional (default 0 = none): bounds every attempt + backoff
 max_retries = 1                       # optional (default 1; 0 disables retry onto another instance)
 [upstream.health]                     # required: instances start unhealthy, a probe admits them
 path = "/healthz"                     # required
@@ -272,14 +386,33 @@ upstream = "app"         # required: the [[upstream]] name to forward a passing 
 filters = ["my-filter"]  # optional: filter ids run in order (empty = pure pass-through)
 host = "example.com"     # optional: match only this authority (case-insensitive); omit = any host
 strip_prefix = "/api"    # optional: strip this prefix before forwarding (the chain saw the original)
+[route.timeouts]         # optional: absent = the upstream's own timeouts apply, unchanged
+request_timeout_ms = 30000 # optional: overrides the upstream's per-try bound; 0 disables it here
+overall_timeout_ms = 45000 # optional: overrides the upstream's overall bound; 0 = no overall bound
 [route.upgrade]          # optional: absent = deny-by-default, no HTTP/1.1 Upgrade tunnelled
 protocols = ["websocket"] # required if the section is present; token allowlist, `h2c` rejected
 idle_timeout_ms = 300000  # optional (default 300000 = 5 min); 0 disables the idle timer
+[route.headers]          # optional: literal response headers, no filter needed
+set = { "X-Content-Type-Options" = "nosniff" }  # replaces any same-named header on the way out
+remove = ["server"]                             # dropped from every response this route answers
 ```
 
 `[route.upgrade]` opts a route into tunnelling `HTTP/1.1 Upgrade` (e.g. WebSocket): a listed token
 re-issues the handshake upstream and, on a verified `101`, splices a bidirectional byte tunnel with
 an activity-reset idle timeout (ADR 000048).
+
+`[route.timeouts]` overrides the two timeouts the upstream declares as defaults (ADR 000102), per
+knob and independently: the route's value wins where it declares one, the upstream's stands
+everywhere else. Omitting a field is **not** the same as writing `0` — `0` disables that bound for
+this route, which is how a streaming route opts out of a short upstream default. Details and the
+per-try/overall interaction are in the
+[operations guide](operations.md#request-timeouts-which-value-actually-applies).
+
+`[route.headers]` is the constant-header case that does **not** need a filter (ADR 000100): literal
+values only, applied after the response chain to every response the route answers — a filter's
+`replace` and the fail-closed 5xx included. A header whose value depends on the request is a
+per-request decision and stays a filter's job. Details and the one gap (a response returned before
+a route is chosen) are in the [operations guide](operations.md#declared-response-headers-which-responses-they-land-on).
 
 ### `[[tls]]`
 
@@ -291,8 +424,8 @@ host = "example.com"          # optional SNI host; omit = the default cert
 ```
 
 With no `[[tls]]`, the fast path serves plain HTTP/1.1; one or more certs enable TLS termination
-(rustls, ADR 000014). `[chain]` exists for the single-chain convenience API, but the fast-path server
-uses `[[route]]`.
+(rustls, ADR 000014). Filters run only as part of a `[[route]]`'s `filters`; a manifest that still
+declares the older global `[chain]` is rejected at validation, with a diagnostic naming that move.
 
 ### `[listen]`
 
@@ -303,6 +436,9 @@ advertised_port = 443    # optional: the port Alt-Svc advertises for h3 when the
 
 [listen.proxy_protocol]  # optional: PROXY protocol v2 reception (ADR 000057); absent = off
 trusted = ["10.0.0.0/8"] # required when present: CIDRs of the L4 LBs allowed to speak PROXY v2
+
+[listen.trusted_proxy]   # optional: client identity from X-Forwarded-For (ADR 000103); absent = off
+trusted = ["10.0.0.0/8"] # required when present: CIDRs of the L7 front proxies allowed to name it
 ```
 
 `[listen]` is captured at startup — a reload does not re-bind or change it; restart to apply.
@@ -315,6 +451,16 @@ any non-TCP/IPv4/IPv6 `PROXY` command. `trusted` takes CIDR notation only (a sin
 `"192.0.2.1/32"`), and the h3 (QUIC/UDP) listener is out of scope — front it with a QUIC-aware
 LB only if that LB can pass the client address another way (e.g. Kubernetes
 `externalTrafficPolicy: Local`).
+
+`[listen.trusted_proxy]` answers the same question one layer up, for an L7 front proxy that cannot
+speak PROXY v2. When the address already resolved for a request falls inside `trusted`, its inbound
+`X-Forwarded-For` is read right to left, declared hops are dropped, and the first address no
+declared proxy vouched for becomes the client — feeding the same consumers as above. Anything else
+falls back to that resolved address: an absent, malformed, or entirely-declared list, and every
+request from outside the CIDRs. Only `X-Forwarded-For` is a restoration source, and the scheme
+stays the wire truth (an inbound `X-Forwarded-Proto` is never honored). Prefer PROXY v2 when the
+front tier can speak it — it restores the client below HTTP, where the request cannot reach.
+See the [hardening guide](hardening.md#client-identity-behind-a-front-proxy).
 
 ## 5. Package, sign, and run
 
@@ -498,7 +644,7 @@ registry = "ghcr.io"
 metadata = { oci = { registry = "ghcr.io", namespacePrefix = "kaikei-e/wit/" } }
 EOF
 
-wkg get plecto:filter@0.3.0 --config wkg-registry.toml -o wit/ --format wit
+wkg get plecto:filter@0.4.0 --config wkg-registry.toml -o wit/ --format wit
 ```
 
 That writes the plain-text WIT to `wit/`, ready for `wit_bindgen::generate!` (or any other
@@ -520,7 +666,7 @@ disappear without a major bump. Do not depend on it outside an explicit opt-in b
 ### Compatibility policy
 
 The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
-versioning policy already says so. `plecto:filter@0.3.0` and a `plecto` binary at `0.3.0` is the
+versioning policy already says so. `plecto:filter@0.4.0` and a `plecto` binary at `0.6.x` is the
 normal, expected state.
 
 - **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional
@@ -538,10 +684,23 @@ normal, expected state.
   maintain", and even that requires a dedicated ADR, **at least 24 months' notice**, and a
   migration document. Cutting 1.0 is the act that brings this pledge into force (which is why 1.0
   waits for the `wasi:http` convergence major to settle first).
-- **`filter` vs. `filter-body` compatibility is part of this policy** (ADR 000038): the base
+- **`filter` vs. `filter-body` compatibility is part of this policy** (ADR 000038 / 000098): the base
   `filter` world exporting nothing new stays minor-compatible forever by construction (the
-  *absence* of `on-request-body` is itself contractual, not an oversight). Adding an export to
+  *absence* of a body hook is itself contractual, not an oversight). Adding an export to
   `filter-body` is minor; changing an existing export's signature (on either world) is major.
+
+### Rebuilding a 0.3.0 filter against 0.4.0
+
+An already-deployed 0.3.0 component needs **no** rebuild — it keeps loading. Rebuilding its
+*source* against 0.4.0 takes two mechanical edits:
+
+- `req.path` → `req.path_with_query` (`http-request.path` → `path-with-query`, ADR 000104). Same
+  value, query included; only the name changed, so the compiler finds every site.
+- `RequestBodyDecision::Continue(bytes)` → either `Continue` (you did not change the body) or
+  `Modified(RequestBodyEdit { body: bytes, set_headers: vec![], remove_headers: vec![] })` (you
+  did). The split is the point: `%continue` no longer carries a body, so an inspecting filter
+  stops paying to hand the bytes back (ADR 000098). When in doubt, `Modified` is always
+  behaviour-preserving — it is exactly what the host's 0.3 adapter does with your old `continue`.
 
 This is the filter-author-facing analogue of the supply-chain discipline Plecto applies to its own
 release binaries and images (ADR 000047): a digest-pinned artifact, a declared stability contract,

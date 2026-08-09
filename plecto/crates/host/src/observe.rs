@@ -265,6 +265,7 @@ pub enum Hook {
     OnRequest,
     OnRequestBody,
     OnResponse,
+    OnResponseBody,
 }
 
 impl Hook {
@@ -273,14 +274,8 @@ impl Hook {
             Hook::OnRequest => "on-request",
             Hook::OnRequestBody => "on-request-body",
             Hook::OnResponse => "on-response",
+            Hook::OnResponseBody => "on-response-body",
         }
-    }
-}
-
-fn isolation_str(isolation: Isolation) -> &'static str {
-    match isolation {
-        Isolation::Trusted => "trusted",
-        Isolation::Untrusted => "untrusted",
     }
 }
 
@@ -329,7 +324,7 @@ pub(crate) fn build_filter_span(
         outcome,
         attributes: vec![
             KeyValue::new("filter.id", filter_id.to_string()),
-            KeyValue::new("plecto.isolation", isolation_str(isolation)),
+            KeyValue::new("plecto.isolation", isolation.as_str()),
             KeyValue::new("plecto.outcome", outcome.as_str()),
             KeyValue::new("plecto.hook", hook.as_str()),
         ],

@@ -1,5 +1,5 @@
 //! E2E (tdd-workflow Phase 0) for the binary's operator CLI: `plecto --version` and
-//! `plecto validate <manifest>` (the `nginx -t` shape — validate a manifest in CI / before a
+//! `plecto validate <manifest>` (check the config and exit — validate a manifest in CI / before a
 //! SIGHUP without serving). Drives the real compiled binary (`CARGO_BIN_EXE_plecto`).
 //!
 //! `validate` is a STATIC config check: parse (strict, `deny_unknown_fields`), reference and
@@ -68,6 +68,29 @@ fn version_flag_names_the_compiled_capability_profile() {
         stdout.contains(expected),
         "--version names the compiled profile, want {expected:?}, got: {stdout:?}"
     );
+}
+
+#[test]
+fn version_flag_lists_the_loadable_filter_contract_versions() {
+    // ADR 000099: `--version` answers "what does this binary accept?" — the set of
+    // `plecto:filter` contract versions it can load — which is a different question from "what
+    // did each filter bind in this configuration?" (the per-filter startup line). An operator
+    // deciding whether a proxy bump forces a filter rebuild reads this one.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["--version"], dir.path());
+    assert!(out.status.success(), "--version exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for version in [
+        "plecto:filter@0.1.0",
+        "plecto:filter@0.2.0",
+        "plecto:filter@0.3.0",
+        "plecto:filter@0.4.0",
+    ] {
+        assert!(
+            stdout.contains(version),
+            "--version lists {version} as loadable, got: {stdout:?}"
+        );
+    }
 }
 
 #[test]
@@ -171,6 +194,44 @@ fn validate_rejects_a_route_referencing_an_unknown_upstream() {
     assert!(
         stderr.contains("nonexistent"),
         "the error names the unknown upstream, got: {stderr:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_the_inert_chain_section_and_names_the_migration() {
+    // ADR 000101: the serving binary never runs `[chain]` — only a `[[route]]`'s inline `filters`
+    // reach the dispatcher. A manifest declaring one must fail closed here rather than start
+    // clean with zero filters applied, and the diagnostic must hand the operator the migration
+    // instead of leaving them to find it.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = format!(
+        r#"
+[[filter]]
+id = "security-headers"
+source = "oci/security-headers"
+digest = "sha256:abc"
+
+[chain]
+filters = ["security-headers"]
+{VALID_MANIFEST}"#
+    );
+    std::fs::write(dir.path().join("plecto.toml"), manifest).unwrap();
+
+    let out = run(&["validate", "plecto.toml"], dir.path());
+
+    assert!(
+        !out.status.success(),
+        "a manifest declaring [chain] must fail validate, stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[chain]"),
+        "the error names the rejected section, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("[[route]]"),
+        "the error names where the filters belong, got: {stderr:?}"
     );
 }
 

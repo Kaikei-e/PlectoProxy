@@ -15,17 +15,224 @@ All notable changes to Plecto are documented here. The format follows
   error type of a dependency re-surfaced through a public enum. `cargo semver-checks` runs on
   every release, but it compares type paths, so a dependency's major bump behind an unchanged
   path is a gap it cannot see; that judgement stays manual.
-- **WIT contract**: the filter contract is versioned independently as `plecto:filter@<version>`.
-  A manifest declares which contract its filters target; the host keeps loading every contract
-  version it ships support for, so a proxy upgrade never silently breaks deployed filters. The
-  contract is published as a CNCF Wasm OCI Artifact to `ghcr.io` on every tagged release (`wkg
-  publish`, ADR 000064); the published digest is recorded in that tag's release notes, the
-  contract-side counterpart of the binary/image supply-chain record below.
+- **WIT contract**: the filter contract is versioned independently as `plecto:filter@<version>`,
+  and **bumping the proxy never requires rebuilding a filter**. The upgrade rule now lives where
+  the decision is made — [README](README.md#upgrading-two-independent-version-series) and
+  [docs/operations.md](docs/operations.md#upgrading-two-independent-version-series) — rather than
+  only here. The contract is published as a CNCF Wasm OCI Artifact to `ghcr.io` on every tagged
+  release (`wkg publish`, ADR 000064); the published digest is recorded in that tag's release
+  notes, the contract-side counterpart of the binary/image supply-chain record below.
+- **Access log**: the field set of the `plecto::access` line is a contract on the same footing as
+  the manifest schema. Adding, renaming, or removing a field is listed under **Changed** with a
+  migration note; the typed field list is in
+  [docs/operations.md](docs/operations.md#the-access-log-field-contract).
 - **Release artifacts**: binaries and images are cosign-signed (keyless) with SBOMs attached —
   the same supply-chain bar Plecto's own filter loading enforces. Verify commands are in the
   release notes of each release.
 
 ## [Unreleased]
+
+## [0.7.0] - 2026-08-09
+
+Minor bump, not a patch: this release removes public API from the crates.io-published
+`plecto-control` / `plecto-host`, rejects a manifest section that used to parse, and moves the
+filter contract to `plecto:filter@0.4.0`. Under the pre-1.0 policy above a minor bump is where
+breaking changes live; `cargo-semver-checks` gates it. **Deployed filters do not need a
+rebuild** — the two version series stay independent, and every frozen contract track keeps its
+load-time adapter.
+
+### Added
+
+- **Response-body inspection** (`on-response-body`, ADR 000098). A filter can now read the
+  upstream's response body — the hook the "we don't build it natively, you write it as a filter"
+  answer for DLP, PII masking, and response-side guardrails was missing. It completes
+  `plecto:filter@0.4.0`, which is now releasable.
+
+  **The host holds the response headers until the body decision returns.** That is the whole
+  design: nothing has been written to the client while the filter is reading, so a filter can
+  still rewrite the body (`modified`) or answer with a different response entirely (`replace`),
+  and the host can still refuse a response it could not inspect. `%continue` is a bare arm — the
+  dominant case is pure inspection, and handing the bytes back to say "unchanged" would charge it
+  a full copy for nothing. `Content-Length` stays host-owned: a filter that names it fails the
+  decision closed rather than having it stripped, because a length that disagrees with the bytes
+  is a response-desync primitive.
+
+  **Buffering is decided per direction, from the contract.** The host probes each body hook by
+  name at load, so a route buffers the request body, the response body, both, or — the
+  overwhelmingly common case — neither. A filter that reads only one body costs the other nothing,
+  and **no existing filter starts buffering anything**: the `0.1` / `0.2` tracks cannot express the
+  response hook and the in-tree `0.3` shelf never declared it. What is accepted is the *lattice* —
+  the base `filter` exports plus any subset of the body hooks — with `filter` and `filter-body` as
+  its two ends rather than an enumeration of the legal shapes.
+
+  **Defaults are fail-closed, and nothing is skipped silently.** On a route that declares an
+  inspecting filter, the forwarded request drops `Accept-Encoding` / `Range` / `If-Range` so the
+  upstream returns a whole identity representation. A response the host cannot inspect anyway — a
+  streaming media type, a surviving content coding, a `206` fragment — is answered `502` by
+  default, and a body over the cap likewise (`502`, not `413`: that status is the request plane's
+  vocabulary). Every such case increments
+  `plecto_response_body_inspection_skipped_total{reason=…}` and names the reason on the access
+  log line, whether it was refused or forwarded.
+
+  Configured per route under `[route.response_body]`: `max_bytes` (default 1 MiB, ceiling 16 MiB —
+  the request-side cap), `over_cap` = `reject` (default) / `process-partial` / `passthrough`,
+  `uninspectable` = `reject` (default) / `passthrough`, and `content_types`, the allowlist that
+  ARMS buffering — matched against the content type **as received from the upstream**, so a filter
+  earlier in the chain cannot rewrite a header to steer a response past the filter that inspects
+  it. Every value is validated at build: an unusable one stops startup or reload rather than
+  quietly disarming the inspection the route was configured for.
+
+- **`plecto:filter@0.4.0` contract version rails** (ADR 000098 / 000104). `0.3.0` is frozen at
+  [`plecto/wit/v0.3.0/`](plecto/wit/v0.3.0/world.wit) and the current contract text moves to
+  `0.4.0`, with two changes. **`request-body-decision` now has the same shape as the other three
+  decisions** — `%continue` / `modified(request-body-edit)` / `short-circuit(http-response)` —
+  so all four read the same way. `%continue` is a *bare* arm: the dominant body use case is
+  inspection (WAF / DLP / schema checks), and 0.3.0's `continue(list<u8>)` charged that case a
+  full copy back across the boundary just to say "unchanged". `modified` carries the new bytes
+  **plus** the header edits a body transform usually forces (content-type after a re-encode, a
+  digest stamp); `Content-Length` stays host-owned and is re-derived from the body actually
+  forwarded. **`http-request.path` is renamed `path-with-query`**, the value unchanged: the field
+  always carried the query, the operator-facing access log deliberately carries a query-*less*
+  `path`, and one name for two meanings was the only wrong part.
+
+  **No deployed filter needs a rebuild.** `0.1.0` / `0.2.0` / `0.3.0` components keep loading
+  through load-time adapters, as the compat policy promises, and every in-tree reference filter
+  stays on `0.3.0` on purpose — the shelf is the evidence, exercised on every CI run
+  (`crates/host/tests/compat_v01.rs` / `compat_v02.rs` / `compat_v03.rs`). The load-bearing
+  mapping: a frozen guest's `continue(bytes)` always meant "forward THIS body", so the adapter
+  lands it on `modified` — reading it as the new bare `%continue` would silently discard a
+  rewriting filter's transform. Rebuilding a filter's *source* against 0.4.0 is two mechanical
+  edits, described in
+  [docs/writing-a-filter.md](docs/writing-a-filter.md#rebuilding-a-030-filter-against-040).
+  `plecto new-filter` scaffolds `0.4.0`, and `plecto --version` now lists all four loadable
+  contracts.
+
+- **Per-route timeout overrides** (`[route.timeouts]`, ADR 000102). A route can now declare
+  `request_timeout_ms` (per-try) and `overall_timeout_ms` of its own, overriding the defaults its
+  upstream declares. One rule governs both, per knob and independently: **the upstream declares the
+  default, the route overrides it.** Routes whose latency budgets genuinely differ — a resize
+  endpoint that needs 30 s and a plain REST call that should fail in 2 — can therefore share one
+  upstream, instead of declaring a second `[[upstream]]` at the same address purely to change a
+  timeout, which duplicated its health prober and split its circuit-breaker state across two states
+  for one backend. Omitting a field and writing `0` remain different: omitted takes the upstream's
+  value, `0` disables that bound for this route, so `request_timeout_ms = 0` is the per-route
+  streaming opt-out. The per-try and overall bounds still apply together with the tighter one
+  winning, the fault markers still distinguish them (`upstream-timeout` / `request-timeout`), and
+  `max_retries` / `[upstream.circuit_breaker]` / `[upstream.outlier_detection]` stay per-upstream —
+  they describe the backend, not a route's time budget. Absent section, unchanged behavior. See the
+  [operations guide](docs/operations.md#request-timeouts-which-value-actually-applies).
+
+- **Declarative per-route response headers** (`[route.headers]`, ADR 000100). A route can now
+  declare `set = { … }` / `remove = [ … ]` and get constant response headers without writing a
+  filter — the case that previously cost an operator a Rust toolchain, a vendored WIT copy, a
+  signing key, an OCI layout, and a `sha256:` digest to re-pin on every build. Values are literals:
+  no conditionals, no interpolation from the request, no patterns; a header whose value depends on
+  the request is a per-request decision and stays a filter's job. The declaration is a **floor** —
+  applied after the response filter chain and before compression, `set` replaces every same-named
+  header the upstream or a filter produced and `remove` drops the name, on **every** response the
+  route answers: a filter's `replace`, a filter's short-circuit, a chain's fail-closed 5xx, the
+  native rate limit's 429, and the forward-side 502 / 503 / 504. One gap is deliberate: a response
+  returned before a route is chosen (the no-route 404, the path-normalization 400) carries no
+  declaration, because there is no route to take it from. Header names are matched
+  case-insensitively, and validation is fail-closed — an invalid name or value, a duplicate name, an
+  empty block, or a hop-by-hop / `content-length` name fails `plecto validate`, startup, and reload
+  rather than being dropped at request time. Absent section, unchanged behavior. See the
+  [operations guide](docs/operations.md#declared-response-headers-which-responses-they-land-on).
+- **Client identity behind a trusted L7 proxy** (`[listen.trusted_proxy]`, ADR 000103). Declaring
+  `trusted = ["<CIDR>", ...]` lets a request whose already-resolved address falls inside those
+  CIDRs have its client read out of the inbound `X-Forwarded-For`: the list is walked right to
+  left, declared hops are dropped, and the first address no declared proxy vouched for becomes the
+  client — feeding the per-client-IP rate limit, `source_ip` Maglev hashing, the access log's
+  `client` field, and the re-issued `X-Forwarded-For` / `X-Real-IP`. This closes the gap for a
+  fronting L7 tier that cannot speak PROXY protocol v2; where v2 is available it remains the first
+  choice, since it restores the address below HTTP. Absent section, unchanged behavior — the
+  restoration path does not exist unless declared, and a request from outside the CIDRs always
+  keeps the edge default (inbound forwarding headers dropped, the peer re-issued). Every
+  unresolvable case falls back to that peer: an absent, malformed, or entirely-declared list, and
+  any list longer than the scan bound. `X-Forwarded-For` is the only restoration source — the rest
+  of the client-IP header family stays dropped — and the scheme still comes from the wire, so an
+  inbound `X-Forwarded-Proto` is never honored. `trusted` takes CIDR notation only (a single host
+  is `"10.1.2.3/32"`) and must list at least one entry; an empty or unparsable list fails
+  `plecto validate` and startup. See the
+  [hardening guide](docs/hardening.md#client-identity-behind-a-front-proxy).
+- **`plecto_upstream_instances{upstream,state}`** (ADR 000099): a gauge counting each upstream's
+  instances by state — `healthy`, `unhealthy`, `ejected` — so a fail-closed 503 from an empty
+  rotation (ADR 000017) has an externally visible explanation. Rendered by walking the live
+  upstream groups at scrape time, with no persistent counter behind it, so a reload can never
+  leave it stale. Probe health (ADR 000017) and outlier ejection (ADR 000032) are independent
+  axes, and the label folds them by severity (`ejected` > `unhealthy` > `healthy`) so each
+  instance is counted in exactly one series: the per-upstream series sum back to its instance
+  count, and cardinality is bounded by declared upstreams × 3. The combination "probe-healthy but
+  ejected" is therefore not recoverable from this metric — `plecto_outlier_ejections_total`
+  remains the cumulative ejection signal.
+- **Filter contract versions in `plecto --version`** (ADR 000099): a `filter contracts:` line
+  listing every `plecto:filter` version this binary can load. Alongside it, each filter now logs
+  one line at load (startup and every reload) naming the contract version it actually bound and
+  its isolation — the version set the binary accepts and the version a given filter uses are
+  different questions, and an upgrade decision needs both.
+
+### Changed
+
+- **The access log gains a `response_body_inspection_skipped` field** (ADR 000098). It names why a
+  route that declared an `on-response-body` filter served a response that filter never saw
+  (`streaming-content-type` / `content-encoding` / `partial-content` / `over-cap`), and is `null`
+  on every other transaction. The field set is a contract, so this is listed here even though the
+  value is null for every deployment that has no such filter. **Migration**: none required —
+  existing fields are unchanged, and a mapping pinned to field names (as
+  [docs/operations.md](docs/operations.md#the-access-log-field-contract) asks) simply gains an
+  optional key.
+
+- **Log lines are flattened JSON** (ADR 000099). The binary's JSON subscriber now writes each
+  event's fields at the top level of the line — beside `timestamp` / `level` / `target` — instead
+  of nesting them under a `fields` object. The nesting was the JSON layer's default, never a
+  chosen shape, and it left ingestion layers unable to map `method` / `status` / `duration_ms`
+  into typed slots without unwrapping first. This changes every log line the binary emits, not
+  only the access log. **Migration**: read the access log's fields from the line root rather than
+  from `fields.*`; the field names themselves are unchanged. The full typed field list — now a
+  contract, per the versioning policy above — is in
+  [docs/operations.md](docs/operations.md#the-access-log-field-contract).
+- **The access log carries `trace_id` and `span_id`** (ADR 000099), unconditionally — not only for
+  sampled transactions. The proxy is the one hop that sees every request, so its log line is where
+  "give me the trace for this slow request" gets answered; for an unsampled transaction the ids
+  are the only handle on it at all. Both are the W3C lowercase-hex forms, and `trace_id` is the
+  caller's when the request arrived with a `traceparent`.
+- **Manifest: a declared `[chain]` is now rejected** (breaking, ADR 000101). The section was
+  validated (its filter ids were checked against the declared set) and resolved into the active
+  config, but no serving path ever ran it — the fast path runs the matched `[[route]]`'s inline
+  `filters` and nothing else, and a manifest with no routes answers 404. A manifest could
+  therefore validate green, start clean, and apply zero filters. A non-empty `[chain] filters`
+  now fails closed in `plecto validate`, at startup, and on reload, with a diagnostic that names
+  where the filters belong. The rejection is unconditional — it does not depend on whether
+  `[[route]]` is also declared — so there is no "sometimes live" case to remember. An empty or
+  absent `[chain]` keeps validating, and config versions (manifest content hashes) are unchanged.
+  **Migration**: move each filter id from `[chain] filters` into the `filters` of the `[[route]]`
+  that needs it.
+- **The response-side contract documents its capability first** (docs only, ADR 000104). The WIT
+  doc comments on `on-response`, `response-decision::replace`, and `http-response` opened with
+  what the mechanism is *not* — "`resp.body` is always empty (header-only)", "nothing is
+  short-circuited here" — so a reader asking "can a filter change the response body?" met those
+  invariants before reaching the arm that answers yes, and could conclude the contract had no
+  answer at all. They now lead with the capability — `replace` authors a whole response, status
+  and headers **and body** — and every invariant that followed is kept, unchanged, after it.
+  [docs/writing-a-filter.md](docs/writing-a-filter.md#recipe-answer-with-a-body-of-your-own-replace)
+  gains the worked recipe that arm exists for: an error page keyed on the upstream's status, its
+  text injected through `[filter.config]` rather than compiled in, and the path condition matched
+  in the filter because a route's `path_prefix` is a wider, routing-level bound. Comments and
+  prose only — the contract's types, signatures, and `plecto:filter@0.3.0` package version are
+  untouched, so no filter needs rebuilding.
+
+### Removed
+
+- **The chain-only convenience API** (breaking, ADR 000101): `Control::on_request` /
+  `Control::on_response`, `ConfigSnapshot::on_request` / `ConfigSnapshot::on_response`, and the
+  `ControlError::UnknownChainFilter` variant that reported against the section above. The
+  manifest `[chain]` was their only input — the config they read is crate-private and cannot be
+  built from outside — so rejecting the section leaves them unreachable rather than merely
+  unused. **Migration**: `ConfigSnapshot::find_route` plus `dispatch_request` /
+  `dispatch_request_body` / `dispatch_response` — the calls the fast path itself drives — run a
+  route's chain against one snapshot pinned for the whole transaction. `plecto-control` is
+  published to crates.io, so this is a public-API removal and rides a pre-1.0 **minor** bump per
+  the versioning policy above; `cargo semver-checks` detects it.
 
 ## [0.6.4] - 2026-08-06
 

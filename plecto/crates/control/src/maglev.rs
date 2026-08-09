@@ -15,9 +15,9 @@
 //! **smooth weighted-frequency** generalisation (a backend of weight `w` takes a turn every
 //! `max_weight / w` rounds): it needs only `M ≥ N`, gives every positive-weight backend at least one
 //! entry in the first round (no zero-entry corner case), and reduces to the paper's plain round-robin
-//! when all weights are equal. This is the de-facto technique across the field (Envoy / Cilium /
-//! Katran-V2 converged on it); we implement the documented algorithm from first principles, not
-//! their code.
+//! when all weights are equal. Weighted-frequency turn-taking is the convention load balancers have
+//! converged on for this gap; we implement it from the published algorithm and first principles, not
+//! from anyone's source.
 //!
 //! ## Stability across health flips
 //!
@@ -25,7 +25,7 @@
 //! reconcile), NOT when an instance's health bit flips — so affinity survives a transient eject.
 //! `UpstreamGroup::pick` looks up `table[hash(key) mod M]`, returns that instance when it is
 //! eligible, and otherwise falls back to the healthy-set round-robin (the affinity target is down →
-//! best-effort, the same fail-soft Envoy uses).
+//! best-effort; affinity is an optimisation, so it fails soft rather than shedding the request).
 
 use crate::hash::murmur3_x64_128;
 

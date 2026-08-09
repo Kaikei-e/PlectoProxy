@@ -354,8 +354,9 @@ pub struct ValidateOutcome {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// Statically validate `manifest` — the `plecto validate` core (the `nginx -t` shape): every
-/// check the server would fail closed on at startup that needs no artifact and mutates nothing.
+/// Statically validate `manifest` — the `plecto validate` core (the check-the-config-and-exit
+/// shape a serving daemon conventionally offers): every check the server would fail closed on at
+/// startup that needs no artifact and mutates nothing.
 /// Covers the strict parse (the caller already ran it), `[trust]` key files, `[state]` coherence,
 /// per-filter metering/rate-limit ranges, duplicate ids, chain and route references, the weighted
 /// split, `[[tls]]` cert/key loads, and `[[upstream]]` (LB config + `[upstream.tls]` CA loads).
@@ -566,7 +567,7 @@ fn add_otlp_buffer(
     (host.with_added_telemetry_sink(buffer.clone()), Some(buffer))
 }
 
-/// The pure filter/chain-semantics checks shared by [`validate_manifest`] (the `nginx -t` core)
+/// The pure filter/chain-semantics checks shared by [`validate_manifest`] (the config-check core)
 /// and [`build_active`] (the load path): the inert `[chain]` section, duplicate filter ids, and
 /// per-entry metering / rate-limit ranges. ONE function so a check added for one caller cannot be
 /// silently missed by the other (the two previously re-implemented this sequence in parallel).

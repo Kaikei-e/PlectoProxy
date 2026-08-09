@@ -13,8 +13,9 @@ use std::time::Duration;
 /// Kubernetes exec probe (default `timeoutSeconds: 1`) would kill a hanging probe first anyway.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `plecto validate [--resolve] <manifest.toml>` — static manifest validation (the `nginx -t`
-/// shape): strict parse + every fail-closed startup check that needs no artifact and mutates
+/// `plecto validate [--resolve] <manifest.toml>` — static manifest validation (the
+/// check-the-config-and-exit shape): strict parse + every fail-closed startup check that needs
+/// no artifact and mutates
 /// nothing. `--resolve` additionally resolves each `[[filter]]`'s OCI layout and runs the
 /// loader's provenance gate (digest pin + trusted signatures + SBOM binding) — the CI
 /// pre-flight that pairs with `plecto package` (field report §3.5) — still with no serving,

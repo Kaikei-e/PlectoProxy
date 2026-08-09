@@ -1,5 +1,5 @@
 //! Periodic DNS re-resolution of upstream hostnames — the standard periodic-DNS
-//! endpoint-discovery technique (the shape of nginx `resolver`+`resolve` / Envoy STRICT_DNS):
+//! endpoint-discovery technique:
 //! each address a hostname resolves to becomes a load-balancing endpoint with its own health,
 //! refreshed on the upstream's `resolve_interval_ms`, so a container re-creation's new IP is
 //! picked up without a restart. One supervisor task drives all resolving groups, mirroring the

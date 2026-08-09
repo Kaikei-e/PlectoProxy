@@ -156,8 +156,8 @@ pub(crate) const MAX_CONNECTIONS_PER_IP: u32 = 256;
 pub fn raise_nofile_limit() {
     match unix_raise_nofile_limit() {
         Ok((soft, hard)) => {
-            // 1 client fd + 1 upstream fd per proxied connection (the same accounting nginx
-            // documents for a proxying worker), doubled for headroom: the admin/health listener,
+            // 1 client fd + 1 upstream fd per proxied connection (the standard descriptor
+            // accounting for a proxying worker), doubled for headroom: the admin/health listener,
             // DNS-refresh sockets, TLS resumption file handles, and connections mid-teardown that
             // have not yet released their `MAX_CONNECTIONS` permit.
             let wanted = MAX_CONNECTIONS as u64 * 4;

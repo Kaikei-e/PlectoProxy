@@ -1,5 +1,5 @@
 //! E2E (tdd-workflow Phase 0) for the binary's operator CLI: `plecto --version` and
-//! `plecto validate <manifest>` (the `nginx -t` shape — validate a manifest in CI / before a
+//! `plecto validate <manifest>` (check the config and exit — validate a manifest in CI / before a
 //! SIGHUP without serving). Drives the real compiled binary (`CARGO_BIN_EXE_plecto`).
 //!
 //! `validate` is a STATIC config check: parse (strict, `deny_unknown_fields`), reference and

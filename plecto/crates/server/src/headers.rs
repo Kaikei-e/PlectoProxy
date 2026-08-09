@@ -86,10 +86,11 @@ pub(crate) fn te_requests_trailers(map: &hyper::HeaderMap) -> bool {
 }
 
 /// Forwarding / client-IP headers a client could spoof: RFC 7239 `Forwarded`, the de-facto
-/// `X-Forwarded-*`, and the de-facto client-IP family that many backends and CDNs trust (nginx's
-/// `X-Real-IP`, Akamai/Cloudflare `True-Client-IP`, `CF-Connecting-IP`, `Fastly-Client-IP`,
-/// `X-Client-IP`, `X-Cluster-Client-IP`). As an EDGE proxy Plecto strips this whole family on
-/// ingress and sets its own (review f000005 P2#3 / ADR 000018 + 000022), so an untrusted client
+/// `X-Forwarded-*`, and the de-facto client-IP family that many backends and CDNs trust
+/// (`X-Real-IP`, `True-Client-IP`, `CF-Connecting-IP`, `Fastly-Client-IP`, `X-Client-IP`,
+/// `X-Cluster-Client-IP` — CDN-issued conventions, none of them specified by an RFC). As an EDGE
+/// proxy Plecto strips this whole family on ingress and sets its own (review f000005 P2#3 /
+/// ADR 000018 + 000022), so an untrusted client
 /// cannot forge its source IP / scheme for an IP-based filter or the upstream — stripping `XFF`
 /// alone would leave a spoofed `X-Real-IP` to fool a backend that reads it instead.
 const FORWARDED_HEADERS: &[&str] = &[
@@ -137,8 +138,8 @@ fn forwarded_client(headers: &hyper::HeaderMap, trusted: &TrustedProxyTrust) -> 
 /// Edge-proxy client-IP propagation: drop any client-supplied forwarding / client-IP headers
 /// (`FORWARDED_HEADERS`), then set `X-Forwarded-For` and `X-Real-IP` (the client) and
 /// `X-Forwarded-Proto` (the wire scheme) afresh, and return the client this transaction is
-/// attributed to. `X-Real-IP` is re-issued — not just stripped — so a backend reading the nginx
-/// convention rather than `XFF` still gets Plecto's authoritative value (ADR 000022 widens
+/// attributed to. `X-Real-IP` is re-issued — not just stripped — so a backend reading that
+/// de-facto convention rather than `XFF` still gets Plecto's authoritative value (ADR 000022 widens
 /// ADR 000018's "issue For+Proto only"). The chain (so IP-based rate-limit / auth filters can
 /// trust them) and the upstream then see only Plecto's values, never the client's claim.
 ///

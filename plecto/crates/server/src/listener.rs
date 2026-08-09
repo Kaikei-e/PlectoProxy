@@ -177,7 +177,7 @@ async fn serve_inner(
 
     // Periodic DNS re-resolution of hostname upstreams (`resolve_interval_ms`): a second
     // supervisor beside the health checks, swapping each resolving group's endpoint set in place
-    // (nginx `resolve` / Envoy STRICT_DNS shape). Idles cheaply when no upstream opts in.
+    // (the periodic-DNS endpoint-discovery shape). Idles cheaply when no upstream opts in.
     let dns_task = tokio::spawn(crate::dns::serve_dns_refresh(
         state.control.clone(),
         drain_rx.clone(),

@@ -6,9 +6,9 @@
 //!
 //! Usage:
 //! - `plecto <manifest.toml> [listen_addr]` — serve (listen defaults to `127.0.0.1:8080`)
-//! - `plecto validate <manifest.toml>` — statically validate a manifest and exit (the `nginx -t`
-//!   shape: strict parse + every fail-closed startup check that needs no artifact; for CI and
-//!   pre-SIGHUP checks)
+//! - `plecto validate <manifest.toml>` — statically validate a manifest and exit (the
+//!   check-the-config-and-exit shape: strict parse + every fail-closed startup check that needs
+//!   no artifact; for CI and pre-SIGHUP checks)
 //! - `plecto conformance <component.wasm> [--json]` — Filter Dev Kit (ADR 000065): run the
 //!   generic `plecto:filter` conformance battery against a component and exit non-zero unless
 //!   every check passes. `--json` prints a machine-readable report instead of plain text.
@@ -83,7 +83,7 @@ async fn run() -> anyhow::Result<()> {
             println!("{}", plecto_control::manifest_json_schema()?);
             return Ok(());
         }
-        // Static manifest validation (the `nginx -t` shape): strict parse + every fail-closed
+        // Static manifest validation (check the config and exit): strict parse + every fail-closed
         // startup check that needs no artifact and mutates nothing, then exit. `--resolve`
         // additionally resolves each filter's OCI layout and runs the loader's provenance gate
         // (digest pin + signatures + SBOM binding, field report §3.5) — still without serving,

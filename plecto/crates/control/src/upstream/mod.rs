@@ -50,8 +50,7 @@ fn now_millis() -> u64 {
 /// The swappable endpoint set of a group: the instances plus the LB state compiled from them
 /// (a Maglev table indexes into `instances`, so the two must swap together). Behind an `ArcSwap`
 /// on the group so periodic DNS re-resolution (the standard periodic-DNS endpoint-discovery
-/// technique — the shape of nginx `resolve` / Envoy STRICT_DNS) can replace the set in place
-/// while routes keep holding their `Arc<UpstreamGroup>`.
+/// technique) can replace the set in place while routes keep holding their `Arc<UpstreamGroup>`.
 #[derive(Debug)]
 pub struct Endpoints {
     /// The instances, in configured (or resolved) address order.

@@ -115,13 +115,14 @@ pub struct RouteUpgrade {
     /// header (e.g. `["websocket"]`). Must be non-empty; `h2c` is rejected.
     pub protocols: Vec<String>,
     /// Idle timeout for an established tunnel, in ms — a byte in EITHER direction resets it
-    /// (the activity-based form nginx/Envoy/HAProxy all share). `0` disables the timer.
+    /// (the activity-based form tunnel idle timers conventionally take). `0` disables the timer.
     #[serde(default = "default_upgrade_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
 }
 
-/// 5 minutes — Envoy's stream-idle default; long enough for ping/pong-quiet apps, short enough
-/// that an abandoned tunnel cannot hold a connection permit for hours.
+/// 5 minutes — the conventional stream-idle order of magnitude: long enough for apps whose
+/// ping/pong is minutes apart, short enough that an abandoned tunnel cannot hold a connection
+/// permit for hours.
 fn default_upgrade_idle_timeout_ms() -> u64 {
     300_000
 }

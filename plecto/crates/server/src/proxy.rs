@@ -676,8 +676,9 @@ async fn upgrade_switch(
 }
 
 /// Response side: the route's chain in reverse (status / headers only). What comes out is either
-/// the forwarded upstream stream — which the caller's single exit then stamps and compresses (ADR
-/// 000074: filters always see identity) — or a synthesised response, which is never compressed.
+/// the forwarded upstream stream — which the caller's single exit then stamps and compresses, after
+/// the chain, so filters always see identity (ADR 000074) — or a synthesised response, which is
+/// host-framed and never compressed (ADR 000075 decision 1).
 /// A filterless route skips the blocking-pool hop and the contract projection; the hop-by-hop
 /// strip still applies, directly on the original header bytes.
 async fn respond_through_chain(

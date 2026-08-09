@@ -56,7 +56,7 @@ _Avoid_: filter rewrite（フィルタ駆動の書換は別レイヤ・後続）
 upstream を構成する 1 つの `host:port`。active health check が healthy / unhealthy を切り替え、unhealthy な
 instance は分配集合から外れる（eject）。起動時は pessimistic（unhealthy）で始まり、最初の成功 probe で healthy に
 昇格する。
-_Avoid_: endpoint（Envoy 用語）, backend（曖昧）, wasmtime の instance（別 context・extension plane 側の語）
+_Avoid_: endpoint（他プロキシ実装の語彙と衝突）, backend（曖昧）, wasmtime の instance（別 context・extension plane 側の語）
 
 **Active health check**:
 background タスクが各 upstream instance を health の probe path へ定期 probe し、連続成功 / 失敗が閾値に達したら

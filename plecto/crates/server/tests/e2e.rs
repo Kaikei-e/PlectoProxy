@@ -53,7 +53,7 @@ async fn echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallibl
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    // `X-Real-IP` is re-issued by Plecto (nginx convention); `CF-Connecting-IP` is part of the
+    // `X-Real-IP` is re-issued by Plecto (the de-facto convention); `CF-Connecting-IP` is part of the
     // stripped client-IP family but NOT re-issued — so a test can prove both halves of the edge
     // model (ADR 000022): the re-issued header carries the real peer, the dropped one is empty.
     let xrealip = req

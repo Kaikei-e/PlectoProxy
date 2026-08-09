@@ -257,6 +257,9 @@ async fn the_restored_client_keys_the_per_client_rate_limit() {
     let client = client();
     wait_ready(&client, proxy).await;
 
+    // The bucket refills at `rate` tokens per second and the manifest floor is 1, so the drained
+    // state this asserts on only lasts a sub-second window: the two requests that must straddle it
+    // run back to back, with the second client's request after them rather than in between.
     let (first, ..) = get(&client, proxy, &[("x-forwarded-for", "198.51.100.1")]).await;
     assert_eq!(
         first,
@@ -264,18 +267,18 @@ async fn the_restored_client_keys_the_per_client_rate_limit() {
         "the restored client spends the one token in its own bucket"
     );
 
-    let (other, ..) = get(&client, proxy, &[("x-forwarded-for", "198.51.100.2")]).await;
-    assert_eq!(
-        other,
-        StatusCode::OK,
-        "a different restored client has its OWN bucket — keyed on the loopback peer instead, \
-         this request would be shed"
-    );
-
     let (again, ..) = get(&client, proxy, &[("x-forwarded-for", "198.51.100.1")]).await;
     assert_eq!(
         again,
         StatusCode::TOO_MANY_REQUESTS,
         "the first client's bucket is empty, so its own next request is shed"
+    );
+
+    let (other, ..) = get(&client, proxy, &[("x-forwarded-for", "198.51.100.2")]).await;
+    assert_eq!(
+        other,
+        StatusCode::OK,
+        "a different restored client has its OWN bucket — keyed on the loopback peer instead, the \
+         two requests above would have drained one shared bucket and shed this one"
     );
 }

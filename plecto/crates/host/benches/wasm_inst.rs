@@ -52,7 +52,7 @@ fn fixture(opts: LoadOptions) -> Fx {
         .unwrap();
     let req = HttpRequest {
         method: "GET".to_string(),
-        path: "/api/data".to_string(),
+        path_with_query: "/api/data".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: vec![Header {

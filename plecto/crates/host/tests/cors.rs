@@ -54,7 +54,7 @@ fn signed_load(config: &[(&str, &str)]) -> (Host, LoadedFilter) {
 fn request(method: &str, headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
         method: method.to_string(),
-        path: "/api/data".to_string(),
+        path_with_query: "/api/data".to_string(),
         authority: "api.example.test".to_string(),
         scheme: "https".to_string(),
         headers: headers

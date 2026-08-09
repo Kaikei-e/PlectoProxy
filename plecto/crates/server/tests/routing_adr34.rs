@@ -75,7 +75,7 @@ async fn send(
     client: &Client<HttpConnector, Empty<Bytes>>,
     proxy: SocketAddr,
     method: &str,
-    path: &str,
+    path_with_query: &str,
     headers: &[(&str, &str)],
 ) -> (StatusCode, String) {
     let mut builder = Request::builder()

@@ -19,13 +19,23 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
-use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
+use plecto_host::test_support::{
+    TestSigner, bound_sbom, filter_hello_component, filter_v04_component,
+};
 use plecto_server::serve;
 
 /// A body-echoing upstream: collects the request body and returns it verbatim as the response body
 /// (with `x-from: upstream`), so a test can observe exactly what reached the upstream — and prove a
-/// short-circuit never did.
+/// short-circuit never did. It also reports which of the body hook's header edits arrived, so the
+/// 0.4.0 `request-body-edit` header edits are observable from the client side too.
 async fn echo_body(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let edited = req
+        .headers()
+        .get("x-plecto-body-edited")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("absent")
+        .to_string();
+    let dropped = req.headers().contains_key("x-drop-me");
     let received = req
         .into_body()
         .collect()
@@ -35,6 +45,8 @@ async fn echo_body(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
     Ok(Response::builder()
         .status(200)
         .header("x-from", "upstream")
+        .header("x-saw-body-edited", edited)
+        .header("x-saw-drop-me", if dropped { "1" } else { "0" })
         .body(Full::new(received))
         .unwrap())
 }
@@ -104,7 +116,12 @@ fn control_for(upstream_addr: SocketAddr) -> Arc<Control> {
 /// Same as [`control_for`] but with every given address in one upstream group, so round-robin —
 /// and retry onto another instance — can be exercised through the filter-body route.
 fn control_for_addrs(addrs: &[SocketAddr]) -> Arc<Control> {
-    let component = filter_hello_component();
+    control_for_component(filter_hello_component(), addrs)
+}
+
+/// The same route wired to an arbitrary body-reading filter component, so the frozen-0.3 guest
+/// and the 0.4.0-native one run the identical fast path.
+fn control_for_component(component: Vec<u8>, addrs: &[SocketAddr]) -> Arc<Control> {
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&component).unwrap();
     let sbom = bound_sbom(&component);
@@ -165,11 +182,36 @@ async fn post(
     send(client, proxy, "POST", path, body).await
 }
 
+/// [`post`] with inbound headers, so a test can send the header a body edit is supposed to remove.
+async fn post_with(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    proxy: SocketAddr,
+    path: &str,
+    body: &'static [u8],
+    headers: &[(&str, &str)],
+) -> (StatusCode, hyper::HeaderMap, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy}{path}"));
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder.body(Full::new(Bytes::from_static(body))).unwrap();
+    let resp = client.request(req).await.expect("proxy request");
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    (
+        parts.status,
+        parts.headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
 async fn send(
     client: &Client<HttpConnector, Full<Bytes>>,
     proxy: SocketAddr,
     method: &str,
-    path: &str,
+    path_with_query: &str,
     body: &'static [u8],
 ) -> (StatusCode, hyper::HeaderMap, String) {
     let req = Request::builder()
@@ -217,6 +259,76 @@ async fn request_body_is_transformed_by_the_hook() {
     assert_eq!(
         body, "HELLO WORLD",
         "the upstream received the body uppercased by the on-request-body hook"
+    );
+}
+
+#[tokio::test]
+async fn a_040_guests_body_edit_reaches_the_upstream_with_its_headers() {
+    // The 0.4.0 rail end to end (ADR 000098): a guest built against the CURRENT contract returns
+    // `modified(request-body-edit)` and the fast path forwards BOTH halves of that edit — the new
+    // body and the header edits that came with it. A declared header edit that never reached the
+    // upstream would be a contract that lies.
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_component(filter_v04_component(), &[upstream])).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, headers, body) = post_with(
+        &client,
+        proxy,
+        "/api/hello",
+        b"rewrite me",
+        &[("x-drop-me", "1")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "REWRITE ME",
+        "the upstream received the body the 0.4.0 guest returned in its edit"
+    );
+    assert_eq!(
+        headers.get("x-saw-body-edited").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "the edit's set-headers reached the upstream"
+    );
+    assert_eq!(
+        headers.get("x-saw-drop-me").and_then(|v| v.to_str().ok()),
+        Some("0"),
+        "the edit's remove-headers reached the upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_040_guests_bare_continue_forwards_the_buffered_body_unchanged() {
+    // `%continue` carries no bytes (ADR 000098), so the fast path must forward what it already
+    // buffered — not an empty body, and not a body the guest never handed back.
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_component(filter_v04_component(), &[upstream])).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, _headers, body) = post(&client, proxy, "/api/hello", b"leave me alone").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "leave me alone");
+}
+
+#[tokio::test]
+async fn a_040_guest_decides_on_the_query_it_now_has_a_name_for() {
+    // ADR 000104: `path-with-query` reaches the guest with the query intact, so a filter can
+    // short-circuit on it — through the fast path, not just a direct host call.
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_component(filter_v04_component(), &[upstream])).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, headers, _body) = post(&client, proxy, "/api/hello?deny=1", b"anything").await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        !headers.contains_key("x-from"),
+        "a query-keyed short-circuit must not reach the upstream"
     );
 }
 

@@ -92,6 +92,14 @@ pub fn filter_compat_v02_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_COMPAT_V02_COMPONENT")).expect("read filter-compat-v02 component")
 }
 
+/// The compiled `filter-v04` component bytes — the fixture pinned to the CURRENT
+/// `plecto:filter@0.4.0` contract, exercising the bare `%continue` body arm,
+/// `modified(request-body-edit)` and `path-with-query` (ADR 000098 / 000104). Built by this
+/// crate's `build.rs`.
+pub fn filter_v04_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_V04_COMPONENT")).expect("read filter-v04 component")
+}
+
 /// The compiled `filter-extauthz` component bytes — the outbound-HTTP example (an ext_authz-style
 /// gate), built by this crate's `build.rs` when the `outbound-http` feature is on (ADR 000036).
 #[cfg(feature = "outbound-http")]

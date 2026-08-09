@@ -164,7 +164,7 @@ mod tests {
     fn request_edit_sets_replaces_and_removes_case_insensitively() {
         let mut request = HttpRequest {
             method: "GET".to_string(),
-            path: "/".to_string(),
+            path_with_query: "/".to_string(),
             authority: "a".to_string(),
             scheme: "https".to_string(),
             headers: vec![h("X-Keep", "1"), h("X-Drop", "old"), h("X-Replace", "old")],
@@ -198,6 +198,35 @@ mod tests {
                 .any(|x| x.name.eq_ignore_ascii_case("x-add"))
         );
         assert!(request.headers.iter().any(|x| x.name == "X-Keep"));
+    }
+
+    #[test]
+    fn body_edit_replaces_the_body_and_applies_its_header_edits() {
+        // ADR 000098: `modified(request-body-edit)` carries the header edits a body transform
+        // forces (content-type after a re-encode, a digest stamp). They apply to the request the
+        // chain is about to forward, on the same set/remove rules as a request-side edit — a body
+        // hook that declares a header edit and gets it dropped would be a contract that lies.
+        let mut headers = vec![h("content-type", "text/plain"), h("x-drop", "1")];
+        let body = apply_request_body_edit(
+            &mut headers,
+            RequestBodyEdit {
+                body: b"{}".to_vec(),
+                set_headers: vec![h("content-type", "application/json")],
+                remove_headers: vec!["x-drop".to_string()],
+            },
+        );
+
+        assert_eq!(body, b"{}".to_vec());
+        let ct: Vec<_> = headers
+            .iter()
+            .filter(|x| x.name.eq_ignore_ascii_case("content-type"))
+            .collect();
+        assert_eq!(ct.len(), 1, "set replaces, not duplicates");
+        assert_eq!(ct[0].value.as_slice(), b"application/json");
+        assert!(
+            !headers.iter().any(|x| x.name.eq_ignore_ascii_case("x-drop")),
+            "removed header gone"
+        );
     }
 
     #[test]

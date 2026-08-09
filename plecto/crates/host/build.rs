@@ -82,6 +82,17 @@ fn main() {
             "filter_compat_v02",
             "FILTER_COMPAT_V02_COMPONENT",
         );
+        // filter-v04 is pinned to the CURRENT 0.4.0 contract (wit/) — the guest that exercises
+        // the arms only 0.4.0 has (bare `%continue`, `modified(request-body-edit)`,
+        // `path-with-query`), while the reference shelf stays on frozen 0.3.0. Test-only, so it
+        // lives under crates/host/fixtures/, not examples/.
+        build_component(
+            &cargo,
+            &manifest.join("fixtures").join("filter-v04"),
+            &out_dir,
+            "filter_v04",
+            "FILTER_V04_COMPONENT",
+        );
         // filter-noop is the "pure WASM no-op" rung of the benchmark cost ladder (no host-API
         // calls). It is benchmark-only, so it lives under bench/filters/, not examples/.
         build_component(

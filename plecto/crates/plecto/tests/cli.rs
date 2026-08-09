@@ -84,6 +84,7 @@ fn version_flag_lists_the_loadable_filter_contract_versions() {
         "plecto:filter@0.1.0",
         "plecto:filter@0.2.0",
         "plecto:filter@0.3.0",
+        "plecto:filter@0.4.0",
     ] {
         assert!(
             stdout.contains(version),

@@ -63,7 +63,7 @@ fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
 fn request(target: &str) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/protected".to_string(),
+        path_with_query: "/protected".to_string(),
         authority: "gateway.test".to_string(),
         scheme: "https".to_string(),
         headers: vec![Header {
@@ -206,7 +206,7 @@ fn no_target_fails_closed() {
 
     let req = HttpRequest {
         method: "GET".to_string(),
-        path: "/protected".to_string(),
+        path_with_query: "/protected".to_string(),
         authority: "gateway.test".to_string(),
         scheme: "https".to_string(),
         headers: vec![],

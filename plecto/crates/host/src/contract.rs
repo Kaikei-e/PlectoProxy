@@ -693,20 +693,20 @@ mod tests {
         // RFC 9110 §7.6.1 names never survive the proxy (the fast path strips them at egress),
         // so the mappers drop them instead of failing the whole decision — a deployed filter
         // that harmlessly sets `Connection: close` must not start failing every request.
-        let edit = types_v03::RequestDecision::Modified(types_v03::RequestEdit {
+        let edit = types_v04::RequestDecision::Modified(types_v04::RequestEdit {
             set_headers: vec![
-                types_v03::Header {
+                types_v04::Header {
                     name: "Connection".to_string(),
                     value: b"close".to_vec(),
                 },
-                types_v03::Header {
+                types_v04::Header {
                     name: "x-user".to_string(),
                     value: b"alice".to_vec(),
                 },
             ],
             remove_headers: vec![],
         });
-        match request_decision_from_v03(edit) {
+        match request_decision_from_v04(edit) {
             Some(RequestDecision::Modified(edit)) => {
                 assert_eq!(
                     edit.set_headers.len(),
@@ -724,15 +724,15 @@ mod tests {
             "TE",
             "upgrade",
         ] {
-            let sc = types_v03::RequestDecision::ShortCircuit(types_v03::HttpResponse {
+            let sc = types_v04::RequestDecision::ShortCircuit(types_v04::HttpResponse {
                 status: 200,
-                headers: vec![types_v03::Header {
+                headers: vec![types_v04::Header {
                     name: name.to_string(),
                     value: b"x".to_vec(),
                 }],
                 body: Vec::new(),
             });
-            match request_decision_from_v03(sc) {
+            match request_decision_from_v04(sc) {
                 Some(RequestDecision::ShortCircuit(resp)) => {
                     assert!(resp.headers.is_empty(), "{name} must be dropped, not fatal");
                 }
@@ -800,7 +800,7 @@ mod tests {
         // the host's canonical byte header is what flows on (ADR 000071 decision 2).
         let req = HttpRequest {
             method: "GET".to_string(),
-            path: "/".to_string(),
+            path_with_query: "/".to_string(),
             authority: "a".to_string(),
             scheme: "https".to_string(),
             headers: vec![Header {
@@ -846,32 +846,32 @@ mod tests {
     }
 
     #[test]
-    fn v03_replace_output_passes_the_same_fail_closed_validation_as_short_circuit() {
+    fn v04_replace_output_passes_the_same_fail_closed_validation_as_short_circuit() {
         // ADR 000073 decision 4: `replace` output is untrusted guest data headed for the client,
         // so it passes the SAME header validation as a request-side short-circuit. CRLF fails
         // closed (the mapper returns None → RunError::InvalidOutput); clean bytes pass intact.
-        let bad = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+        let bad = types_v04::ResponseDecision::Replace(types_v04::HttpResponse {
             status: 200,
-            headers: vec![types_v03::Header {
+            headers: vec![types_v04::Header {
                 name: "x-evil".to_string(),
                 value: b"a\r\nx-smuggled: 1".to_vec(),
             }],
             body: b"payload".to_vec(),
         });
         assert!(
-            response_decision_from_v03(bad).is_none(),
+            response_decision_from_v04(bad).is_none(),
             "CRLF in a replace header fails closed"
         );
 
-        let ok = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+        let ok = types_v04::ResponseDecision::Replace(types_v04::HttpResponse {
             status: 418,
-            headers: vec![types_v03::Header {
+            headers: vec![types_v04::Header {
                 name: "x-blob".to_string(),
                 value: vec![0xC3, 0x28, 0xFF],
             }],
             body: b"payload".to_vec(),
         });
-        match response_decision_from_v03(ok) {
+        match response_decision_from_v04(ok) {
             Some(ResponseDecision::Replace(resp)) => {
                 assert_eq!(resp.status, 418);
                 assert_eq!(resp.headers[0].value, vec![0xC3, 0x28, 0xFF]);
@@ -887,7 +887,7 @@ mod tests {
         // lossy-UTF-8 form: non-UTF-8 header bytes survive verbatim.
         let req = HttpRequest {
             method: "GET".to_string(),
-            path: "/".to_string(),
+            path_with_query: "/".to_string(),
             authority: "a".to_string(),
             scheme: "https".to_string(),
             headers: vec![Header {
@@ -933,14 +933,18 @@ mod tests {
                 Some(ContractVersion::V03),
             ),
             (
+                r#"(component (import "plecto:filter/host-log@0.4.0" (instance)))"#,
+                Some(ContractVersion::V04),
+            ),
+            (
                 r#"(component (import "plecto:filter/host-clock@0.2.0" (instance)))"#,
                 Some(ContractVersion::V02),
             ),
-            // no plecto import at all: fail closed at load (do not guess V03).
+            // no plecto import at all: fail closed at load (do not guess the newest).
             (r"(component)", None),
-            // future / unknown track: fail closed (do not silently bind as V03).
+            // future / unknown track: fail closed (do not silently bind as the newest).
             (
-                r#"(component (import "plecto:filter/host-log@0.4.0" (instance)))"#,
+                r#"(component (import "plecto:filter/host-log@0.5.0" (instance)))"#,
                 None,
             ),
         ];
@@ -957,21 +961,134 @@ mod tests {
 
     #[test]
     fn oversize_guest_response_body_fails_closed() {
-        let ok = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+        let ok = types_v04::ResponseDecision::Replace(types_v04::HttpResponse {
             status: 200,
             headers: vec![],
             body: vec![0u8; MAX_GUEST_RESPONSE_BODY_LEN],
         });
-        assert!(response_decision_from_v03(ok).is_some());
+        assert!(response_decision_from_v04(ok).is_some());
 
-        let over = types_v03::ResponseDecision::Replace(types_v03::HttpResponse {
+        let over = types_v04::ResponseDecision::Replace(types_v04::HttpResponse {
             status: 200,
             headers: vec![],
             body: vec![0u8; MAX_GUEST_RESPONSE_BODY_LEN + 1],
         });
         assert!(
-            response_decision_from_v03(over).is_none(),
+            response_decision_from_v04(over).is_none(),
             "a synthesised body over the cap must fail closed"
         );
+    }
+
+    #[test]
+    fn a_frozen_body_continue_carries_its_bytes_onto_the_modified_arm() {
+        // The one mapping the 0.4.0 reshape could silently lose (ADR 000098): every frozen track
+        // spelled the body decision `continue(list<u8>)`, and those bytes ALWAYS meant "forward
+        // THIS body". 0.4.0's bare `%continue` means "forward what you buffered", so mapping the
+        // frozen arm onto it would discard a rewriting guest's transform. It maps to `modified`.
+        match request_body_decision_from_v03(types_v03::RequestBodyDecision::Continue(
+            b"REWRITTEN".to_vec(),
+        )) {
+            Some(RequestBodyDecision::Modified(edit)) => {
+                assert_eq!(edit.body, b"REWRITTEN".to_vec());
+                assert!(edit.set_headers.is_empty());
+                assert!(edit.remove_headers.is_empty());
+            }
+            other => panic!("a 0.3 continue(bytes) must become modified, got {other:?}"),
+        }
+        match request_body_decision_from_v02(types_v02::RequestBodyDecision::Continue(
+            b"REWRITTEN".to_vec(),
+        )) {
+            Some(RequestBodyDecision::Modified(edit)) => assert_eq!(edit.body, b"REWRITTEN".to_vec()),
+            other => panic!("a 0.2 continue(bytes) must become modified, got {other:?}"),
+        }
+        match request_body_decision_from_v01(types_v01::RequestBodyDecision::Continue(
+            b"REWRITTEN".to_vec(),
+        )) {
+            Some(RequestBodyDecision::Modified(edit)) => assert_eq!(edit.body, b"REWRITTEN".to_vec()),
+            other => panic!("a 0.1 continue(bytes) must become modified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_frozen_body_continue_still_means_forward_these_zero_bytes() {
+        // The degenerate case the "compare against the input" shortcut would get wrong: a 0.3
+        // guest that DELETES the body returns `continue(vec![])`. That is a rewrite to empty, not
+        // "unchanged", so it must still land on `modified`.
+        match request_body_decision_from_v03(types_v03::RequestBodyDecision::Continue(Vec::new())) {
+            Some(RequestBodyDecision::Modified(edit)) => assert!(edit.body.is_empty()),
+            other => panic!("expected modified with an empty body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_040_body_arms_map_one_to_one_and_validate_their_edits() {
+        assert!(matches!(
+            request_body_decision_from_v04(types_v04::RequestBodyDecision::Continue),
+            Some(RequestBodyDecision::Continue)
+        ));
+
+        let ok = types_v04::RequestBodyDecision::Modified(types_v04::RequestBodyEdit {
+            body: b"payload".to_vec(),
+            set_headers: vec![types_v04::Header {
+                name: "content-type".to_string(),
+                value: b"application/json".to_vec(),
+            }],
+            remove_headers: vec!["x-old".to_string()],
+        });
+        match request_body_decision_from_v04(ok) {
+            Some(RequestBodyDecision::Modified(edit)) => {
+                assert_eq!(edit.body, b"payload".to_vec());
+                assert_eq!(edit.set_headers[0].value, b"application/json".to_vec());
+                assert_eq!(edit.remove_headers, vec!["x-old".to_string()]);
+            }
+            other => panic!("expected modified, got {other:?}"),
+        }
+
+        // A body edit's headers are untrusted guest output on their way upstream — same
+        // fail-closed gate as every other guest-supplied header (ADR 000071).
+        let bad = types_v04::RequestBodyDecision::Modified(types_v04::RequestBodyEdit {
+            body: b"payload".to_vec(),
+            set_headers: vec![types_v04::Header {
+                name: "x-evil".to_string(),
+                value: b"a\r\nx-smuggled: 1".to_vec(),
+            }],
+            remove_headers: vec![],
+        });
+        assert!(
+            request_body_decision_from_v04(bad).is_none(),
+            "CRLF in a body edit's header fails closed"
+        );
+    }
+
+    #[test]
+    fn path_with_query_repacks_into_each_frozen_tracks_path_field() {
+        // ADR 000104: the rename is a field NAME change; the value each frozen guest sees is
+        // unchanged, query included.
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path_with_query: "/api?x=1&y=2".to_string(),
+            authority: "a".to_string(),
+            scheme: "https".to_string(),
+            headers: vec![],
+        };
+        assert_eq!(request_to_v01(&req).path, "/api?x=1&y=2");
+        assert_eq!(request_to_v02(&req).path, "/api?x=1&y=2");
+        assert_eq!(request_to_v03(&req).path, "/api?x=1&y=2");
+    }
+
+    #[test]
+    fn every_shipped_contract_version_is_loadable_and_named() {
+        // The set an operator reads off `plecto --version` to answer "does this bump force a
+        // filter rebuild?" (ADR 000064). Adding 0.4.0 must not drop a frozen track.
+        assert_eq!(
+            SUPPORTED_CONTRACT_VERSIONS,
+            &[
+                ContractVersion::V01,
+                ContractVersion::V02,
+                ContractVersion::V03,
+                ContractVersion::V04,
+            ]
+        );
+        assert_eq!(ContractVersion::V04.package(), "plecto:filter@0.4.0");
     }
 }

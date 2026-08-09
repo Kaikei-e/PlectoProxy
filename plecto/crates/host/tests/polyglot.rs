@@ -80,7 +80,7 @@ fn signed_load(name: &str, bytes: &[u8], opts: LoadOptions) -> (Host, LoadedFilt
 fn request(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: headers
@@ -215,14 +215,14 @@ fn every_language_transforms_and_blocks_the_body() {
             .on_request_body(b"hello world", &RequestTrace::root())
             .unwrap();
         match decision {
-            RequestBodyDecision::Continue(body) => assert_eq!(
-                body,
+            // These guests are on the frozen tracks, where "forward this body" was spelled
+            // `continue(bytes)`; the adapter lands it on 0.4.0's `modified` (ADR 000098).
+            RequestBodyDecision::Modified(edit) => assert_eq!(
+                edit.body,
                 b"HELLO WORLD".to_vec(),
                 "{name}: body must round-trip uppercased"
             ),
-            RequestBodyDecision::ShortCircuit(_) => {
-                panic!("{name}: expected continue with transformed body")
-            }
+            other => panic!("{name}: expected a body transform, got {other:?}"),
         }
 
         let (decision, _logs) = filter
@@ -232,9 +232,7 @@ fn every_language_transforms_and_blocks_the_body() {
             RequestBodyDecision::ShortCircuit(resp) => {
                 assert_eq!(resp.status, 403, "{name}: marker body must be blocked 403")
             }
-            RequestBodyDecision::Continue(_) => {
-                panic!("{name}: expected short-circuit on the marker body")
-            }
+            other => panic!("{name}: expected short-circuit on the marker body, got {other:?}"),
         }
     }
 }

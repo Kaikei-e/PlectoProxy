@@ -36,7 +36,7 @@ fn signed_load() -> (Host, LoadedFilter) {
 fn req() -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/legacy".to_string(),
+        path_with_query: "/legacy".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         // Non-UTF-8 bytes prove the 0.2 projection stays byte-faithful (it is a clone, not the

@@ -205,7 +205,7 @@ fn opts_for(backend: SocketAddr, cfg: BTreeMap<String, String>) -> LoadOptions {
 fn request(client_ip: &str) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/api".to_string(),
+        path_with_query: "/api".to_string(),
         authority: "gateway.test".to_string(),
         scheme: "https".to_string(),
         headers: vec![Header {

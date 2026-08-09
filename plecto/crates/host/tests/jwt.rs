@@ -216,7 +216,7 @@ fn on_req(f: &LoadedFilter, r: &HttpRequest) -> Result<(RequestDecision, Vec<Log
 fn request(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/api/data".to_string(),
+        path_with_query: "/api/data".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: headers

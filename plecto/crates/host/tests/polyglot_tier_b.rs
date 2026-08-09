@@ -77,7 +77,7 @@ fn signed_load_with_sink(
 fn request(headers: &[(&str, &str)]) -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
-        path: "/".to_string(),
+        path_with_query: "/".to_string(),
         authority: "example.test".to_string(),
         scheme: "https".to_string(),
         headers: headers
@@ -169,14 +169,16 @@ fn with_the_wasi_minimal_grant_the_fat_guest_satisfies_the_conformance_subset() 
         .on_request_body(b"hello world", &RequestTrace::root())
         .unwrap();
     match decision {
-        RequestBodyDecision::Continue(body) => {
+        // A frozen-track guest's `continue(bytes)` is a rewrite; the adapter lands it on 0.4.0's
+        // `modified` arm (ADR 000098).
+        RequestBodyDecision::Modified(edit) => {
             assert_eq!(
-                body,
+                edit.body,
                 b"HELLO WORLD".to_vec(),
                 "body must round-trip uppercased"
             )
         }
-        RequestBodyDecision::ShortCircuit(_) => panic!("expected continue with transformed body"),
+        other => panic!("expected a body transform, got {other:?}"),
     }
 }
 

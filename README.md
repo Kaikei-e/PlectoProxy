@@ -91,8 +91,8 @@ gate on what you load, with **mesh-less mutual TLS** as the complementary second
 
 **Rule of thumb:** policy, WAF, auth, and rewriting go in a filter; TLS, routing, LB, and
 connection pools stay native ([ADR 000029](docs/ADR/000029.md)). The WASM "tax" is paid only on
-decision logic — **≈ 1 µs/request** pooled ([performance](performance/README.md)). Canon:
-[docs/design-principles.md](docs/design-principles.md).
+decision logic — pooled no-op dispatch is **≈ 4.5 µs/req** ([performance](performance/README.md)).
+Canon: [docs/design-principles.md](docs/design-principles.md).
 
 ## Quick start
 

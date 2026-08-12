@@ -89,8 +89,8 @@ capability 契約を必須ゲートとし、mesh を持ち込まない環境向�
 - **データプレーンで panic 禁止** — 一つの不正リクエストが worker を巻き込んではならない。
 
 **判断の指針:** ポリシー・WAF・認証・書換 → フィルタ。TLS・ルーティング・LB・コネクションプール →
-native（[ADR 000029](docs/ADR/000029.md)）。WASM 税は判断ロジックにのみ課され、pooled フィルタで
-**≈ 1 µs/req**（[performance](performance/README.md)）。原典は
+native（[ADR 000029](docs/ADR/000029.md)）。WASM 税は判断ロジックにのみ課され、pooled no-op の
+dispatch は **≈ 4.5 µs/req**（[performance](performance/README.md)）。原典は
 [docs/design-principles.ja.md](docs/design-principles.ja.md)。
 
 ## クイックスタート

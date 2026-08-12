@@ -28,28 +28,44 @@ flowchart LR
     client(["Client"])
     upstream(["Upstream service"])
 
-    subgraph fast["Fast path · native Rust"]
+    subgraph fast["Fast path — native Rust"]
         direction TB
-        edge["accept · TLS · HTTP/1·2·3"]
-        route["route match · load balance"]
+        edge["accept · TLS terminate<br/>HTTP/1.1 · 2 · 3"]
+        route["route match<br/>load balance"]
         edge --> route
     end
 
-    subgraph ext["Extension plane · your filter, sandboxed WASM"]
+    subgraph ext["Extension plane — your filter, sandboxed WASM"]
         direction TB
-        inspect["inspect each request<br/>headers, and the body if it asks"]
-        decide{"decide"}
+        inspect["inspect each request:<br/>headers — body only if it asks"]
+        decide{{"typed decision"}}
         inspect --> decide
     end
 
-    state[("Host-held state<br/>rate-limit · KV · counter · log · clock")]
+    state[("Host-held state<br/>KV · counter · rate-limit · clock · log")]
 
-    client -->|"1 · request"| edge
-    route -->|"2 · run the filter chain"| inspect
-    decide -->|"3 · continue / modify, then forward"| upstream
-    decide -.->|"3 · reject and answer now<br/>401 / 403 / 429"| client
-    upstream -->|"4 · response — filters may edit it"| client
-    decide <-->|"only the capabilities it was lent"| state
+    client -- "① request" --> edge
+    route -- "② run the filter chain" --> inspect
+    decide -- "③ continue / modify → forward" --> upstream
+    decide -. "③ reject: 401 / 403 / 429<br/>answered here — upstream never sees it" .-> client
+    upstream -- "④ response — filters may edit it" --> client
+    inspect <-. "host-API:<br/>only the capabilities it was lent" .-> state
+
+    classDef endpoint fill:#546e7a,stroke:#37474f,color:#ffffff
+    classDef fastNode fill:#c2410c,stroke:#7c2d12,color:#ffffff
+    classDef wasmNode fill:#654ff0,stroke:#4527a0,color:#ffffff
+    classDef stateNode fill:#0f766e,stroke:#134e4a,color:#ffffff
+    class client,upstream endpoint
+    class edge,route fastNode
+    class inspect,decide wasmNode
+    class state stateNode
+
+    style fast fill:#e8590c14,stroke:#e8590c,color:#e8590c
+    style ext fill:#654ff014,stroke:#654ff0,color:#8b7bff
+
+    linkStyle 4 stroke:#16a34a,stroke-width:2px
+    linkStyle 5 stroke:#dc2626,stroke-width:2px
+    linkStyle 7 stroke:#0d9488,stroke-width:2px
 ```
 
 **Continue**, **modify**, or **reject** (answer the client *now* — the upstream is never reached)

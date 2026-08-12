@@ -28,28 +28,44 @@ flowchart LR
     client(["クライアント"])
     upstream(["upstream サービス"])
 
-    subgraph fast["fast path · native Rust"]
+    subgraph fast["fast path — native Rust"]
         direction TB
-        edge["接続受付 · TLS · HTTP/1·2·3"]
-        route["route 照合 · load balance"]
+        edge["接続受付 · TLS 終端<br/>HTTP/1.1 · 2 · 3"]
+        route["route 照合<br/>load balance"]
         edge --> route
     end
 
-    subgraph ext["extension plane · あなたのフィルタ（sandbox WASM）"]
+    subgraph ext["extension plane — あなたのフィルタ（sandbox WASM）"]
         direction TB
-        inspect["各リクエストを検査<br/>ヘッダ、必要なら body も"]
-        decide{"判断"}
+        inspect["各リクエストを検査:<br/>ヘッダ — body は要求時のみ"]
+        decide{{"型付き判断"}}
         inspect --> decide
     end
 
-    state[("host 保持の状態<br/>rate-limit · KV · counter · log · clock")]
+    state[("host 保持の状態<br/>KV · counter · rate-limit · clock · log")]
 
-    client -->|"1 · リクエスト"| edge
-    route -->|"2 · filter chain を実行"| inspect
-    decide -->|"3 · continue / modify → 転送"| upstream
-    decide -.->|"3 · reject＝その場で応答<br/>401 / 403 / 429"| client
-    upstream -->|"4 · レスポンス（戻りで改変可）"| client
-    decide <-->|"貸与された capability のみ"| state
+    client -- "① リクエスト" --> edge
+    route -- "② filter chain を実行" --> inspect
+    decide -- "③ continue / modify → 転送" --> upstream
+    decide -. "③ reject: 401 / 403 / 429<br/>その場で応答 — upstream には届かない" .-> client
+    upstream -- "④ レスポンス — 戻りでフィルタが改変可" --> client
+    inspect <-. "host-API:<br/>貸与された capability のみ" .-> state
+
+    classDef endpoint fill:#546e7a,stroke:#37474f,color:#ffffff
+    classDef fastNode fill:#c2410c,stroke:#7c2d12,color:#ffffff
+    classDef wasmNode fill:#654ff0,stroke:#4527a0,color:#ffffff
+    classDef stateNode fill:#0f766e,stroke:#134e4a,color:#ffffff
+    class client,upstream endpoint
+    class edge,route fastNode
+    class inspect,decide wasmNode
+    class state stateNode
+
+    style fast fill:#e8590c14,stroke:#e8590c,color:#e8590c
+    style ext fill:#654ff014,stroke:#654ff0,color:#8b7bff
+
+    linkStyle 4 stroke:#16a34a,stroke-width:2px
+    linkStyle 5 stroke:#dc2626,stroke-width:2px
+    linkStyle 7 stroke:#0d9488,stroke-width:2px
 ```
 
 **continue**・**modify**・**reject**（*その場で*応答＝upstream に届かない）——これがメンタルモデルの

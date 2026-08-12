@@ -1,0 +1,34 @@
+// This guest's OWN world, declared in its OWN package against the canonical
+// `plecto:filter@0.4.0` types — the canonical `plecto/wit/world.wit` is never edited to
+// accommodate a guest (ADR 000063 decision 3), and no combination world reaches the
+// published contract surface.
+//
+// It sits BETWEEN the two published worlds on the acceptance lattice (ADR 000098
+// decision 2): everything `filter` requires, plus `on-request-body` — and deliberately
+// NOT `on-response-body`. The host probes the optional body exports by name at load, so
+// the ABSENCE of `on-response-body` is what tells it to keep streaming the response body
+// zero-copy (ADR 000038) while buffering only the request body this filter must read.
+//
+// Imports are subset too: this filter spends rate-limit tokens (host-ratelimit), reads
+// operator config (host-config), and logs (host-log). It needs no clock (the host's token
+// bucket refills against its own per-request snapshot), no KV and no counters — so it
+// borrows none of them. Deny-by-default cuts both ways: do not ask for a capability you
+// do not use (ADR 000006).
+//
+// `plecto:filter@0.4.0` is resolved from `wit/deps/plecto-filter/`, which build.mjs
+// materialises from the canonical file at build time (see .gitignore) so this guest can
+// never drift from the contract it claims to implement.
+package plecto:tokenlimit-js;
+
+world filter-request-body {
+    use plecto:filter/types@0.4.0.{http-request, http-response, request-decision, response-decision, request-body-decision};
+
+    import plecto:filter/host-log@0.4.0;
+    import plecto:filter/host-ratelimit@0.4.0;
+    import plecto:filter/host-config@0.4.0;
+
+    export init: func();
+    export on-request: func(req: http-request) -> request-decision;
+    export on-request-body: func(body: list<u8>) -> request-body-decision;
+    export on-response: func(req: http-request, resp: http-response) -> response-decision;
+}

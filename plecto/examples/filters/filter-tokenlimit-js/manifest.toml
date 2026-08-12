@@ -1,0 +1,69 @@
+# A Plecto manifest that runs the token-cost limiter behind an authentication filter.
+# The manifest is the static source of truth for which filters load, with which trust roots,
+# in what order (ADR 000007 / 000008). See docs/writing-a-filter.md for the full field reference.
+
+# Trusted signer public keys (PEM, manifest-relative). A filter must be signed by one of these.
+[trust]
+keys = ["keys/signer.pub"]
+
+# --- 1. authenticate ---------------------------------------------------------------------------
+# The chain runs in the order listed on the route below. filter-apikey
+# (examples/filters/filter-apikey) maps a credential to a caller and stamps the AUTHORITATIVE
+# `x-authenticated-user` on the request it forwards, overwriting whatever the client sent. Running
+# it first is what makes the budget below attach to an identity the gateway established rather than
+# to a header the caller chose.
+[[filter]]
+id = "apikey"
+source = "artifacts/apikey"           # manifest-relative path to the local OCI image-layout
+digest = "sha256:REPLACE_ME"          # the pinned OCI image-manifest digest
+isolation = "trusted"
+
+# --- 2. price and charge ------------------------------------------------------------------------
+[[filter]]
+id = "tokenlimit"                     # host-assigned identity; namespaces this filter's bucket
+source = "artifacts/tokenlimit-js"    # manifest-relative path to the local OCI image-layout
+digest = "sha256:REPLACE_ME"          # the pinned OCI image-manifest digest
+# "trusted" (pooled) so a bad value under [filter.config] traps in init and fails the LOAD,
+# instead of surfacing one request at a time (ADR 000066).
+isolation = "trusted"
+
+# The token bucket this filter spends against (ADR 000026). The OPERATOR owns the numbers —
+# the filter can only decide which key to charge and how much, never how big its own budget is.
+# Below: 60k tokens of burst, refilled at 1k/second.
+ratelimit = { capacity = 60000, refill_tokens = 1000, refill_interval_ms = 1000 }
+
+# Business config the filter reads back through host-config (ADR 000066). All keys are optional;
+# the values shown are the filter's own defaults, spelled out here so they are visible.
+[filter.config]
+# Key on the identity the auth filter established, NOT on a header the client controls.
+key-header = "x-authenticated-user"
+max-tokens-default = "1024"     # output reservation charged when the body omits max_tokens
+chars-per-token = "4"           # UTF-8 bytes per estimated token
+
+# Per-model multipliers, in percent (absent = 100). QUOTE these keys: an unquoted dot would make
+# TOML build a nested table, and this section is a flat string -> string map.
+"model-cost-percent.chat-large" = "500"
+"model-cost-percent.chat-mini" = "25"
+
+# QUICK TRIAL ONLY — key straight off a client-supplied header, with no auth filter in front:
+#
+#   key-header = "x-api-key"
+#   [[route]] filters = ["tokenlimit"]
+#
+# A client-supplied key header is spoofable: any caller can send another caller's value and drain
+# that caller's budget (or dodge their own by rotating the value). Use it to try the filter out,
+# never to deploy it.
+
+[[upstream]]
+name = "model-api"
+addresses = ["127.0.0.1:9000"]    # one or more host:port instances (round-robin over the healthy set)
+[upstream.health]
+path = "/healthz"                 # only `path` is required; interval/timeout/thresholds default
+
+# Route: the completion endpoint only. This filter reads the request body, so keep it off routes
+# whose requests carry no JSON body — a bodyless request is answered 400.
+[[route]]
+filters = ["apikey", "tokenlimit"]   # order matters: the stamp must exist before it is read
+upstream = "model-api"
+[route.match]
+path_prefix = "/v1/chat/completions"

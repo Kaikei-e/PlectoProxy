@@ -1,0 +1,12 @@
+{
+  "name": "filter-tokenlimit-js",
+  "private": true,
+  "type": "module",
+  "description": "Token-cost rate limiter starter as a zero-WASI plecto:filter component (ComponentizeJS)",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.21.0"
+  }
+}

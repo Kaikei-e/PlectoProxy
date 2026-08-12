@@ -1,0 +1,28 @@
+// This guest's OWN world, declared in its own package against the canonical
+// `plecto:filter@0.4.0` types (which live under `wit/deps/`, copied from the contract at
+// build time — never edited here, ADR 000063 Decision 3).
+//
+// The shape is the base `filter` floor PLUS `on-request-body`, and deliberately WITHOUT
+// `on-response-body`. That absence is contractual, not an omission: the host probes the
+// optional body exports by name, so a missing `on-response-body` is what tells it to keep
+// streaming upstream response bodies zero-copy past this filter (ADR 000038 / 000098).
+// A token-cost limiter reads what the client ASKS for, never what comes back, so paying
+// the response-side buffer tax would be pure loss.
+//
+// Imports are subset to the three capabilities this filter actually exercises
+// (deny-by-default, ADR 000006): the bucket, the operator's config, and the log. It never
+// touches KV, counters, or the clock, so it does not ask for them.
+package plecto:tokenlimit-moonbit;
+
+world filter-request-body {
+    use plecto:filter/types@0.4.0.{http-request, http-response, request-decision, response-decision, request-body-decision};
+
+    import plecto:filter/host-log@0.4.0;
+    import plecto:filter/host-ratelimit@0.4.0;
+    import plecto:filter/host-config@0.4.0;
+
+    export init: func();
+    export on-request: func(req: http-request) -> request-decision;
+    export on-request-body: func(body: list<u8>) -> request-body-decision;
+    export on-response: func(req: http-request, resp: http-response) -> response-decision;
+}

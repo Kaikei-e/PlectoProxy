@@ -26,23 +26,25 @@ host explicitly lends it — enforced by the sandbox, not by convention.
 ```mermaid
 flowchart LR
     client(["Client"])
+
+    subgraph proxy["Plecto Proxy"]
+        direction LR
+        subgraph fast["Fast path — native Rust"]
+            edge["accept · TLS terminate<br/>HTTP/1.1 · 2 · 3"]
+            route["route match<br/>load balance"]
+            edge --> route
+        end
+
+        subgraph ext["Extension plane — your filter, sandboxed WASM"]
+            inspect["inspect each request:<br/>headers — body only if it asks"]
+            decide{{"typed decision"}}
+            inspect --> decide
+        end
+
+        state[("Host-held state<br/>KV · counter · rate-limit · clock · log")]
+    end
+
     upstream(["Upstream service"])
-
-    subgraph fast["Fast path — native Rust"]
-        direction TB
-        edge["accept · TLS terminate<br/>HTTP/1.1 · 2 · 3"]
-        route["route match<br/>load balance"]
-        edge --> route
-    end
-
-    subgraph ext["Extension plane — your filter, sandboxed WASM"]
-        direction TB
-        inspect["inspect each request:<br/>headers — body only if it asks"]
-        decide{{"typed decision"}}
-        inspect --> decide
-    end
-
-    state[("Host-held state<br/>KV · counter · rate-limit · clock · log")]
 
     client -- "① request" --> edge
     route -- "② run the filter chain" --> inspect
@@ -60,6 +62,7 @@ flowchart LR
     class inspect,decide wasmNode
     class state stateNode
 
+    style proxy fill:transparent,stroke:#64748b,stroke-width:1.5px,stroke-dasharray:6 4,color:#64748b
     style fast fill:#e8590c14,stroke:#e8590c,color:#e8590c
     style ext fill:#654ff014,stroke:#654ff0,color:#8b7bff
 

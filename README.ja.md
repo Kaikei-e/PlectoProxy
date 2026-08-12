@@ -26,23 +26,25 @@ Plecto Proxy は、**相補関係にある二つの構成要素**を型付き [W
 ```mermaid
 flowchart LR
     client(["クライアント"])
+
+    subgraph proxy["Plecto Proxy"]
+        direction LR
+        subgraph fast["fast path — native Rust"]
+            edge["接続受付 · TLS 終端<br/>HTTP/1.1 · 2 · 3"]
+            route["route 照合<br/>load balance"]
+            edge --> route
+        end
+
+        subgraph ext["extension plane — あなたのフィルタ（sandbox WASM）"]
+            inspect["各リクエストを検査:<br/>ヘッダ — body は要求時のみ"]
+            decide{{"型付き判断"}}
+            inspect --> decide
+        end
+
+        state[("host 保持の状態<br/>KV · counter · rate-limit · clock · log")]
+    end
+
     upstream(["upstream サービス"])
-
-    subgraph fast["fast path — native Rust"]
-        direction TB
-        edge["接続受付 · TLS 終端<br/>HTTP/1.1 · 2 · 3"]
-        route["route 照合<br/>load balance"]
-        edge --> route
-    end
-
-    subgraph ext["extension plane — あなたのフィルタ（sandbox WASM）"]
-        direction TB
-        inspect["各リクエストを検査:<br/>ヘッダ — body は要求時のみ"]
-        decide{{"型付き判断"}}
-        inspect --> decide
-    end
-
-    state[("host 保持の状態<br/>KV · counter · rate-limit · clock · log")]
 
     client -- "① リクエスト" --> edge
     route -- "② filter chain を実行" --> inspect
@@ -60,6 +62,7 @@ flowchart LR
     class inspect,decide wasmNode
     class state stateNode
 
+    style proxy fill:transparent,stroke:#64748b,stroke-width:1.5px,stroke-dasharray:6 4,color:#64748b
     style fast fill:#e8590c14,stroke:#e8590c,color:#e8590c
     style ext fill:#654ff014,stroke:#654ff0,color:#8b7bff
 

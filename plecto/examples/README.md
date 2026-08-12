@@ -64,6 +64,9 @@ componentized by `crates/host/build.rs` (ADR 000010).
 | `filter-hello-js` | Zero-WASI conformance port of `filter-hello` — JS/TS via ComponentizeJS (Tier A). |
 | `filter-hello-c` | Zero-WASI conformance port of `filter-hello` — C via wasi-sdk (Tier A). |
 | `filter-hello-go` | Fat-guest conformance port of `filter-hello` — Go/TinyGo, minimal WASI (Tier B, behind `fat-guest`, ADR 000063). |
+| `filter-tokenlimit-js` | **Starter**: LLM token-cost rate limiter in JS/TS (Tier A). The canonical copy-target of the three — carries the full build→sign→serve walkthrough. First `plecto:filter@0.4.0` example guests. |
+| `filter-tokenlimit-moonbit` | The same limiter in MoonBit (Tier A) — the smallest build of the three. |
+| `filter-tokenlimit-go` | The same limiter in Go/TinyGo (Tier B, `wasi = "minimal"`) — the fat-guest exemplar. |
 | `filter-template` | Scaffold for your own filter. |
 | `filter-streaming` | Streaming `stream<u8>` body filter (feature-gated). |
 | `filter-extauthz` | ext_authz over the SSRF-guarded outbound capability (feature-gated, ADR 000036). |

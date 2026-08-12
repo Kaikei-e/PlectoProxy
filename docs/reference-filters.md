@@ -70,6 +70,12 @@ to satisfy the import at instantiation.
   every prebuilt profile (ADR 000079).
 - **`filter-hello`, `filter-quickstart`, the polyglot `filter-hello-*` family** — conformance and
   teaching fixtures, not references (ADR 000080 Decision 3).
+- **the polyglot `filter-tokenlimit-*` family** — practical starters for body-hook +
+  `host-ratelimit` cost accounting (token-cost admission at the gateway). They implement
+  estimate-and-admit only: the WIT surface has no refund call, so an estimate is never
+  reconciled against actual usage. That makes them a fork point, not a billing source of
+  truth — shipping a signed artifact would misread as one, the same way ADR 000081 keeps
+  `filter-ratelimit-redis` off the shelf.
 
 ## Verify, then load
 

@@ -578,6 +578,36 @@ cargo test -p plecto-host --features polyglot-conformance --test polyglot
 cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyglot_tier_b
 ```
 
+### Start from a practical example
+
+The `filter-hello-*` guests above are *conformance fixtures* — they exercise every host-API on
+purpose and are a poor thing to copy. For a filter that does real work, start from
+**`filter-tokenlimit-*`** instead: one policy (an LLM token-cost rate limiter — price each request
+from its JSON body, spend that price against the host bucket, report what it cost) written three
+times, and the **first `plecto:filter@0.4.0` example guests** in the repository. They show the
+0.4.0-only shapes a new filter should be written against: `path-with-query`, the bare `%continue`
+body arm, and a guest-declared subset world that exports `on-request-body` but deliberately not
+`on-response-body`.
+
+| Tier | Language | Example | Start here because |
+|---|---|---|---|
+| A | JavaScript/TypeScript | [`filter-tokenlimit-js`](../plecto/examples/filters/filter-tokenlimit-js) | The canonical copy-target: the complete build → sign → `validate --resolve` → serve → curl walkthrough lives in its README. |
+| A | MoonBit | [`filter-tokenlimit-moonbit`](../plecto/examples/filters/filter-tokenlimit-moonbit) | The smallest build of the three; shows committed wit-bindgen bindings and the UTF-16 → UTF-8 boundary a MoonBit guest has to get right. |
+| B | Go | [`filter-tokenlimit-go`](../plecto/examples/filters/filter-tokenlimit-go) | The fat-guest exemplar: `wasi = "minimal"` in the manifest, vendored WIT deps with a drift check, and the Tier B import allowlist asserted at build time. |
+
+All three are held to **one shared assertion battery** in the host test suite, so "same body → same
+cost, status, and headers" is a test rather than a claim:
+
+```bash
+cargo test -p plecto-host --features polyglot-conformance --test tokenlimit
+cargo test -p plecto-host --features polyglot-conformance,fat-guest --test tokenlimit_tier_b
+```
+
+They are starters, not shelf artifacts (ADR 000080): copy one, change the cost formula to whatever
+your upstream actually bills, and read its README's *Expectations* section first — an
+estimate-and-admit limiter never reconciles against actual usage, and that boundary is a design
+choice, not a gap.
+
 To opt a Go/TinyGo (or other Tier B) filter in, build the host with the `fat-guest` cargo feature
 and declare the grant in its manifest entry:
 

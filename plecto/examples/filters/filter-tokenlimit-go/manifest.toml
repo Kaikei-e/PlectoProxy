@@ -1,0 +1,73 @@
+# A Plecto manifest that runs filter-tokenlimit-go behind an authentication filter.
+# The manifest is the static source of truth for which filters load, with which trust roots, in
+# what order (ADR 000007 / 000008). See docs/writing-a-filter.md for the full field reference.
+
+# Trusted signer public keys (PEM, manifest-relative). A filter must be signed by one of these.
+[trust]
+keys = ["keys/signer.pub"]
+
+# --- 1. authenticate ---------------------------------------------------------------------------
+# The chain runs in the order listed on the route below. filter-apikey
+# (examples/filters/filter-apikey) maps a credential to a caller and stamps the AUTHORITATIVE
+# `x-authenticated-user` on the request it forwards, overwriting whatever the client sent. Running
+# it first is what makes the budget below attach to an identity the gateway established rather than
+# to a header the caller chose. A JWT filter stamping the same header from `sub` works identically.
+[[filter]]
+id = "apikey"
+source = "artifacts/apikey"             # manifest-relative path to the local OCI image-layout
+digest = "sha256:REPLACE_ME"            # the pinned OCI image-manifest digest
+isolation = "trusted"
+
+# --- 2. price and charge ------------------------------------------------------------------------
+[[filter]]
+id = "tokenlimit"                       # host-assigned identity; namespaces this filter's bucket
+source = "artifacts/tokenlimit-go"      # manifest-relative path to the local OCI image-layout
+digest = "sha256:REPLACE_ME"            # the pinned OCI image-manifest digest
+
+# `trusted` pools one instance and builds it eagerly at load, which is what turns a bad
+# `[filter.config]` value into a LOAD failure instead of a 500 on the first request that hits it
+# (this filter traps in `init` on an unparseable number — ADR 000066).
+isolation = "trusted"
+
+# Tier B (ADR 000063): a TinyGo guest carries a language runtime that assumes a WASI baseline, so
+# it needs the fixed minimal grant — and the host must be built with the `fat-guest` feature, or
+# this line is rejected at validate. Tier A (Rust / C / MoonBit / JS) guests leave it at "none".
+wasi = "minimal"
+
+# The token bucket this filter spends against (ADR 000026). The OPERATOR owns the numbers: the
+# filter decides what a request costs, never how big the budget is. Sized here in "tokens" of the
+# same currency the filter estimates: 60k of burst, refilled at 1k/second.
+ratelimit = { capacity = 60000, refill_tokens = 1000, refill_interval_ms = 1000 }
+
+[filter.config]
+# Key on the identity the auth filter established, NOT on a header the client controls.
+key-header = "x-authenticated-user"
+# Assumed output reservation when the body carries no `max_tokens`.
+max-tokens-default = "1024"
+# UTF-8 bytes per estimated token — the input side of the price.
+chars-per-token = "4"
+# Per-model multipliers, in integer percent of the estimated cost. Keys must be QUOTED: the dot is
+# part of the key, not a TOML table separator. A model with no entry here is charged 100%.
+"model-cost-percent.chat-large" = "500"
+"model-cost-percent.chat-mini" = "25"
+
+# QUICK TRIAL ONLY — key straight off a client-supplied header, with no auth filter in front:
+#
+#   key-header = "x-api-key"
+#   [[route]] filters = ["tokenlimit"]
+#
+# A client-supplied key header is spoofable: any caller can send another caller's value and drain
+# that caller's budget (or dodge their own by rotating the value). Use it to try the filter out,
+# never to deploy it.
+
+[[upstream]]
+name = "model-api"
+addresses = ["127.0.0.1:9000"]          # one or more host:port instances (round-robin when healthy)
+[upstream.health]
+path = "/healthz"                       # only `path` is required; interval/timeout/thresholds default
+
+[[route]]
+filters = ["apikey", "tokenlimit"]      # order matters: the stamp must exist before it is read
+upstream = "model-api"
+[route.match]
+path_prefix = "/v1/chat/completions"

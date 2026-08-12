@@ -1,0 +1,36 @@
+// The guest-local world for this filter. It is deliberately NOT part of the canonical
+// `plecto:filter` package (vendored verbatim under `deps/plecto-filter-0.4.0/`, never edited):
+//
+//  1. the export set is a SUBSET of the acceptance lattice — `filter` plus `on-request-body`
+//     and NOT `on-response-body`. The absence is contractual: the host reads it as "this filter
+//     never inspects a response body" and keeps the response plane streaming zero-copy
+//     (ADR 000038 / 000098). A world naming that subset belongs to the guest, not to the
+//     published contract, whose two published worlds are only the ends of the lattice.
+//  2. TinyGo's `wasip2` target compiles against the `wasi:cli` world, so a Go guest must compose
+//     `include wasi:cli/imports@0.2.0` into whatever world it targets. That composition lives
+//     HERE and only here — the canonical `plecto:filter` world must never carry WASI
+//     (ADR 000063 Decision 3), or every Tier A guest would inherit an import it must not have.
+//
+// Imports are also a subset: this filter decides from operator config and the host token bucket,
+// so it asks for `host-config`, `host-ratelimit` and `host-log` — and nothing else. It needs no
+// wall clock (`host-ratelimit` refills against the host's own per-request snapshot) and no KV
+// (the filter is stateless; the budget lives in the host bucket).
+package plecto:tokenlimit-go;
+
+world filter-request-body {
+    use plecto:filter/types@0.4.0.{http-request, http-response, request-decision, response-decision, request-body-decision};
+
+    import plecto:filter/host-log@0.4.0;
+    import plecto:filter/host-config@0.4.0;
+    import plecto:filter/host-ratelimit@0.4.0;
+
+    // Tier B ("fat guest", ADR 000063): the TinyGo runtime's own baseline. The host lends this
+    // slice only when the manifest entry says `wasi = "minimal"` AND the host was built with the
+    // `fat-guest` feature; `wasi:sockets` / `wasi:http` are never in it.
+    include wasi:cli/imports@0.2.0;
+
+    export init: func();
+    export on-request: func(req: http-request) -> request-decision;
+    export on-request-body: func(body: list<u8>) -> request-body-decision;
+    export on-response: func(req: http-request, resp: http-response) -> response-decision;
+}

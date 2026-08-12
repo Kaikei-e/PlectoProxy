@@ -306,6 +306,14 @@ jobs:
           ./examples/filters/filter-hello-moonbit/build.sh
           ./examples/filters/filter-hello-js/build.sh
           ./examples/filters/filter-hello-go/build.sh
+          # The filter-tokenlimit trio: the same POLICY in three languages, driven by one shared
+          # assertion battery (tests/tokenlimit{,_tier_b}.rs) in the single cargo invocation below.
+          # Same toolchains as the hello guests, minus wkg — the Go guest vendors its WIT deps and
+          # asserts them byte-identical to the canonical contract, and the MoonBit guest's bindings
+          # are committed (so it needs moon + wasm-tools only).
+          ./examples/filters/filter-tokenlimit-moonbit/build.sh
+          ./examples/filters/filter-tokenlimit-js/build.sh
+          ./examples/filters/filter-tokenlimit-go/build.sh
 
       - name: Wait for the background disk cleanup
         if: runner.environment == 'github-hosted'
@@ -316,7 +324,9 @@ jobs:
           df -h /
       # The whole feature-gated surface in ONE invocation and ONE dep world: host + control
       # suites (tcp_gate's fat-guest × outbound-tcp case, the outbound-http suites
-      # extauthz / jwt) plus both polyglot conformance suites.
+      # extauthz / jwt) plus all four polyglot conformance suites (filter-hello Tier A/B and
+      # filter-tokenlimit Tier A/B — the `polyglot-conformance` + `fat-guest` features below
+      # already gate them, so they need no extra cargo invocation).
       - run: >
           cargo test -p plecto-host -p plecto-control --locked --features
           plecto-host/streaming-body,plecto-host/outbound-http,plecto-host/outbound-tcp,plecto-host/fat-guest,plecto-host/polyglot-conformance,plecto-control/outbound-http,plecto-control/outbound-tcp,plecto-control/fat-guest

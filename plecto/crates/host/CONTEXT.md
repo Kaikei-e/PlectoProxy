@@ -44,6 +44,18 @@ trap しない・宣言 deadline 内に応答する）を指す。`tests/polyglo
 （`filter-hello` 固有の振る舞いに依存する Rust 内部の回帰テスト、CLI には持ち出さない）。
 _Avoid_: valid filter（漠然）, passes tests（フィクスチャ依存の含意）
 
+**PIXIT**:
+Protocol Implementation eXtra Information for Testing（ISO/IEC 9646 の用語）。operator が conformance 実行へ
+明示的に渡す試験環境情報 — 対象 filter の manifest entry と、その解決に要る base_dir。許可能力の source of
+truth は常に operator の manifest であり、guest の import 列から能力を推論しない。PIXIT 不足は component の
+非適合（fail）ではなく環境不足（environment）。
+_Avoid_: capability auto-detection（推論の含意）, test config（漠然）
+
+**Battery（conformance battery）**:
+公開 conformance の check 集合。SemVer で独立に版付けし（`battery@1.0.0` …）、`plecto package` / `plecto dev`
+は焼付けた pin だけを用いる。WIT package version とは別軸で、対応は適用行列が持つ。
+_Avoid_: test suite（フィクスチャ・コーパス型の含意）, checks（版の含意が落ちる）
+
 ## 実行モデル
 
 **init hook**:

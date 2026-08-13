@@ -96,7 +96,10 @@ mod util;
 pub mod test_support;
 
 pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_bucket};
-pub use conformance::{ConformanceCheck, ConformanceReport, check as run_conformance};
+pub use conformance::{
+    BatteryVersion, ConformanceCheck, ConformanceOptions, ConformanceReport, Verdict,
+    check as run_conformance, check_with as run_conformance_with,
+};
 #[doc(hidden)]
 pub use contract::HOP_BY_HOP_GUEST_HEADERS;
 pub use contract::{ContractVersion, FILTER_WIT, SUPPORTED_CONTRACT_VERSIONS, header};

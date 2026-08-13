@@ -48,7 +48,11 @@ impl Verdict {
 /// Which frozen case set a run executes (ADR 000108). The caller PINS it — `plecto conformance
 /// --battery <semver>`, a burnt-in pin for `package` / `dev` — so deepening the battery can never
 /// turn an already-shipped component's gate red on its own.
+///
+/// Sealed: every deepening of the battery mints a version here, so a caller must fall back on an
+/// unknown pin rather than fail to compile against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BatteryVersion {
     /// The frozen pair: `v1.0.0-S1` (world satisfaction + load gate) and `v1.0.0-D1` (a generic
     /// `on-request` stimulus).
@@ -69,7 +73,11 @@ impl BatteryVersion {
 /// capability set, config and budgets an operator's manifest entry lends this filter, lowered the
 /// same way production lowers it. The default is the no-manifest floor: `battery@1.0.0` with
 /// `LoadOptions::untrusted()`, i.e. the zero-WASI host API and an empty config lane.
+///
+/// Sealed: build it from [`ConformanceOptions::default`] and the `with_*` methods — ADR 000108
+/// keeps adding to what a run is given, and none of those additions should be a break.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConformanceOptions {
     pub battery: BatteryVersion,
     pub pixit: LoadOptions,
@@ -85,6 +93,11 @@ impl ConformanceOptions {
 
 /// One named property with its verdict and a human-readable detail (the failure reason, or a
 /// short confirmation on success).
+///
+/// Sealed: a case is the host's to report, not a caller's to synthesise, and ADR 000108 keeps
+/// widening what one carries (`id` and `verdict` landed in 0.8.0). Read the fields; construct
+/// through [`check`] / [`check_with`].
+#[non_exhaustive]
 pub struct ConformanceCheck {
     /// Stable case ID (ADR 000108), e.g. `v1.0.0-S1` — what CI tracks across battery versions.
     pub id: &'static str,
@@ -97,6 +110,10 @@ pub struct ConformanceCheck {
 
 /// The full battery's result. `plecto conformance` exits non-zero unless
 /// [`ConformanceReport::is_conformant`] is true.
+///
+/// Sealed for the same reason as [`ConformanceCheck`]: ADR 000108 puts `battery_version`,
+/// `wit_package` and `profile` next to `checks` in the JSON, and each of those is a field here.
+#[non_exhaustive]
 pub struct ConformanceReport {
     pub checks: Vec<ConformanceCheck>,
 }

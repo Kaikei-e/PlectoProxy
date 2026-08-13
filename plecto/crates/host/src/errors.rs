@@ -10,7 +10,13 @@ use crate::{Header, HttpResponse};
 /// output; a `RunError` is the filter *failing*. The fast path MUST fail-closed on it:
 /// synthesise an error response and never forward to upstream (CLAUDE.md — no fail-open).
 /// Keeping the two apart also makes "deadline" vs "trap" an observable health signal.
+///
+/// Sealed: the fault vocabulary grows as the host learns to tell faults apart (`InvalidOutput`
+/// is the most recent), and no caller needs an exhaustive match to stay fail-closed —
+/// [`RunError::fail_closed_response`] is the host's own mapping, and a caller writing its own
+/// must send a 5xx for the arm it does not recognise anyway.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RunError {
     /// The filter ran past its epoch deadline (ADR 000006 metering) and was interrupted.
     /// Fail-closed mapping: 504.
@@ -86,7 +92,12 @@ impl RunError {
 /// / the eager trusted-instance build). `Host::load`'s public signature stays `anyhow::Result`
 /// (unchanged, so `plecto-control::ControlError::Load`'s existing `anyhow::Error` passthrough
 /// keeps working); callers that want the concrete variant can `downcast_ref::<LoadError>()`.
+///
+/// Sealed: every rejection the load gate learns to name separately is a variant here
+/// (`MissingCapability` in 0.8.0), and a caller reached through `downcast_ref` is already
+/// matching a subset — the fallback arm it has is the one an unknown rejection belongs in.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoadError {
     #[error("filter id must be non-empty")]
     EmptyFilterId,

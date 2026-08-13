@@ -119,12 +119,24 @@ first.
   covers every component importing WASI at all, since only `plecto:filter` is lent.
 
 - **Breaking (Rust library API)**: `plecto_host::ConformanceCheck` gained the `id` and `verdict`
-  fields, and `plecto_host::LoadError` gained the `MissingCapability` variant. All of
-  `ConformanceCheck`'s fields are public and neither type is `#[non_exhaustive]`, so external
+  fields, and `plecto_host::LoadError` gained the `MissingCapability` variant. External
   struct-literal construction and exhaustive `match`es must be updated; `passed` is kept as a
   projection of `verdict == Verdict::Pass` so code that only *reads* a check keeps compiling.
   Per the pre-1.0 policy above this rides a **minor** bump, and `cargo-semver-checks` flags both
   (`constructible_struct_adds_field`, `enum_variant_added`).
+
+- **Breaking (Rust library API): the report types and the error enums are now
+  `#[non_exhaustive]`.** `ConformanceCheck`, `ConformanceReport`, `ConformanceOptions`,
+  `BatteryVersion`, `LoadError`, and `RunError` are sealed against the *next* round of additions:
+  ADR 000108 puts `battery_version` / `wit_package` / `profile` in the report and mints a battery
+  version for each deepening, and both error enums grow a variant whenever the host learns to name
+  a fault or a rejection separately. Downstream crates lose struct-literal construction (use
+  `check` / `check_with` and `ConformanceOptions::default()`) and exhaustive `match`es (add a
+  fallback arm — for `RunError` the fail-closed 5xx it already needs, or
+  `RunError::fail_closed_response`); reading fields and matching named variants are unaffected.
+  This is the same break the two bullets around it already require a recompilation for, taken once
+  so the additions after it are not breaks at all. `Verdict` stays open deliberately: ADR 000108
+  fixes its five values, so a wildcard arm would cost every caller and buy nothing.
 
 - **Breaking (Rust library API), `plecto-control`**: the same break reaches
   `plecto_control::ConformanceCheck`, which is a re-export of the host type. **`cargo-semver-checks`

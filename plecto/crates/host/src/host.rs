@@ -60,6 +60,36 @@ pub struct Host {
     _epoch_ticker: EpochTicker,
 }
 
+/// Which capability namespaces one `load` lends its component. Decided once from [`LoadOptions`]
+/// and read by both the linker wiring and the pre-instantiate import diagnostic, so the two can
+/// never disagree about what was lent. A namespace absent from this build's features is simply
+/// never lent — indistinguishable, from the component's side, from an operator who did not grant
+/// it (ADR 000108).
+#[derive(Default)]
+struct LentCapabilities {
+    /// `wasi:io` / `wasi:clocks` / `wasi:random` / `wasi:cli` — the minimal base under every
+    /// WASI-shaped capability.
+    wasi_base: bool,
+    filesystem: bool,
+    http: bool,
+    sockets: bool,
+}
+
+impl LentCapabilities {
+    /// Is `import` (a component import name, e.g. `wasi:sockets/tcp@0.2.7`) inside a namespace
+    /// this load lends? Namespace granularity — see the call site.
+    fn covers(&self, import: &str) -> bool {
+        match import.split('/').next().unwrap_or(import) {
+            "plecto:filter" => true,
+            "wasi:io" | "wasi:clocks" | "wasi:random" | "wasi:cli" => self.wasi_base,
+            "wasi:filesystem" => self.filesystem,
+            "wasi:http" => self.http,
+            "wasi:sockets" => self.sockets,
+            _ => false,
+        }
+    }
+}
+
 impl Host {
     /// A host backed by an in-memory store (the default; process-lifetime state). `trust` is
     /// the set of keys allowed to sign loadable filters (ADR 000006) — pass `TrustPolicy::empty()`
@@ -247,6 +277,22 @@ impl Host {
         // capability's own interfaces, still deny-by-default (every call is gated by the
         // SSRF-guarded hooks / the vetted lookup + connect check). A filter without a policy links
         // no WASI at all, exactly as before.
+        let mut lent = LentCapabilities::default();
+        #[cfg(feature = "outbound-http")]
+        {
+            lent.http = opts.outbound_http.is_some();
+        }
+        #[cfg(feature = "outbound-tcp")]
+        {
+            lent.sockets = opts.outbound_tcp.is_some();
+        }
+        #[cfg(feature = "fat-guest")]
+        {
+            lent.filesystem = opts.wasi_minimal;
+        }
+        // The minimal WASI base rides along with every capability whose guest needs a WASI runtime.
+        lent.wasi_base = lent.http || lent.sockets || lent.filesystem;
+
         #[cfg(feature = "outbound-http")]
         let outbound = opts
             .outbound_http
@@ -270,27 +316,12 @@ impl Host {
             feature = "outbound-tcp",
             feature = "fat-guest"
         ))]
-        {
-            let mut needs_wasi_base = false;
-            #[cfg(feature = "outbound-http")]
-            {
-                needs_wasi_base |= outbound.is_some();
-            }
-            #[cfg(feature = "outbound-tcp")]
-            {
-                needs_wasi_base |= outbound_tcp.is_some();
-            }
-            #[cfg(feature = "fat-guest")]
-            {
-                needs_wasi_base |= opts.wasi_minimal;
-            }
-            if needs_wasi_base {
-                wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
-                // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
-                // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem — the
-                // capability boundary that matters (mirrors the streaming path, audit F-002).
-                add_cli_runtime(&mut linker)?;
-            }
+        if lent.wasi_base {
+            wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
+            // The std guest's runtime also imports the rest of wasi:cli (environment / exit /
+            // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem — the
+            // capability boundary that matters (mirrors the streaming path, audit F-002).
+            add_cli_runtime(&mut linker)?;
         }
         // Fat guest (ADR 000063): TinyGo's wasip2 runtime unconditionally imports
         // `wasi:filesystem/types` + `wasi:filesystem/preopens` even for a program that never
@@ -298,11 +329,11 @@ impl Host {
         // preopened directory, ever) so such a guest instantiates while filesystem access stays
         // structurally unreachable.
         #[cfg(feature = "fat-guest")]
-        if opts.wasi_minimal {
+        if lent.filesystem {
             crate::state::add_inert_filesystem(&mut linker)?;
         }
         #[cfg(feature = "outbound-http")]
-        if outbound.is_some() {
+        if lent.http {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         }
         // Outbound TCP (ADR 000060): the `wasi:sockets` TCP-connect slice ONLY — network /
@@ -310,7 +341,7 @@ impl Host {
         // the host's OWN vetted ip-name-lookup (the upstream one has no hostname filter). The UDP
         // interfaces are never linked: the capability's absence, not a runtime deny.
         #[cfg(feature = "outbound-tcp")]
-        if outbound_tcp.is_some() {
+        if lent.sockets {
             use wasmtime_wasi::p2::bindings::sockets;
             use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
             let getter = <HostState as WasiSocketsView>::sockets;
@@ -333,6 +364,23 @@ impl Host {
                 &mut linker,
                 HostState::tcp_lookup,
             )?;
+        }
+
+        // Enumerate the component's imports BEFORE instantiating (ADR 000108): an import nothing
+        // lent it gets its own typed variant instead of collapsing into wasmtime's
+        // unresolved-import text, which names only the first unresolved instance and cannot be
+        // told apart from world non-conformance. Deliberately COARSER than the linker (whole
+        // namespaces, not the exact interface slice), so this can only classify a load that would
+        // have failed anyway — never reject one the linker would have resolved. Enforcement stays
+        // the linker's; this is diagnosis.
+        let unlent: Vec<String> = component
+            .component_type()
+            .imports(engine)
+            .filter(|(name, _)| !lent.covers(name))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        if !unlent.is_empty() {
+            return Err(LoadError::MissingCapability { imports: unlent });
         }
 
         let pre = match version {

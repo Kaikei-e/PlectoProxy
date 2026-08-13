@@ -112,6 +112,18 @@ pub enum LoadError {
          (need @0.1 / @0.2 / @0.3; fail-closed)"
     )]
     UnsupportedContractVersion,
+    /// The component imports capability namespaces this load was not lent — an operator's
+    /// manifest that grants no `outbound_tcp`, or a binary built without the feature that could
+    /// lend it. Typed apart from [`LoadError::Wasmtime`] because "nothing lent it this" is a
+    /// different statement from "it does not satisfy the world" (ADR 000108), and only the latter
+    /// is the component's problem. The capability set stays the operator's to grant: naming the
+    /// unlent imports is a diagnostic, never a request the host honours.
+    #[error(
+        "nothing lent this component the capabilities it imports: {} \
+         (deny-by-default; the operator's manifest decides the capability set)",
+        .imports.join(", ")
+    )]
+    MissingCapability { imports: Vec<String> },
     /// The eager trusted-instance build (`Host::load`'s `Isolation::Trusted` path) failed —
     /// carries the same error `RunError::Instantiate` would for a later rebuild.
     #[error("filter instantiation failed: {0}")]

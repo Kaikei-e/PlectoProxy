@@ -12,7 +12,10 @@
 //! conformance in one observable check.
 
 use crate::dev_signer::{DevSigner, bound_sbom};
-use crate::{Header, Host, HttpRequest, LoadOptions, LoadedFilter, RequestTrace, SignedArtifact};
+use crate::{
+    Header, Host, HttpRequest, Isolation, LoadError, LoadOptions, LoadedFilter, RequestTrace,
+    SignedArtifact,
+};
 
 /// The verdict vocabulary of one conformance case (ADR 000108). `environment` — a PIXIT
 /// shortfall, a missing binary feature, an unreachable test dependency — is deliberately NOT
@@ -99,8 +102,13 @@ pub struct ConformanceReport {
 }
 
 impl ConformanceReport {
+    /// True only when every APPLICABLE MUST passed (ADR 000108): `na` marks a case the
+    /// component's contract cannot express (PICS), so it does not block conformance, while
+    /// `fail` / `inconclusive` / `environment` each fail the gate closed.
     pub fn is_conformant(&self) -> bool {
-        self.checks.iter().all(|c| c.passed)
+        self.checks
+            .iter()
+            .all(|c| matches!(c.verdict, Verdict::Pass | Verdict::Na))
     }
 }
 
@@ -112,19 +120,25 @@ pub fn check(component_bytes: &[u8]) -> ConformanceReport {
 
 /// Run the battery `options` pins, with the capabilities and config its PIXIT lends (ADR 000108).
 pub fn check_with(component_bytes: &[u8], options: ConformanceOptions) -> ConformanceReport {
-    let _ = options;
     let mut checks = Vec::new();
 
-    let loaded = load_self_signed(component_bytes);
+    let loaded = load_self_signed(component_bytes, options.pixit);
+    // The environment/world split is decided by the TYPED load error, never by reading wasmtime's
+    // message: a capability nothing lent is an ENVIRONMENT shortfall, everything else — a
+    // malformed component, an unrecognised contract version, a rejected signature — is the
+    // component failing to satisfy what it was asked to satisfy.
+    let s1 = match &loaded {
+        Ok(_) => Verdict::Pass,
+        Err(e) => match e.downcast_ref::<LoadError>() {
+            Some(LoadError::MissingCapability { .. }) => Verdict::Environment,
+            _ => Verdict::Fail,
+        },
+    };
     checks.push(ConformanceCheck {
         id: "v1.0.0-S1",
         name: "loads under the plecto:filter contract",
-        passed: loaded.is_ok(),
-        verdict: if loaded.is_ok() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
+        passed: s1 == Verdict::Pass,
+        verdict: s1,
         detail: match &loaded {
             Ok(_) => "component/SBOM self-signature verified, world satisfied".to_string(),
             Err(e) => format!("{e:#}"),
@@ -136,7 +150,9 @@ pub fn check_with(component_bytes: &[u8], options: ConformanceOptions) -> Confor
             id: "v1.0.0-D1",
             name: "handles a generic request without trapping or exceeding its deadline",
             passed: false,
-            verdict: Verdict::Fail,
+            // A skipped case carries S1's class, so a capability shortfall does not turn back
+            // into a world-conformance failure one line below where it was told apart.
+            verdict: s1,
             detail: "skipped: component did not load".to_string(),
         });
         return ConformanceReport { checks };
@@ -161,7 +177,7 @@ pub fn check_with(component_bytes: &[u8], options: ConformanceOptions) -> Confor
     ConformanceReport { checks }
 }
 
-fn load_self_signed(component_bytes: &[u8]) -> anyhow::Result<LoadedFilter> {
+fn load_self_signed(component_bytes: &[u8], pixit: LoadOptions) -> anyhow::Result<LoadedFilter> {
     let (signer, _private_key_pem) = DevSigner::generate()?;
     let component_signature = signer.sign(component_bytes)?;
     let sbom = bound_sbom(component_bytes);
@@ -173,9 +189,16 @@ fn load_self_signed(component_bytes: &[u8]) -> anyhow::Result<LoadedFilter> {
         sbom: &sbom,
         sbom_signature: &sbom_signature,
     };
-    // `Untrusted` (fresh-per-request, tight default deadlines): the conservative assumption for
-    // an arbitrary component this CLI has never seen before.
-    host.load("conformance", &artifact, LoadOptions::untrusted())
+    // S1 is decided at link + `InstancePre` and the battery never runs `init` at load (ADR
+    // 000108): keep the PIXIT's capability set, config and budgets, but normalise the instance
+    // lifecycle to `Untrusted` — `Host::load` eagerly instantiates and runs `init` for `Trusted`,
+    // which would fold "the operator's config is incomplete" into the world-satisfaction verdict.
+    // Without a PIXIT this is the untrusted floor the battery has always used.
+    let opts = LoadOptions {
+        isolation: Isolation::Untrusted,
+        ..pixit
+    };
+    host.load("conformance", &artifact, opts)
 }
 
 fn generic_request() -> HttpRequest {

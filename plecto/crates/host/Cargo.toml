@@ -13,6 +13,17 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+# docs.rs builds the capability features so their gated API (`outbound`, `fat_guest`, the lent-WASI
+# surface) is documented — the same set `plecto-server`'s `capabilities` profile ships (ADR 000079).
+# NOT `all-features`: `test-support` makes build.rs compile the guest fixtures (wasm32-unknown-unknown
+# and wasm32-wasip2 targets) and `polyglot-conformance` needs MoonBit / Node / wasi-sdk, none of which
+# exist in the docs.rs builder. The capability features alone touch no wasm target — every fixture
+# build is gated on `test-support` first (build.rs), the same reason a plain release container can
+# build `--features capabilities`. `streaming-body` stays out: it is experimental and, by its own
+# rule, out of every shipped profile.
+[package.metadata.docs.rs]
+features = ["outbound-http", "outbound-tcp", "fat-guest"]
+
 # No libtest `#[bench]` fns live in the lib; disabling its bench harness lets `cargo bench` run
 # ONLY the criterion targets (which alone understand `--save-baseline` for the CI regression gate).
 [lib]

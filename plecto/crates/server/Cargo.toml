@@ -14,6 +14,12 @@ categories.workspace = true
 publish.workspace = true
 include = ["src/**", "tests/**", "CONTEXT.md"]
 
+# docs.rs documents the `capabilities` release profile (ADR 000079) — the umbrella over
+# outbound-http / outbound-tcp / fat-guest. Not `all-features`: `bench-harnesses` points at the
+# repo-root `bench/` dir, absent from a published crate. See `crates/host/Cargo.toml` for the rest.
+[package.metadata.docs.rs]
+features = ["capabilities"]
+
 # The M2 fast path: a listener that drives requests through the control plane's routed filter
 # chains and forwards to upstreams — HTTP/1.1 + HTTP/2 over TCP and HTTP/3 over QUIC (ADR 000013 /
 # 000014 / 000015 / 000016). Library only — the `plecto` binary and operator CLI live in the

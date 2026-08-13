@@ -13,6 +13,13 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+# docs.rs builds the capability features so a manifest section that only parses behind one
+# (`[filter.outbound_http]` / `[filter.outbound_tcp]` / `wasi = "minimal"`) is documented rather than
+# silently absent. Not `all-features` — see the note in `crates/host/Cargo.toml`; these three forward
+# to exactly the host features that need no wasm target.
+[package.metadata.docs.rs]
+features = ["outbound-http", "outbound-tcp", "fat-guest"]
+
 # plecto-control — the control plane (ADR 000007 / 000008): a single declarative TOML
 # manifest pins filters by OCI digest, an offline OCI image-layout store resolves them,
 # the host loads them (ADR 000006 provenance), a chain dispatcher drives a request through

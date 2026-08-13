@@ -32,6 +32,142 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-14
+
+Minor bump, not a patch: the generic conformance battery in the crates.io-published `plecto-host`
+gains a verdict vocabulary, and carrying it changes two public types in ways downstream code cannot
+compile against (see **Changed**). Under the pre-1.0 policy above a minor bump is where those live.
+**Deployed filters do not need a rebuild** — the filter contract stays at `plecto:filter@0.4.0`,
+and the manifest schema, the access-log field set, and the CLI surface are all unchanged. The
+`plecto conformance` / `package` / `dev` half of ADR 000108 — `--battery`, `--manifest --filter`,
+and the verdict in `--json` — is decided but not in this release; the library is where it lands
+first.
+
+### Added
+
+- **Three practical starter filters — one policy, three languages** (ADR 000105):
+  `filter-tokenlimit-js`, `filter-tokenlimit-moonbit` (Tier A, zero-WASI) and `filter-tokenlimit-go`
+  (Tier B, `wasi = "minimal"`) under `plecto/examples/filters/`. They are the first example guests
+  written against `plecto:filter@0.4.0`, and the first that answer a real question rather than
+  porting `filter-hello`: **counting requests is the wrong unit in front of an LLM upstream**, where
+  one request can cost a thousand times another. Each prices a request from its body — the input
+  text plus the output the caller reserved via `max_tokens` — and spends that estimate against a
+  host-side token bucket, so the filter decides *which key to charge and how much* while the
+  counting stays host-native (ADR 000005).
+
+  **The three are the same policy, pinned by one shared assertion battery** (golden vectors: the
+  same body must yield the same cost, status, and headers in every language), so the trio is also
+  the evidence that the contract means one thing across toolchains. The tiers differ by exactly one
+  `LoadOptions` grant, which is what makes the Tier A / Tier B split legible. CI builds and tests
+  all three inside the existing `test-features` job — no new job.
+
+  **They are starters, not shelf entries**: copy the directory and edit it. They are deliberately
+  *not* published as signed OCI artifacts, for the reason `docs/reference-filters.md` now records —
+  they implement estimate-and-admit only, and the WIT surface has no refund call, so an estimate is
+  never reconciled against actual usage. That makes them a fork point rather than a billing source
+  of truth, and a signed artifact would misread as the latter (the rule ADR 000081 already applies
+  to `filter-ratelimit-redis`).
+
+- **A capability-aware conformance battery** (ADR 000108), in `plecto-host`. Running a component
+  through the battery previously meant running it against the *no-manifest floor* — the zero-WASI
+  host API — so a filter that legitimately imports a lent capability could only ever be reported as
+  broken. Two new inputs fix that, both under the caller's control:
+
+  - **`ConformanceOptions`** — the battery pin plus the **PIXIT**: the capability set, config, and
+    budgets an operator's manifest entry lends this filter, lowered as a `LoadOptions` exactly the
+    way production lowers it. `ConformanceOptions::default()` is the old floor
+    (`battery@1.0.0` + `LoadOptions::untrusted()`), reached through `with_pixit` when there is a
+    manifest entry to lend. Run via **`check_with`** (re-exported as `run_conformance_with`); the
+    one-argument `check` / `run_conformance` stay, unchanged in signature and behaviour, as the
+    alias for a caller with no manifest.
+  - **`BatteryVersion`** — which frozen case set a run executes, pinned by the *caller*, so
+    deepening the battery later can never turn an already-shipped component's gate red on its own.
+    `1.0.0` freezes the pair `v1.0.0-S1` (world satisfaction + load gate) and `v1.0.0-D1` (a generic
+    `on-request` stimulus), and each check now carries that stable case ID.
+
+- **`Verdict`** — the five-way outcome of one case: `pass` / `fail` / `na` / `inconclusive` /
+  `environment`. The load-bearing one is **`environment`**, which is deliberately not `fail`:
+  "nothing lent this component the capability it imports" is a different statement from "this
+  component does not satisfy the world", and only the second is the component's problem. `na` marks
+  a case this component's contract cannot express (PICS), which is not a pass either.
+
+- **`LoadError::MissingCapability { imports }`** — a typed variant for a component that imports
+  capability namespaces the load was not lent, either because the operator's manifest granted none
+  or because the binary was built without the feature that could lend it. It is what lets the
+  battery tell `environment` from `fail` without matching on strings.
+
+### Changed
+
+- **Conformance is decided by verdict, and `environment` still fails the gate closed.**
+  `ConformanceReport::is_conformant` accepted every check's `passed` bool; it now accepts only
+  `pass` and `na`, so `fail`, `inconclusive`, **and `environment`** each fail closed. The new
+  vocabulary buys a filter author a precise diagnosis, not a way to pass: a run that could not lend
+  what the component needs is not a conformant run, and `plecto conformance` keeps exiting non-zero
+  on it. `na` is the one verdict that does not block, because a case the component's contract cannot
+  express was never a MUST for it.
+
+- **`Host::load` enumerates a component's imports before instantiating it** (ADR 000108). An
+  unlent import used to surface as wasmtime's unresolved-import text, which names only the *first*
+  unresolved instance and cannot be told apart from world non-conformance. The host now walks
+  `component_type().imports()` against the same lent-capability value that drives the linker wiring
+  and returns `LoadError::MissingCapability` naming all of them. The check is deliberately **coarser
+  than the linker** — whole namespaces, not the exact interface slice — so it can only classify a
+  load that would have failed anyway, never reject one the linker would have resolved. Enforcement
+  stays the linker's; this is diagnosis. **Migration**: `Host::load`'s signature is unchanged, but
+  any tooling or test that matched on the *text* of a failed load for a component importing an
+  unlent capability now sees the new message. Match the variant instead. On default features this
+  covers every component importing WASI at all, since only `plecto:filter` is lent.
+
+- **Breaking (Rust library API)**: `plecto_host::ConformanceCheck` gained the `id` and `verdict`
+  fields, and `plecto_host::LoadError` gained the `MissingCapability` variant. All of
+  `ConformanceCheck`'s fields are public and neither type is `#[non_exhaustive]`, so external
+  struct-literal construction and exhaustive `match`es must be updated; `passed` is kept as a
+  projection of `verdict == Verdict::Pass` so code that only *reads* a check keeps compiling.
+  Per the pre-1.0 policy above this rides a **minor** bump, and `cargo-semver-checks` flags both
+  (`constructible_struct_adds_field`, `enum_variant_added`).
+
+- **Breaking (Rust library API), `plecto-control`**: the same break reaches
+  `plecto_control::ConformanceCheck`, which is a re-export of the host type. **`cargo-semver-checks`
+  reports `plecto-control` clean** — rustdoc does not inline a re-export from another crate, so the
+  type has no body for the lint to compare and the break is invisible to it. This is the manual
+  judgement the versioning policy above reserves, in its exact shape. Note also that
+  `plecto-control` does not yet re-export `Verdict`, so `plecto_control::ConformanceCheck.verdict`
+  is a public field whose type cannot be named from that crate; reach it through `plecto_host` until
+  the re-export catches up.
+
+### Docs
+
+- **Six ADRs open the next slice.** Accepted: **000105** (the polyglot starter band and token-cost
+  admission as the first `plecto:filter@0.4.0` worked example), **000108** (version the conformance
+  battery under SemVer and define PIXIT as the manifest-derived test precondition — the decision
+  this release implements the library half of), **000109** (extend scaffold WIT vendoring to a
+  versioned `wit/deps/` tree and close vendoring at the single `new-filter` point), and **000110**
+  (fix `plecto dev`'s build / watch / artifact hand-off as a language-independent contract).
+  Proposed, no implementation: **000106** (lend filters an outbound TLS capability via an in-repo
+  `wasi:sockets` vendor and a own-bindgen reimplementation, keeping plaintext `outbound-tcp`'s
+  meaning intact) and **000107** (restate the Redis reference's promotion criteria as ten
+  falsifiable items, adding validation of the cost input). ADR 000081 moves to **accepted** — what
+  was accepted is the decision to declare that filter demo-only and to place promotion criteria on
+  it, not a claim that it became production-ready; it stays off the shelf.
+- **`crates/host/CONTEXT.md` defines PIXIT and conformance battery** as domain terms, including why
+  the operator's manifest is what supplies the former.
+- **`docs/writing-a-filter.md` and `plecto/examples/README.md`** carry the tokenlimit trio, and
+  `docs/reference-filters.md` records why it stays off the shelf.
+
+### Packaging
+
+- **`[package.metadata.docs.rs]` on all three library crates**, so docs.rs documents the
+  capability-gated API instead of dropping it: `plecto-host` and `plecto-control` build with
+  `outbound-http` / `outbound-tcp` / `fat-guest`, and `plecto-server` with the `capabilities`
+  umbrella (ADR 000079) over the same three. Not `all-features` — `test-support` makes `build.rs`
+  compile the guest fixtures for `wasm32-unknown-unknown` / `wasm32-wasip2` and
+  `polyglot-conformance` needs MoonBit / Node / wasi-sdk, none of which exist in the docs.rs
+  builder. The capability features alone need no wasm target, for the same reason the release
+  container can build `--features capabilities`: every fixture build is gated on `test-support`
+  first. The experimental `streaming-body` stays out, as it does from every shipped profile.
+- **The multi-replica example's pinned image follows the release**, `0.6.0` → `0.8.0` — it had been
+  left behind two releases (`PLECTO_IMAGE` still overrides it).
+
 ## [0.7.0] - 2026-08-09
 
 Minor bump, not a patch: this release removes public API from the crates.io-published

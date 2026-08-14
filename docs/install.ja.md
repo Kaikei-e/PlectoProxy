@@ -62,7 +62,9 @@ cargo install plecto
 | [`plecto-server`](https://crates.io/crates/plecto-server) | ライブラリとしての fast path: HTTP/1.1 · 2 · 3・TLS・routing・LB・upstream 管理 |
 
 CI ジョブが各リリースの公開 API を「crates.io にある最新版」と差分検査するので、バージョンを上げ忘れた
-破壊的変更は利用者のビルドではなく出荷前に落ちる。
+破壊的変更は利用者のビルドではなく出荷前に落ちる。ただし正直な限界が一つある: このツールは型の
+**パス**を比較するため、パスが変わらないまま隠れる破壊（cross-crate re-export 越しの変更など）は
+CHANGELOG の versioning policy が留保する手動判断のままである。
 
 ## Runtime capability profile
 

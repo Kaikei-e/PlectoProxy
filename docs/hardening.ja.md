@@ -54,8 +54,9 @@ client-IP ヘッダ family は従来どおり剥がされる。scheme はワイ�
 
 運用上の注意が二つ。`trusted` は信頼の付与であり、しかも非対称である——狭すぎれば復元が起きないだけだが、
 広すぎればその範囲に到達できる者が自分でクライアントアドレスを名乗れてしまう。迷ったら狭く取ること。
-そしてモードを切り替えると per-client のキー（バケット・ハッシュ割り当て）が別のキー空間へ移る。
-切り替え自体は無停止だが、カウンタは引き継がれない。
+そしてモードの切り替えは **reload ではなく restart** である——`[listen.trusted_proxy]` は起動時に
+固定されるため、`SIGHUP` だけでは何も変わらない。切り替えると per-client のキー（バケット・ハッシュ
+割り当て）が別のキー空間へ移り、カウンタは引き継がれない。
 
 ## マルチレプリカ構成でのレートリミット
 
@@ -118,7 +119,7 @@ external global rate-limit 配置と同型——しかも Plecto Proxy ではそ
 （[ADR 000061](ADR/000061.md)）: `outbound-tcp` capability（[ADR 000060](ADR/000060.md)）経由の、
 一般形の fixed-window counter（`INCRBY` + 無条件の `EXPIRE ... NX`、Redis 7.0+ / Valkey）。manifest の
 `[filter.config]`（`host-config` capability 経由、[ADR 000066](ADR/000066.md)）でバックエンド
-host/port・window・limit・cost 取得元、そして**必須**の `on_backend_error = "deny" | "allow"` を宣言
+host/port・window・limit・cost 取得元・route tag、そして**必須**の `on_backend_error = "deny" | "allow"` を宣言
 する——既定値は無く、Redis 障害時にルートを遮断するか local floor だけの可用性優先に倒すかを運用者が
 明示的に選ぶ。この filter は `isolation = "trusted"` を要求する: pooled instance が持続接続を跨リクエスト
 で保持し（毎回再接続しない）、同じ eager load-time instantiate が必須設定の欠落・不正値を毎リクエスト
@@ -129,7 +130,9 @@ host/port・window・limit・cost 取得元、そして**必須**の `on_backend
 `AUTH`・ACL・TLS のいずれも実装しておらず、trusted network 限定である。[ADR 000081](ADR/000081.md)
 が定める昇格条件——ACL user + `AUTH`（または同等の認証）、TLS（または同等の検証可能な暗号化）、
 manifest 直書きではない経路での資格情報配布——を満たすまでは、technical preview・学習用途の補助として
-扱い、フリート全体の production クォータの根拠にはしないこと。
+扱い、フリート全体の production クォータの根拠にはしないこと（この昇格条件は
+[ADR 000107](ADR/000107.md)（現状 proposed）が 10 項目の反証可能なチェックリストとして再確定し、
+cost 入力の検証を必須に加えている）。
 
 このうち三つ目には機構が入った: **`[filter.config_files]`**（[ADR 000095](ADR/000095.md)）は
 `host-config` のキーをファイルへ向け、ロード時と各リロード時に読む。よって資格情報は mount された

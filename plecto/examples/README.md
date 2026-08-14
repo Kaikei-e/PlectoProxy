@@ -2,9 +2,10 @@
 
 Runnable, use-case-focused demos — a guided path from a 5-minute hello up through the real things a
 gateway does. Each is one self-contained file that spins up the proxy **plus** its in-process
-upstreams, prints exactly what to `curl`, and cleans up on exit. Every demo loads its filter through
-the **production path** (cosign signature + SBOM verification, fail-closed), so nothing here is a toy
-shortcut.
+upstreams, prints exactly what to `curl`, and cleans up on exit. Every demo that loads a filter
+loads it through the **production path** (cosign signature + SBOM verification, fail-closed), so
+nothing here is a toy shortcut (the pure fast-path demos — `load-balancing`, `canary`,
+`resilience` — run no filter at all, by design).
 
 Run any of them with:
 
@@ -13,7 +14,8 @@ cargo run -p plecto-server --example <name>
 ```
 
 Each example directory has its own README with the exact `curl`s and their expected
-output; `./examples/try.sh <name>` (or `just demo <name>`) runs the whole scenario for you.
+output; `./examples/try.sh <name>` (or `just demo <name>`) runs the whole scenario for every
+demo except `quickstart`, which is just the plain `cargo run` above.
 
 ## Learning path
 
@@ -40,26 +42,34 @@ cross-replica TLS resumption (shared STEK), and downstream mTLS.
 
 **Advanced (feature-gated).** The outbound **ext_authz** capability (ADR 000036, `--features
 outbound-http`), the **outbound-tcp** capability (ADR 000060, `--features outbound-tcp` —
-`filters/filter-tcp-gate` and `filters/filter-ratelimit-redis`), and the **streaming body** filter
-(`--features streaming-body`) are exercised today by the host test suite and their guest crates
-(`filters/filter-extauthz`, `filters/filter-tcp-gate`, `filters/filter-ratelimit-redis`,
-`filters/filter-streaming`); dedicated server demos are a follow-up.
+`filters/filter-tcp-gate` and `filters/filter-ratelimit-redis`), the **fat-guest** minimal-WASI
+grant the Go guests need (ADR 000063, `--features fat-guest`), and the **streaming body** filter
+(`streaming-body`, a `plecto-host`-only feature) are exercised today by the host test suite and
+their guest crates (`filters/filter-extauthz`, `filters/filter-tcp-gate`,
+`filters/filter-ratelimit-redis`, `filters/filter-streaming`); dedicated server demos are a
+follow-up.
 
 ## Write your own filter
 
 [`filters/filter-template`](filters/filter-template/) is a self-contained starting point (the WIT
 contract is vendored, so it builds anywhere). Copy it, or `cargo generate` it — see its README.
+For a realistic policy to start from, copy one of the **tokenlimit starters** in the table below —
+[`filters/filter-tokenlimit-js`](filters/filter-tokenlimit-js/) carries the full
+build→sign→serve walkthrough.
 
 ## The filter guests (`filters/`)
 
-The WASM components the demos load. Each is its own workspace, built for `wasm32-unknown-unknown` and
-componentized by `crates/host/build.rs` (ADR 000010).
+The WASM component guests. The Rust guests are built by `crates/host/build.rs` — most for
+`wasm32-unknown-unknown` and componentized with wit-component (ADR 000010), the feature-gated ones
+directly for `wasm32-wasip2` — while the polyglot guests (JS / MoonBit / C / Go) are built outside
+cargo by their own `build.sh`. The demos above load only `filter-quickstart` / `filter-apikey` /
+`filter-hello`; the rest are conformance fixtures, references, and starters.
 
 | Guest | Role |
 |-------|------|
 | `filter-quickstart` | Minimal starter — stamps one response header (behind `quickstart`). |
-| `filter-apikey` | Real-world API-key auth gate (behind `wasm-auth`). |
-| `filter-hello` | The **conformance fixture** the host tests load — exercises every host-API. Not a starter (it does everything on purpose). |
+| `filter-apikey` | Real-world API-key auth gate (behind `wasm-auth` and `production`). |
+| `filter-hello` | The **conformance fixture** the host tests load — exercises every host-API. Also the stand-in filter for `filter-chain` / `hot-reload` / `tls-http`. Not a starter (it does everything on purpose). |
 | `filter-hello-moonbit` | Zero-WASI conformance port of `filter-hello` — MoonBit (Tier A). |
 | `filter-hello-js` | Zero-WASI conformance port of `filter-hello` — JS/TS via ComponentizeJS (Tier A). |
 | `filter-hello-c` | Zero-WASI conformance port of `filter-hello` — C via wasi-sdk (Tier A). |

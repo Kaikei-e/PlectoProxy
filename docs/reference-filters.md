@@ -41,7 +41,8 @@ the package settings (same quirk as the WIT packages, ADR 000064).
 Every shelf entry is still built against `plecto:filter@0.3.0` while the host's current contract
 is `plecto:filter@0.4.0`, and that is deliberate rather than a backlog item: the shelf IS the
 evidence for the compat promise (ADR 000064). The host keeps a load-time adapter per frozen
-track, and `crates/host/tests/compat_v0*.rs` runs these guests through it on every CI run, so
+track, and `crates/host/tests/compat_v0*.rs` exercises each adapter with a fixture guest on
+every CI run, while each shelf entry has its own per-filter suite (listed below), so
 "an older filter keeps working after a proxy upgrade" is a test result rather than a claim. A
 shelf entry moves to 0.4.0 when it needs something 0.4.0 adds, not on the version bump itself.
 

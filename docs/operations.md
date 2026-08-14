@@ -35,7 +35,9 @@ window_ms = 30000           # how long in-flight work may finish
 ```
 
 Both endpoints live on the admin listener (`[observability] admin_addr`), which is off by
-default — zero-downtime rollouts behind an LB require it to be set.
+default — zero-downtime rollouts behind an LB require it to be set. Note that `[listen.drain]`
+and `[observability]` are captured at startup: changing them is a restart, not a reload
+(see [Reload vs restart](#reload-vs-restart)).
 
 ## Probing from inside the container: `plecto healthz`
 
@@ -72,7 +74,7 @@ starts, those clients see refused connections — the exact blip the contract ex
 | No LB (direct clients, single instance) | `0` (the default). Nothing watches `/readyz`; a grace only delays shutdown. |
 | Kubernetes | ≥ readiness probe `periodSeconds × failureThreshold` of the Pod. Point the readinessProbe at `/readyz`, the livenessProbe at `/healthz`. |
 | Active health checks (interval × consecutive failures) | ≥ that product (plus any post-fail hold-down your front LB applies). |
-| Passive-plane health checks (interval × unhealthy threshold) | ≥ that product. |
+| Passive health checks (interval × unhealthy threshold) | ≥ that product. |
 | DNS-based routing | ≥ record TTL. If the TTL is minutes, prefer removing the record first and only then signalling. |
 
 Orchestrators that remove the replica from rotation *before* delivering `SIGTERM` (Kubernetes
@@ -100,7 +102,8 @@ The admin `/metrics` endpoint exposes, alongside the RED signals:
 
 ## The access log: field contract
 
-The access log is opt-in and **off by default**. Turn it on with `[observability] access_log`:
+The access log is opt-in and **off by default**. Turn it on with `[observability] access_log`
+(captured at startup, like the rest of `[observability]` — turning it on is a restart):
 
 ```toml
 [observability]
@@ -131,7 +134,7 @@ slots without unwrapping a nested object first.
 | `duration_ms` | number | Whole milliseconds from the start of the transaction to the response head. |
 | `trace_id` | string | W3C trace id (32 lowercase hex chars) — the caller's, when it sent a `traceparent`, otherwise one Plecto minted. |
 | `span_id` | string | W3C span id (16 lowercase hex chars) of Plecto's own request span — the id it propagates upstream. |
-| `response_body_inspection_skipped` | string \| null | Why a route that declared an `on-response-body` filter served a response that filter never saw ([ADR 000098](ADR/000098.md)): `streaming-content-type`, `content-encoding`, `partial-content`, or `over-cap`. `null` on every other transaction, including every route with no such filter. |
+| `response_body_inspection_skipped` | string (absent otherwise) | Why a route that declared an `on-response-body` filter served a response that filter never saw ([ADR 000098](ADR/000098.md)): `streaming-content-type`, `content-encoding`, `partial-content`, or `over-cap`. On every other transaction — including every route with no such filter — the key is **absent**, not `null`; don't pin an ingestion mapping on a null value. |
 
 Two properties this line is meant to keep:
 
@@ -313,7 +316,10 @@ plecto validate --resolve manifest.toml  # + digest pins, signatures, SBOM bindi
 Two things stay load-time-only, by design: contract-version support and trusted `init()` behaviour
 need compile/instantiate, which would break validate's "mutates nothing" contract — both still fail
 closed at the actual load. The authoring-side pipeline that feeds this check (`plecto conformance` →
-`plecto package` → pin the printed digest) is in [writing a filter §5](writing-a-filter.md).
+`plecto package` → pin the printed digest) is in [writing a filter §5](writing-a-filter.md); since
+0.8.0 the underlying gate scores each case with a five-way verdict, and everything except `pass`
+and `na` — including `environment`, a run that could not lend a capability the component imports —
+keeps the exit code non-zero.
 
 ## Reload vs restart
 
@@ -331,4 +337,9 @@ edit needed. A certbot deploy hook is therefore just `cp` (or the renewal itself
 config version, while secret material (private keys, the STEK, config-file values) rides a
 separate fingerprint that is deliberately never logged — a logged digest over a low-entropy
 secret would be an offline brute-force oracle. Two things still need a restart rather than a
-reload: `[trust]` and `[state]`, both rejected fail-closed by `SIGHUP`.
+reload: `[trust]` and `[state]`, both rejected fail-closed by `SIGHUP`. A third group is
+**startup-fixed rather than rejected**: the listener half of `[listen]` (`addr`,
+`advertised_port`, `proxy_protocol`, `trusted_proxy`, `drain` — everything except
+`[listen.client_auth]`, which a reload does consume) and all of `[observability]` are captured
+when the process starts. Editing only those sections leaves the config version unchanged, so
+`SIGHUP` logs "unchanged" and swaps nothing — plan a restart for them.

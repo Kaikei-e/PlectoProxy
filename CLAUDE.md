@@ -16,9 +16,12 @@
   ポリシー）。任意言語で書き、`plecto:filter` WIT 契約で差し込み、無停止で差し替える。
 
 M0（`plecto:filter` 契約 + wasmtime ホスト）・M1（filter-runtime 堅牢化 + trusted インスタンスプール）・
-M2 slice 1–5（HTTP/1.1·2·3 fast path + routing + rustls TLS 終端 + 複数 upstream の round-robin LB /
-active+passive health, ADR 000017）が着地済み。動かせるデモは `examples/<use-case>/`（ユースケース別、
-`cargo run -p plecto-server --example wasm-auth` など。旧 wasm-bindgen PoC は撤去）。設計が向かう先は
+M4（配布: OCI + cosign + SBOM、`plecto package`、SIGHUP reload、crates.io 公開）は着地済み。
+M2 fast path は slice 1–5（HTTP/1.1·2·3 + routing + rustls TLS 終端 + LB / active+passive health, ADR 000017）を
+超えて成熟中（mTLS 双方向・PROXY v2・WebSocket tunnel・circuit breaker / outlier / retry・compression 等）。
+M3 は Stage 1–2（async `call_async` + buffered body フック）、M5（traces / RED / OTLP）もおおむね着地。
+現況の正は [docs/ROADMAP.md](docs/ROADMAP.md)。動かせるデモは `examples/<use-case>/`（ユースケース別、
+`cargo run -p plecto-server --example wasm-auth` など）。設計が向かう先は
 **wasmtime 埋め込みホスト + Component Model フィルタ**で、作業はこの方向を主軸に置く。
 
 ## リポジトリ構成
@@ -29,19 +32,21 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 ├── CONTEXT-MAP.md             ← ドメイン用語集の地図（コンテキスト分割・全体横断語彙）
 ├── docs/design-principles.md  ← 設計思想の原典（EN 正 / .ja.md 同期。原則・方針・指針の三層）
 ├── docs/ADR/                  ← Architecture Decision Records（NNNNNN.md, 6桁）
-└── plecto/                    ← Rust workspace（fast path / host / control）
+└── plecto/                    ← Rust workspace（fast path / host / control / plecto CLI）
     ├── wit/                   ← plecto:filter ワールド（契約・contract-first）
     ├── deny.toml              ← cargo-deny サプライチェーン方針（CI ブロッキング）
     ├── crates/
     │   ├── host/              ← wasmtime 埋め込みホスト（plecto-host）。CONTEXT.md = Extension plane
     │   ├── control/           ← control plane（plecto-control）。CONTEXT.md = Control
     │   ├── server/            ← fast path ライブラリ（plecto-server）。tokio/hyper listener。CONTEXT.md = Fast path
-    │   └── plecto/            ← `plecto` バイナリ + operator CLI（validate/conformance/new-filter/dev/schema）。
-    │                             `cargo install plecto` の一等導線（ADR 000091）
+    │   └── plecto/            ← `plecto` バイナリ + operator CLI（serve/validate/conformance/package/
+    │                             new-filter/dev/healthz/schema）。`cargo install plecto` の一等導線（ADR 000091）
     └── examples/              ← 動かせるデモ（`<use-case>/` = cargo run -p plecto-server --example）と
-        └── filters/           ← 例フィルタ guest（独立 workspace・build.rs が component 化）
-            ├── filter-hello/  ← conformance 用フィクスチャ（wasm32-unknown-unknown ゲスト）
-            └── filter-apikey/ ← 実用例: API キー認証ゲート
+        └── filters/           ← 例フィルタ guest（独立 workspace）。Rust ゲストは crates/host/build.rs が
+            │                     component 化、多言語ゲスト（JS/MoonBit/C/Go）は各 build.sh がビルド
+            ├── filter-hello*/ ← conformance 用フィクスチャ（Rust/C/Go/JS/MoonBit の 5 言語）
+            ├── filter-apikey/ ほか実用例（cors/extauthz/jwt/ratelimit-redis/tcp-gate…）
+            └── filter-tokenlimit-{js,moonbit,go}/ ← practical starter 三兄弟（ADR 000105）
 ```
 
 ## コア原則（迷ったらこの順で優先）
@@ -49,7 +54,7 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 **安全 × ポータビリティ × セルフホスト性 × 運用の単純さ** ＞ 機能網羅性 × 強い権限 × 分散デフォルト。
 
 - **deny-by-default capability** — フィルタはホストが明示的に貸した能力以外、何も触れない（sandbox 強制）。
-- **判断は型で** — フィルタの戻り値は `decision` variant（request 側 `continue` / `modified` / `short-circuit`、response 側 `continue` / `modified` / `replace`、ADR 000073）。ヘッダ値は `list<u8>`（原文バイト、ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取る。
+- **判断は型で** — フィルタの戻り値は `decision` variant（request 側 `continue` / `modified` / `short-circuit`、response 側 `continue` / `modified` / `replace`、ADR 000073。body 側は `request-body-decision` / `response-body-decision`、ADR 000098 / 000104）。ヘッダ値は `list<u8>`（原文バイト、ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取る。
 - **init と per-request を分離** — 高コスト初期化は init フックへ、ホット経路は軽く保つ。
 - **フィルタはステートレス** — 状態はホスト KV（redb）に置く。
 - **fail-closed** — フィルタ trap / deadline 超過で素通り（fail-open）させない。
@@ -63,14 +68,14 @@ active+passive health, ADR 000017）が着地済み。動かせるデモは `exa
 cargo test --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-# WASM フィルタ
-# 現行（無 WASI / header-only, ADR 000010）: wasm32-unknown-unknown でビルドし wit-component で component 化
+# WASM フィルタ（現行契約 plecto:filter@0.4.0: header フック + buffered body フック, list<u8>）
+# Rust ゲスト（無 WASI, ADR 000010）: wasm32-unknown-unknown でビルドし wit-component で component 化
 cargo build --target wasm32-unknown-unknown --release   # crates/host/build.rs が ComponentEncoder で component 化
-# 将来（body / stream<u8> / wasi:http 再利用, wasmtime 46 以降）: wasm32-wasip2 へ移行
-cargo build --target wasm32-wasip2 --release      # Rust filter（→ componentize）
-# 多言語ゲスト（zero-WASI・検証済み）: MoonBit / JS (ComponentizeJS) / C (wasi-sdk)
-examples/filters/filter-hello-{moonbit,js,c}/build.sh   # 各 build.sh が WASI import ゼロを assert
-cargo test -p plecto-host --features polyglot-conformance --test polyglot   # 同一アサーションで検証
+# feature-gated ゲスト（outbound-http/tcp・streaming など）は wasm32-wasip2 直ビルド（build.rs が担当）
+# 多言語ゲスト: Tier A = zero-WASI（MoonBit / JS (ComponentizeJS) / C (wasi-sdk)）、Tier B = Go (TinyGo, wasi minimal)
+examples/filters/filter-hello-{moonbit,js,c,go}/build.sh   # Tier A の build.sh は WASI import ゼロを assert
+cargo test -p plecto-host --features polyglot-conformance --test polyglot                    # Tier A 検証
+cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyglot_tier_b   # Tier B 検証
 ```
 
 ## 規約
@@ -91,5 +96,5 @@ cargo test -p plecto-host --features polyglot-conformance --test polyglot   # �
   `web-researcher`
 - ドキュメント: `plecto-adr-writer`, `plecto-postmortem-writer`
 
-> 設計判断は常にプロジェクトの設計 tenets（上記コア原則 / Fork 1–10）に従属する。矛盾する変更を
-> 提案するときは、どの Fork を更新するかを明示し、必要なら ADR を書く。
+> 設計判断は常にプロジェクトの設計 tenets（上記コア原則 / `docs/design-principles.md` の原則 P1–P12）に
+> 従属する。矛盾する変更を提案するときは、どの原則を更新するかを明示し、必要なら ADR を書く。

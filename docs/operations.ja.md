@@ -35,7 +35,9 @@ window_ms = 30000           # in-flight の作業に許す完走時間
 ```
 
 両エンドポイントは admin リスナー（`[observability] admin_addr`、既定オフ）上にある。
-LB 背後での無瞬断ローリングデプロイには admin_addr の設定が前提になる。
+LB 背後での無瞬断ローリングデプロイには admin_addr の設定が前提になる。なお `[listen.drain]` と
+`[observability]` は起動時に固定される——変更は reload ではなく restart
+（[reload と restart の使い分け](#reload-と-restart-の使い分け) 参照）。
 
 ## コンテナ内部からのプローブ: `plecto healthz`
 
@@ -72,7 +74,7 @@ Kubernetes では admin エンドポイントへ直接 `httpGet` プローブを
 | LB なし（直接クライアント・単一インスタンス） | `0`（既定）。誰も `/readyz` を見ていないので、猶予は shutdown を遅らせるだけ。 |
 | Kubernetes | Pod の readiness probe `periodSeconds × failureThreshold` 以上。readinessProbe は `/readyz`、livenessProbe は `/healthz` に向ける。 |
 | Active health check（interval × 連続失敗回数） | その積以上（フロント LB が失敗後に保持する hold-down があれば加算）。 |
-| Data-plane health check（interval × unhealthy 閾値） | その積以上。 |
+| Passive health check（interval × unhealthy 閾値） | その積以上。 |
 | DNS ベースのルーティング | レコード TTL 以上。TTL が分単位なら、先にレコードを消してからシグナルを送る運用を推奨。 |
 
 `SIGTERM` 配送より**前に**ローテーションから外すオーケストレータ（Kubernetes は EndpointSlice
@@ -98,7 +100,8 @@ admin `/metrics` は RED シグナルに加えて次を出す:
 
 ## アクセスログ: フィールド契約
 
-アクセスログは opt-in で、既定では**無効**。`[observability] access_log` で有効にする:
+アクセスログは opt-in で、既定では**無効**。`[observability] access_log` で有効にする
+（`[observability]` の他の項目と同じく起動時固定——有効化は restart）:
 
 ```toml
 [observability]
@@ -129,7 +132,7 @@ access_log = true
 | `duration_ms` | number | トランザクション開始から応答ヘッダまでのミリ秒（整数）。 |
 | `trace_id` | string | W3C trace id（小文字 hex 32 桁）。呼び出し元が `traceparent` を送っていればその値、なければ Plecto が採番した値。 |
 | `span_id` | string | Plecto 自身の request span の W3C span id（小文字 hex 16 桁）。upstream へ伝播するのもこの id。 |
-| `response_body_inspection_skipped` | string \| null | `on-response-body` フィルタを宣言したルートで、そのフィルタが見られなかったレスポンスの理由（[ADR 000098](ADR/000098.md)）: `streaming-content-type` / `content-encoding` / `partial-content` / `over-cap`。それ以外のトランザクション（該当フィルタを持たないルートを含む）では `null`。 |
+| `response_body_inspection_skipped` | string（該当時のみ） | `on-response-body` フィルタを宣言したルートで、そのフィルタが見られなかったレスポンスの理由（[ADR 000098](ADR/000098.md)）: `streaming-content-type` / `content-encoding` / `partial-content` / `over-cap`。それ以外のトランザクション（該当フィルタを持たないルートを含む）ではキー自体が**出ない**（`null` にはならない——取り込みマッピングを null 値に固定しないこと）。 |
 
 この行が守る性質は 2 つ:
 
@@ -306,6 +309,9 @@ plecto validate --resolve manifest.toml  # + digest pin・署名・SBOM binding
 compile / instantiate を要し、validate の「何も変異しない」契約を壊すため — どちらも実ロード時に
 fail-closed のまま検出される。この検査に供給する authoring 側パイプライン（`plecto conformance` →
 `plecto package` → 印字された digest を pin）は [writing a filter §5](writing-a-filter.md) を参照。
+0.8.0 以降、下層の conformance ゲートは case ごとに五値の verdict を付け、`pass` と `na` 以外——
+component が import する capability を実行側が貸せなかった `environment` を含む——はすべて
+exit code を非 0 に保つ。
 
 ## reload と restart の使い分け
 
@@ -323,3 +329,8 @@ deploy hook は「配置（あるいは更新そのもの）＋ `kill -HUP`」�
 設定ファイルの値）は**意図的にログへ出さない**別の fingerprint に乗る——低エントロピーな秘密の
 digest がログに出れば、それはオフライン総当たりのオラクルになるため。reload ではなく restart が
 必要なのは `[trust]` と `[state]` の 2 つで、どちらも `SIGHUP` が fail-closed で拒否する。
+もう一群、**拒否されず起動時固定**のものがある: `[listen]` のリスナー半分（`addr` /
+`advertised_port` / `proxy_protocol` / `trusted_proxy` / `drain`——reload が消費する
+`[listen.client_auth]` だけが例外）と `[observability]` 全体はプロセス起動時に取り込まれる。
+これらのセクションだけを編集しても config version は変わらないため、`SIGHUP` は
+「unchanged」をログして何も差し替えない——ここは restart を予定に入れること。

@@ -34,7 +34,7 @@ The fast path and the extension plane are not in a hierarchy or a master–serva
 
 ### P3 — Decisions travel as types; even the absence of a capability is a type
 
-A filter's return value is never a bare flag or boolean but always a WIT `variant`: on the request side the three-valued `continue` / `modified(request-edit)` / `short-circuit(http-response)`; on the response side `continue` / `modified(response-edit)`. As the WIT source comments put it: **"Never a bare flag."** (Tenet 3.)
+A filter's return value is never a bare flag or boolean but always a WIT `variant`: on the request side the three-valued `continue` / `modified(request-edit)` / `short-circuit(http-response)`; on the response side `continue` / `modified(response-edit)` / `replace(http-response)` (ADR 000073); the body hooks return their own `request-body-decision` / `response-body-decision` (ADR 000098 / 000104). As the WIT source comments put it: **"Never a bare flag."** (Tenet 3.)
 
 The principle covers **absence** as well as presence. The contract is split into a header-only `filter` world and a body-reading `filter-body` world, so the very **absence** of an `on-request-body` export is a machine-verifiable fact — "this filter does not read the body" — from which the host derives skipping body buffering entirely (zero-copy passthrough; ADR 000005 / 000025 / 000038). Deriving performance optimisation **from the shape of the contract** rather than from operator vigilance is the heart of Plecto Proxy's type design.
 
@@ -88,33 +88,34 @@ Untrusted input is never allowed to take a worker down. Filter traps are isolate
 
 ## Chapter 2 — Architectural policy: how structure is chosen
 
-### 2.1 Three bounded contexts
+### 2.1 Four bounded contexts
 
-Plecto Proxy's Rust workspace consists of three bounded contexts, each with its own `CONTEXT.md`. A
-fourth crate, `plecto` (ADR 000091), is a thin operator-CLI entry point over Fast path + Control
-(`cargo install plecto`) — it introduces no context of its own, and only exists as the landing spot
-for the CLI once it was split out of `plecto-server`.
+Plecto Proxy's Rust workspace consists of four bounded contexts, each with its own `CONTEXT.md`.
+The fourth, `plecto` (ADR 000091), is a thin operator-CLI entry point over the three libraries
+(`cargo install plecto`) — the data plane, control plane, and wasmtime host all live in the
+library crates, and the CLI layer stays thin.
 
 | Context | crate | Responsibility |
 |---|---|---|
 | **Fast path** | `plecto-server` | Connection acceptance, TLS termination, HTTP/1.1/2/3, route matching, chain driving, upstream forwarding (ADR 000013) |
 | **Extension plane / host runtime** | `plecto-host` | The embedded wasmtime host. Enforcement of the `plecto:filter` contract, the filter execution model, the capability boundary (host-API) |
 | **Control** | `plecto-control` | Declarative manifest, loading through the provenance gate, zero-downtime reload, config versions. "What is loaded, and when it swaps" |
+| **plecto binary / operator CLI** | `plecto` | The end-user entry point: `serve` plus the operator CLI (validate / conformance / package / new-filter / dev / healthz / schema) (ADR 000091) |
 
-Three relations: **Fast path → Extension plane** (drives the chain per request), **Control → Extension plane** (the manifest digest-pins filters and declares chain order and trust roots; reload swaps atomically), **Control → Fast path** (the manifest declares routes and targets; the fast path takes a per-request `ConfigSnapshot` to select routes). The contract `wit/` sits at the workspace root, belonging to no crate — the contract is shared property between contexts, owned by none of them.
+Three relations: **Fast path → Extension plane** (drives the chain per request), **Control → Extension plane** (the manifest digest-pins filters and declares chain order and trust roots; reload swaps atomically), **Control → Fast path** (the manifest declares routes and targets; the fast path takes a per-request `ConfigSnapshot` to select routes). The contract `wit/` sits at the workspace root — shared property between contexts, owned by none of them (a byte-identical copy is vendored into `crates/host/wit/` for `cargo package`, with CI checking the two never drift).
 
 ### 2.2 Contract architecture (`plecto:filter@0.4.0`)
 
-The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. Header values are `list<u8>` (ADR 000071); `on-response` receives the as-forwarded request snapshot and `response-decision` carries a `replace` arm, so P3 (decisions as types) holds symmetrically on the response side (ADR 000073). `0.1.0` / `0.2.0` remain loadable via frozen trees + host adapters. The current contract's structure:
+The contract is defined as its own world, with type convergence toward `wasi:http` (proxy / middleware) fixed as the M3 direction (ADR 000002 / 000020). Deny-by-default is maintained independently of the type vocabulary. Header values are `list<u8>` (ADR 000071); `on-response` receives the as-forwarded request snapshot and `response-decision` carries a `replace` arm, so P3 (decisions as types) holds symmetrically on the response side (ADR 000073). `0.1.0` / `0.2.0` / `0.3.0` remain loadable via frozen trees + host adapters. The current contract's structure:
 
 - **types**: `http-request` / `http-response` (header values are raw bytes), `request-edit` / `response-edit` (rewrites expressed as diffs), and the typed decision variants — request-side `continue` / `modified` / `short-circuit`, response-side `continue` / `modified` / `replace` (ADR 000073).
 - **host-API (six capabilities; 1 interface = 1 capability)**: `host-log` / `host-clock` (wall-clock snapshot captured once at request start) / `host-kv` / `host-counter` / `host-ratelimit` (token bucket stays **host-native**) / `host-config` (read-only manifest `[filter.config]`, ADR 000066).
-- **Two worlds**: `filter` (header-only) and `filter-body` (+ `on-request-body`, buffer-then-decide, `list<u8>` in v1). The duplication instead of `include` is a deliberate workaround for WIT's `use`-propagation semantics, with the reason recorded in comments — **the contract file carrying its own design annotations is this repository's house style.**
+- **Two worlds**: `filter` (header-only) and `filter-body` (+ `on-request-body` / `on-response-body`, buffer-then-decide, `list<u8>` in v1; a component may export any subset of the body hooks — the two worlds are the ends of that lattice). The duplication instead of `include` is a deliberate workaround for WIT's `use`-propagation semantics, with the reason recorded in comments — **the contract file carrying its own design annotations is this repository's house style.**
 - **Experimental**: `plecto:filter-streaming` (`stream<u8>`, async) is quarantined behind the off-by-default `streaming-body` feature and stays out of the default build until `wasm32-wasip3` reaches Tier 2.
 
-Contract-evolution policy: changes are additive by default; true streaming of bodies has a reserved seat in the contract as the `list<u8>` → `stream<u8>` swap. Hot-path work (rate-limit refill and the like) drops out of the contract into native — "the WASM tax is paid only on decision logic." `plecto new-filter` fetches the published contract via `wkg` today (ADR 000064 / 000065); ADR 000072 accepts offline self-vendoring of the same `wit/world.wit` the host bindgen reads as the follow-on.
+Contract-evolution policy: changes are additive by default; true streaming of bodies has a reserved seat in the contract as the `list<u8>` → `stream<u8>` swap. Hot-path work (rate-limit refill and the like) drops out of the contract into native — "the WASM tax is paid only on decision logic." `plecto new-filter` writes the contract compiled into the binary itself — the offline self-vendoring ADR 000072 accepted, no network involved; `wkg` publication (ADR 000064 / 000065) remains the distribution channel for authors not using the scaffold.
 
-The compatibility promise is **staged** (ADR 000085). Through 0.x, the shipped policy stands: the host keeps loading every contract version it has shipped support for (0.1 / 0.2 run today via frozen trees + load-time adapters), and a superseded major stays accepted for at least two release series before an ADR-declared removal (ADR 000064). From contract 1.0 onward, **every shipped world stays loadable permanently** — the sole exception, "keeping this world loadable is itself unsafe to maintain", requires a dedicated ADR, at least 24 months' notice, and a migration document. Cutting 1.0 is the act that brings this pledge into force, so 1.0 is a milestone of promise, not of feature count.
+The compatibility promise is **staged** (ADR 000085). Through 0.x, the shipped policy stands: the host keeps loading every contract version it has shipped support for (0.1 / 0.2 / 0.3 run today via frozen trees + load-time adapters), and a superseded major stays accepted for at least two release series before an ADR-declared removal (ADR 000064). From contract 1.0 onward, **every shipped world stays loadable permanently** — the sole exception, "keeping this world loadable is itself unsafe to maintain", requires a dedicated ADR, at least 24 months' notice, and a migration document. Cutting 1.0 is the act that brings this pledge into force, so 1.0 is a milestone of promise, not of feature count.
 
 ### 2.3 Execution model: a lifecycle that branches on trust
 
@@ -123,7 +124,7 @@ The precise definition of "stateless" (P6) makes the two-way branch of instance 
 - **trusted**: checked out per request from a fixed-capacity, lazily-filled instance pool and reused (init runs once; init derivatives stay resident). Exhaustion means a bounded wait then fail-closed. A pool-wide circuit breaker and recycle-after-N bound state accumulation and failure.
 - **untrusted**: fresh-per-request instantiation. Linear memory is **fresh by construction** (not an active zeroize operation). The lesson of CVE-2022-39393 (slot-reuse leakage under pooling + memory-init-cow; fixed in wasmtime 2.0.2) is carved into the design as defence-in-depth even though it is long fixed.
 
-Runtime bounding is layered: epoch interruption (a CPU budget; chosen over fuel per wasmtime's own report that it is lighter. It is not a wall-clock SLA, so blocking host calls carry a separate host-timeout — a two-layer design), `StoreLimits` memory caps, table caps, per-filter + host-wide state quotas (fail-closed on excess), and a tightened init deadline for untrusted filters (ADR 000027). The sync chain is bridged to the tokio fast path via `spawn_blocking` (ADR 000013); from wasmtime 46 the host runs guest hooks with `call_async` (fibers) (M3 Stage 1).
+Runtime bounding is layered: epoch interruption (a CPU budget; chosen over fuel per wasmtime's own report that it is lighter. It is not a wall-clock SLA, so blocking host calls carry a separate host-timeout — a two-layer design), `StoreLimits` memory caps, table caps, per-filter + host-wide state quotas (fail-closed on excess), and a tightened init deadline for untrusted filters (ADR 000027). The sync chain is bridged to the tokio fast path via `spawn_blocking` (ADR 000013); the host runs guest hooks with `call_async` (fibers) (M3 Stage 1), on a pinned wasmtime whose newly default-on language proposals (GC, exception handling) are explicitly turned back off (ADR 000096).
 
 ### 2.4 Fast-path policy: deterministic matching, layered resilience
 

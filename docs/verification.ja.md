@@ -23,12 +23,12 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 | 供給網ポリシー（ライセンス・advisory・取得元） | `cargo-deny`（ci.yml） | 全 PR + main |
 | crates.io 公開ライブラリ 3 クレートの公開 API semver（最新公開版との差分） | `semver-checks`（ci.yml） | 全 PR + main |
 | workflow のセキュリティ lint（`zizmor`、`.github/workflows/` 全体） | `workflow-lint`（ci.yml） | 全 PR + main |
-| ADR グラフ（append-only エッジ・wikilink・frontmatter）**と** WIT / guest テンプレートの vendoring ドリフト | `fmt` / `docs`（ci.yml → `scripts/check_adr_graph.py`・`scripts/check_wit_vendoring.py`） | 全 PR + main |
+| ADR グラフ（append-only エッジ・wikilink・frontmatter——`docdag validate` + `scripts/check_adr_graph.py`）**と** WIT / guest テンプレートの vendoring ドリフト（`scripts/check_wit_vendoring.py`） | `docs` / `fmt`（ci.yml） | 全 PR + main |
 | 両 capability profile の release ビルド | `release-parity`（ci.yml） | main のみ（merge-heavy） |
 | **Fuzzing** — `plecto/fuzz/` の全 libfuzzer ターゲットを、コミット済み corpus 起点で時間制限つき実行 | `fuzz`（[fuzz.yml](../.github/workflows/fuzz.yml)） | 週次 + 手動 |
 | release gate: その commit で `main` CI が green のときのみ tag がリリースされる | `gate`（[release.yml](../.github/workflows/release.yml)） | 全 tag |
-| 署名付き成果物: cargo-auditable バイナリ、SPDX SBOM、**digest への** cosign keyless 署名、provenance / SBOM attestation、署名付き reference-filter OCI artifact | `binaries` / `container-*` / `filter-publish`（release.yml） | 全 tag |
-| unsolicited PR ポリシー（招待制コントリビューション） | [pr-policy.yml](../.github/workflows/pr-policy.yml) | 全 PR |
+| 署名付き成果物: cargo-auditable バイナリ、SPDX SBOM、**digest への** cosign keyless 署名、provenance / SBOM attestation、WIT 契約の OCI artifact 公開、署名付き reference-filter OCI artifact | `binaries` / `container-*` / `wit-publish` / `filter-publish`（release.yml） | 全 tag |
+| unsolicited PR ポリシー（招待制コントリビューション） | [pr-policy.yml](../.github/workflows/pr-policy.yml) | PR open 時 |
 
 正直な限界（含意ではなく明記する）:
 

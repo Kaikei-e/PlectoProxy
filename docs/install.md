@@ -62,7 +62,10 @@ program rather than running it as one:
 | [`plecto-server`](https://crates.io/crates/plecto-server) | The fast path as a library: HTTP/1.1 · 2 · 3, TLS, routing, load balancing, upstream management. |
 
 A CI job diffs each release's public API against the newest version already published, so an
-unbumped breaking change fails before it ships rather than in a consumer's build.
+unbumped breaking change fails before it ships rather than in a consumer's build — with one
+honest bound: the tool compares type paths, so a break hiding behind an unchanged path (such as
+a cross-crate re-export) still needs the manual judgement the CHANGELOG's versioning policy
+reserves.
 
 ## Runtime capability profiles
 

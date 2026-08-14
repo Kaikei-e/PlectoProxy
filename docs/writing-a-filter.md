@@ -367,6 +367,9 @@ unhealthy_threshold = 3               # optional (default 3)
 port = 9100                           # optional (default: probe the instance's own traffic port)
 [upstream.tls]                        # optional (absent = plain HTTP/1.1 to every instance)
 ca_path = "certs/internal-ca.pem"     # optional: replaces the webpki roots (self-signed / internal CA)
+sni = "internal.example"              # optional: verification-name override (IP-literal / DNS-expanded endpoints)
+client_cert_path = "certs/client.pem" # optional: present a client identity (upstream mTLS, ADR 000078)
+client_key_path = "certs/client.key"  # required when client_cert_path is set
 ```
 
 Every upstream **requires** a `[upstream.health]` block with at least `path`, because instances start
@@ -381,11 +384,12 @@ re-resolves a hostname address on an interval (Compose service names, k8s headle
 
 ```toml
 [[route]]
-path_prefix = "/api"     # required: match requests whose path starts here (longest prefix wins)
 upstream = "app"         # required: the [[upstream]] name to forward a passing request to
 filters = ["my-filter"]  # optional: filter ids run in order (empty = pure pass-through)
-host = "example.com"     # optional: match only this authority (case-insensitive); omit = any host
 strip_prefix = "/api"    # optional: strip this prefix before forwarding (the chain saw the original)
+[route.match]            # required: the match dimensions, ANDed
+path_prefix = "/api"     # required: match requests whose path starts here (longest prefix wins)
+host = "example.com"     # optional: match only this authority (case-insensitive); omit = any host
 [route.timeouts]         # optional: absent = the upstream's own timeouts apply, unchanged
 request_timeout_ms = 30000 # optional: overrides the upstream's per-try bound; 0 disables it here
 overall_timeout_ms = 45000 # optional: overrides the upstream's overall bound; 0 = no overall bound
@@ -442,6 +446,10 @@ trusted = ["10.0.0.0/8"] # required when present: CIDRs of the L7 front proxies 
 ```
 
 `[listen]` is captured at startup — a reload does not re-bind or change it; restart to apply.
+(The one exception is `[listen.client_auth]`, inbound-mTLS client verification, which a reload
+*does* consume — a rotated client-CA bundle is picked up by `SIGHUP`. That block and
+`[listen.drain]`, the graceful-shutdown knobs, are covered in the
+[hardening](hardening.md) and [operations](operations.md) guides.)
 With `[listen.proxy_protocol]`, a peer inside `trusted` MUST open every TCP connection with a
 PROXY v2 header (its `LOCAL` command — LB health checks — keeps the real endpoints), and the
 restored client address feeds the per-client-IP rate limit, `X-Forwarded-For`/`X-Real-IP`
@@ -510,7 +518,7 @@ The fastest contract-level check, no manifest or upstream needed, is `plecto con
 (ADR 000065) against a built component:
 
 ```bash
-plecto conformance my-filter/dist/my_filter.component.wasm
+plecto conformance my-filter.component.wasm   # §3's output (JS builds emit dist/*.component.wasm)
 ```
 
 It self-signs with a throwaway key (never your persistent `.plecto/dev-key`) and checks the
@@ -519,6 +527,16 @@ gate, and it handles a generic request without trapping or exceeding its deadlin
 check your filter's specific policy (e.g. "does it block the right headers") — that is what §1's
 world and your own test requests are for. `plecto dev` (§5) runs this same battery automatically
 before every reload.
+
+Since 0.8.0 the battery underneath is **versioned** (`battery@1.0.0`, cases `v1.0.0-S1` /
+`v1.0.0-D1`) and scores each case with a five-way verdict: `pass` / `fail` / `na` /
+`inconclusive` / `environment`. `environment` means the run could not lend a capability your
+component imports — a bare `plecto conformance` lends nothing, so a filter built with
+`outbound-http` or `wasi = "minimal"` lands here. That is a diagnosis ("nothing lent it"), not a
+defect ("it doesn't satisfy the world"), but it still exits non-zero, and today's CLI still
+prints it as `FAIL` — the verdict vocabulary reaches the CLI with ADR 000108's `--battery` /
+`--manifest --filter` flags, decided but not yet wired. Until then, running the battery with
+your manifest's grants is a `plecto-host` library call (`run_conformance_with`).
 
 The fastest way to see *your* filter run end to end is to adapt an example:
 
@@ -696,7 +714,7 @@ disappear without a major bump. Do not depend on it outside an explicit opt-in b
 ### Compatibility policy
 
 The contract's version is **independent of Plecto's own release version** — CHANGELOG.md's
-versioning policy already says so. `plecto:filter@0.4.0` and a `plecto` binary at `0.6.x` is the
+versioning policy already says so. `plecto:filter@0.4.0` and a `plecto` binary at `0.8.x` is the
 normal, expected state.
 
 - **SemVer, additive = minor, breaking = major.** A new capability interface, a new optional
@@ -747,6 +765,6 @@ output, the full four-part diagnostic (code, cause, suggestion, docs link) is pr
 | Code | Where it appears | Meaning | What to do |
 |------|------------------|---------|------------|
 | `PLECTO-E0001` | startup error / reload log | the component or SBOM signature does not verify against any key in the manifest's `[trust]` | sign with a key listed under `[trust]` (cosign sign-blob or your CI's signer); for local dev, `plecto dev` signs with `.plecto/dev-key` automatically ([ADR 000006](ADR/000006.md)) |
-| `PLECTO-E0002` | `429` response header | the request exceeded the filter's host-native rate-limit bucket | raise `[filter.ratelimit]` capacity / `refill_per_sec`, or have the client back off per the 429's `retry-after` header ([ADR 000026](ADR/000026.md)) |
+| `PLECTO-E0002` | `429` response header | the request exceeded the route's native rate-limit floor (`[route.rate_limit]`, checked before the chain runs) | raise the route's `rate` / `burst`, or have the client back off per the 429's `retry-after` header ([ADR 000033](ADR/000033.md)) |
 | `PLECTO-E0003` | `400` response header | the request path failed normalization (`..` traversal, invalid percent-encoding, or a raw control byte) | this rejects the client's request, not your manifest — check what the client sends as the path ([ADR 000013](ADR/000013.md)) |
 | `PLECTO-E0004` | `plecto validate` warning | a `[trust]` key file carries the dev-key marker (generated by `plecto dev` / `plecto new-filter`) | expected for a dev manifest; for production, replace it with a key from your real signing pipeline ([ADR 000065](ADR/000065.md)) |

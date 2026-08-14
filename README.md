@@ -133,12 +133,12 @@ is **[docs/quickstart/](docs/quickstart/README.md)**. Signed binaries, `cargo in
 the two runtime capability profiles are in [docs/install.md](docs/install.md).
 
 Nine runnable demos cover auth, load balancing, TLS across HTTP/1.1 · 2 · 3, hot reload, canary,
-and resilience — each loading its filter through the production path (signature + SBOM verified,
-fail-closed) and printing the `curl` commands to run:
+and resilience — every demo that loads a filter loads it through the production path (signature +
+SBOM verified, fail-closed) — and each prints the `curl` commands to run:
 
 ```bash
 cd plecto
-./examples/try.sh quickstart   # guided: runs it, curls it, cleans up (or `all`)
+./examples/try.sh wasm-auth   # guided: runs it, curls it, cleans up (or `all`)
 ```
 
 [`plecto/examples/README.md`](plecto/examples/README.md) is the learning path;
@@ -157,7 +157,9 @@ checks, outlier detection, circuit breakers, two-tier timeouts, and jittered ret
 re-encrypt with TLS+ALPN and re-resolve from DNS; WebSocket tunnels splice end to end. Inbound
 admission control caps connections globally *and* per source IP; ingress path normalization makes
 route selection a reliable auth boundary. The binary wires SIGHUP reload, graceful shutdown, OTLP
-export, and an operator CLI covering a filter's whole lifecycle.
+export, and an operator CLI covering a filter's whole lifecycle — scaffold, dev loop, a
+versioned conformance battery, packaging/signing, and a CI pre-flight of the loader's own
+provenance gate.
 
 **[docs/features.md](docs/features.md)** is the full table, concern by concern, with the deciding
 ADR on every row — and what is deliberately *not* there.
@@ -167,7 +169,9 @@ ADR on every row — and what is deliberately *not* there.
 A filter is a component that implements the world — the in-tree example, in Rust:
 
 ```rust
-wit_bindgen::generate!({ path: "../../../wit", world: "filter" });
+wit_bindgen::generate!({ path: "../../../wit/v0.3.0", world: "filter" });
+
+use crate::plecto::filter::types::{Header, ResponseEdit};
 
 struct FilterQuickstart;
 
@@ -184,7 +188,7 @@ impl Guest for FilterQuickstart {
             set_status: None,
             set_headers: vec![Header {
                 name: "x-plecto".into(),
-                value: b"hello-from-wasm".to_vec(), // list<u8> header values (@0.3.0)
+                value: b"hello-from-wasm".to_vec(), // list<u8> header values
             }],
             remove_headers: vec![],
         })
@@ -195,9 +199,13 @@ export!(FilterQuickstart);
 ```
 
 That targets the header-only `filter` world, so the host streams the body straight through; a
-filter that needs the body targets `filter-body` and adds one export. Start with `plecto
-new-filter --lang rust my-filter`, which scaffolds the crate, vendors the WIT contract, and writes
-a ready-to-run dev manifest.
+filter that needs the body targets `filter-body` and adds body exports (`on-request-body` /
+`on-response-body` — any subset). The example pins the frozen `0.3.0` world it was written
+against, which the host keeps loading. Start with `plecto new-filter --lang rust my-filter`,
+which scaffolds the crate, vendors the current WIT contract, and writes a ready-to-run dev
+manifest — or copy one of the three **tokenlimit starters**
+(`filter-tokenlimit-{js,moonbit,go}`): one token-budget policy for LLM upstreams in three
+languages, the first example guests written against `plecto:filter@0.4.0`.
 
 Because the contract is WIT, **any language that compiles to a WASM component can write a filter**,
 proven two ways. **Tier A (zero-WASI, the default)**: the same conformance subset ported to

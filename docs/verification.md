@@ -23,12 +23,12 @@ requires). Scheduled jobs cover what neither needs to block on.
 | Supply-chain policy (licenses, advisories, sources) | `cargo-deny` (ci.yml) | every PR + main |
 | Public-API semver of the crates.io library crates, diffed against the newest published version | `semver-checks` (ci.yml) | every PR + main |
 | Workflow security lint (`zizmor`) over `.github/workflows/` | `workflow-lint` (ci.yml) | every PR + main |
-| ADR graph (append-only edges, wikilinks, frontmatter) **and** WIT/template vendoring drift | `fmt` / `docs` (ci.yml → `scripts/check_adr_graph.py`, `scripts/check_wit_vendoring.py`) | every PR + main |
+| ADR graph (append-only edges, wikilinks, frontmatter — `docdag validate` + `scripts/check_adr_graph.py`) **and** WIT/template vendoring drift (`scripts/check_wit_vendoring.py`) | `docs` / `fmt` (ci.yml) | every PR + main |
 | Release-profile builds of both capability profiles | `release-parity` (ci.yml) | main only (merge-heavy) |
 | **Fuzzing** — every libfuzzer target (`plecto/fuzz/`), bounded run from the committed corpus | `fuzz` ([fuzz.yml](../.github/workflows/fuzz.yml)) | weekly + on demand |
 | Release gate: a tag only releases if `main` CI was green for that commit | `gate` ([release.yml](../.github/workflows/release.yml)) | every tag |
-| Signed artifacts: cargo-auditable binaries, SPDX SBOM, cosign keyless signatures **by digest**, provenance/SBOM attestations, signed reference-filter OCI artifacts | `binaries` / `container-*` / `filter-publish` (release.yml) | every tag |
-| Unsolicited-PR policy (invitation-only contributions) | [pr-policy.yml](../.github/workflows/pr-policy.yml) | every PR |
+| Signed artifacts: cargo-auditable binaries, SPDX SBOM, cosign keyless signatures **by digest**, provenance/SBOM attestations, the WIT contract as an OCI artifact, signed reference-filter OCI artifacts | `binaries` / `container-*` / `wit-publish` / `filter-publish` (release.yml) | every tag |
+| Unsolicited-PR policy (invitation-only contributions) | [pr-policy.yml](../.github/workflows/pr-policy.yml) | every PR when opened |
 
 Honest bounds, stated rather than implied:
 

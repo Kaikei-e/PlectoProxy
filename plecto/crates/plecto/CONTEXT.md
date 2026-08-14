@@ -1,6 +1,6 @@
 # plecto binary — 用語集
 
-`plecto` バイナリと operator CLI（validate / conformance / new-filter / dev / schema）を持つ
+`plecto` バイナリと operator CLI（validate / conformance / package / new-filter / dev / healthz / schema）を持つ
 エンドユーザ入口のクレート。データプレーン・コントロールプレーン・wasmtime ホストの実体は
 ライブラリ 3 クレート（`plecto-server` / `plecto-control` / `plecto-host`）にあり、本クレートは
 その上の薄い CLI 層に徹する（`cargo install plecto` の一等導線）。全体像と他コンテキストとの
@@ -10,7 +10,8 @@
   fast path を起動する主経路（ADR 000013）。SIGHUP hot reload / SIGTERM graceful drain は
   ライブラリ側の実装をそのまま配線する（ADR 000008 / 000039）。
 - **operator CLI** — `validate`（設定を検証して終了する型の静的検証、ADR 000046）、`schema`（manifest の
-  JSON Schema、ADR 000049）、`--version`（capability profile 表示、ADR 000079）、`healthz`
+  JSON Schema、ADR 000049）、`--version`（capability profile ＋ 対応 filter contract 版の表示、
+  ADR 000079 / 000099）、`healthz`
   （自己プローブ）、`package`（CI パッケージング）。
 - **healthz（自己プローブ）** — `plecto healthz [--live] [--admin-addr] [<manifest>]`。distroless
   イメージ内から admin エンドポイントを 1 回 GET し、2xx なら exit 0・それ以外は 1（Docker が

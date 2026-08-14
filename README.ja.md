@@ -131,12 +131,12 @@ manifest・スタンドイン backend・最初のプロキシ応答までのコ�
 2 つの runtime capability profile は [docs/install.ja.md](docs/install.ja.md)。
 
 自己完結デモが 9 つあり、認証・ロードバランシング・HTTP/1.1 · 2 · 3 の TLS 終端・hot reload・canary・
-resilience を扱う。どれも**本番ロードパス**（署名 + SBOM 検証、fail-closed）でフィルタを読み、
-貼り付け用の `curl` を表示する:
+resilience を扱う。フィルタを載せるデモはどれも**本番ロードパス**（署名 + SBOM 検証、fail-closed）で
+読み、いずれも貼り付け用の `curl` を表示する:
 
 ```bash
 cd plecto
-./examples/try.sh quickstart   # 起動・curl・後片付けまで自動（または `all`）
+./examples/try.sh wasm-auth   # 起動・curl・後片付けまで自動（または `all`）
 ```
 
 学習パスは [`plecto/examples/README.md`](plecto/examples/README.md)。
@@ -154,7 +154,9 @@ least-request・weighted Maglev）。その背後に health check・outlier dete
 二段 timeout・jittered retry が付く。upstream への脚は TLS+ALPN で再暗号化し DNS を再解決する。
 WebSocket トンネルは end-to-end で成立する。inbound の admission control は接続数を全体*と*送信元 IP
 単位で抑え、ingress の path 正規化が route 選択を信頼できる認証境界にする。出荷バイナリには SIGHUP
-reload・graceful shutdown・OTLP export・フィルタの全ライフサイクルを覆う operator CLI が配線済み。
+reload・graceful shutdown・OTLP export・フィルタの全ライフサイクルを覆う operator CLI——scaffold・
+dev ループ・版付き conformance battery・パッケージング/署名・loader 自身の provenance ゲートの
+CI pre-flight——が配線済み。
 
 概念ごとの完全な表（各行に決定 ADR つき）と、**意図的に置いていないもの**の一覧は
 **[docs/features.ja.md](docs/features.ja.md)**。
@@ -164,7 +166,9 @@ reload・graceful shutdown・OTLP export・フィルタの全ライフサイク�
 フィルタはワールドを実装したコンポーネントにすぎない——同梱の例（Rust）:
 
 ```rust
-wit_bindgen::generate!({ path: "../../../wit", world: "filter" });
+wit_bindgen::generate!({ path: "../../../wit/v0.3.0", world: "filter" });
+
+use crate::plecto::filter::types::{Header, ResponseEdit};
 
 struct FilterQuickstart;
 
@@ -181,7 +185,7 @@ impl Guest for FilterQuickstart {
             set_status: None,
             set_headers: vec![Header {
                 name: "x-plecto".into(),
-                value: b"hello-from-wasm".to_vec(), // list<u8> ヘッダ値（@0.3.0）
+                value: b"hello-from-wasm".to_vec(), // list<u8> ヘッダ値
             }],
             remove_headers: vec![],
         })
@@ -192,9 +196,12 @@ export!(FilterQuickstart);
 ```
 
 これは header-only の `filter` world を対象にしているので、host は body を素通しする。body が要る
-フィルタは `filter-body` を対象にし export を 1 つ追加する。最短経路は
-`plecto new-filter --lang rust my-filter`——クレートを scaffold し、WIT 契約を vendoring し、
-すぐ動く dev manifest を書き出す。
+フィルタは `filter-body` を対象にし body export（`on-request-body` / `on-response-body`——任意の
+部分集合）を追加する。この例は執筆時の凍結 world `0.3.0` を pin しており、host は読み続ける。
+最短経路は `plecto new-filter --lang rust my-filter`——クレートを scaffold し、現行の WIT 契約を
+vendoring し、すぐ動く dev manifest を書き出す。あるいは **tokenlimit starter** 三兄弟
+（`filter-tokenlimit-{js,moonbit,go}`）を copy する——LLM upstream 向けの token-budget ポリシー
+1 つを 3 言語で書いた、`plecto:filter@0.4.0` 対象の最初の例ゲスト。
 
 契約が WIT なので、**WASM コンポーネントへコンパイルできる言語ならどれでもフィルタを書ける**。
 それを二段構えで証明している。**Tier A（zero-WASI、既定）**: 同一の conformance サブセットを

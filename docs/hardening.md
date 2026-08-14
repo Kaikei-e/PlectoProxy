@@ -56,8 +56,9 @@ restoration decides *who the client is*, not what gets forwarded.
 
 Two operational notes. `trusted` is a trust grant, and it is asymmetric: too narrow only loses the
 restoration, too wide lets anyone who can reach that range name their own client address — when in
-doubt, narrow. And switching the mode on or off moves every per-client key (buckets, hash
-assignments) into a different key space; the change is not disruptive, but the counters do not
+doubt, narrow. And switching the mode on or off is a **restart, not a reload** —
+`[listen.trusted_proxy]` is captured at startup, so a bare `SIGHUP` changes nothing — and it moves
+every per-client key (buckets, hash assignments) into a different key space; the counters do not
 carry over.
 
 ## Multi-replica rate limiting
@@ -123,7 +124,7 @@ implementation ([ADR 000061](ADR/000061.md)): a general, textbook fixed-window c
 (`INCRBY` + an unconditional `EXPIRE ... NX`, Redis >= 7.0 / Valkey) over the `outbound-tcp`
 capability ([ADR 000060](ADR/000060.md)). Its manifest `[filter.config]` (via the `host-config`
 capability, [ADR 000066](ADR/000066.md)) declares the backend host/port, window, limit, cost
-source, and a **required** `on_backend_error = "deny" | "allow"` — there is no default, so an
+source, route tag, and a **required** `on_backend_error = "deny" | "allow"` — there is no default, so an
 operator must decide explicitly whether a Redis outage fails the route closed or falls back to
 the local floor alone. The filter needs `isolation = "trusted"`: a pooled instance holds one
 persistent backend connection across requests instead of reconnecting every time, and the same
@@ -135,6 +136,8 @@ rather than a per-request 503 (see the filter's own doc comments and `docs/writi
 evidence for a fleet-wide production quota, until it is upgraded per the promotion checklist in
 [ADR 000081](ADR/000081.md): ACL user + `AUTH` (or equivalent), TLS (or equivalent verifiable
 encryption), and credentials delivered out of band rather than inlined in the manifest.
+([ADR 000107](ADR/000107.md), currently proposed, restates that checklist as ten falsifiable
+items and adds mandatory cost-input validation.)
 
 The third of those now has its mechanism: **`[filter.config_files]`** ([ADR 000095](ADR/000095.md))
 points a `host-config` key at a file, read at load and at every reload, so a credential arrives as

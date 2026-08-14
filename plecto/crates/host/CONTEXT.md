@@ -38,22 +38,35 @@ fast path（host）と untrusted な WASM フィルタの間の型付き境界�
 型を再利用しつつ、decision / hooks / host-API という Plecto 固有の語彙を持つ独自ワールド。
 
 **Conformant（component）**:
-`plecto conformance` が判定する性質。特定フィクスチャの挙動（`filter-hello` の `x-block` ヘッダ応答など）ではなく、
+`plecto conformance` が判定する性質。特定フィクスチャの挙動（`filter-hello` の `x-plecto-block` ヘッダ応答など）ではなく、
 任意の `plecto:filter` 実装に共通して要求できる汎用プロパティ（world の構造的妥当性・署名/SBOM ロードゲート通過・
-trap しない・宣言 deadline 内に応答する）を指す。`tests/polyglot.rs` の言語横断フィクスチャテストは別物
+trap しない・宣言 deadline 内に応答する）を指す。判定は check ごとの verdict で決まり、`is_conformant` は
+`pass` と `na` のみを通す（`fail` / `inconclusive` / `environment` はいずれも fail-closed）。
+`tests/polyglot.rs` の言語横断フィクスチャテストは別物
 （`filter-hello` 固有の振る舞いに依存する Rust 内部の回帰テスト、CLI には持ち出さない）。
 _Avoid_: valid filter（漠然）, passes tests（フィクスチャ依存の含意）
 
+**Verdict**:
+conformance の 1 case の五値の結果（`pass` / `fail` / `na` / `inconclusive` / `environment`）。
+`environment` は「component が import する capability をこの実行が貸していない」——component の欠陥
+（`fail`）とは別の言明で、`LoadError::MissingCapability` から分類する。`na` は component の契約が
+その case を表現できない（PICS）ことを示し、pass でもない。ゲートを塞がないのは `pass` と `na` だけ。
+_Avoid_: decision（フィルタの戻り値と衝突する）, result（漠然）
+
 **PIXIT**:
 Protocol Implementation eXtra Information for Testing（ISO/IEC 9646 の用語）。operator が conformance 実行へ
-明示的に渡す試験環境情報 — 対象 filter の manifest entry と、その解決に要る base_dir。許可能力の source of
+明示的に渡す試験環境情報 — manifest entry が貸す capability・config・budget を、production と同じ形で
+`LoadOptions` に lower したもの（`ConformanceOptions::with_pixit`）。許可能力の source of
 truth は常に operator の manifest であり、guest の import 列から能力を推論しない。PIXIT 不足は component の
-非適合（fail）ではなく環境不足（environment）。
+非適合（fail）ではなく環境不足（environment）。CLI からの受け渡し（`--manifest --filter`）は
+決定済み・未実装（ADR 000108）。
 _Avoid_: capability auto-detection（推論の含意）, test config（漠然）
 
 **Battery（conformance battery）**:
-公開 conformance の check 集合。SemVer で独立に版付けし（`battery@1.0.0` …）、`plecto package` / `plecto dev`
-は焼付けた pin だけを用いる。WIT package version とは別軸で、対応は適用行列が持つ。
+公開 conformance の check 集合。SemVer で独立に版付けし（現行 `battery@1.0.0` = case `v1.0.0-S1` / `v1.0.0-D1`）、
+どの版を走らせるかは **caller が pin する**（`ConformanceOptions` / `BatteryVersion`）——battery を後から深めても、
+出荷済み component のゲートが勝手に赤くならない。pin を渡さない `check` / `run_conformance` は
+現行版 + `LoadOptions::untrusted()` の floor。WIT package version とは別軸で、対応は適用行列が持つ。
 _Avoid_: test suite（フィクスチャ・コーパス型の含意）, checks（版の含意が落ちる）
 
 ## 実行モデル
@@ -76,7 +89,9 @@ _Avoid_: body mode（曖昧）, body flag（点ではなく分類）
 ボディに触れないフィルタ。ボディ・ストリームはゼロコピーでバイパスできる。
 
 **Body-transform filter**:
-ボディを `stream<u8>` で流しながら読む/変換するフィルタ。WASM 税（コピー）を負う側。
+ボディに触れるフィルタ。現行契約は buffer-then-decide（`filter-body` world、`list<u8>`、ADR 000098 / 000104）。
+`stream<u8>` で流す形は off-by-default の `plecto:filter-streaming` world（`streaming-body` feature）側。
+WASM 税（コピー）を負う側。
 
 **Zero-WASI guest（Tier A）**:
 `plecto:filter` の interface だけを import する（WASI import ゼロの）フィルタコンポーネント。
@@ -115,7 +130,7 @@ _Avoid_: instance cache（再利用の意図が出ない）, worker pool（ス�
 ## 能力境界
 
 **Host-API（capability）**:
-ホストがフィルタに明示的に貸す能力（KV / counter / ratelimit / metrics / log / clock / random など）。
+ホストがフィルタに明示的に貸す能力（log / clock / KV / counter / ratelimit / config）。
 deny-by-default で、貸していないもの（任意 outbound・FS・socket）はサンドボックスが触れさせない。
 能力ごとに別 interface に切る。
 _Avoid_: syscall, runtime API（曖昧）

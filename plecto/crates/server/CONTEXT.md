@@ -10,7 +10,8 @@
 **Route**:
 1 本の routing 規則。**match 基準**（match dimension の AND）に当たったリクエストを、その route の inline chain で
 処理し、その転送先（単一 upstream または weighted backends）へ転送する。fast path はリクエストごとに route を
-1 本だけ選ぶ。chain / strip_prefix / rate limit は route 単位で、転送先が weighted でも全 backend に共通に掛かる。
+1 本だけ選ぶ。chain / strip_prefix / rate limit / compression / response headers / timeouts は route 単位で、
+転送先が weighted でも全 backend に共通に掛かる。
 _Avoid_: rule（曖昧）, mapping（方向が出ない）
 
 **Match dimension（照合軸）**:
@@ -26,8 +27,9 @@ _Avoid_: dispatch（chain 駆動と紛らわしい）, 最長一致（path だ�
 
 **Upstream**:
 fast path が一致リクエストを転送する名前付きバックエンド。1 つ以上の **upstream instance** から成り、fast path
-は転送時に healthy な instance を round-robin で 1 つ選ぶ（ADR 000017）。route は upstream を名前で指す。plain
-HTTP/1.1 で転送する（upstream TLS は後続）。
+は転送時に healthy な instance を **LB algorithm**（既定 round-robin、ADR 000017 / 000035）で 1 つ選ぶ。route は
+upstream を名前で指す。転送は既定で plain HTTP/1.1、`[upstream.tls]` 宣言時は rustls で再暗号化する（ALPN h2 優先・
+custom CA・SNI 検証名 override・client cert による mTLS、ADR 000042 / 000050 / 000078）。
 _Avoid_: backend pool（pool ではなく instance 群で表す）, origin（CDN 文脈の語）
 
 **Weighted backends（traffic split / canary）**:
@@ -71,7 +73,8 @@ _Avoid_: liveness probe（k8s 用語）, ping（多義）
 **Passive ejection**:
 実リクエストの転送失敗（接続失敗 / timeout）を active と**同じ health 状態**に反映し、instance を demote する補完
 信号。active が先回り検知、passive が取りこぼしを拾う。引き金になったリクエスト自体は救済しない（retry しない）。
-_Avoid_: outlier detection（独立サブシステムを含意。ここでは active と単一状態機を共有）
+_Avoid_: outlier detection（別物——連続 5xx で eject する health 状態機から独立した第三軸、ADR 000032。
+ここの passive は transport 失敗を active と**単一の**状態機に反映する信号）
 
 **LB algorithm（per-upstream 選択則）**:
 upstream ごとに選ぶ instance 選択則（ADR 000035）。`round_robin`（既定）・`least_request`（P2C）・`maglev`
@@ -122,12 +125,14 @@ _Avoid_: backend weight（route→group split の重み。層が違う）, capac
 _Avoid_: circuit break（別概念）
 
 **Retryable failure**:
-別 instance への再送が許される転送失敗——応答ヘッダ到達前の **timeout**（ADR 000019）と、**接続失敗**（upstream が
-未受信）。mid-response の transport fault や upstream の 5xx は retryable ではない（health 信号にもしない）。
-_Avoid_: error（広すぎる）, 5xx（upstream 応答は retry 対象外）
+別 instance への再送が許される転送失敗——応答ヘッダ到達前の **timeout**（ADR 000019）、**接続失敗**（upstream が
+未受信）、および gateway クラスの **502 / 503 / 504 応答**（ADR 000030。health 信号にはしない——instance は
+demote されない）。mid-response の transport fault と他の 5xx は retryable ではない。
+_Avoid_: error（広すぎる）, 5xx（retry するのは gateway クラス 502/503/504 のみ）
 
 **Upstream retry（bounded）**:
-retryable failure を**別の**healthy instance へ最大回数まで再送する補完（ADR 000023）。timeout retry は冪等メソッド
+retryable failure を**別の**healthy instance へ最大回数まで再送する補完（ADR 000023 / 000030）。再送間には
+full-jitter の指数 backoff を挟む。timeout retry は冪等メソッド
 限定（upstream が処理済みかもしれない）、接続失敗は任意メソッド（未受信なので安全）、いずれも **bodyless 限定**
 （opaque body は再生不可）。別 instance が無ければ retry せず元の fault を返す。タイムアウトは health 信号にしない。
 _Avoid_: failover（含意が広い）, hedging（並行投機ではなく逐次再送）
@@ -143,8 +148,9 @@ circuit break（upstream 飽和を 503 で守る別軸、ADR 000028）
 ## リクエスト処理
 
 **Opaque body（pass-through）**:
-fast path がフィルタに渡さず素通しでストリームするボディ。header-only 契約（ADR 000010）ゆえ、リクエスト
-ボディは upstream へ、レスポンスボディはクライアントへ、フィルタを介さず流れる。
+fast path がフィルタに渡さず素通しでストリームするボディ。header-only フィルタしか居ない route の既定形
+（ADR 000010）で、リクエストボディは upstream へ、レスポンスボディはクライアントへ、フィルタを介さず流れる。
+body hook（`filter-body` world）を持つフィルタが居る route では buffer-then-decide に切り替わる。
 _Avoid_: body proxy（変換を含意。ここでは非接触）
 
 **Blocking bridge（sync↔async）**:

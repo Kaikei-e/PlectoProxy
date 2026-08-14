@@ -34,7 +34,7 @@ fast path と extension plane は上下関係でも主従関係でもなく、**
 
 ### P3 — 判断は型で運ぶ。能力の不在も型で表す
 
-フィルタの戻り値は裸のフラグやブール値ではなく、常に WIT の `variant` である: request 側は `continue` / `modified(request-edit)` / `short-circuit(http-response)` の三値、response 側は `continue` / `modified(response-edit)`。WIT 原文のコメントにある通り **"Never a bare flag."**（Tenet 3）。
+フィルタの戻り値は裸のフラグやブール値ではなく、常に WIT の `variant` である: request 側は `continue` / `modified(request-edit)` / `short-circuit(http-response)` の三値、response 側は `continue` / `modified(response-edit)` / `replace(http-response)`（ADR 000073）。body フックは独自の `request-body-decision` / `response-body-decision` を返す（ADR 000098 / 000104）。WIT 原文のコメントにある通り **"Never a bare flag."**（Tenet 3）。
 
 この原則は「存在」だけでなく**「不在」にも及ぶ**。契約は header-only の `filter` world と body-reading の `filter-body` world に分かれており、`on-request-body` export の**不在そのもの**が「このフィルタはボディを読まない」という機械検証可能な事実となり、ホストはそれを根拠にボディのバッファリングを丸ごとスキップする（zero-copy passthrough、ADR 000005 / 000025 / 000038）。性能最適化を運用者の注意力ではなく**契約の形から導出する**——これが Plecto Proxy の型設計の核心である。
 
@@ -88,32 +88,33 @@ untrusted な入力が worker を巻き込んで落とすことを許さない�
 
 ## 第2章 アーキテクチャ方針 — 構造の選び方
 
-### 2.1 三つの境界づけられた文脈
+### 2.1 四つの境界づけられた文脈
 
-Plecto Proxy の Rust workspace は三つの境界づけられた文脈から成り、各文脈は自分の `CONTEXT.md` を持つ。
-四つ目の crate `plecto`（ADR 000091）は Fast path + Control の上の薄い operator CLI 入口（`cargo install
-plecto`）で、新しい文脈を持ち込まない——`plecto-server` から CLI を分離した際の受け皿にすぎない。
+Plecto Proxy の Rust workspace は四つの境界づけられた文脈から成り、各文脈は自分の `CONTEXT.md` を持つ。
+四つ目の crate `plecto`（ADR 000091）はライブラリ 3 クレートの上の薄い operator CLI 入口（`cargo install
+plecto`）——データプレーン・コントロールプレーン・wasmtime ホストの実体はライブラリ側にあり、CLI 層は薄いままに保つ。
 
 | 文脈 | crate | 責務 |
 |---|---|---|
 | **Fast path** | `plecto-server` | 接続受付・TLS 終端・HTTP/1.1/2/3・route 照合・chain 駆動・upstream 転送（ADR 000013） |
 | **Extension plane / host runtime** | `plecto-host` | wasmtime 埋め込みホスト。`plecto:filter` 契約の執行・フィルタ実行モデル・能力境界（host-API） |
 | **Control** | `plecto-control` | 宣言的マニフェスト・provenance ゲート経由のロード・無停止 reload・config version。「何がロードされ、いつ差し替わるか」 |
+| **plecto binary / operator CLI** | `plecto` | エンドユーザ入口: `serve` ＋ operator CLI（validate / conformance / package / new-filter / dev / healthz / schema）（ADR 000091） |
 
-関係は三本: **Fast path → Extension plane**（per-request に chain を駆動）、**Control → Extension plane**（manifest が filter を digest pin し chain 順と trust root を宣言、reload が atomic に差し替え）、**Control → Fast path**（manifest が route と転送先を宣言し、fast path は per-request に `ConfigSnapshot` を取って route を選ぶ）。契約 `wit/` は workspace 直下に置かれ、どの crate にも属さない——契約は文脈間の共有財であって、どれかの所有物ではない。
+関係は三本: **Fast path → Extension plane**（per-request に chain を駆動）、**Control → Extension plane**（manifest が filter を digest pin し chain 順と trust root を宣言、reload が atomic に差し替え）、**Control → Fast path**（manifest が route と転送先を宣言し、fast path は per-request に `ConfigSnapshot` を取って route を選ぶ）。契約 `wit/` は workspace 直下に置かれる——文脈間の共有財であって、どれかの所有物ではない（`cargo package` のためのバイト同一コピーを `crates/host/wit/` に vendoring し、両者の drift は CI が検査する）。
 
 ### 2.2 契約アーキテクチャ（`plecto:filter@0.4.0`）
 
-契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。ヘッダ値は `list<u8>`（ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取り、`response-decision` は `replace` arm を持つ——P3（判断は型で）が response 側にも対称に成立する（ADR 000073）。`0.1.0` / `0.2.0` は凍結ツリー＋ホストアダプタでロード可能。現行契約の構造:
+契約は独自ワールドとして定義し、確定方向として `wasi:http`（proxy / middleware）への型収斂を M3 で行う（ADR 000002 / 000020）。deny-by-default は型語彙と独立に維持される。ヘッダ値は `list<u8>`（ADR 000071）。`on-response` は as-forwarded リクエストスナップショットを受け取り、`response-decision` は `replace` arm を持つ——P3（判断は型で）が response 側にも対称に成立する（ADR 000073）。`0.1.0` / `0.2.0` / `0.3.0` は凍結ツリー＋ホストアダプタでロード可能。現行契約の構造:
 
 - **types**: `http-request` / `http-response`（ヘッダ値は原文バイト）・`request-edit` / `response-edit`（書換は差分で表現）・型付き decision variant——request 側 `continue` / `modified` / `short-circuit`、response 側 `continue` / `modified` / `replace`（ADR 000073）。
 - **host-API（6能力・1 interface = 1 capability）**: `host-log` / `host-clock`（リクエスト開始時スナップショット）/ `host-kv` / `host-counter` / `host-ratelimit`（token bucket は **host-native**）/ `host-config`（manifest `[filter.config]` の読み取り専用、ADR 000066）。
-- **二つの world**: `filter`（header-only）と `filter-body`（+ `on-request-body`、buffer-then-decide、v1 は `list<u8>`）。`include` ではなく敢えて重複記述しているのは WIT の `use` 伝播仕様への対処であり、コメントで理由が明記される——**契約ファイル自身が設計判断の注釈を持つ**のがこのリポジトリの流儀である。
+- **二つの world**: `filter`（header-only）と `filter-body`（+ `on-request-body` / `on-response-body`、buffer-then-decide、v1 は `list<u8>`。component は body フックの任意の部分集合を export でき、二つの world はその格子の両端である）。`include` ではなく敢えて重複記述しているのは WIT の `use` 伝播仕様への対処であり、コメントで理由が明記される——**契約ファイル自身が設計判断の注釈を持つ**のがこのリポジトリの流儀である。
 - **実験系**: `plecto:filter-streaming`（`stream<u8>`・async）は off-by-default の `streaming-body` feature に隔離され、`wasm32-wasip3` の Tier-2 到達まで既定ビルドに入らない。
 
-契約進化の方針: 変更は additive を基本とし、body の真のストリーミング化は `list<u8>` → `stream<u8>` の差し替えとして契約に席を確保済み。ホット経路（rate limit の refill 等）は契約の外＝native に落とす——「WASM 税は判断ロジックにのみ払う」。`plecto new-filter` は現状 `wkg` 経由で公開契約を取得する（ADR 000064 / 000065）。オフライン self-vendoring（ホスト bindgen と同じ `wit/world.wit` の同梱）は ADR 000072 で採択済み・実装は後続。
+契約進化の方針: 変更は additive を基本とし、body の真のストリーミング化は `list<u8>` → `stream<u8>` の差し替えとして契約に席を確保済み。ホット経路（rate limit の refill 等）は契約の外＝native に落とす——「WASM 税は判断ロジックにのみ払う」。`plecto new-filter` はバイナリに同梱した契約をそのまま書き出す——ADR 000072 が採択したオフライン self-vendoring で、ネットワークは介在しない。`wkg` 公開（ADR 000064 / 000065）は scaffold を使わない作者向けの配布チャネルとして残る。
 
-互換性の約束は**段階化**されている（ADR 000085）。0.x の間は発効済みポリシーがそのまま立つ: host は出荷サポートした全契約バージョンを読み続け（0.1 / 0.2 は凍結ツリー＋ロード時アダプタで現に動いている）、旧 major は ADR で廃止を宣言するまで最低 2 リリース系列は受理し続ける（ADR 000064）。契約 1.0 以降は、**出荷したすべての world を恒久的に読み続ける**——唯一の例外は「当該 world を読み続けること自体が安全上維持不能」な場合のみで、その場合も単独 ADR・最低 24 ヶ月の告知・移行文書を必須とする。1.0 を切る行為がこの保証の発効であり、1.0 は機能量ではなく**約束の節目**である。
+互換性の約束は**段階化**されている（ADR 000085）。0.x の間は発効済みポリシーがそのまま立つ: host は出荷サポートした全契約バージョンを読み続け（0.1 / 0.2 / 0.3 は凍結ツリー＋ロード時アダプタで現に動いている）、旧 major は ADR で廃止を宣言するまで最低 2 リリース系列は受理し続ける（ADR 000064）。契約 1.0 以降は、**出荷したすべての world を恒久的に読み続ける**——唯一の例外は「当該 world を読み続けること自体が安全上維持不能」な場合のみで、その場合も単独 ADR・最低 24 ヶ月の告知・移行文書を必須とする。1.0 を切る行為がこの保証の発効であり、1.0 は機能量ではなく**約束の節目**である。
 
 ### 2.3 実行モデル: 信頼で分岐するライフサイクル
 
@@ -122,7 +123,7 @@ plecto`）で、新しい文脈を持ち込まない——`plecto-server` から
 - **trusted**: 固定容量・遅延充填のインスタンスプールから per-request に checkout・再利用（init は一度きり、init 派生物は常駐）。枯渇は有界待ち後 fail-closed。プール全体の circuit breaker と recycle-after-N で状態蓄積と故障を有界化。
 - **untrusted**: fresh-per-request instantiation。linear memory は**構成上フレッシュ**（zeroize という能動操作ではなく fresh-by-construction）。CVE-2022-39393（pooling + memory-init-cow でのスロット再利用リーク、wasmtime 2.0.2 で修正済み）の教訓を、修正済みでもなお defense-in-depth として設計に刻む。
 
-実行時の有界化は多層である: epoch interruption（CPU 予算。fuel より軽量という wasmtime 公式の報告に基づく選択。wall-clock SLA ではないため、ブロックする host call には別機構の host-timeout を重ねる二層設計）、`StoreLimits` によるメモリ上限、table 上限、per-filter + host 全体の状態 quota（超過 fail-closed）、untrusted の init deadline 締め付け（ADR 000027）。sync な chain は `spawn_blocking` で tokio の fast path に橋渡しされ（ADR 000013）、wasmtime 46 以降はホスト側が `call_async`（fiber）で guest hook を走らせる（M3 Stage 1）。
+実行時の有界化は多層である: epoch interruption（CPU 予算。fuel より軽量という wasmtime 公式の報告に基づく選択。wall-clock SLA ではないため、ブロックする host call には別機構の host-timeout を重ねる二層設計）、`StoreLimits` によるメモリ上限、table 上限、per-filter + host 全体の状態 quota（超過 fail-closed）、untrusted の init deadline 締め付け（ADR 000027）。sync な chain は `spawn_blocking` で tokio の fast path に橋渡しされ（ADR 000013）、ホスト側は `call_async`（fiber）で guest hook を走らせる（M3 Stage 1）。pin した wasmtime で新たに default-on になった言語 proposal（GC・exception handling）は明示的に off へ戻す（ADR 000096）。
 
 ### 2.4 fast path 方針: 照合は決定的に、耐障害は層別に
 

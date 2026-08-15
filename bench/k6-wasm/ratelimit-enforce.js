@@ -15,8 +15,16 @@ const OUT = __ENV.OUT || "ratelimit_enforce.json";
 
 const accepted = new Counter("accepted");
 const limited = new Counter("limited");
+const noStatus = new Counter("no_status");
 const latAccept = new Trend("lat_accept", true);
 const latLimit = new Trend("lat_limit", true);
+
+// The VU pool stays under the fast path's per-source-IP connection cap (ADR 000092): every VU holds
+// its own keep-alive connection and the whole generator shares one loopback source address, so a
+// larger pool has its excess connections refused at accept — and a refused connection returns no
+// HTTP status, which deflates the shed fraction below without any of the counters noticing. Little's
+// law keeps the small pool ample: at loopback service times this arrival rate needs single-digit VUs.
+const POOL = Number(__ENV.PREALLOC || 200);
 
 // NO warmup exclusion here, deliberately: the initial burst (~capacity tokens draining) IS part of
 // the measured signal — excluding the first seconds would hide the very convergence being proven.
@@ -29,8 +37,8 @@ export const options = {
       rate: RATE,
       timeUnit: "1s",
       duration: DUR,
-      preAllocatedVUs: Math.max(200, Math.ceil(RATE / 10)),
-      maxVUs: Math.max(1000, RATE),
+      preAllocatedVUs: POOL,
+      maxVUs: POOL,
     },
   },
 };
@@ -43,6 +51,10 @@ export default function () {
   } else if (res.status === 429) {
     limited.add(1);
     latLimit.add(res.timings.duration);
+  } else {
+    // No status at all (a connection the proxy never accepted) — its own bucket, so a
+    // generator-side artifact can never pass as enforcement signal.
+    noStatus.add(1);
   }
 }
 
@@ -57,6 +69,7 @@ export function handleSummary(data) {
     achieved_rps: data.metrics.http_reqs.values.rate,
     accepted: acc,
     limited: lim,
+    no_status: data.metrics.no_status ? data.metrics.no_status.values.count : 0,
     allowed_rps: acc / secs,
     limited_frac: lim / Math.max(1, acc + lim),
     accept_p50: a.med || 0,
@@ -66,7 +79,8 @@ export function handleSummary(data) {
   };
   const line =
     `\nenforce ${RATE}/s -> allowed ${out.allowed_rps.toFixed(0)}/s ` +
-    `(${acc} ok / ${lim} 429, ${(out.limited_frac * 100).toFixed(1)}% shed)  ` +
+    `(${acc} ok / ${lim} 429 / ${out.no_status} no-status, ` +
+    `${(out.limited_frac * 100).toFixed(1)}% shed)  ` +
     `accept p99=${out.accept_p99.toFixed(2)}ms  429 p99=${out.limit_p99.toFixed(2)}ms\n`;
   return { [OUT]: JSON.stringify(out, null, 2), stdout: line };
 }

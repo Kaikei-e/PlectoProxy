@@ -30,6 +30,7 @@ const latWrite = new Trend("lat_write", true);
 const latLarge = new Trend("lat_large", true);
 const reqs = new Counter("reqs_measured");
 const limited = new Counter("limited_429");
+const noStatus = new Counter("no_status");
 
 const SMALL = "x".repeat(1024);
 const LARGE = "x".repeat(100 * 1024);
@@ -41,14 +42,24 @@ export const options = {
     mix: {
       executor: "constant-arrival-rate",
       rate: RATE, timeUnit: "1s", duration: `${WARMUP_S + DUR_S}s`,
-      preAllocatedVUs: Number(__ENV.PREALLOC || Math.max(500, Math.ceil(RATE * 0.02))),
-      maxVUs: Number(__ENV.MAXVUS || Math.max(2000, Math.ceil(RATE * 0.08))),
+      // The pool stays under the fast path's per-source-IP connection cap (ADR 000092): every VU
+      // holds its own keep-alive connection and the whole generator shares one loopback source
+      // address, so a larger pool has its excess connections refused at accept — zero-duration
+      // non-responses that would pull the very percentiles this phase publishes downward. Little's
+      // law sets the floor: the blend's slow patches (p99 ~10 ms at this rate) put ~RATE x 0.01
+      // iterations in flight, so the pool is taken right up to the cap's margin — what still does
+      // not fit is reported as dropped iterations, the honest open-loop shed signal.
+      preAllocatedVUs: Number(__ENV.PREALLOC || 240),
+      maxVUs: Number(__ENV.MAXVUS || 240),
     },
   },
 };
 
 function record(trend, res, measuring) {
   if (!measuring) return;
+  // A connection the proxy never accepted carries no status and a near-zero duration; letting it
+  // into the trend would improve the published percentiles by failing.
+  if (res.status === 0) { noStatus.add(1); return; }
   trend.add(res.timings.duration);
   reqs.add(1);
   if (res.status === 429) limited.add(1);
@@ -81,6 +92,7 @@ export function handleSummary(data) {
     offered_rps: n / DUR_S,
     dropped: data.metrics.dropped_iterations ? data.metrics.dropped_iterations.values.count : 0,
     limited: data.metrics.limited_429 ? data.metrics.limited_429.values.count : 0,
+    no_status: data.metrics.no_status ? data.metrics.no_status.values.count : 0,
     read_p50: rd.med || 0, read_p99: rd["p(99)"] || 0, read_p99_9: rd["p(99.9)"] || 0,
     auth_p50: au.med || 0, auth_p99: au["p(99)"] || 0,
     write_p50: wr.med || 0, write_p99: wr["p(99)"] || 0,
@@ -89,6 +101,6 @@ export function handleSummary(data) {
   const line = `\nweighted ${PROFILE} @ ${Math.round(out.offered_rps)} rps: ` +
     `read p99=${out.read_p99.toFixed(2)}ms  auth p99=${out.auth_p99.toFixed(2)}ms  ` +
     `write p99=${out.write_p99.toFixed(2)}ms  large p99=${out.large_p99.toFixed(2)}ms  ` +
-    `dropped=${out.dropped} 429=${out.limited}\n`;
+    `dropped=${out.dropped} 429=${out.limited} no-status=${out.no_status}\n`;
   return { [OUT]: JSON.stringify(out, null, 2), stdout: line };
 }

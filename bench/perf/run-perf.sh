@@ -429,6 +429,7 @@ with open(sys.argv[2],"w",newline="") as o:
     w=csv.writer(o); w.writerow(["outcome","rps","p50","p95","p99","count"])
     w.writerow(["accept",round(d["accepted"]/dur,1),round(d["accept_p50"],3),round(d["accept_p95"],3),round(d["accept_p99"],3),d["accepted"]])
     w.writerow(["reject",round(d["rejected"]/dur,1),round(d["reject_p50"],3),round(d["reject_p95"],3),round(d["reject_p99"],3),d["rejected"]])
+    w.writerow(["no-status",round(d["no_status"]/dur,1),"","","",d["no_status"]])
 print("wrote wasm_mixed.csv")
 ' "$tmp/mixed.json" "$DATA/wasm_mixed.csv" 60
   cat "$DATA/wasm_mixed.csv"
@@ -714,17 +715,17 @@ with open(sys.argv[3],"w",newline="") as o:
 import json,sys
 d=json.load(open(sys.argv[1]))
 print("metric,value")
-for k in ("target_rps","achieved_rps","allowed_rps","limited_frac","accept_p50","accept_p99","limit_p99","accepted","limited"):
+for k in ("target_rps","achieved_rps","allowed_rps","limited_frac","accept_p50","accept_p99","limit_p99","accepted","limited","no_status"):
     print(f"{k},{round(d[k],3)}")
 ' "$tmp/enforce.json" > "$DATA/ratelimit_enforce.csv"
   python3 -c '
 import json,csv,sys
 d=json.load(open(sys.argv[1]))
 with open(sys.argv[2],"w",newline="") as o:
-    w=csv.writer(o); w.writerow(["key","offered_rps","allowed_rps","shed_frac"])
+    w=csv.writer(o); w.writerow(["key","offered_rps","allowed_rps","shed_frac","no_status"])
     hot_shed=d["hot_429"]/max(1,d["hot_ok"]+d["hot_429"])
-    w.writerow(["hot",d["hot_offered_rps"],round(d["hot_allowed_rps"],1),round(hot_shed,4)])
-    w.writerow(["light",d["light_offered_rps"],round(d["light_allowed_rps"],1),round(d["light_429_frac"],4)])
+    w.writerow(["hot",d["hot_offered_rps"],round(d["hot_allowed_rps"],1),round(hot_shed,4),d["hot_no_status"]])
+    w.writerow(["light",d["light_offered_rps"],round(d["light_allowed_rps"],1),round(d["light_429_frac"],4),d["light_no_status"]])
 ' "$tmp/fairness.json" "$DATA/ratelimit_fairness.csv"
   echo "--- enforce ---"; cat "$DATA/ratelimit_enforce.csv"
   echo "--- fairness ---"; cat "$DATA/ratelimit_fairness.csv"
@@ -814,7 +815,7 @@ with open(sys.argv[3],"w",newline="") as o:
             w.writerow([p,"auth",round(d["auth_p50"],3),round(d["auth_p99"],3),""])
             w.writerow([p,"write",round(d["write_p50"],3),round(d["write_p99"],3),""])
             w.writerow([p,"large",round(d["large_p50"],3),round(d["large_p99"],3),""])
-        print("%s: offered %.0f rps, dropped %d, 429s %d"%(p,d["offered_rps"],d["dropped"],d.get("limited",0)))
+        print("%s: offered %.0f rps, dropped %d, 429s %d, no-status %d"%(p,d["offered_rps"],d["dropped"],d.get("limited",0),d.get("no_status",0)))
 ' "$tmp/mix_read-only.json" "$tmp/mix_mix.json" "$DATA/mix.csv"
   cat "$DATA/mix.csv"
 }

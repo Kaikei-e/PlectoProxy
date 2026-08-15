@@ -32,6 +32,16 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-15
+
+Minor bump, not a patch: a manifest value that used to validate green is now rejected, and the
+`plecto-control` public API changes in ways downstream code cannot compile against (see
+**Changed**). Under the pre-1.0 policy above a minor bump is where those live. **Deployed
+filters do not need a rebuild** — the filter contract stays at `plecto:filter@0.4.0`, and the
+access-log field set is unchanged. The CLI's per-check output moves to the verdict vocabulary
+(details under **Added**); a consumer parsing the *text* output of `conformance` / `package` /
+`dev` sees new spellings, while `--json` only gains fields.
+
 ### Added
 
 - **Per-check `id` and `verdict` in `plecto conformance --json`** — the first slice of ADR 000108's
@@ -61,6 +71,16 @@ All notable changes to Plecto are documented here. The format follows
   **Migration**: replace a TLS collector URL with a local collector's plaintext endpoint.
   The library-level fail-soft guard in `plecto-server` is unchanged for callers that build a
   config without manifest validation.
+
+- **Breaking (Rust library API), `plecto-control`**: `ControlError` gains the
+  `InvalidOtlpEndpoint` variant and is now `#[non_exhaustive]` — sealed against the next round
+  the same way 0.8.0 sealed the host's `LoadError` / `RunError`: the rejection vocabulary grows
+  every time the manifest surface learns to refuse a new mistake fail-closed, and no caller
+  needs an exhaustive match to stay correct (every variant means "this config must not serve").
+  Downstream crates with an exhaustive `match` must add a fallback arm; `matches!` patterns and
+  named-variant matching are unaffected. `cargo-semver-checks` flags both
+  (`enum_variant_added`, and the seal), which the pre-1.0 policy above places in this minor.
+  Also additive, not breaking: `Manifest::restart_only_fields()`.
 
 ### Docs
 

@@ -314,7 +314,7 @@ The two places that answer the two different questions:
 
 ```console
 $ plecto --version
-plecto 0.8.0 (profile: minimal)
+plecto 0.9.0 (profile: minimal)
 filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0, plecto:filter@0.4.0
 ```
 

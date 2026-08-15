@@ -133,6 +133,21 @@ impl Manifest {
     pub fn from_toml(s: &str) -> Result<Self, ControlError> {
         Ok(toml::from_str(s)?)
     }
+
+    /// The startup-fixed fields this manifest declares, in manifest spelling (`[observability]`,
+    /// `[listen].drain`, …), empty when it declares none. They are captured when the process
+    /// starts and `skip_serializing` keeps them out of the config version, so editing only these
+    /// leaves the version unchanged and a `SIGHUP` reload swaps nothing — they take a restart
+    /// (`docs/operations.md`, "Reload vs restart"). `plecto validate` reports them so an operator
+    /// reads that before the reload rather than after it.
+    pub fn restart_only_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.observability.is_declared() {
+            fields.push("[observability]");
+        }
+        fields.extend(self.listen.restart_only_fields());
+        fields
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +212,80 @@ path_prefix = "/api"
             m.content_hash().unwrap(),
             m2.content_hash().unwrap(),
             "a route change must flip the content hash"
+        );
+    }
+
+    #[test]
+    fn restart_only_fields_name_every_declared_startup_fixed_section() {
+        let m = Manifest::from_toml(
+            r#"
+[observability]
+admin_addr = "127.0.0.1:9090"
+
+[listen]
+addr = "0.0.0.0:8080"
+advertised_port = 443
+[listen.drain]
+window_ms = 5000
+[listen.proxy_protocol]
+trusted = ["10.0.0.0/8"]
+[listen.trusted_proxy]
+trusted = ["10.0.0.0/8"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.restart_only_fields(),
+            vec![
+                "[observability]",
+                "[listen].addr",
+                "[listen].advertised_port",
+                "[listen].proxy_protocol",
+                "[listen].drain",
+                "[listen].trusted_proxy",
+            ]
+        );
+    }
+
+    #[test]
+    fn restart_only_fields_reports_only_what_is_declared() {
+        // Nothing declared → nothing to warn about (`plecto validate` prints no note at all).
+        assert!(
+            Manifest::from_toml("")
+                .unwrap()
+                .restart_only_fields()
+                .is_empty(),
+            "a manifest declaring no startup-fixed field has none to report"
+        );
+        // `[observability]`'s knobs are all falsy-by-default, so presence is structural, not
+        // sectional: an empty `[observability]` changes nothing at startup either.
+        assert!(
+            Manifest::from_toml("[observability]\n")
+                .unwrap()
+                .restart_only_fields()
+                .is_empty(),
+            "an empty [observability] declares no startup-fixed value"
+        );
+        assert_eq!(
+            Manifest::from_toml("[observability]\naccess_log = true\n")
+                .unwrap()
+                .restart_only_fields(),
+            vec!["[observability]"]
+        );
+        assert_eq!(
+            Manifest::from_toml("[observability]\notlp_endpoint = \"http://localhost:4318\"\n")
+                .unwrap()
+                .restart_only_fields(),
+            vec!["[observability]"]
+        );
+        // `client_auth` is the reload-consumed exception: it rides the content hash, so it is NOT
+        // startup-fixed and must never appear in the note.
+        assert!(
+            Manifest::from_toml("[listen.client_auth]\nca_path = \"ca.pem\"\n")
+                .unwrap()
+                .restart_only_fields()
+                .is_empty(),
+            "[listen].client_auth is consumed on every reload, not fixed at startup"
         );
     }
 

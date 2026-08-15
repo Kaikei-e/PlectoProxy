@@ -266,7 +266,7 @@ impl Control {
         // replacing it), before `build_active` loads filters (the sink is cloned into each).
         // The caller supplied the `Host`, so its sink is the caller's (or `NoopSink`); this
         // testable core keeps its own empty `filter_metrics` tally rather than reaching into it.
-        let (host, otlp) = add_otlp_buffer(host, manifest);
+        let (host, otlp) = add_otlp_buffer(host, manifest)?;
         Self::assemble(
             host,
             store,
@@ -309,7 +309,7 @@ impl Control {
     ) -> Result<Self, ControlError> {
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let manifest = read_manifest(manifest_path)?;
-        let (host, otlp) = add_otlp_buffer(host, &manifest);
+        let (host, otlp) = add_otlp_buffer(host, &manifest)?;
         Self::assemble(
             host,
             store,
@@ -383,6 +383,7 @@ pub fn validate_manifest(
     TrustPolicy::from_pem_keys(&pems).map_err(|e| ControlError::TrustKey(e.to_string()))?;
     manifest.state.validate()?;
     manifest.listen.validate()?;
+    manifest.observability.validate()?;
     let filter_ids = validate_filters_and_chain(manifest)?;
     // `[filter.config_files]` joins the artifact-free fail-closed file loads (trust keys, TLS
     // certs, upstream CA): a missing/unreadable/colliding secret file is caught here, in CI or
@@ -523,7 +524,7 @@ fn build_host_and_store(manifest: &Manifest, base_dir: &Path) -> Result<BuiltHos
         .map_err(|e| ControlError::HostInit(e.to_string()))?
         .with_telemetry_sink(filter_metrics.clone());
     // OTLP export (ADR 000040): the span buffer fans in beside the metrics tally.
-    let (host, otlp) = add_otlp_buffer(host, manifest);
+    let (host, otlp) = add_otlp_buffer(host, manifest)?;
     let store = oci::OciLayoutStore::new(base_dir);
     Ok((host, store, filter_metrics, otlp))
 }
@@ -557,15 +558,19 @@ fn build_state_backend(
 
 /// When `[observability] otlp_endpoint` is set, fan the OTLP span buffer (ADR 000040) in beside
 /// the host's current sink. Must run before filters load (the sink is cloned into each).
+/// Re-runs `Observability::validate` on the build path — the same rule `build_state_backend`
+/// follows for `[state]` — so a manifest read straight into a constructor is held to what
+/// `plecto validate` enforces (ADR 000111).
 fn add_otlp_buffer(
     host: Host,
     manifest: &Manifest,
-) -> (Host, Option<Arc<plecto_host::otlp::OtlpBuffer>>) {
+) -> Result<(Host, Option<Arc<plecto_host::otlp::OtlpBuffer>>), ControlError> {
+    manifest.observability.validate()?;
     if manifest.observability.otlp_endpoint.is_none() {
-        return (host, None);
+        return Ok((host, None));
     }
     let buffer = Arc::new(plecto_host::otlp::OtlpBuffer::default());
-    (host.with_added_telemetry_sink(buffer.clone()), Some(buffer))
+    Ok((host.with_added_telemetry_sink(buffer.clone()), Some(buffer)))
 }
 
 /// The pure filter/chain-semantics checks shared by [`validate_manifest`] (the config-check core)

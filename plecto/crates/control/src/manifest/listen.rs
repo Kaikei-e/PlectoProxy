@@ -64,6 +64,21 @@ impl Listen {
     pub(crate) fn content_hash_exempt(&self) -> bool {
         self.client_auth.is_none()
     }
+
+    /// The startup-fixed fields this section declares, in manifest spelling: every field the
+    /// struct-level note keeps out of the content hash, i.e. everything but `client_auth`.
+    pub(crate) fn restart_only_fields(&self) -> Vec<&'static str> {
+        [
+            ("[listen].addr", self.addr.is_some()),
+            ("[listen].advertised_port", self.advertised_port.is_some()),
+            ("[listen].proxy_protocol", self.proxy_protocol.is_some()),
+            ("[listen].drain", self.drain.is_some()),
+            ("[listen].trusted_proxy", self.trusted_proxy.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, declared)| declared.then_some(field))
+        .collect()
+    }
 }
 
 /// `[listen.client_auth]` (ADR 000078): downstream client-certificate verification. Granularity

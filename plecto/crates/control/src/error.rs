@@ -108,6 +108,16 @@ pub enum ControlError {
     )]
     InertChainSection,
 
+    /// `[observability] otlp_endpoint` named a base URL the serving binary cannot export to
+    /// (ADR 000111): the exporter implements the plaintext subset of OTLP/HTTP, where the scheme
+    /// is the sole transport-security determinant. A scheme the exporter cannot honor — or a base
+    /// URL that does not parse — is rejected fail-closed at validation and at startup, rather than
+    /// accepted into a process that validates green, starts clean, and exports nothing.
+    #[error(
+        "invalid [observability] otlp_endpoint {endpoint:?}: {reason}; trace export is plaintext OTLP/HTTP only (TLS export is not implemented) — to reach a TLS collector, run an OpenTelemetry Collector beside this process (the agent pattern), point otlp_endpoint at it over plain http://, and let the collector originate TLS"
+    )]
+    InvalidOtlpEndpoint { endpoint: String, reason: String },
+
     #[error("duplicate filter id {0:?} in manifest")]
     DuplicateFilterId(String),
 

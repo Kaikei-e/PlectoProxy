@@ -595,6 +595,68 @@ fn control_load_rejects_a_declared_chain() {
     }
 }
 
+/// A manifest whose only content is a trace-export endpoint.
+fn otlp_manifest_toml(endpoint: &str) -> String {
+    format!("[observability]\notlp_endpoint = \"{endpoint}\"\n")
+}
+
+#[test]
+fn validate_rejects_an_otlp_endpoint_the_exporter_cannot_honor() {
+    // ADR 000111: the exporter implements the plaintext OTLP/HTTP subset, where the scheme is the
+    // sole transport-security determinant — so an endpoint the serving binary cannot export to
+    // fails validation rather than validating green and then exporting nothing forever. The
+    // diagnostic carries the standard configuration (a local collector originating TLS), not just
+    // the refusal.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = Manifest::from_toml(&otlp_manifest_toml("https://otel.example:4318")).unwrap();
+
+    let err = plecto_control::validate_manifest(&manifest, dir.path())
+        .expect_err("a TLS otlp_endpoint must fail validation");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("otlp_endpoint"),
+        "the error names the rejected field, got: {message}"
+    );
+    assert!(
+        message.contains("plaintext") && message.contains("agent"),
+        "the error states the constraint and the migration, got: {message}"
+    );
+}
+
+#[test]
+fn a_plaintext_otlp_endpoint_still_validates() {
+    // Port and path are optional (the OTLP spec permits their absence) — only the scheme and a
+    // parseable base URL are required.
+    let dir = tempfile::tempdir().unwrap();
+    for endpoint in ["http://127.0.0.1:4318", "http://collector/"] {
+        let manifest = Manifest::from_toml(&otlp_manifest_toml(endpoint)).unwrap();
+        plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
+    }
+}
+
+#[test]
+fn control_load_rejects_an_otlp_endpoint_the_exporter_cannot_honor() {
+    // The same rejection on the startup path (not only under `plecto validate`): a manifest whose
+    // trace export could never run must not build a live config.
+    let signer = TestSigner::new().unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let manifest = Manifest::from_toml(&otlp_manifest_toml("https://otel.example:4318")).unwrap();
+
+    match Control::load(host, &manifest, Box::new(MemoryStore::new())) {
+        Ok(_) => panic!("a TLS otlp_endpoint must not build a live config"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("otlp_endpoint")
+                    && message.contains("plaintext")
+                    && message.contains("agent"),
+                "the startup error carries the same migration, got: {message}"
+            );
+        }
+    }
+}
+
 #[test]
 fn validate_warns_when_trust_references_a_dev_key() {
     // ADR 000065 decision 2/5: a `[trust]` key file carrying `plecto_host::DEV_KEY_MARKER`

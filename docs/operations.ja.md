@@ -77,14 +77,32 @@ Kubernetes では admin エンドポイントへ直接 `httpGet` プローブを
 | Passive health check（interval × unhealthy 閾値） | その積以上。 |
 | DNS ベースのルーティング | レコード TTL 以上。TTL が分単位なら、先にレコードを消してからシグナルを送る運用を推奨。 |
 
-`SIGTERM` 配送より**前に**ローテーションから外すオーケストレータ（Kubernetes は EndpointSlice
-からの除去がそれ）は必要な猶予を縮めるが、その除去のトリガーも readiness probe なので、上の
-probe 由来の下限が安全な選択のまま変わらない。
+**ローテーションからの除去は `SIGTERM` より前に順序付けられていない。** Kubernetes ではこの二つ
+は同時に起きる: kubelet が Pod の graceful shutdown を開始するのと同じタイミングで、control
+plane はその Pod を Service の EndpointSlice から外すかどうかを評価し、その更新は各データプレーン
+へ atomic にではなく eventually に伝播する。つまりレプリカは `SIGTERM` を受け取った後もなお新規
+接続を渡されうる。上の probe 由来の下限が安全な選択のまま変わらないのは、まさにそのため —
+`readiness_grace_ms` は「除去が伝播しきる時間」を覆う必要があり、既に終わっている前提は置けない。
 
 `window_ms` は別の関心事: **既に受け付けた**作業にどれだけ完走を許すかの上限。最も遅い正当な
-リクエストに合わせる（既定 30 秒は per-try upstream timeout の既定と、スーパーバイザの一般的な
-30 秒 kill 猶予に整合 — 例: Kubernetes の `terminationGracePeriodSeconds` は
-`readiness_grace_ms + window_ms` より大きくすること）。
+リクエストに合わせる（既定 30 秒は per-try upstream timeout の既定に整合）。
+
+そのうえでスーパーバイザ側を確認すること。**その kill 猶予は `readiness_grace_ms + window_ms`
+より大きくなければならない** — そして既定では余裕が無い: Kubernetes の
+`terminationGracePeriodSeconds` の既定 30 秒は既定の `0 + 30000` とちょうど等しく、`SIGKILL` は
+window が切れた後ではなく切れると同時に届く。Docker はさらに厳しい。`docker stop` は `SIGTERM`
+を送り、デーモン既定で Linux コンテナは 10 秒の猶予の後に `SIGKILL` を送る（コンテナ単位では
+`--stop-timeout`）。Compose の `stop_grace_period` も既定 10 秒。つまり 30 秒の window はそもそも
+完走できず、プロセスは drain の途中で kill され、接続は drain 自身の条件で閉じられるのではなく
+切断される。`readiness_grace_ms + window_ms` をコンテナの stop 猶予より下げるか、stop 猶予を
+それより上げるかのどちらかにすること。再作成は古いコンテナを stop するので、`docker compose up`
+にも `docker compose stop` と同じ猶予が効く。
+
+`window_ms = 8000` と既定の `readiness_grace_ms = 0` なら、上の healthcheck と同じサービスに:
+
+```yaml
+stop_grace_period: 12s   # > readiness_grace_ms + window_ms
+```
 
 ## drain（とトンネル）を観測する
 
@@ -147,6 +165,24 @@ access_log = true
 削除は公開インターフェースの変更であり、そこに記された pre-1.0 バージョニング方針のもとで
 [`CHANGELOG.md`](../CHANGELOG.md) の **Changed** に移行注記つきで載る。取り込み設定は行の順序や
 全体の形ではなく、上表のフィールド名に対して固定すること。
+
+## トレース export: `otlp_endpoint`
+
+`[observability] otlp_endpoint` は collector の **base URL** であり、exporter がそこへ `/v1/traces`
+を付与する（`OTEL_EXPORTER_OTLP_ENDPOINT` と同じセマンティクス）。`[observability]` の他の項目と
+同じく起動時に読まれるので、変更は restart。ポートとパスは省略できる。
+
+**export は平文 OTLP/HTTP のみ。** Plecto が実装しているのは exporter 仕様のそのサブセットであり、
+そこではスキームが輸送セキュリティの唯一の決定因なので、値は `http://` の base URL でなければ
+ならない。それ以外のスキームは `plecto validate` でも起動でも fail-closed で落ちる——清潔に起動して
+何も export しない、という結末にはならない（[ADR 000111](ADR/000111.md)）。TLS のみの collector へ
+出したいときは、プロキシと同居する OpenTelemetry Collector（agent パターン）を立て、`otlp_endpoint`
+を平文 `http://` でそこへ向け、TLS は collector に張らせる——export の資格情報の置き場所も本来そこ。
+
+```toml
+[observability]
+otlp_endpoint = "http://127.0.0.1:4318"  # ローカル collector が以降の TLS を張る
+```
 
 ## 宣言したレスポンスヘッダ: どの応答に乗るか
 

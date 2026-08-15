@@ -77,15 +77,35 @@ starts, those clients see refused connections — the exact blip the contract ex
 | Passive health checks (interval × unhealthy threshold) | ≥ that product. |
 | DNS-based routing | ≥ record TTL. If the TTL is minutes, prefer removing the record first and only then signalling. |
 
-Orchestrators that remove the replica from rotation *before* delivering `SIGTERM` (Kubernetes
-does, once the endpoint leaves the EndpointSlice) shrink the needed grace — but the readiness
-probe is still what triggers that removal, so the probe-derived bound above stays the safe
-choice.
+**Removal from rotation is not ordered before `SIGTERM`.** In Kubernetes the two are concurrent:
+at the same time as the kubelet starts the Pod's graceful shutdown, the control plane evaluates
+removing that Pod from the EndpointSlice objects backing its Services, and that update reaches each
+dataplane eventually rather than atomically. A replica can therefore still be handed new
+connections after it has taken `SIGTERM`. That is precisely why the probe-derived bound above stays
+the safe choice: `readiness_grace_ms` has to cover the removal propagating, not assume it already
+happened.
 
 `window_ms` is a separate concern: it bounds how long **accepted** work may finish. Size it to
-your slowest legitimate request (the default 30 s matches the default per-try upstream timeout
-and the common 30 s supervisor kill grace — e.g. Kubernetes `terminationGracePeriodSeconds`,
-which must exceed `readiness_grace_ms + window_ms`).
+your slowest legitimate request — the default 30 s matches the default per-try upstream timeout.
+
+Then check the supervisor's side of it. **Its kill grace must exceed
+`readiness_grace_ms + window_ms`** — and under defaults it does not, by any margin: Kubernetes'
+`terminationGracePeriodSeconds` defaults to 30 s, exactly the default `0 + 30000`, so the `SIGKILL`
+lands as the window expires rather than after it. Docker is tighter still. `docker stop` sends
+`SIGTERM` and then `SIGKILL` after a grace period the daemon defaults to 10 seconds for Linux
+containers (per container: `--stop-timeout`), and Compose's `stop_grace_period` defaults to the
+same 10 seconds — so a 30 s window cannot finish there at all: the process is killed mid-drain and
+its connections are severed rather than closed on the drain's own terms. Either bring
+`readiness_grace_ms + window_ms` under the container's stop grace, or raise the stop grace above it.
+Recreation stops the old container, so the same grace applies to `docker compose up` as to
+`docker compose stop`.
+
+With `window_ms = 8000` and the default `readiness_grace_ms = 0`, on the same service as the
+healthcheck above:
+
+```yaml
+stop_grace_period: 12s   # > readiness_grace_ms + window_ms
+```
 
 ## Watching a drain (and tunnels)
 
@@ -150,6 +170,24 @@ removing a field is a change to a published interface: it is listed under **Chan
 [`CHANGELOG.md`](../CHANGELOG.md) with a migration note, under the pre-1.0 versioning policy stated
 there. Pin your ingestion mapping to the field names above rather than to field order or to the
 line's overall shape.
+
+## Trace export: `otlp_endpoint`
+
+`[observability] otlp_endpoint` is the collector's **base URL** — the exporter appends `/v1/traces`
+to it, mirroring `OTEL_EXPORTER_OTLP_ENDPOINT` — and, like the rest of `[observability]`, it is read
+at startup, so changing it is a restart. Port and path are optional.
+
+**Export is plaintext OTLP/HTTP only.** Plecto implements that subset of the exporter spec, where
+the scheme is the sole transport-security determinant, so the value must be an `http://` base URL;
+any other scheme fails `plecto validate` **and** startup, fail-closed, rather than starting clean
+and exporting nothing ([ADR 000111](ADR/000111.md)). To reach a TLS-only collector, run an
+OpenTelemetry Collector beside the proxy (the agent pattern), point `otlp_endpoint` at it over plain
+`http://`, and let the collector originate TLS — which is also where the export credentials belong.
+
+```toml
+[observability]
+otlp_endpoint = "http://127.0.0.1:4318"  # the local collector originates TLS onward
+```
 
 ## Declared response headers: which responses they land on
 

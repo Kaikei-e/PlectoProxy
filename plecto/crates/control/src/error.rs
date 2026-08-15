@@ -4,7 +4,12 @@
 
 use thiserror::Error;
 
+/// Sealed: the rejection vocabulary grows every time the manifest surface learns to refuse a
+/// new mistake fail-closed (`InvalidOtlpEndpoint` is the most recent), and no caller needs an
+/// exhaustive match to stay correct — every variant means "this config must not serve", so the
+/// arm a caller does not recognise gets the same refusal handling as the ones it does.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ControlError {
     #[error("manifest parse error: {0}")]
     ManifestParse(#[from] toml::de::Error),

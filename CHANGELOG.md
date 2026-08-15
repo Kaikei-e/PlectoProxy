@@ -32,6 +32,53 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Per-check `id` and `verdict` in `plecto conformance --json`** — the first slice of ADR 000108's
+  CLI half: each check now carries its stable battery case ID and the five-way verdict
+  (`pass` / `fail` / `na` / `inconclusive` / `environment`) the library has reported since 0.8.0.
+  `passed` stays as the `verdict == pass` projection and the exit code is unchanged. The text
+  output of `conformance`, and the per-check gate lines of `package` and `dev`, print the same
+  verdict vocabulary (`[pass]` / `[fail]` / `[environment]` …) instead of the bool-derived
+  `[PASS]` / `[FAIL]`, so the binary speaks one spelling. `--battery` and `--manifest --filter`
+  (PIXIT) remain pending.
+- **`plecto validate` names the startup-fixed fields a manifest declares.** One line after
+  `manifest OK`, listing the declared sections that are not part of the config version
+  (`[observability]`, and the `[listen]` fields other than `client_auth`) — changing only those
+  takes a restart, not a reload, and the note says so where the operator is already looking.
+  Backed by the additive `Manifest::restart_only_fields()` in `plecto-control`.
+
+### Changed
+
+- **Manifest: an `otlp_endpoint` the exporter cannot honor is now rejected fail-closed**
+  (ADR 000111). The trace exporter speaks plaintext OTLP/HTTP only, so any other scheme
+  (`https://`, `grpc://`, a bare `host:port`) used to validate green, start clean, and disable
+  export at runtime with a single error log — permanently empty traces behind a passing gate.
+  `plecto validate` and startup now reject the value, and the diagnostic names the standard fix:
+  run an OpenTelemetry Collector beside the process (the agent pattern), point `otlp_endpoint`
+  at it over plain `http://`, and let the collector originate TLS. Port and path stay optional,
+  and the field keeps its base-URL semantics (the exporter appends `/v1/traces`).
+  **Migration**: replace a TLS collector URL with a local collector's plaintext endpoint.
+  The library-level fail-soft guard in `plecto-server` is unchanged for callers that build a
+  config without manifest validation.
+
+### Docs
+
+- **ADR 000111** (the rejection above) and **ADR 000112** (proposed: an operator-declared
+  `[route] name` and a `route` label on request metrics — the design ADR 000099's reconsideration
+  condition (a) asked for; no implementation in this release).
+- **`docs/operations.md` / `.ja.md`: the drain window is now sized against the container stop
+  grace.** The section states the defaults that matter — `docker stop` and Compose
+  `stop_grace_period` default to 10 s, Kubernetes `terminationGracePeriodSeconds` to 30 s — and
+  that the default 30 s `window_ms` cannot finish under Docker defaults; a Compose
+  `stop_grace_period` example is included. The claim that endpoint removal is ordered before
+  `SIGTERM` in Kubernetes is corrected to what the platform documents: concurrent and eventually
+  consistent, which is exactly why the probe-derived `readiness_grace_ms` bound stays the safe
+  choice.
+- **`docs/features.md` and `docs/operations.md` state the trace-export transport constraint**
+  (plaintext OTLP/HTTP only; agent-pattern collector for TLS backends) instead of leaving its
+  first mention to a runtime error string.
+
 ## [0.8.0] - 2026-08-14
 
 Minor bump, not a patch: the generic conformance battery in the crates.io-published `plecto-host`

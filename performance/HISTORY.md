@@ -5,6 +5,14 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-07-11 (v0.3.0 feature costs) — targeted `v03` pass
+
+Targeted `bash bench/perf/run-perf.sh v03` (not a full `all` refresh): fills the previously-unmeasured
+ADR 000073 response-context / `replace` rungs and the ADR 000074/075 compression opt-in row.
+Method: same adjacent-delta ladder + oha fixed-rate CO-safe tails as the WASM plane; see
+[`bench/methodology.md`](../bench/methodology.md) § v0.3.0 response / compression. Track
+**µs/req** (and fixed-rate p50), not %-of-baseline.
+
 ## 2026-07-11 (release confirmation) — v0.3.0 release gate
 
 A second full `bash bench/perf/run-perf.sh all` refresh (plus a fresh `cargo bench` criterion

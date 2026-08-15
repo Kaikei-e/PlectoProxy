@@ -200,6 +200,45 @@ HTTP throughput」形を 1 サイズで採る。
 | 5 | oha README | https://github.com/hatoo/oha | S | `-q` + `--latency-correction`, `-H` |
 | 6 | k6 open vs closed | https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/ | S | CO と arrival-rate |
 
+## 生成器のサイズと DUT 自身の admission control
+
+負荷生成器の同時接続数は「測りたい負荷」ではなく**生成器側の実装都合**で決まりがちで、これが DUT の
+admission control と衝突すると、測定値は静かに壊れる。Plecto の fast path は一つの source IP が保持できる
+同時接続を `MAX_CONNECTIONS_PER_IP` = 256 に制限する（ADR 000092、CWE-770/400）。ループバック実験では
+生成器・proxy・upstream が同じ 127.0.0.1 を共有するため、**VU プールがこの上限を超えると超過分は accept
+で拒否される** —— 拒否された接続は HTTP ステータスを返さないので、`status === 200` / `=== 429` で分岐する
+スクリプトからは**存在ごと消える**。
+
+規則は二つ:
+
+1. **プールは上限未満に固定する。** 目的が admission control そのものでない限り、`preAllocatedVUs` /
+   `maxVUs` は 256 未満に置く（本リポは 200–240）。Little の法則より、ループバックの sub-ms サービス時間
+   では 20,000 req/s でも in-flight は数十のオーダーなので、大きなプールは元々測定的価値がない。プールが
+   足りなければ k6 は `dropped_iterations` として報告する —— open-loop の正直な shed signal であり、
+   静かな歪みより常に良い。例外は closed-loop `sweep` の VU 400/800 rung で、これは**上限を踏むことが目的**。
+2. **ステータスのない応答は独立バケットに数える。** 「200 でない = 短絡された」と解釈すると、拒否された
+   接続が filter の判断として計上される。各シナリオは `no_status` を別に数え、CSV に出す。**期待値は 0**
+   であり、0 でない run はその行を無効とみなす。
+
+この二点を欠いたまま 2026-07-20 に測った結果は、短絡 mix が 90/10 ではなく 76/24 に見え、rate-limit の
+enforcement は offered の 48.8 % を失い、fairness の light key は 500/s のうち 140/s しか通っていないように
+見えた（= starvation の誤検出）。2026-08-15 に両方を直したところ、いずれも設計値に戻り、shed 率は上限導入前
+（2026-07-11）の 79.3 % と小数点まで一致した。**負荷生成器の設定は、それ自体が測定対象に対する仮定である。**
+
+同じ理由で `footprint` phase も接続数を 250（上限未満）に落とし、bytes/conn の除数を「要求数」ではなく
+**生成器が実際に開いたと報告した数**に変えた。要求数で割ると、拒否された分だけ小さい値を publish してしまう。
+
+### 情報の鮮度
+
+- 再検証日: 2026-08-15。手法本体は変更なし（下記の通りツール側の破壊的変更は本リポに当たらない）。
+- **k6 v2.0**: 削除されたのは `externally-controlled` executor / `pause|resume|scale|status` /
+  `k6 login` / `--no-summary` / `--summary-mode=legacy`、および REST API サーバの自動起動。本リポが使う
+  `constant-arrival-rate` / `constant-vus` / `handleSummary` / `-q` / `--out influxdb` は現行のまま。
+  ([Migrate to k6 v2](https://grafana.com/docs/k6/latest/get-started/migrating-to-v2/), Tier S)
+- **RFC 9411**: Informational、obsoleted / updated ともに無し（現行）。
+- **oha 1.14 / gungraun 0.19**: `-q` + `--latency-correction`、`--baseline=` / `--callgrind-limits`
+  ともに現行仕様。ローカル runner と `Cargo.lock` の版一致を CI と同じ方式で確認。
+
 ## Offline policy
 
 - **During a load run**: loopback only. `K6_NO_USAGE_REPORT=true`. No registry / CDN / phone-home.

@@ -667,14 +667,22 @@ phase_footprint(){
   sleep 2
   local idle; idle="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"  # kB
   echo "idle VmRSS: ${idle} kB" | tee "$DATA/footprint.txt"
-  # hold K steady keep-alive connections and re-read RSS
-  loadgen hold --target "http://$BENCH_ADDR/baseline/x" --conns 1000 --seconds 6 &
+  # Hold steady keep-alive connections and re-read RSS. The requested count stays under the fast
+  # path's per-source-IP admission cap (ADR 000092): asking for more only gets the excess refused at
+  # accept, and this phase measures the marginal cost of a held connection, not the cap. The divisor
+  # is the count the generator reports as actually open — dividing by the REQUESTED count is how an
+  # earlier snapshot published a bytes/conn figure four times too small.
+  local hold_out; hold_out="$(mktemp)"
+  loadgen hold --target "http://$BENCH_ADDR/baseline/x" --conns 250 --seconds 6 >"$hold_out" 2>&1 &
   HOLD=$!
   sleep 3
   local busy; busy="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
   wait $HOLD 2>/dev/null
-  echo "RSS with ~1000 conns: ${busy} kB" | tee -a "$DATA/footprint.txt"
-  python3 -c "print(f'bytes/conn ≈ {($busy-$idle)*1024/1000:.0f}')" | tee -a "$DATA/footprint.txt"
+  local held; held="$(sed -n 's/^hold: \([0-9]\{1,\}\) connections.*/\1/p' "$hold_out")"
+  rm -f "$hold_out"
+  echo "RSS with ${held:-0} held conns: ${busy} kB" | tee -a "$DATA/footprint.txt"
+  python3 -c "print(f'bytes/conn ≈ {($busy-$idle)*1024/max(1,${held:-0}):.0f} (over ${held:-0} held connections)')" \
+    | tee -a "$DATA/footprint.txt"
   release_proxy
 }
 

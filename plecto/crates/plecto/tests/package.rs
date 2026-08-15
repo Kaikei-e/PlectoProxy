@@ -3,7 +3,9 @@
 //! operator key into the signed offline OCI image-layout the loader requires and prints the
 //! pinned image-manifest digest — nothing else — to stdout, so `DIGEST=$(plecto package …)`
 //! composes. `validate --resolve` then proves, without serving, that a manifest + its layouts
-//! would pass the load-time gates: digest pin, trusted signatures, SBOM binding.
+//! would pass the load-time gates: digest pin, trusted signatures, SBOM binding. `plecto
+//! conformance` — the gate `package` runs before it signs anything — is covered here too, on the
+//! same fixture component.
 //!
 //! Drives the real compiled binary (`CARGO_BIN_EXE_plecto`).
 
@@ -125,6 +127,76 @@ fn package_gates_on_conformance_and_writes_nothing_for_junk() {
     assert!(
         !dir.path().join("layout").exists(),
         "a non-conformant component never produces a layout"
+    );
+}
+
+#[test]
+fn conformance_json_scores_every_case_with_an_id_and_a_verdict() {
+    // ADR 000108: the machine-readable report carries the stable case id and the five-way verdict
+    // next to the legacy `passed` bool, so CI can track one case across battery versions and tell
+    // an environment shortfall apart from world non-conformance.
+    let dir = tempfile::tempdir().unwrap();
+    write_component(dir.path());
+
+    let out = run(&["conformance", "filter.wasm", "--json"], dir.path());
+    assert!(
+        out.status.success(),
+        "the fixture filter is conformant, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(report["conformant"], serde_json::json!(true));
+    let checks = report["checks"].as_array().expect("the report lists cases");
+    assert!(
+        !checks.is_empty(),
+        "the battery reports its cases: {report}"
+    );
+    for check in checks {
+        for key in ["id", "name", "passed", "verdict", "detail"] {
+            assert!(
+                check.get(key).is_some(),
+                "every case carries `{key}`: {check}"
+            );
+        }
+        assert_eq!(check["verdict"], serde_json::json!("pass"), "{check}");
+        assert_eq!(
+            check["passed"],
+            serde_json::json!(true),
+            "`passed` stays the `verdict == pass` projection: {check}"
+        );
+    }
+    let ids: Vec<&str> = checks.iter().filter_map(|c| c["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        ["v1.0.0-S1", "v1.0.0-D1"],
+        "the ids are the battery's stable case names"
+    );
+}
+
+#[test]
+fn conformance_reports_the_verdict_of_a_component_that_does_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("filter.wasm"), b"not a component").unwrap();
+
+    let json = run(&["conformance", "filter.wasm", "--json"], dir.path());
+    assert!(
+        !json.status.success(),
+        "a non-conformant component exits non-zero"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).expect("stdout is JSON");
+    assert_eq!(report["conformant"], serde_json::json!(false));
+    assert_eq!(report["checks"][0]["verdict"], serde_json::json!("fail"));
+    assert_eq!(report["checks"][0]["passed"], serde_json::json!(false));
+
+    // The text arm speaks the same verdict vocabulary, one marker per case (a `detail` carrying
+    // a multi-line parser diagnostic wraps under its own marker).
+    let text = run(&["conformance", "filter.wasm"], dir.path());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    let markers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('[')).collect();
+    assert_eq!(markers.len(), 2, "one marker per case: {stdout:?}");
+    assert!(
+        markers.iter().all(|line| line.starts_with("[fail]")),
+        "the text arm prints the verdict, not a bool-derived word: {stdout:?}"
     );
 }
 

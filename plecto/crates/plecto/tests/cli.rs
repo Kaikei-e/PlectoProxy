@@ -157,6 +157,68 @@ fn validate_accepts_a_good_manifest_and_exits_without_serving() {
 }
 
 #[test]
+fn validate_notes_the_startup_fixed_fields_a_manifest_declares() {
+    // `[observability]` and the listener half of `[listen]` are captured at construction and stay
+    // out of the config version, so editing only them makes a SIGHUP report "unchanged" and swap
+    // nothing (docs/operations.md, "Reload vs restart"). The operator learns that from `validate`,
+    // not from a reload that silently did nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = format!(
+        r#"
+[observability]
+admin_addr = "127.0.0.1:9090"
+
+[listen]
+addr = "0.0.0.0:8080"
+[listen.drain]
+window_ms = 5000
+{VALID_MANIFEST}"#
+    );
+    std::fs::write(dir.path().join("plecto.toml"), manifest).unwrap();
+
+    let out = run(&["validate", "plecto.toml"], dir.path());
+
+    assert!(
+        out.status.success(),
+        "the manifest is valid, stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let note = stdout
+        .lines()
+        .find(|l| l.starts_with("note:"))
+        .unwrap_or_else(|| panic!("validate notes the startup-fixed fields, got: {stdout:?}"));
+    for field in ["[observability]", "[listen].addr", "[listen].drain"] {
+        assert!(
+            note.contains(field),
+            "the note names {field}, got: {note:?}"
+        );
+    }
+    assert!(
+        note.contains("restart"),
+        "the note says what to do about it, got: {note:?}"
+    );
+    assert!(
+        !note.contains("advertised_port"),
+        "the note lists only what the manifest declares, got: {note:?}"
+    );
+}
+
+#[test]
+fn validate_stays_quiet_when_no_startup_fixed_field_is_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("plecto.toml"), VALID_MANIFEST).unwrap();
+
+    let out = run(&["validate", "plecto.toml"], dir.path());
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("note:"),
+        "nothing startup-fixed is declared, so there is nothing to note: {stdout:?}"
+    );
+}
+
+#[test]
 fn validate_rejects_an_unknown_field_with_a_nonzero_exit() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

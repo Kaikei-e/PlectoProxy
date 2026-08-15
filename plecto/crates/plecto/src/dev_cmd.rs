@@ -160,8 +160,12 @@ fn build_sign_and_gate(
 
     let report = plecto_control::run_conformance(&component);
     for check in &report.checks {
-        let mark = if check.passed { "PASS" } else { "FAIL" };
-        println!("  [{mark}] {} — {}", check.name, check.detail);
+        println!(
+            "  [{}] {} — {}",
+            check.verdict.as_str(),
+            check.name,
+            check.detail
+        );
     }
     if !report.is_conformant() {
         bail!("{filter_id} is not conformant with plecto:filter");

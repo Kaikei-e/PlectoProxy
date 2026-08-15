@@ -36,6 +36,7 @@ pub(crate) fn validate(rest: Vec<String>) -> anyhow::Result<()> {
             for warning in &outcome.warnings {
                 println!("warning {warning}");
             }
+            note_restart_only_fields(&path)?;
         }
         Err(e) => anyhow::bail!("manifest INVALID: {path}: {e}"),
     }
@@ -56,6 +57,28 @@ pub(crate) fn validate(rest: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
+/// Name the startup-fixed fields a validated manifest declares. They are captured when the
+/// process starts and stay out of the config version, so editing only them makes a `SIGHUP`
+/// report `Unchanged` and swap nothing — an operator who reads "manifest OK" and reloads would
+/// otherwise learn that from the absence of an effect.
+fn note_restart_only_fields(path: &str) -> anyhow::Result<()> {
+    // Re-read what validation already parsed: `ValidateOutcome` is a published type, and one
+    // operator hint is not worth widening it.
+    let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
+    let fields = plecto_control::Manifest::from_toml(&raw)
+        .map_err(|e| anyhow::anyhow!("parse {path}: {e}"))?
+        .restart_only_fields();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "note: {} — startup-fixed, not part of the config version; changing only these takes a \
+         restart, not a reload",
+        fields.join(", ")
+    );
+    Ok(())
+}
+
 /// `plecto conformance <component.wasm> [--json]` — run the generic `plecto:filter` conformance
 /// battery against a component; non-zero exit unless every check passes.
 pub(crate) fn conformance(rest: Vec<String>) -> anyhow::Result<()> {
@@ -71,16 +94,31 @@ pub(crate) fn conformance(rest: Vec<String>) -> anyhow::Result<()> {
         let checks: Vec<serde_json::Value> = report
             .checks
             .iter()
-            .map(|c| serde_json::json!({"name": c.name, "passed": c.passed, "detail": c.detail}))
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "passed": c.passed,
+                    "verdict": c.verdict.as_str(),
+                    "detail": c.detail,
+                })
+            })
             .collect();
         println!(
             "{}",
             serde_json::json!({"conformant": report.is_conformant(), "checks": checks})
         );
     } else {
+        // The verdict, not the `passed` projection: `environment` (nothing lent the capability
+        // this component imports) still fails the gate closed, but reading it as `FAIL` would
+        // send an operator hunting for a defect in the component (ADR 000108).
         for check in &report.checks {
-            let mark = if check.passed { "PASS" } else { "FAIL" };
-            println!("[{mark}] {} — {}", check.name, check.detail);
+            println!(
+                "[{}] {} — {}",
+                check.verdict.as_str(),
+                check.name,
+                check.detail
+            );
         }
     }
     if report.is_conformant() {
@@ -131,7 +169,12 @@ pub(crate) fn package(rest: Vec<String>) -> anyhow::Result<()> {
     let report = plecto_control::run_conformance(&component);
     if !report.is_conformant() {
         for check in report.checks.iter().filter(|c| !c.passed) {
-            eprintln!("[FAIL] {} — {}", check.name, check.detail);
+            eprintln!(
+                "[{}] {} — {}",
+                check.verdict.as_str(),
+                check.name,
+                check.detail
+            );
         }
         anyhow::bail!("{component_path} is not conformant with plecto:filter — nothing packaged");
     }

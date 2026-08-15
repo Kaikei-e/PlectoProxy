@@ -533,10 +533,12 @@ Since 0.8.0 the battery underneath is **versioned** (`battery@1.0.0`, cases `v1.
 `inconclusive` / `environment`. `environment` means the run could not lend a capability your
 component imports — a bare `plecto conformance` lends nothing, so a filter built with
 `outbound-http` or `wasi = "minimal"` lands here. That is a diagnosis ("nothing lent it"), not a
-defect ("it doesn't satisfy the world"), but it still exits non-zero, and today's CLI still
-prints it as `FAIL` — the verdict vocabulary reaches the CLI with ADR 000108's `--battery` /
-`--manifest --filter` flags, decided but not yet wired. Until then, running the battery with
-your manifest's grants is a `plecto-host` library call (`run_conformance_with`).
+defect ("it doesn't satisfy the world"), but it still exits non-zero. The CLI reports both halves
+per case: `--json` carries `checks[].id` and `checks[].verdict` next to the `passed` bool, and the
+text output prints the verdict as its marker (`[pass]` / `[environment]` / …). What is still
+pending is ADR 000108's PIXIT flags (`--battery`, `--manifest --filter`) — until they land,
+running the battery with your manifest's grants is a `plecto-host` library call
+(`run_conformance_with`).
 
 The fastest way to see *your* filter run end to end is to adapt an example:
 

@@ -32,6 +32,51 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-18
+
+Patch release: routine dependency maintenance plus a corrected performance snapshot. Nothing
+under `plecto/` changes but the lockfile — no WIT contract, manifest schema, CLI, or public API
+change — and `cargo semver-checks` reports no semver update required against the crates.io 0.9.0
+baseline (196 checks passing on each of `plecto-host` / `plecto-control` / `plecto-server`,
+default features). **Deployed filters do not need a rebuild**: the contract stays at
+`plecto:filter@0.4.0`. No guest lockfile moves either, so the reference filter components are
+byte-identical and the shelf does not republish.
+
+### Changed
+
+- **Workspace lockfile refresh**: no declared version range in `Cargo.toml` moves — every bump
+  lands inside a range that was already there. The ones that reach a shipped binary are the
+  TLS/crypto stack (`aws-lc-rs` 1.17.3 → 1.18.0 with `aws-lc-sys` 0.43 → 0.44, `rustls-webpki`
+  0.103.13 → 0.103.14), the HTTP/2 and HTTP/3 termination paths (`h2` 0.4.15 → 0.4.16,
+  `quinn-proto` 0.11.16 → 0.11.17), the host-state backend (`redb` 4.1.0 → 4.2.0), and a row of
+  patch bumps across `futures` 0.3.34, `thiserror` 2.0.20, `http-body-util` 0.1.5, `clap` 4.6.6,
+  `async-trait` 0.1.92, `uuid` 1.24.1, `portable-atomic` 1.15, `inotify` 0.11.5, plus the
+  `icu_*` 2.2 → 2.3 family `idna` pulls in. The rest are build-only, dev-only, or compiled by no
+  profile Plecto ships: `cc`, `pkg-config`, `rcgen` 0.14.9, the `wast` / `wat` 255 → 256 pair,
+  the `wasm-bindgen` family (a wasm-target dependency), and `aws-lc-fips-sys`, which no manifest
+  here enables the `fips` feature to reach.
+- **`redb` 4.2.0 keeps the on-disk format at version 3**, so an existing host-state file opens
+  unchanged — the upgrade needs no migration step and no operator action.
+
+### Docs
+
+- **The performance snapshot is re-measured, and two phases de-contaminated**
+  (`performance/README.md`, measured at `b2a89be` = v0.9.0; the figures stand for 0.9.1, which
+  changes no source). The load generators' VU pools had exceeded the fast path's per-source-IP
+  connection cap, so refused connections were being counted as filter decisions. The k6
+  scenarios now bound their pools and track status-less responses in their own `no_status`
+  counter; every re-measured scenario reports zero of them, and the figures return to their
+  pre-cap values — the short-circuit mix reads its designed 90/10 split, enforcement accounts
+  for every offered request and sheds 79.3 %, and the light rate-limit key passes untouched.
+  The `footprint` phase had the same defect and then divided the RSS delta by the *requested*
+  connection count, publishing a per-connection cost four times too small; it now holds a count
+  under the cap and divides by what the generator reports as open (~25.4 KB/conn, back on the
+  historical figure).
+- **`bench/methodology.md`** records why a load generator's pool size is itself an assumption
+  about the system under test, and the tool re-validation behind leaving the method otherwise
+  unchanged (k6 v2's removals do not touch these scenarios; RFC 9411, oha and gungraun are
+  current).
+
 ## [0.9.0] - 2026-08-15
 
 Minor bump, not a patch: a manifest value that used to validate green is now rejected, and the

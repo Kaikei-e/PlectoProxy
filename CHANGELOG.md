@@ -32,6 +32,20 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-21
+
+Minor-line release carrying the wasmtime 47 → 48 major bump — identical in content to the
+burned 0.10.0 below, re-issued so the shipped artifacts, the git tag, and the crates.io
+packages all come from one committed tree. Minor rather than patch because the runtime's
+types are re-surfaced through public signatures — `LoadError::Wasmtime(wasmtime::Error)` and
+`Host::pooling_allocator_metrics()` — so a downstream crate naming wasmtime 47 types cannot
+compile against this build. `cargo semver-checks` reports no required bump: the type paths are
+unchanged, which is exactly the gap the versioning policy above assigns to manual judgement
+(the same call as `toml` in 0.6.0). **Deployed filters do not need a rebuild**: the contract
+stays at `plecto:filter@0.4.0`, all four shipped contract versions keep loading, and no guest
+lockfile moves, so the reference filter components are byte-identical and the shelf does not
+republish.
+
 ### Security
 
 - **Runtime: wasmtime 47.0.3 → 48.0.0** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, per
@@ -78,6 +92,16 @@ All notable changes to Plecto are documented here. The format follows
   pushed the contamination into plain sight; the fixture is now returned to the harness and
   dropped outside the measurement, the same de-contamination the wall-clock phases received
   earlier.
+
+## [0.10.0] - 2026-08-21 [YANKED]
+
+Burned by a release-ordering mistake and superseded by 0.10.1 on the same day. The `v0.10.0`
+tag was cut on the pre-bump merge commit, so the GitHub release artifacts under that tag were
+built from a 0.9.1-versioned tree and self-report `plecto 0.9.1`; the crates.io 0.10.0
+packages were published from the not-yet-committed release tree — correct content, but with no
+commit or tag to pair the supply-chain record with. crates.io versions are immutable, so the
+number cannot be reused: the crates.io 0.10.0 packages are yanked, and `release.yml` now
+refuses a tag that does not match the workspace version. Use 0.10.1.
 
 ## [0.9.1] - 2026-08-18
 

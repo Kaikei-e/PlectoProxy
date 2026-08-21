@@ -85,6 +85,20 @@ jobs:
       contents: read
       actions: read # reads the tagged commit's ci.yml runs
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # A tag cut on the wrong commit ships artifacts whose self-reported version disagrees
+      # with the tag (and with the release notes reader's expectation) — refuse it here, before
+      # any artifact job runs.
+      - name: Require the tag to match the workspace version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' plecto/Cargo.toml | head -1)
+          if [ "${tag}" != "${ver}" ]; then
+            echo "tag v${tag} does not match workspace version ${ver} — this tag does not point at its release-prep commit" >&2
+            exit 1
+          fi
+          echo "tag v${tag} matches the workspace version"
       - name: Require a green default-branch CI run for the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}

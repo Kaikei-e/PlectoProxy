@@ -13,7 +13,7 @@ Plecto Proxy の入手経路は 3 つ、provenance の強い順に並べる。�
 
 ```bash
 IMAGE=ghcr.io/kaikei-e/plecto
-TAG=0.9.1   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
+TAG=0.10.1   # 最新リリースを選ぶ: https://github.com/Kaikei-e/PlectoProxy/releases
 DIGEST=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
 
 docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.1 verify "$IMAGE@$DIGEST" \

@@ -32,6 +32,16 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-21
+
+Minor release: the static contract gate for `plecto validate --resolve` (ADR 000114). Minor
+because `cargo semver-checks` demands it outright this time: `plecto-control`'s
+`ResolvedFilterCheck` gained a public field — a break for struct-literal constructors
+(`constructible_struct_adds_field` against the 0.10.1 baseline) — while `plecto-host`'s new
+`LoadError` variants ride behind `#[non_exhaustive]` and require nothing. **Deployed filters do
+not need a rebuild**: the contract stays at `plecto:filter@0.4.0`, and the gate changes what
+`validate` reports, not what the host loads.
+
 ### Added
 
 - **`plecto validate --resolve` now checks the filter contract statically** (ADR 000114). Every
@@ -56,6 +66,12 @@ All notable changes to Plecto are documented here. The format follows
   moves the bundled series surfaces as a compile error rather than a silent format drift — the
   static gate reaches `wit_parser` only through wasmtime's own re-export. Bumping `wasmtime` now
   means bumping `wit-component` to the matching series in the same commit.
+- **The perf harness refuses stale or missing example binaries.** Every phase now inherits a
+  freshness preflight (a gate verdict is only evidence about the build it measured), phase
+  failures aggregate into a non-zero exit instead of vanishing, and the HTTP/3 check no longer
+  records an unreachable server as a result. `PLECTO_BENCH_ALLOW_STALE=1` opts out for
+  deliberate cross-build comparison; the rule and its rationale are in
+  [bench/methodology.md](bench/methodology.md).
 
 ## [0.10.1] - 2026-08-21
 

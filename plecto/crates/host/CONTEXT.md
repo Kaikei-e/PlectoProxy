@@ -93,6 +93,19 @@ _Avoid_: body mode（曖昧）, body flag（点ではなく分類）
 `stream<u8>` で流す形は off-by-default の `plecto:filter-streaming` world（`streaming-body` feature）側。
 WASM 税（コピー）を負う側。
 
+**Stage 1 / Stage 2（M3 の段階名）**:
+M3 host async 化の段階名。Stage 1 = guest export を `call_async`（wasmtime fiber）で駆動する host
+async 化（landed）。Stage 2 = buffered `list<u8>` body フックの追加（landed）。`stream<u8>` を流す形は
+Stage 2 に含まれず、Streaming increment（下記）という別語。ADR 000021 本文の「Stage 2」は当時の呼称で
+`stream<u8>` 本固定を指す——append-only の歴史記録としてそのまま読み、現行の正は ROADMAP のこの定義。
+_Avoid_: Stage 2 を stream 契約の意味で使う（ROADMAP と衝突）, Stage 3（存在しない番号を発明しない）
+
+**Streaming increment**:
+buffered body 契約の外側に置かれた off-by-default の増分。`plecto:filter-streaming` world
+（`streaming-body` feature）で `stream<u8>` を流す実験実装を指し、本固定（凍結解除）のゲートは
+`wasm32-wasip3` の Tier 2 化 + wit-bindgen async の成熟（ADR 000021 / 000025 の再検討条件）。
+_Avoid_: true streaming（文書ではこの増分名で呼ぶ）
+
 **Zero-WASI guest（Tier A）**:
 `plecto:filter` の interface だけを import する（WASI import ゼロの）フィルタコンポーネント。
 デフォルトの deny-by-default Linker が追加の宣言なしに instantiate できる形。Rust

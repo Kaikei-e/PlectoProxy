@@ -240,9 +240,10 @@ impl HostState {
             wasi_minimal,
         } = init;
         // The base WasiCtx builder: empty (no fs, no env, no preopens) until a lent capability
-        // configures its own slice. Outbound TCP installs its `socket_addr_check`; fat guest
-        // wires stdout/stderr into this filter's host-log (ADR 000063). Neither present leaves
-        // the builder's deny-all-sockets / discard-stdio defaults standing.
+        // configures its own slice. Outbound TCP installs its `socket_addr_check` and enables TCP;
+        // fat guest wires stdout/stderr into this filter's host-log (ADR 000063). Neither present
+        // leaves the builder's defaults standing, which refuse to create a socket of any kind and
+        // discard stdio.
         #[cfg(any(
             feature = "outbound-http",
             feature = "outbound-tcp",
@@ -379,9 +380,9 @@ impl wasmtime_wasi::WasiView for HostState {
 }
 
 #[cfg(feature = "outbound-http")]
-impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
-    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p2::WasiHttpCtxView {
+impl wasmtime_wasi_http::WasiHttpView for HostState {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.table,
             hooks: &mut self.hooks,

@@ -81,8 +81,12 @@ fn fresh_fixture() -> Fx {
 #[library_benchmark]
 #[bench::trusted_pooled(setup = pooled_fixture)]
 #[bench::untrusted_fresh(setup = fresh_fixture)]
-fn on_request(fx: Fx) {
+fn on_request(fx: Fx) -> Fx {
+    // Returned so the harness drops the fixture OUTSIDE the measured section: consuming it here
+    // counted Host/Engine teardown into the per-request number (wasmtime 48 made that teardown
+    // ~3x costlier, drowning the signal this gate exists to judge).
     let _ = black_box(fx.filter.on_request(black_box(&fx.req), &fx.trace));
+    fx
 }
 
 library_benchmark_group!(name = wasm_inst, benchmarks = [on_request]);

@@ -16,8 +16,9 @@
 //!    requires the destination to pass the SSRF floor AND to match an allowlist entry for that
 //!    port whose host is either the destination IP literal or a name the host itself pinned to
 //!    that IP. A guest cannot connect to an address it did not obtain through the vetted lookup
-//!    (or that the operator did not list literally) — resolution cannot be bypassed. `TcpBind`
-//!    and every UDP use are denied outright (no listen, no UDP; the UDP interfaces are not even
+//!    (or that the operator did not list literally) — resolution cannot be bypassed. Listening,
+//!    accepting and every UDP use are denied outright; of the bind checks only the wildcard bind
+//!    that `connect` itself implies passes (no listen, no UDP; the UDP interfaces are not even
 //!    linked).
 //! 3. **Resource bounds** — a per-request connect budget (`max_connections`, reset by
 //!    `begin_request`; held connections on a pooled instance cost only their opening request) and
@@ -43,7 +44,7 @@ use wasmtime_wasi::p2::bindings::sockets::ip_name_lookup::{
     Host, HostResolveAddressStream, ResolveAddressStream,
 };
 use wasmtime_wasi::p2::bindings::sockets::network::{self, ErrorCode, IpAddress, Network};
-use wasmtime_wasi::p2::{DynPollable, SocketError, subscribe};
+use wasmtime_wasi::p2::{DynPollable, Pollable, SocketError, subscribe};
 use wasmtime_wasi::sockets::SocketAddrUse;
 
 use crate::outbound::{AddrVerdict, OutboundTcpPolicy};
@@ -119,9 +120,9 @@ impl TcpGuard {
         }
     }
 
-    /// Configure a shared `WasiCtxBuilder` for a Store guarded by this handle: every
-    /// socket-address use funnels into [`TcpGuard::permits`], UDP is disabled outright, and the
-    /// upstream ip-name-lookup permission stays at its deny default (the host's own lookup
+    /// Configure a shared `WasiCtxBuilder` for a Store guarded by this handle: TCP is enabled at
+    /// all, every socket-address use funnels into [`TcpGuard::permits`], UDP is disabled outright,
+    /// and the upstream ip-name-lookup permission stays at its deny default (the host's own lookup
     /// implementation replaces it). A builder (not a built `WasiCtx`) so `HostState::new` can
     /// compose this with the fat-guest stdio wiring (ADR 000063) on the same builder.
     pub(crate) fn configure_wasi_ctx(&self, builder: &mut wasmtime_wasi::WasiCtxBuilder) {
@@ -131,26 +132,37 @@ impl TcpGuard {
                 let verdict = guard.permits(addr, addr_use);
                 Box::pin(std::future::ready(verdict))
             });
+            // Creating a TCP socket is a permission of its own, denied by default and checked
+            // before any address is in play; the per-address gate above is what keeps it narrow.
+            builder.allow_tcp(true);
             builder.allow_udp(false);
         }
-        // No policy: the builder's defaults already deny every socket address.
+        // No policy: the builder's defaults deny socket creation itself, TCP and UDP alike.
     }
 
     /// The connect gate. Pure decision logic (no I/O), so the deny paths are directly
-    /// unit-testable: TCP connect only, SSRF floor + private opt-in on the destination, an
-    /// allowlist entry for the port whose host is the destination literal or pinned to it, and
-    /// the per-request budget — consumed LAST, only by an otherwise-permitted connect.
+    /// unit-testable: TCP connect only (plus the wildcard bind connect itself implies), the SSRF
+    /// floor with private opt-in on the destination, an allowlist entry for the port whose host
+    /// is the destination literal or pinned to it, and the per-request budget — consumed LAST,
+    /// only by an otherwise-permitted connect.
     fn permits(&self, addr: SocketAddr, addr_use: SocketAddrUse) -> bool {
         let Some(inner) = &self.inner else {
             return false;
         };
         match addr_use {
             SocketAddrUse::TcpConnect => {}
-            // No bind (and thus no listen), no UDP in any form.
-            SocketAddrUse::TcpBind
+            // A connect on an unbound socket asks permission for the implicit bind the OS is about
+            // to perform, passing the wildcard address (`0.0.0.0:0` / `[::]:0`); denying it would
+            // deny connect itself. Nothing else follows from the carve-out — a wildcard-bound
+            // socket receives nothing without `listen`, which is its own check below.
+            SocketAddrUse::TcpBind => return addr.ip().is_unspecified() && addr.port() == 0,
+            // Listen and accept are now checks in their own right, and UDP stays off in every
+            // form: the capability is outbound connect only.
+            SocketAddrUse::TcpListen
+            | SocketAddrUse::TcpAccept
             | SocketAddrUse::UdpBind
-            | SocketAddrUse::UdpConnect
-            | SocketAddrUse::UdpOutgoingDatagram => return false,
+            | SocketAddrUse::UdpSend
+            | SocketAddrUse::UdpReceive => return false,
         }
         let ip = addr.ip().to_canonical();
         if inner.policy.classify(ip) != AddrVerdict::Allowed {
@@ -239,8 +251,27 @@ impl Host for TcpLookupView<'_> {
             }
             Ok(ips.into_iter().map(IpAddress::from).collect::<Vec<_>>())
         });
-        let resource = self.table.push(ResolveAddressStream::Waiting(task))?;
-        Ok(resource)
+        let resource = self.table.push(PlectoResolveStream::Waiting(task))?;
+        Ok(Resource::new_own(resource.rep()))
+    }
+}
+
+/// Host-side state behind a guest `resolve-address-stream` handle. wasmtime 48 made the upstream
+/// `ResolveAddressStream` unconstructible outside wasmtime-wasi, so the table holds this type
+/// instead; the generated bindings only ever carry the handle's rep, and `Resource::new_own`
+/// maps between the two typed views of it.
+pub(crate) enum PlectoResolveStream {
+    Waiting(wasmtime_wasi::runtime::AbortOnDropJoinHandle<Result<Vec<IpAddress>, SocketError>>),
+    Done(Result<std::vec::IntoIter<IpAddress>, SocketError>),
+}
+
+#[wasmtime_wasi::async_trait]
+impl Pollable for PlectoResolveStream {
+    async fn ready(&mut self) {
+        if let PlectoResolveStream::Waiting(task) = self {
+            let result = (&mut *task).await;
+            *self = PlectoResolveStream::Done(result.map(Vec::into_iter));
+        }
     }
 }
 
@@ -276,19 +307,20 @@ impl HostResolveAddressStream for TcpLookupView<'_> {
         &mut self,
         resource: Resource<ResolveAddressStream>,
     ) -> Result<Option<IpAddress>, SocketError> {
-        let stream: &mut ResolveAddressStream = self.table.get_mut(&resource)?;
+        let stream: &mut PlectoResolveStream =
+            self.table.get_mut(&Resource::new_borrow(resource.rep()))?;
         loop {
             match stream {
-                ResolveAddressStream::Waiting(future) => {
+                PlectoResolveStream::Waiting(future) => {
                     match wasmtime_wasi::runtime::poll_noop(Pin::new(future)) {
                         Some(result) => {
-                            *stream = ResolveAddressStream::Done(result.map(|v| v.into_iter()));
+                            *stream = PlectoResolveStream::Done(result.map(Vec::into_iter));
                         }
                         None => return Err(ErrorCode::WouldBlock.into()),
                     }
                 }
-                ResolveAddressStream::Done(Ok(iter)) => return Ok(iter.next()),
-                ResolveAddressStream::Done(slot @ Err(_)) => {
+                PlectoResolveStream::Done(Ok(iter)) => return Ok(iter.next()),
+                PlectoResolveStream::Done(slot @ Err(_)) => {
                     // Surface the error once; later polls see an exhausted (empty) stream. The
                     // Ok arm is unreachable given the match guard but stays panic-free (bp-rust:
                     // no data-plane panics).
@@ -305,11 +337,18 @@ impl HostResolveAddressStream for TcpLookupView<'_> {
         &mut self,
         resource: Resource<ResolveAddressStream>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        subscribe(self.table, resource)
+        // A borrowed view: handing `subscribe` an OWNED handle would transfer ownership to the
+        // pollable, which then deletes the stream entry when the guest drops the pollable — and
+        // the guest's own stream drop would trap on the vanished entry.
+        subscribe(
+            self.table,
+            Resource::<PlectoResolveStream>::new_borrow(resource.rep()),
+        )
     }
 
     fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> wasmtime::Result<()> {
-        self.table.delete(resource)?;
+        self.table
+            .delete::<PlectoResolveStream>(Resource::new_own(resource.rep()))?;
         Ok(())
     }
 }
@@ -366,23 +405,45 @@ mod tests {
     fn deny_all_guard_permits_nothing() {
         let g = TcpGuard::deny_all();
         assert!(!g.permits(addr("93.184.216.34", 443), SocketAddrUse::TcpConnect));
+        // not even the wildcard bind the connect carve-out lets through for a policied guard
+        assert!(!g.permits(addr("0.0.0.0", 0), SocketAddrUse::TcpBind));
     }
 
     #[test]
-    fn bind_and_udp_uses_are_denied_even_for_an_allowed_destination() {
-        // The capability is active TCP connect ONLY (ADR 000060): no listen, no UDP — even to an
-        // address that would pass every connect check.
+    fn listen_accept_bind_and_udp_uses_are_denied_even_for_an_allowed_destination() {
+        // The capability is active TCP connect ONLY (ADR 000060): no listen, no accept, no UDP —
+        // even to an address that would pass every connect check.
         let g = guard(policy(vec![entry("8.8.8.8", 853)], vec![], 4));
         let dest = addr("8.8.8.8", 853);
         assert!(g.permits(dest, SocketAddrUse::TcpConnect));
         for blocked in [
             SocketAddrUse::TcpBind,
+            SocketAddrUse::TcpListen,
+            SocketAddrUse::TcpAccept,
             SocketAddrUse::UdpBind,
-            SocketAddrUse::UdpConnect,
-            SocketAddrUse::UdpOutgoingDatagram,
+            SocketAddrUse::UdpSend,
+            SocketAddrUse::UdpReceive,
         ] {
             assert!(!g.permits(dest, blocked), "{blocked:?} must be denied");
         }
+    }
+
+    #[test]
+    fn only_the_wildcard_bind_that_connect_implies_is_permitted() {
+        // connect() on an unbound socket asks permission for the implicit bind first, with the
+        // wildcard address; that one must pass or nothing connects. Any address a guest could
+        // pick for itself does not — and no bind check spends the connect budget.
+        let g = guard(policy(vec![entry("8.8.8.8", 853)], vec![], 1));
+        for _ in 0..8 {
+            assert!(g.permits(addr("0.0.0.0", 0), SocketAddrUse::TcpBind));
+            assert!(g.permits(addr("::", 0), SocketAddrUse::TcpBind));
+        }
+        assert!(!g.permits(addr("0.0.0.0", 8080), SocketAddrUse::TcpBind));
+        assert!(!g.permits(addr("127.0.0.1", 0), SocketAddrUse::TcpBind));
+        assert!(
+            g.permits(addr("8.8.8.8", 853), SocketAddrUse::TcpConnect),
+            "the single-connect budget survived the bind checks"
+        );
     }
 
     #[test]

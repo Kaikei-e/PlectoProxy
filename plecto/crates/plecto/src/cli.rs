@@ -17,9 +17,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// check-the-config-and-exit shape): strict parse + every fail-closed startup check that needs
 /// no artifact and mutates
 /// nothing. `--resolve` additionally resolves each `[[filter]]`'s OCI layout and runs the
-/// loader's provenance gate (digest pin + trusted signatures + SBOM binding) — the CI
-/// pre-flight that pairs with `plecto package` (field report §3.5) — still with no serving,
-/// no wasmtime, no state.
+/// loader's provenance gate (digest pin + trusted signatures + SBOM binding) plus the static
+/// contract gate (ADR 000114) — the CI pre-flight that pairs with `plecto package` (field report
+/// §3.5) — still with no serving, no wasmtime Engine/Store, no compilation, no state.
 pub(crate) fn validate(rest: Vec<String>) -> anyhow::Result<()> {
     let resolve = rest.iter().any(|a| a == "--resolve");
     let path = rest
@@ -50,6 +50,24 @@ pub(crate) fn validate(rest: Vec<String>) -> anyhow::Result<()> {
                     "filter {} OK: artifact verified ({})",
                     check.id, check.digest
                 );
+                match &check.contract {
+                    plecto_control::ContractTargetVerdict::Satisfied(versions) => println!(
+                        "filter {} contract OK: satisfies {} (static check — a pass is not a \
+                         load guarantee; the real load remains authoritative)",
+                        check.id,
+                        versions
+                            .iter()
+                            .map(|v| v.package())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    plecto_control::ContractTargetVerdict::Inconclusive { imports } => println!(
+                        "filter {} contract UNCHECKED: imports outside the contract ({}) — the \
+                         operator's grants decide at load",
+                        check.id,
+                        imports.join(", ")
+                    ),
+                }
             }
             Ok(())
         }

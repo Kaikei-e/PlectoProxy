@@ -505,8 +505,13 @@ plecto validate --resolve manifest.toml
 ```
 
 `validate --resolve` runs the loader's provenance gate (digest pin + trusted signatures + SBOM
-binding) against the real layout, so CI knows *before* a deploy that the manifest + artifact pair
-would pass — what plain `validate` (static, artifact-free) deliberately does not check. `--sbom
+binding) against the real layout, plus a static contract check that targets the component at every
+`plecto:filter` world the binary ships ([ADR 000114](ADR/000114.md)) — so CI knows *before* a
+deploy that the manifest + artifact pair would pass, and that the filter was not built against a
+WIT version this binary no longer carries. Both are what plain `validate` (static, artifact-free)
+deliberately does not check. The contract check adds a rejection and nothing else: a pass is not a
+load guarantee, and a filter that imports outside the contract (a Go guest's `wasi:*`, an outbound
+capability) is reported `contract UNCHECKED` — the manifest decides what is lent to it. `--sbom
 <statement.json>` replaces the default minimal in-toto statement; the statement's subject digest
 must still be this component's sha256, or the loader refuses the pair. The
 [`wasm-auth` example](../plecto/examples/wasm-auth/main.rs) remains a runnable end-to-end

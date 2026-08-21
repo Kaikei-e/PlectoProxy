@@ -135,12 +135,46 @@ pub enum LoadError {
         .imports.join(", ")
     )]
     MissingCapability { imports: Vec<String> },
+    /// No world this build ships accepts the component's own type section — the static gate
+    /// `plecto validate --resolve` runs before any engine exists (ADR 000114). A rejection only:
+    /// the converse verdict says the component was not refused, never that it will load.
+    #[error(
+        "component satisfies no shipped plecto:filter contract (tried {}): {detail}",
+        join_tried(.tried)
+    )]
+    ContractNotSatisfied {
+        tried: Vec<&'static str>,
+        detail: String,
+    },
+    /// The component's type section could not be read as a WIT world at all, so no world can
+    /// judge it. Fail-closed: wasmtime's own validation refuses the same bytes.
+    #[error("component type cannot be decoded as a WIT world: {0}")]
+    ContractUndecodable(anyhow::Error),
     /// The eager trusted-instance build (`Host::load`'s `Isolation::Trusted` path) failed —
     /// carries the same error `RunError::Instantiate` would for a later rebuild.
     #[error("filter instantiation failed: {0}")]
     Instantiate(anyhow::Error),
     #[error(transparent)]
     Wasmtime(#[from] wasmtime::Error),
+}
+
+/// `plecto:filter@0.1.0, @0.2.0, …` — the package name is spelled once so the tried set reads as
+/// a list of contract versions rather than four near-identical strings.
+fn join_tried(tried: &[&'static str]) -> String {
+    let mut out = String::new();
+    for (i, package) in tried.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match (i, package.split_once('@')) {
+            (0, _) | (_, None) => out.push_str(package),
+            (_, Some((_, version))) => {
+                out.push('@');
+                out.push_str(version);
+            }
+        }
+    }
+    out
 }
 
 /// Verify the SBOM attests THIS component: parse it as an in-toto-style statement and require

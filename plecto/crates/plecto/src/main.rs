@@ -86,9 +86,10 @@ async fn run() -> anyhow::Result<()> {
         // Static manifest validation (check the config and exit): strict parse + every fail-closed
         // startup check that needs no artifact and mutates nothing, then exit. `--resolve`
         // additionally resolves each filter's OCI layout and runs the loader's provenance gate
-        // (digest pin + signatures + SBOM binding, field report §3.5) — still without serving,
-        // without wasmtime, without state. Plain (non-JSON) output — this is an operator/CI
-        // command, not the serving process.
+        // (digest pin + signatures + SBOM binding, field report §3.5) plus the static contract
+        // gate (ADR 000114) — still without serving, without a wasmtime Engine/Store, without
+        // compilation, without state. Plain (non-JSON) output — this is an operator/CI command,
+        // not the serving process.
         "validate" => return cli::validate(args.collect()),
         // Filter Dev Kit conformance CLI (ADR 000065 decision 3): the CLI surface over the same
         // generic-property battery `plecto dev` runs before every reload. Self-signs with a

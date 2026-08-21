@@ -69,12 +69,16 @@ toml_edit = "0.25"
 # wit-component: wrap a rebuilt wasm32-unknown-unknown core module into a Component at runtime —
 # the same `ComponentEncoder` recipe `crates/host/build.rs` already uses at BUILD time (ADR
 # 000010), needed here because `plecto dev` componentizes on every file-watch trigger, not once.
-wit-component = "0.255"
+wit-component = { workspace = true }
 
 [dev-dependencies]
 # the host's test_support (TestSigner / bound_sbom / filter_hello_component) for the binary
 # E2E fixtures (tests/binary_signals.rs / tests/listen.rs).
 plecto-host = { path = "../host", features = ["test-support"] }
+# plecto-control: write a signed OCI layout directly in a test, bypassing `plecto package`'s
+# conformance gate — the only way to hand `validate --resolve` a component that no shipped
+# `plecto:filter` world accepts.
+plecto-control = { workspace = true }
 tempfile = "3"
 bytes = { workspace = true }
 http-body-util = { workspace = true }

@@ -32,6 +32,31 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`plecto validate --resolve` now checks the filter contract statically** (ADR 000114). Every
+  resolved component is targeted at each `plecto:filter` world this binary ships, using the world
+  bytes `bindgen!` embeds in the binary — no wasmtime `Engine`/`Store`, no compilation, no state,
+  so `validate`'s "mutates nothing" contract is intact. A filter built against a WIT version the
+  binary no longer carries now fails in CI instead of at the first request. The check only ever
+  adds a rejection: a pass is not a load guarantee (it is deliberately looser about WebAssembly
+  proposals than the runtime), and a component importing outside the contract — a Go/TinyGo guest's
+  `wasi:*`, an outbound capability — is reported `contract UNCHECKED` rather than rejected, since
+  what is lent to it is the manifest's decision. Two new `plecto-host` `LoadError` variants,
+  `ContractNotSatisfied` and `ContractUndecodable`, name the rejection.
+
+### Changed
+
+- `plecto-control`'s `ResolvedFilterCheck` gained a public `contract: ContractTargetVerdict` field.
+  Downstream code that builds the struct with a literal must add it; code that only reads the
+  existing fields is unaffected.
+- `wit-component` is declared once in `[workspace.dependencies]` and pinned to the wasm-tools
+  series `wasmtime` bundles (0.254, down from 0.255). The encoder that writes the embedded world
+  bytes and the decoder that reads them are now the same crate, and a future wasmtime bump that
+  moves the bundled series surfaces as a compile error rather than a silent format drift — the
+  static gate reaches `wit_parser` only through wasmtime's own re-export. Bumping `wasmtime` now
+  means bumping `wit-component` to the matching series in the same commit.
+
 ## [0.10.1] - 2026-08-21
 
 Minor-line release carrying the wasmtime 47 → 48 major bump — identical in content to the

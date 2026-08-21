@@ -71,6 +71,10 @@ mod stdio;
 // code, distinct from `tests/polyglot.rs`'s fixture-specific internal regression suite.
 mod conformance;
 mod contract;
+// The static contract gate (ADR 000114): does a component's own type section satisfy any world
+// this build ships? Pure parsing — the engine-free approximation `plecto validate --resolve` runs
+// where the real load gate cannot.
+mod contract_target;
 // DevSigner (ADR 000065): the persistent, project-local signing key for `plecto dev` /
 // `plecto conformance`. Production code (unlike `test_support`) — it links into a plain
 // `plecto-server` build, not just behind `test-support`.
@@ -103,6 +107,7 @@ pub use conformance::{
 #[doc(hidden)]
 pub use contract::HOP_BY_HOP_GUEST_HEADERS;
 pub use contract::{ContractVersion, FILTER_WIT, SUPPORTED_CONTRACT_VERSIONS, header};
+pub use contract_target::{ContractTargetVerdict, check_contract_target};
 pub use dev_signer::{
     DEV_KEY_MARKER, DevKeyError, DevSigner, PemSigner, bound_sbom, public_key_path_for,
 };
@@ -124,6 +129,9 @@ mod bindings {
         // trivial plecto host-API IMPORTS stay sync (they never block, so they don't need to be
         // async). Body / stream<u8> contract stays frozen until Stage 2.
         exports: { default: async },
+        // Emit `COMPONENT_TYPE`, this world encoded as component-type bytes: what the static
+        // contract gate targets a candidate component against, with no WIT on disk (ADR 000114).
+        include_component_type: true,
     });
 }
 

@@ -337,27 +337,42 @@ A manifest edit or a filter digest bump should fail in CI, not at reload time. `
 <manifest.toml>` runs every fail-closed startup check that needs no artifact — strict parse,
 route/upstream/TLS checks — and mutates nothing (no state file is created), so it is safe to run
 against the production manifest anywhere. `--resolve` extends it to the artifact layer: each
-`[[filter]]`'s OCI layout is resolved, the pinned digest is compared, and the loader's provenance
-gate runs — trusted component/SBOM signatures plus SBOM↔component binding — still with no serving,
-no wasmtime, no state ([ADR 000094](ADR/000094.md)).
+`[[filter]]`'s OCI layout is resolved, the pinned digest is compared, the loader's provenance gate
+runs — trusted component/SBOM signatures plus SBOM↔component binding — and each component is
+checked against every `plecto:filter` world the binary ships, still with no serving, no wasmtime
+`Engine`/`Store`, no compilation, no state ([ADR 000094](ADR/000094.md),
+[ADR 000114](ADR/000114.md)).
 
-The gate is the same function the loader calls at startup and on `SIGHUP`, not a re-implementation,
-so a green pre-flight and a green load cannot drift apart at the artifact layer. Exit code is the
-contract: `0` when everything would load, non-zero otherwise (one `filter <id> OK: artifact
-verified (<digest>)` line per filter on success).
+The provenance gate is the same function the loader calls at startup and on `SIGHUP`, not a
+re-implementation, so a green pre-flight and a green load cannot drift apart at the artifact layer.
+Exit code is the contract: `0` when everything would load, non-zero otherwise. On success each
+filter prints its provenance line and a contract line:
+
+```
+filter auth OK: artifact verified (sha256:…)
+filter auth contract OK: satisfies plecto:filter@0.4.0 (static check — a pass is not a load guarantee; the real load remains authoritative)
+```
 
 ```bash
 plecto validate manifest.toml            # static: config alone
-plecto validate --resolve manifest.toml  # + digest pins, signatures, SBOM binding
+plecto validate --resolve manifest.toml  # + digest pins, signatures, SBOM binding, contract
 ```
 
-Two things stay load-time-only, by design: contract-version support and trusted `init()` behaviour
-need compile/instantiate, which would break validate's "mutates nothing" contract — both still fail
-closed at the actual load. The authoring-side pipeline that feeds this check (`plecto conformance` →
-`plecto package` → pin the printed digest) is in [writing a filter §5](writing-a-filter.md); since
-0.8.0 the underlying gate scores each case with a five-way verdict, and everything except `pass`
-and `na` — including `environment`, a run that could not lend a capability the component imports —
-keeps the exit code non-zero.
+The contract check reads the component's own type section and only ever **adds a rejection**: a
+filter built against a WIT version this binary no longer ships fails here instead of at the first
+request. A pass is not a load guarantee — the static check is deliberately more permissive about
+WebAssembly proposals than the runtime is, and the real load remains authoritative. A filter that
+imports outside the contract (a Go/TinyGo guest's `wasi:*`, an outbound capability) is reported as
+`contract UNCHECKED` rather than rejected: what is lent to it is the manifest's decision, not this
+gate's.
+
+One thing stays load-time-only, by design: trusted `init()` behaviour needs instantiation, which
+would break validate's "mutates nothing" contract — it still fails closed at the actual load. The
+authoring-side pipeline that feeds this check (`plecto conformance` → `plecto package` → pin the
+printed digest) is in [writing a filter §5](writing-a-filter.md); since 0.8.0 the underlying gate
+scores each case with a five-way verdict, and everything except `pass` and `na` — including
+`environment`, a run that could not lend a capability the component imports — keeps the exit code
+non-zero.
 
 ## Reload vs restart
 

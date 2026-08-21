@@ -109,7 +109,15 @@ dhat-heap = []
 instruction-bench = []
 
 [dependencies]
-wasmtime = { workspace = true }
+# `wit-parser`: wasmtime's own re-export, NOT a separate declaration — the `Resolve` / `WorldId`
+# handed to `wit_component::targets` must come from the very wit-parser `wit-component` links, so
+# a wasmtime bump that moves the bundled wasm-tools series fails to compile instead of silently
+# drifting (ADR 000114).
+wasmtime = { workspace = true, features = ["wit-parser"] }
+# wit-component: the static contract gate (`contract_target.rs`) decodes a component's world and
+# type-checks it against the shipped `plecto:filter` worlds — a pure parser, no engine, no Store.
+# Also the build-time componentizer below; one declaration keeps encoder and decoder identical.
+wit-component = { workspace = true }
 # Streaming-body / outbound-http only: a MINIMAL WASI slice (proxy interfaces — no fs/sockets/env) for
 # guests that, unlike the no-WASI header-only filters, import wasi:io. Optional, so the default build
 # never sees it.
@@ -160,7 +168,7 @@ opentelemetry = { workspace = true }
 # build.rs builds the filter-hello guest (wasm32-unknown-unknown) and wraps the
 # core module into a Component Model component, hermetically (no external CLI).
 [build-dependencies]
-wit-component = "0.255"
+wit-component = { workspace = true }
 
 [dev-dependencies]
 # Self dev-dependency: turns on `test-support` for THIS crate's own tests/benches/examples only.
@@ -195,6 +203,10 @@ prost = "0.14"
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 serde = { workspace = true, features = ["derive"] }
 base64 = "0.23"
+# wat: hand-write the pathological components the static contract gate has to classify (a guest
+# importing `wasi:*`, a bare core module) without needing a guest toolchain. The 1.254 line is the
+# CLI face of the 0.254 wasm-tools series `wit-component` above resolves to.
+wat = "1.254"
 
 [[bench]]
 name = "wasm"

@@ -3,7 +3,8 @@
 //! operator key into the signed offline OCI image-layout the loader requires and prints the
 //! pinned image-manifest digest — nothing else — to stdout, so `DIGEST=$(plecto package …)`
 //! composes. `validate --resolve` then proves, without serving, that a manifest + its layouts
-//! would pass the load-time gates: digest pin, trusted signatures, SBOM binding. `plecto
+//! would pass the load-time gates: digest pin, trusted signatures, SBOM binding, and the static
+//! contract gate that targets each component at every shipped `plecto:filter` world. `plecto
 //! conformance` — the gate `package` runs before it signs anything — is covered here too, on the
 //! same fixture component.
 //!
@@ -13,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 
 use plecto_host::DevSigner;
-use plecto_host::test_support::filter_hello_component;
+use plecto_host::test_support::{filter_hello_component, filter_v04_component};
 
 fn run(args: &[&str], dir: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_plecto"))
@@ -33,6 +34,27 @@ fn write_key_pair(dir: &Path) {
 
 fn write_component(dir: &Path) {
     std::fs::write(dir.join("filter.wasm"), filter_hello_component()).unwrap();
+}
+
+/// Sign `component` with a fresh key pair and write the offline OCI layout directly, returning
+/// the pinned digest. `plecto package` cannot do this: its conformance gate runs before it signs
+/// anything, so a component no shipped world accepts never becomes an artifact through the CLI.
+fn write_signed_layout(dir: &Path, component: Vec<u8>) -> String {
+    let (signer, _private_pem) = DevSigner::generate().unwrap();
+    std::fs::write(dir.join("trust.pem"), signer.public_key_pem()).unwrap();
+    let sbom = plecto_control::bound_sbom(&component);
+    let component_signature = signer.sign(&component).unwrap();
+    let sbom_signature = signer.sign(&sbom).unwrap();
+    plecto_control::oci::write_layout(
+        &dir.join("layout"),
+        &plecto_control::ResolvedArtifact {
+            component,
+            component_signature,
+            sbom,
+            sbom_signature,
+        },
+    )
+    .unwrap()
 }
 
 fn manifest_pinning(digest: &str) -> String {
@@ -108,6 +130,78 @@ fn package_prints_only_the_pinned_digest_and_the_layout_passes_resolve() {
         resolve.status.success(),
         "validate --resolve accepts the packaged layout, stderr: {}",
         String::from_utf8_lossy(&resolve.stderr)
+    );
+}
+
+/// The component-model preamble and nothing else: a valid, decodable component whose world
+/// imports nothing outside the contract and exports none of the hooks — so every shipped world
+/// rejects it, and the static gate has to say so.
+const EMPTY_COMPONENT: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+
+#[test]
+fn validate_resolve_rejects_a_component_no_shipped_contract_accepts() {
+    // ADR 000114: a filter built against a WIT the host no longer ships passes the digest pin,
+    // the signature and the SBOM binding — and only the contract gate catches it before the
+    // deploy.
+    let dir = tempfile::tempdir().unwrap();
+    let digest = write_signed_layout(dir.path(), EMPTY_COMPONENT.to_vec());
+    std::fs::write(dir.path().join("plecto.toml"), manifest_pinning(&digest)).unwrap();
+
+    let out = run(&["validate", "--resolve", "plecto.toml"], dir.path());
+    assert!(
+        !out.status.success(),
+        "a component no shipped world accepts fails the pre-flight, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("component satisfies no shipped plecto:filter contract"),
+        "the rejection names the contract gate: {stderr}"
+    );
+    for version in ["plecto:filter@0.1.0", "@0.2.0", "@0.3.0", "@0.4.0"] {
+        assert!(
+            stderr.contains(version),
+            "every shipped contract was tried, {version} missing: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn validate_resolve_reports_the_contract_a_green_layout_satisfies() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key_pair(dir.path());
+    std::fs::write(dir.path().join("filter.wasm"), filter_v04_component()).unwrap();
+
+    let out = package(dir.path());
+    assert!(
+        out.status.success(),
+        "package exits 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    std::fs::write(
+        dir.path().join("plecto.toml"),
+        manifest_pinning(stdout.trim_end()),
+    )
+    .unwrap();
+
+    let resolve = run(&["validate", "--resolve", "plecto.toml"], dir.path());
+    assert!(
+        resolve.status.success(),
+        "a conformant layout still passes, stderr: {}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&resolve.stdout);
+    assert!(
+        stdout.contains("filter hello OK: artifact verified"),
+        "the provenance line is unchanged: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "filter hello contract OK: satisfies plecto:filter@0.4.0 (static check — a pass is \
+             not a load guarantee; the real load remains authoritative)"
+        ),
+        "the contract line names the satisfied world and claims nothing more: {stdout}"
     );
 }
 

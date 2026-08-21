@@ -107,9 +107,9 @@ pub use plecto_host::{
 // production dependency; a plain (non-`test-support`) `plecto-host` build needs no wasm32
 // toolchain, so this widens no dependency edge, just this crate's existing re-export list.
 pub use plecto_host::{
-    ConformanceCheck, ConformanceReport, ContractVersion, DEV_KEY_MARKER, DevKeyError, DevSigner,
-    FILTER_WIT, PemSigner, SUPPORTED_CONTRACT_VERSIONS, bound_sbom, public_key_path_for,
-    run_conformance,
+    ConformanceCheck, ConformanceReport, ContractTargetVerdict, ContractVersion, DEV_KEY_MARKER,
+    DevKeyError, DevSigner, FILTER_WIT, PemSigner, SUPPORTED_CONTRACT_VERSIONS, bound_sbom,
+    check_contract_target, public_key_path_for, run_conformance,
 };
 // The OTLP export surface (ADR 000040): the fast-path server drives the span buffer + the
 // hand-written wire encoding through the control plane, without depending on `plecto-host`.
@@ -426,21 +426,27 @@ pub fn validate_manifest_path(path: &Path) -> Result<ValidateOutcome, ControlErr
     validate_manifest(&manifest, base_dir)
 }
 
-/// One filter proven loadable by [`resolve_manifest`]: its manifest id and the pinned digest
-/// that resolved and verified.
+/// One filter proven loadable by [`resolve_manifest`]: its manifest id, the pinned digest
+/// that resolved and verified, and what the static contract gate said about its component.
 pub struct ResolvedFilterCheck {
     pub id: String,
     pub digest: String,
+    /// Which shipped `plecto:filter` worlds the component statically targets, or why the gate
+    /// declined to judge it (ADR 000114). A component no world accepts never reaches here — it
+    /// is a [`ControlError::Load`].
+    pub contract: ContractTargetVerdict,
 }
 
 /// The artifact half of `plecto validate --resolve` (field report §3.5): for every
 /// `[[filter]]`, resolve its offline OCI image-layout (digest pin), then run the very
 /// provenance gate the loader runs — trusted signatures + SBOM binding
-/// ([`TrustPolicy::verify_artifact`]) — with no wasmtime engine and no state touched. What
-/// this deliberately does NOT prove: `init()` behaviour (a trusted filter's eager-build still
-/// happens only at real load) and contract-version support (detecting the targeted
-/// `plecto:filter` version needs a compile). Pair with [`validate_manifest`] for the full
-/// pre-flight.
+/// ([`TrustPolicy::verify_artifact`]) — followed by the static contract gate
+/// ([`check_contract_target`], ADR 000114), all with no wasmtime `Engine`/`Store`, no
+/// compilation, and no state touched. The contract gate only ever adds a rejection: a component
+/// that satisfies a shipped world may still fail the real load, and one that imports outside the
+/// contract is left unjudged. What this deliberately does NOT prove: `init()` behaviour — a
+/// trusted filter's eager-build still happens only at real load. Pair with [`validate_manifest`]
+/// for the full pre-flight.
 pub fn resolve_manifest(
     manifest: &Manifest,
     base_dir: &Path,
@@ -466,9 +472,16 @@ pub fn resolve_manifest(
                 id: filter.id.clone(),
                 err: e.into(),
             })?;
+        let contract = plecto_host::check_contract_target(&resolved.component).map_err(|e| {
+            ControlError::Load {
+                id: filter.id.clone(),
+                err: e.into(),
+            }
+        })?;
         checks.push(ResolvedFilterCheck {
             id: filter.id.clone(),
             digest: filter.digest.clone(),
+            contract,
         });
     }
     Ok(checks)

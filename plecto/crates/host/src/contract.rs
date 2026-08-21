@@ -7,6 +7,7 @@ mod bindings_v01 {
         path: "wit/v0.1.0",
         world: "filter",
         exports: { default: async },
+        include_component_type: true,
     });
 }
 
@@ -16,6 +17,7 @@ mod bindings_v02 {
         path: "wit/v0.2.0",
         world: "filter",
         exports: { default: async },
+        include_component_type: true,
     });
 }
 
@@ -25,6 +27,7 @@ mod bindings_v03 {
         path: "wit/v0.3.0",
         world: "filter",
         exports: { default: async },
+        include_component_type: true,
     });
 }
 
@@ -86,6 +89,18 @@ pub const SUPPORTED_CONTRACT_VERSIONS: &[ContractVersion] = &[
     ContractVersion::V03,
     ContractVersion::V04,
 ];
+
+/// This version's `filter` world, encoded as component-type bytes by `bindgen!` (ADR 000114).
+/// Crate-internal on purpose: the public surface is [`crate::check_contract_target`], not the
+/// encoding it targets against.
+pub(crate) fn component_type(version: ContractVersion) -> &'static [u8] {
+    match version {
+        ContractVersion::V01 => bindings_v01::COMPONENT_TYPE,
+        ContractVersion::V02 => bindings_v02::COMPONENT_TYPE,
+        ContractVersion::V03 => bindings_v03::COMPONENT_TYPE,
+        ContractVersion::V04 => crate::bindings::COMPONENT_TYPE,
+    }
+}
 
 /// Detect the contract version from the component's decoded import names (wasmtime's own
 /// validated type information, not a byte scan — a scan can false-positive on a string the

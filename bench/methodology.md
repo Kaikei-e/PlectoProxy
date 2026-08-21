@@ -122,6 +122,18 @@ criterion を CI の閾値判定に使わない方針は criterion 公式 FAQ �
 （[gungraun](https://github.com/gungraun/gungraun), Tier S;
 [criterion FAQ](https://bheisler.github.io/criterion.rs/book/faq.html), Tier S）
 
+### 依存 bump の再ベースライン手順
+
+依存の bump が codegen を動かす場合（例: wasmtime の major——Cranelift の最適化パスが変われば
+guest コードの命令数はホストの変更なしに動く）、命令数の差は「Plecto の回帰」ではなく上流の
+差分なので、bump ブランチ上で **pre/post の named baseline を対で取る**。名前は `pre_<dep><major>`
+（例: `pre_wt48`。gungraun の baseline 名は英数字とアンダースコアのみ）とし、得られた命令数 delta は
+bump の ADR に記録する。T1 `gate` も同じブランチで回し、帯を外れた項目は
+`perf/gate_tolerances.toml` の規約どおり**同一 PR で再センタリング**する（期待値変更をレビューに
+乗せるのがこのファイルの目的）。注意すべきは CI の非対称性で、`bench.yml` の instruction ジョブは
+main push の baseline を無審査に保存する——bump がマージされた時点で post 側が新しい基準になり、
+pre 側は残らない。delta の記録を PR / ADR に残すことが、唯一のレビュー痕跡になる。
+
 ### open-loop の分布記録
 
 `plecto-loadgen openloop` は latencies を [HdrHistogram](https://github.com/HdrHistogram/HdrHistogram)

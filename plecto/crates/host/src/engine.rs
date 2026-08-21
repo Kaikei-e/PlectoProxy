@@ -28,6 +28,9 @@ pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
     // capability from either (guests are wasm32-unknown-unknown, header-only), so keep both off:
     // an untrusted component must not reach wasm features the host never decided to lend
     // (deny-by-default).
+    // wasmtime 48 audit (ADR 000096 bump procedure — read the release notes for newly default-on
+    // proposals): 48 turns nothing new on. Fixed-length lists and the implements / external-id
+    // reflection gate ship opt-in, and are left off.
     config.wasm_gc(false);
     config.wasm_exceptions(false);
     // Outbound HTTP (ADR 000036) / outbound TCP (ADR 000060) / fat guest (ADR 000063) lend async

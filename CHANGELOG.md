@@ -32,6 +32,53 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Runtime: wasmtime 47.0.3 → 48.0.0** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, per
+  the workspace's single-declaration rule; the streaming spike host in `spike/streaming-async`
+  follows in its own workspace). 48.0.0 carries the fixes for two advisories whose affected
+  ranges include 47.0.3:
+  - [GHSA-vqjp-4c8c-hfgg](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vqjp-4c8c-hfgg)
+    — *a trailing-slash symlink escapes the `wasi:filesystem` sandbox* (High, originating in
+    `cap-std`). Not reachable here: the filesystem interface is lent inert, with zero preopens,
+    so a filter has no directory handle to walk out of.
+  - [GHSA-x84v-gj2h-g759](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-x84v-gj2h-g759)
+    — *a WASIp3 stream lets the guest choose how much the host allocates* (Moderate). Not
+    reachable either: no feature in this workspace enables the p3 surface.
+
+  Neither was exposed, and the bump is taken regardless — patch-level security fixes are "always
+  safe to take" under the versioning policy above, and sitting inside a published affected range
+  is not a position worth defending.
+- **48 turns no new wasm proposal on by default**, so the ADR 000096 audit finds nothing to
+  close: GC and exception handling remain default-on from 47 and both engine configs keep
+  turning them explicitly off; fixed-length lists and the implements / external-id reflection
+  gate ship opt-in and are left off. The exposure the engine gives an untrusted filter is
+  unchanged from the 47 line.
+
+### Changed
+
+- **`wasmtime-wasi` 48 denies TCP and UDP socket creation by default**, so the `outbound-tcp`
+  capability now enables TCP explicitly rather than relying on an upstream default. Behavior is
+  identical for a filter that was already lent the capability, and for every filter that was not,
+  the upstream default now agrees with Plecto's own deny-by-default stance instead of being
+  overridden by it.
+- **The `wasi-http` host-hook surface moved to the `wasmtime-wasi-http` crate root** with a new
+  `send_request` shape; the outbound-HTTP connector is reworked against it. The guest-visible
+  contract is unchanged, between-bytes-timeout semantics included.
+- **Cranelift gained dead-store elimination in its alias analysis**, on at the default
+  optimization level, so compiled guest code executes fewer instructions than on 47: measured on
+  the decontaminated gate below, `on_request` drops 8.9 % pooled and 6.2 % fresh-per-request,
+  while the pure-Rust fast-path benches are bit-identical. The instruction-count baselines are
+  re-centered on this branch, with the pre-bump baseline kept as `pre_wt48` — the delta is a
+  codegen change upstream, not a regression in anything Plecto owns. The dependency-bump
+  re-baseline procedure is written down in [bench/methodology.md](bench/methodology.md).
+- **The `wasm_inst` gate no longer measures fixture teardown**: the benchmark consumed its
+  fixture inside the measured section, so Host/Engine teardown rode along in the per-request
+  number — over 90 % of the old counts. wasmtime 48 made that teardown roughly 3× costlier and
+  pushed the contamination into plain sight; the fixture is now returned to the harness and
+  dropped outside the measurement, the same de-contamination the wall-clock phases received
+  earlier.
+
 ## [0.9.1] - 2026-08-18
 
 Patch release: routine dependency maintenance plus a corrected performance snapshot. Nothing

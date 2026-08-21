@@ -16,30 +16,42 @@
 //!      closes the DNS-rebinding TOCTOU window. TLS SNI / cert validation still use the original
 //!      hostname.
 //!   4. **Resource bounds** — connect timeout, whole-call `tokio::time::timeout` (the host-side I/O
-//!      deadline epoch interruption cannot provide, ADR 000006 / 000036), and a response-body cap.
+//!      deadline epoch interruption cannot provide, ADR 000006 / 000036), a response-body cap, and
+//!      a per-frame bound on the response body ([`BodyWithTimeout`]).
 //!
 //! Every denial reaches the guest as a `wasi:http` `error-code`, never a silent success — fail-closed.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
-use hyper::{Request, Uri};
+use hyper::body::{Body, Frame, SizeHint};
+use hyper::{Request, Response, Uri};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{Sleep, timeout};
 use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::{DnsErrorPayload, ErrorCode};
-use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
-use wasmtime_wasi_http::p2::types::{
-    HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
-};
-use wasmtime_wasi_http::p2::{HttpResult, WasiHttpHooks, hyper_request_error};
+use wasmtime_wasi_http::p2::hyper_request_error;
+use wasmtime_wasi_http::{Error as WasiHttpError, RequestOptions, WasiBody, WasiHttpHooks};
 
 use crate::outbound::{AddrVerdict, OutboundPolicy, Scheme};
 use crate::resolver::Resolver;
+
+/// The companion future returned alongside the response: wasmtime-wasi-http spawns it and retains
+/// it for the response body's lifetime, so it is where the connection driver's handle must live.
+type IoFuture = Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>;
+
+/// What [`WasiHttpHooks::send_request`] returns: the whole send, resolving to a response plus its
+/// [`IoFuture`].
+type SendFuture =
+    Box<dyn Future<Output = Result<(Response<WasiBody>, IoFuture), WasiHttpError>> + Send>;
 
 /// Per-filter outbound state, held by the loaded filter and shared across its requests. The
 /// semaphore lives here so the per-filter concurrency cap is genuinely shared, not per-request.
@@ -109,23 +121,42 @@ impl PlectoHttpHooks {
 impl WasiHttpHooks for PlectoHttpHooks {
     fn send_request(
         &mut self,
-        request: Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
-        // Never returns Err(HttpError): all denials are surfaced to the guest as a resolved
-        // `error-code` future, which is the fail-closed, guest-observable outcome.
-        Ok(self.dispatch(request, config))
+        request: Request<WasiBody>,
+        _options: Option<RequestOptions>,
+        fut: Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        Response<WasiBody>,
+                        Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>,
+                    ),
+                    WasiHttpError,
+                >,
+            > + Send,
+    > {
+        // `fut` carries a response-processing error back to the request's constructor; on the p2
+        // path — the only one this host links — it is always an immediately-`Ok` future, so there
+        // is nothing to drive (the crate's own default hook drops it too). The guest's
+        // `request-options` are deliberately not consulted either: the operator's `OutboundPolicy`
+        // owns every bound, so a filter cannot widen its own deadlines.
+        drop(fut);
+        // Never returns a trap: denials resolve to `Err(WasiHttpError)`, which wasmtime-wasi-http
+        // hands the guest as an `error-code` — the fail-closed, guest-observable outcome.
+        self.dispatch(request)
     }
 }
 
 impl PlectoHttpHooks {
-    fn dispatch(
-        &mut self,
-        request: Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HostFutureIncomingResponse {
-        let use_tls = config.use_tls;
-        let scheme = if use_tls { Scheme::Https } else { Scheme::Http };
+    fn dispatch(&mut self, request: Request<WasiBody>) -> SendFuture {
+        // 48 dropped the `use_tls` flag from the send seam; the scheme now rides on the request
+        // URI. Anything but http/https can match no allowlist entry, so refuse it outright.
+        let scheme = match request.uri().scheme_str() {
+            Some("https") => Scheme::Https,
+            Some("http") => Scheme::Http,
+            _ => return ready_err(ErrorCode::HttpProtocolError),
+        };
+        let use_tls = scheme == Scheme::Https;
 
         let Some((host, port)) = authority_of(&request, use_tls) else {
             return ready_err(ErrorCode::HttpRequestUriInvalid);
@@ -147,8 +178,12 @@ impl PlectoHttpHooks {
         let total = policy.total_timeout;
         let connect_timeout = policy.connect_timeout;
         let max_body = policy.max_response_bytes;
+        // The operator's total deadline doubles as the response body's per-frame bound: through 47
+        // wasmtime-wasi-http wrapped whatever body this connector returned with exactly this value,
+        // and 48 dropped that wrapper, so `connect_and_send` now applies it itself.
+        let between_bytes = total;
 
-        let handle = wasmtime_wasi::runtime::spawn(async move {
+        Box::new(async move {
             let _permit = permit; // held for the whole call, bounding concurrency
             let outcome = timeout(
                 total,
@@ -160,16 +195,21 @@ impl PlectoHttpHooks {
                     use_tls,
                     connect_timeout,
                     max_body,
-                    total,
+                    between_bytes,
                     request,
                 ),
             )
             .await;
-            let inner = outcome.unwrap_or(Err(ErrorCode::ConnectionTimeout));
-            Ok::<_, wasmtime::Error>(inner)
-        });
-
-        HostFutureIncomingResponse::pending(handle)
+            let (resp, worker) = outcome.unwrap_or(Err(ErrorCode::ConnectionTimeout))?;
+            // Park the connection driver's handle in the companion future rather than dropping it:
+            // wasmtime-wasi-http keeps that future alive for the body's lifetime and aborts it with
+            // the body, which is exactly the driver's required lifetime.
+            let io: IoFuture = Box::new(async move {
+                worker.await;
+                Ok(())
+            });
+            Ok((resp, io))
+        })
     }
 }
 
@@ -196,8 +236,8 @@ async fn resolve_and_connect(
     connect_timeout: Duration,
     max_response_bytes: u64,
     between_bytes_timeout: Duration,
-    request: Request<HyperOutgoingBody>,
-) -> Result<IncomingResponse, ErrorCode> {
+    request: Request<WasiBody>,
+) -> Result<(Response<WasiBody>, AbortOnDropJoinHandle<()>), ErrorCode> {
     let addrs = resolver.resolve(host, port).await.map_err(|e| {
         tracing::debug!(host, port, error = %e, "outbound-http DNS resolution failed");
         dns_err()
@@ -221,8 +261,8 @@ async fn resolve_and_connect(
 }
 
 /// A resolved-error future the guest observes immediately (fail-closed).
-fn ready_err(code: ErrorCode) -> HostFutureIncomingResponse {
-    HostFutureIncomingResponse::ready(Ok(Err(code)))
+fn ready_err(code: ErrorCode) -> SendFuture {
+    Box::new(std::future::ready(Err(WasiHttpError::from(code))))
 }
 
 fn dns_err() -> ErrorCode {
@@ -233,7 +273,7 @@ fn dns_err() -> ErrorCode {
 }
 
 /// Extract `(host, port)` from a request's authority, applying the scheme's default port.
-fn authority_of(request: &Request<HyperOutgoingBody>, use_tls: bool) -> Option<(String, u16)> {
+fn authority_of(request: &Request<WasiBody>, use_tls: bool) -> Option<(String, u16)> {
     let authority = request.uri().authority()?;
     let host = authority.host();
     if host.is_empty() {
@@ -256,8 +296,8 @@ async fn connect_and_send(
     connect_timeout: Duration,
     max_response_bytes: u64,
     between_bytes_timeout: Duration,
-    mut request: Request<HyperOutgoingBody>,
-) -> Result<IncomingResponse, ErrorCode> {
+    mut request: Request<WasiBody>,
+) -> Result<(Response<WasiBody>, AbortOnDropJoinHandle<()>), ErrorCode> {
     // Set the Host header from the authority if the guest didn't. Compute the owned value first so
     // no borrow of `request` is held across the `headers_mut()` insert.
     let host_header = request
@@ -304,19 +344,76 @@ async fn connect_and_send(
         .map_err(hyper_request_error)?;
 
     // Cap the response body (CWE-770): a filter cannot make the host buffer an unbounded response.
+    // The per-frame bound goes outermost, matching where wasmtime-wasi-http used to apply it.
     let resp = resp.map(|body| {
-        Limited::new(body, max_response_bytes as usize)
-            .map_err(move |_| ErrorCode::HttpResponseBodySize(Some(max_response_bytes)))
-            .boxed_unsync()
+        let capped = Limited::new(body, max_response_bytes as usize)
+            .map_err(move |_| WasiHttpError::HttpResponseBodySize(Some(max_response_bytes)))
+            .boxed_unsync();
+        BodyWithTimeout::new(capped, between_bytes_timeout).boxed_unsync()
     });
 
-    Ok(IncomingResponse {
-        resp,
-        // Keep the connection-driver task alive for the response's lifetime; the handle aborts it on
-        // drop. Dropping it here would kill the connection before the body is read.
-        worker: Some(worker),
-        between_bytes_timeout,
-    })
+    // The caller keeps the connection-driver task alive for the response's lifetime; the handle
+    // aborts it on drop, and dropping it here would kill the connection before the body is read.
+    Ok((resp, worker))
+}
+
+/// Bounds the gap between response-body frames, failing the body with `connection-read-timeout`
+/// when one is late. wasmtime-wasi-http wrapped every embedder's response body like this through
+/// 47; from 48 the wrapper lives only inside its own default connector, so the host — which owns
+/// the connector (ADR 000036) — applies the equivalent bound itself.
+struct BodyWithTimeout {
+    inner: WasiBody,
+    /// The active deadline, re-armed whenever a frame arrives.
+    timeout: Pin<Box<Sleep>>,
+    /// Whether `timeout` still needs re-arming on the next `poll_frame`.
+    reset_sleep: bool,
+    /// Longest a frame may take from being first requested to arriving.
+    between_bytes_timeout: Duration,
+}
+
+impl BodyWithTimeout {
+    fn new(inner: WasiBody, between_bytes_timeout: Duration) -> Self {
+        Self {
+            inner,
+            between_bytes_timeout,
+            reset_sleep: true,
+            timeout: Box::pin(wasmtime_wasi::runtime::with_ambient_tokio_runtime(|| {
+                tokio::time::sleep(Duration::from_secs(0))
+            })),
+        }
+    }
+}
+
+impl Body for BodyWithTimeout {
+    type Data = Bytes;
+    type Error = WasiHttpError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, WasiHttpError>>> {
+        let me = Pin::into_inner(self);
+        if me.reset_sleep {
+            me.timeout
+                .as_mut()
+                .reset(tokio::time::Instant::now() + me.between_bytes_timeout);
+            me.reset_sleep = false;
+        }
+        if me.timeout.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)));
+        }
+        let result = Pin::new(&mut me.inner).poll_frame(cx);
+        me.reset_sleep = result.is_ready();
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Drive an established connection: spawn the connection future on a background task and return the
@@ -326,7 +423,7 @@ async fn handshake<S>(
     connect_timeout: Duration,
 ) -> Result<
     (
-        hyper::client::conn::http1::SendRequest<HyperOutgoingBody>,
+        hyper::client::conn::http1::SendRequest<WasiBody>,
         AbortOnDropJoinHandle<()>,
     ),
     ErrorCode,
@@ -391,8 +488,7 @@ fn client_config() -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
 
 /// An empty outgoing body for requests without one (test helper).
 #[cfg(test)]
-fn empty_out_body() -> HyperOutgoingBody {
-    use bytes::Bytes;
+fn empty_out_body() -> WasiBody {
     use http_body_util::Empty;
     Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync()
 }
@@ -404,15 +500,6 @@ mod tests {
     use std::collections::HashMap;
     use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    fn cfg(use_tls: bool) -> OutgoingRequestConfig {
-        OutgoingRequestConfig {
-            use_tls,
-            connect_timeout: Duration::from_secs(2),
-            first_byte_timeout: Duration::from_secs(2),
-            between_bytes_timeout: Duration::from_secs(2),
-        }
-    }
 
     fn test_policy(allow: Vec<AllowEntry>) -> OutboundPolicy {
         OutboundPolicy {
@@ -433,8 +520,22 @@ mod tests {
         }
     }
 
-    fn req(uri: &str) -> Request<HyperOutgoingBody> {
+    fn req(uri: &str) -> Request<WasiBody> {
         Request::builder().uri(uri).body(empty_out_body()).unwrap()
+    }
+
+    /// The response-processing future `wasi:http`'s p2 path always passes to `send_request`.
+    fn no_io() -> IoFuture {
+        Box::new(std::future::ready(Ok(())))
+    }
+
+    /// Drive a `send_request` future to its error. Every denial resolves this way — 48 folded the
+    /// old ready/pending distinction into a single returned future.
+    async fn send_err(fut: SendFuture) -> WasiHttpError {
+        match Pin::from(fut).await {
+            Ok(_) => panic!("expected an error, got a response"),
+            Err(e) => e,
+        }
     }
 
     #[test]
@@ -481,24 +582,6 @@ mod tests {
         }
     }
 
-    fn ready_code(fut: HostFutureIncomingResponse) -> ErrorCode {
-        match fut {
-            HostFutureIncomingResponse::Ready(Ok(Err(code))) => code,
-            _ => panic!("expected a ready error future"),
-        }
-    }
-
-    async fn pending_code(fut: HostFutureIncomingResponse) -> ErrorCode {
-        match fut {
-            HostFutureIncomingResponse::Pending(handle) => match handle.await {
-                Ok(Ok(_)) => panic!("expected an error, got a response"),
-                Ok(Err(code)) => code,
-                Err(e) => panic!("task failed: {e}"),
-            },
-            _ => panic!("expected a pending future"),
-        }
-    }
-
     /// A minimal HTTP/1.1 server on loopback that returns `body` with a correct content-length.
     async fn spawn_server(body: Vec<u8>) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -523,7 +606,7 @@ mod tests {
     async fn connect_and_send_plaintext_success() {
         let addr = spawn_server(b"hello".to_vec()).await;
         let request = req(&format!("http://{addr}/"));
-        let resp = connect_and_send(
+        let (resp, _worker) = connect_and_send(
             addr,
             &addr.ip().to_string(),
             false,
@@ -534,8 +617,8 @@ mod tests {
         )
         .await
         .expect("connect_and_send succeeds");
-        assert_eq!(resp.resp.status(), 200);
-        let bytes = resp.resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello");
     }
 
@@ -543,7 +626,7 @@ mod tests {
     async fn response_body_cap_is_enforced() {
         let addr = spawn_server(vec![b'x'; 100]).await;
         let request = req(&format!("http://{addr}/"));
-        let resp = connect_and_send(
+        let (resp, _worker) = connect_and_send(
             addr,
             &addr.ip().to_string(),
             false,
@@ -554,18 +637,54 @@ mod tests {
         )
         .await
         .expect("headers arrive before the body is read");
-        let collected = resp.resp.into_body().collect().await;
+        let collected = resp.into_body().collect().await;
         assert!(collected.is_err(), "a body over the cap must error");
+    }
+
+    #[tokio::test]
+    async fn response_body_per_frame_timeout_is_enforced() {
+        // The host now owns the per-frame bound wasmtime-wasi-http used to apply: a body that
+        // stalls mid-stream fails rather than hanging on the guest's behalf.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            // announce 100 bytes, send 1, then stall forever
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+                .await;
+            let _ = sock.flush().await;
+            std::future::pending::<()>().await;
+        });
+        let request = req(&format!("http://{addr}/"));
+        let (resp, _worker) = connect_and_send(
+            addr,
+            &addr.ip().to_string(),
+            false,
+            Duration::from_secs(2),
+            1024,
+            Duration::from_millis(150),
+            request,
+        )
+        .await
+        .expect("headers arrive before the body stalls");
+        assert!(matches!(
+            resp.into_body().collect().await,
+            Err(WasiHttpError::ConnectionReadTimeout)
+        ));
     }
 
     #[tokio::test]
     async fn dispatch_denies_unlisted_host() {
         let policy = test_policy(vec![allow("authz.example.com", 443, Scheme::Https)]);
         let mut hooks = OutboundState::new(policy).hooks();
-        let fut = hooks
-            .send_request(req("https://evil.example.com/"), cfg(true))
-            .unwrap();
-        assert!(matches!(ready_code(fut), ErrorCode::HttpRequestDenied));
+        let fut = hooks.send_request(req("https://evil.example.com/"), None, no_io());
+        assert!(matches!(
+            send_err(fut).await,
+            WasiHttpError::HttpRequestDenied
+        ));
     }
 
     #[tokio::test]
@@ -573,10 +692,23 @@ mod tests {
         let policy = test_policy(vec![allow("authz.example.com", 443, Scheme::Https)]);
         let mut hooks = OutboundState::new(policy).hooks();
         // right host, wrong scheme (http vs the allowed https)
-        let fut = hooks
-            .send_request(req("http://authz.example.com/"), cfg(false))
-            .unwrap();
-        assert!(matches!(ready_code(fut), ErrorCode::HttpRequestDenied));
+        let fut = hooks.send_request(req("http://authz.example.com/"), None, no_io());
+        assert!(matches!(
+            send_err(fut).await,
+            WasiHttpError::HttpRequestDenied
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_denies_a_scheme_outside_http_and_https() {
+        // 48 reads the scheme off the request URI; anything else matches no allowlist entry.
+        let policy = test_policy(vec![allow("authz.example.com", 443, Scheme::Https)]);
+        let mut hooks = OutboundState::new(policy).hooks();
+        let fut = hooks.send_request(req("ftp://authz.example.com/"), None, no_io());
+        assert!(matches!(
+            send_err(fut).await,
+            WasiHttpError::HttpProtocolError
+        ));
     }
 
     #[tokio::test]
@@ -590,15 +722,14 @@ mod tests {
             vec![IpAddr::from([127, 0, 0, 1])],
         )]));
         let mut hooks = OutboundState::new_with_resolver(policy, resolver).hooks();
-        let fut = hooks
-            .send_request(
-                req(&format!("http://authz.internal:{}/", live.port())),
-                cfg(false),
-            )
-            .unwrap();
+        let fut = hooks.send_request(
+            req(&format!("http://authz.internal:{}/", live.port())),
+            None,
+            no_io(),
+        );
         assert!(matches!(
-            pending_code(fut).await,
-            ErrorCode::DestinationIpProhibited
+            send_err(fut).await,
+            WasiHttpError::DestinationIpProhibited
         ));
     }
 
@@ -610,9 +741,10 @@ mod tests {
         let mut hooks = state.hooks();
         // exhaust the single shared permit
         let _held = state.permits.clone().try_acquire_owned().unwrap();
-        let fut = hooks
-            .send_request(req("http://authz.internal/"), cfg(false))
-            .unwrap();
-        assert!(matches!(ready_code(fut), ErrorCode::ConnectionLimitReached));
+        let fut = hooks.send_request(req("http://authz.internal/"), None, no_io());
+        assert!(matches!(
+            send_err(fut).await,
+            WasiHttpError::ConnectionLimitReached
+        ));
     }
 }

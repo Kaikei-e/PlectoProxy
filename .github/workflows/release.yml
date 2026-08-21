@@ -86,6 +86,8 @@ jobs:
       actions: read # reads the tagged commit's ci.yml runs
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       # A tag cut on the wrong commit ships artifacts whose self-reported version disagrees
       # with the tag (and with the release notes reader's expectation) — refuse it here, before
       # any artifact job runs.

@@ -134,6 +134,39 @@ bump の ADR に記録する。T1 `gate` も同じブランチで回し、帯を
 main push の baseline を無審査に保存する——bump がマージされた時点で post 側が新しい基準になり、
 pre 側は残らない。delta の記録を PR / ADR に残すことが、唯一のレビュー痕跡になる。
 
+### 測定前の binary 鮮度ガード — 「その verdict はどの build の証拠か」
+
+ベンチの結論は **測った binary についての証拠にしかならない**。`gate` の PASS を「今のコード」の
+根拠として引用できるのは、測った `target/release/examples/*` が今のソースから build されている
+場合だけである。実際に、旧リリース時点の examples が `target/` に残ったまま `gate` が走って
+PASS し、それが新コードの根拠として引用された事故と、examples が丸ごと存在しないまま `all` が
+走って全 phase が起動に失敗しながら **exit 0** で終わり（`h3.txt` には `status=000` という偽の
+結果行まで書かれた）、存在しない HTTP/3 回帰を追いかけた事故が起きている。存在チェック
+（`-x`）だけでは前者を、phase の戻り値を捨てる driver では後者を防げない。
+
+`run-perf.sh` は phase が proxy を起動する前に、必要な release example が **(a) 存在し
+(b) stale でない** ことを要求する（`require_fresh`。phase dispatch 直後の preflight と
+`launch()` の両方で強制されるので、phase 側にコピーを置く必要はない）。違反は phase ではなく
+**run 全体の hard-fail**（exit 3）で、その場で rebuild コマンドを表示する。
+
+- **鮮度の基準時刻** = `plecto/` 配下の「その binary の中身になり得る」ソースの最新 mtime
+  （`*.rs` / `*.toml` / `*.wit` / `*.lock`、tracked + untracked-not-ignored）。未コミットの編集も
+  そのまま効く。`plecto/` 配下の doc 更新は基準に入れない（rebuild を要求する理由がない）。
+  `tests/` / `benches/` / `spike/` も除外する——`cargo build --example` の build graph に無いので、
+  要求した rebuild を cargo が no-op で終え、binary の mtime が動かず**ガードが永久に満たせなく
+  なる**ため。
+- **HEAD の commit 時刻は基準に使わない**。edit → build → commit → 測定は普通の流れで、commit を
+  基準にすると毎回 false positive になる。
+- **escape hatch**: `PLECTO_BENCH_ALLOW_STALE=1` を付けると鮮度判定だけを警告に落とす（存在
+  チェックは落とさない）。用途は 2 つ——古い build を**意図的に**測る cross-build 比較と、
+  build graph 外の変更で rebuild が no-op に終わる場合。常用は禁止で、この変数を付けて得た数値は
+  「どの build か」を明記しない限り snapshot の根拠にできない。
+
+あわせて phase の失敗は握り潰さない: 各 phase は `run_phase` 経由で走り、末尾に per-phase の
+サマリ行を出し、**一つでも失敗した run は非ゼロで終了する**。`h3` phase は他 phase と同じ
+health wait を使い、curl が到達できない（`status=000`）ときは tracked の
+`performance/data/h3.txt` を**書き換えずに**失敗する。
+
 ### open-loop の分布記録
 
 `plecto-loadgen openloop` は latencies を [HdrHistogram](https://github.com/HdrHistogram/HdrHistogram)
@@ -259,6 +292,14 @@ enforcement は offered の 48.8 % を失い、fairness の light key は 500/s 
 
 ## Commands
 
+どの phase も、必要な release example が存在し stale でないことを先に要求する（上の
+「測定前の binary 鮮度ガード」）。build は別コマンド:
+
+```bash
+cd plecto && cargo build --release -p plecto-server --features bench-harnesses \
+  --example load-balancing --example bench-server --example tls-http --example swap-bench
+```
+
 ```bash
 bash bench/perf/run-perf.sh gate  # T1: per-change invariant gate (~6-7 min, machine verdict)
 bash bench/perf/run-perf.sh all   # T2: release-snapshot report (~22 min, report-tier windows)
@@ -267,4 +308,5 @@ bash bench/perf/run-perf.sh v03   # T3: ADR 000073/074/075 in-use costs only (~6
 OPENLOOP_RATE=60000 bash bench/perf/run-perf.sh openloop
 OPENLOOP_GEN=k6 OPENLOOP_RATE=60000 bash bench/perf/run-perf.sh openloop
 sudo unshare -n -- bash -c 'ip link set lo up; REQUIRE_OFFLINE=1 bash bench/perf/run-perf.sh industry'
+PLECTO_BENCH_ALLOW_STALE=1 bash bench/perf/run-perf.sh gate  # 意図的に古い build を測るときだけ
 ```

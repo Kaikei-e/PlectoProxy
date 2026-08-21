@@ -23,6 +23,10 @@
 # regression gate (interleaved invariant deltas, banded verdict, exit code), `all` = T2 release
 # report (TIER=report windows), opt-in phases (`v03`, manual tls modes, mem_matrix.py) = T3 deep.
 #
+# Before anything launches, every release example the phase needs must exist AND be newer than the
+# newest plecto/ source file (require_fresh) — a measurement is only evidence about the build it
+# measured. PLECTO_BENCH_ALLOW_STALE=1 opts out of the freshness half for cross-build comparisons.
+#
 # Default ports avoid colliding with other local services (override with *_ADDR env).
 # Offline: load traffic stays on loopback. Set REQUIRE_OFFLINE=1 to refuse a default IPv4 route
 # (industry-style lab isolation; see bench/methodology.md). INFLUX=1 is opt-in local dashboard only.
@@ -86,7 +90,100 @@ TLS_ADDR="${TLS_ADDR:-127.0.0.1:28443}"
 SWAP_ADDR="${SWAP_ADDR:-127.0.0.1:28087}"
 
 log(){ printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
+err(){ printf '\n\033[1;31m!! %s\033[0m\n' "$*" >&2; }
 gen(){ taskset -c "$GEN_CPUS" "$@"; }   # run a generator on the generator core set
+
+# ---- release-binary freshness guard -------------------------------------------------------------
+# A run must never measure a binary older than the tree it will be cited for. Existence alone is not
+# enough: a gate PASS measured against last release's examples still sitting in target/ was once
+# read as evidence for new code, and a run with no examples at all exited 0 while every phase
+# silently produced nothing.
+#
+# Reference clock = the newest mtime among the sources that can end up INSIDE those binaries: *.rs /
+# *.toml / *.wit / *.lock under plecto/, tracked or merely untracked-but-not-ignored (so an
+# uncommitted edit counts), minus tests/ , benches/ and the spike workspace — none of which are in
+# `cargo build --example`'s graph, so demanding a rebuild for them would ask for a build cargo
+# no-ops, leaving the binary mtime unchanged and the guard permanently unsatisfiable. Doc churn
+# under plecto/ likewise does not demand a rebuild. HEAD's commit time is deliberately NOT part of
+# the reference: edit -> build -> commit -> measure is a normal flow and would false-positive every
+# time. When a rebuild genuinely reports no work to do, PLECTO_BENCH_ALLOW_STALE=1 is the answer.
+BUILD_CMD="  cd plecto && cargo build --release -p plecto-server --features bench-harnesses \\
+    --example load-balancing --example bench-server --example tls-http --example swap-bench"
+SRC_MTIME=""
+STALE_WARNED=""
+src_mtime(){
+  [[ -n "$SRC_MTIME" ]] && { echo "$SRC_MTIME"; return 0; }
+  SRC_MTIME="$(git -C "$ROOT" ls-files -z -c -o --exclude-standard \
+      -- 'plecto/*.rs' 'plecto/*.toml' 'plecto/*.wit' 'plecto/*.lock' \
+         ':(exclude)plecto/spike/*' ':(exclude)plecto/*/tests/*' ':(exclude)plecto/*/benches/*' \
+      2>/dev/null \
+    | xargs -0 -r stat -c %Y -- 2>/dev/null | sort -rn | head -1)"
+  echo "$SRC_MTIME"
+}
+
+# require_fresh <example>... — hard-fails the RUN (not just the phase) on a missing or stale binary.
+# PLECTO_BENCH_ALLOW_STALE=1 downgrades staleness to a warning, for a deliberate cross-build
+# comparison (measuring an old binary on purpose). A MISSING binary is never allowed.
+require_fresh(){
+  local ex bin src bmt missing=() stale=()
+  src="$(src_mtime)"
+  for ex in "$@"; do
+    bin="$WS/target/release/examples/$ex"
+    if [[ ! -x "$bin" ]]; then missing+=("$ex"); continue; fi
+    [[ -n "$src" ]] || continue
+    bmt="$(stat -c %Y "$bin" 2>/dev/null || echo 0)"
+    (( bmt >= src )) || stale+=("$ex (built $(date -d "@$bmt" '+%F %T'))")
+  done
+  if (( ${#stale[@]} )) && [[ "${PLECTO_BENCH_ALLOW_STALE:-}" == "1" ]]; then
+    [[ -n "$STALE_WARNED" ]] || {   # the preflight already said it; don't repeat per launch
+      err "PLECTO_BENCH_ALLOW_STALE=1 — measuring example(s) older than plecto/ sources:"
+      printf '     %s\n' "${stale[@]}" >&2
+      STALE_WARNED=1
+    }
+    stale=()
+  fi
+  (( ${#missing[@]} + ${#stale[@]} )) || return 0
+  (( ${#missing[@]} )) && err "missing release example(s): ${missing[*]}"
+  (( ${#stale[@]} )) && {
+    err "stale release example(s) — built before the newest plecto/ source ($(date -d "@$src" '+%F %T')):"
+    printf '     %s\n' "${stale[@]}" >&2
+  }
+  {
+    echo "  a benchmark verdict is only evidence about the build it measured — rebuild first:"
+    echo "$BUILD_CMD"
+    echo "  (deliberately comparing against an older build? re-run with PLECTO_BENCH_ALLOW_STALE=1)"
+  } >&2
+  exit 3
+}
+
+# ---- phase bookkeeping --------------------------------------------------------------------------
+# Phases return 1 on a failed launch / missing prerequisite; the driver used to drop that on the
+# floor, so a run where every phase failed to start still exited 0. Every phase goes through
+# run_phase: one summary line each, and a non-zero run exit if any of them failed.
+PHASE_RESULTS=()
+RUN_RC=0
+run_phase(){
+  local name="$1" rc=0; shift
+  "$@" || rc=$?
+  if (( rc )); then
+    PHASE_RESULTS+=("FAIL $name (exit $rc)"); RUN_RC=1; err "phase $name FAILED (exit $rc)"
+  else
+    PHASE_RESULTS+=("ok   $name")
+  fi
+  return "$rc"
+}
+
+# The examples a phase can launch — lets the run refuse in its first second instead of 20 minutes in.
+phase_examples(){
+  case "$1" in
+    quick|ceiling|wasm|v03|ws|footprint|ratelimit|body|mix) echo "bench-server";;
+    sweep|openloop|rr|ejection) echo "load-balancing";;
+    swap) echo "swap-bench";;
+    tls|h3) echo "tls-http";;
+    gate|industry) echo "bench-server load-balancing";;
+    all) echo "bench-server load-balancing tls-http swap-bench";;
+  esac
+}
 
 # plecto-loadgen (bench/loadgen): the Rust rr / ejection / swap / ws generators. Built lazily on
 # first use (a warm rebuild is a no-op); replaced the Python drivers, whose GIL-bound workers melted
@@ -131,6 +228,7 @@ trap 'stop_proxy; influx_down' EXIT
 # Memoized: if the same example+addr+env is already running (a release_proxy'd share), reuse it;
 # any mismatch stops the old proxy first, so callers never need to stop before a re-launch.
 launch(){
+  require_fresh "$1"
   local key="$*"
   if [[ -n "$PROXY_PID" && "$key" == "$PROXY_KEY" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "reusing $1 on $2 (pid $PROXY_PID, still pinned $PROXY_CPUS)"
@@ -148,13 +246,15 @@ launch(){
       # A health 200 alone is not proof of THIS proxy: if the fresh process died (bind failure,
       # crash) while something else still answers on the port, the phase would silently measure
       # the wrong config. Require the launched pid to be alive too.
-      kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy $ex exited during startup"; cat "$BLOG"; return 1; }
-      curl -fsS "$health" >/dev/null 2>&1 && { ok=1; break; }
+      kill -0 "$PROXY_PID" 2>/dev/null || { err "proxy $ex exited during startup"; cat "$BLOG" >&2; return 1; }
+      # -k: the readiness probe is loopback-local and tls-http serves a self-signed cert.
+      curl -fsS -k "$health" >/dev/null 2>&1 && { ok=1; break; }
       sleep 0.25
     done
-    [[ -n "$ok" ]] || { echo "proxy $ex did not become healthy"; cat "$BLOG"; return 1; }
+    [[ -n "$ok" ]] || { err "proxy $ex did not become healthy"; cat "$BLOG" >&2; return 1; }
   else
     sleep 2
+    kill -0 "$PROXY_PID" 2>/dev/null || { err "proxy $ex exited during startup"; cat "$BLOG" >&2; return 1; }
   fi
   PROXY_KEY="$key"
   echo "launched $ex on $addr (pid $PROXY_PID, pinned $PROXY_CPUS)"
@@ -275,20 +375,21 @@ phase_industry(){
   # Throughput (RR+CRR) + CO-safe transaction latency at fixed arrival + application mix.
   # Skips resilience timelines / WASM ladder / TLS decomposition — those stay in `all`.
   log "Industry core — ceiling (RR/CRR) + open-loop latency + traffic mix"
-  phase_ceiling
+  run_phase ceiling phase_ceiling
   if command -v k6 >/dev/null 2>&1 || [[ -n "${K6:-}" && -x "${K6}" ]]; then
-    phase_sweep
+    run_phase sweep phase_sweep
   elif [[ -z "${OPENLOOP_RATE:-}" ]]; then
-    echo "industry: k6 not found and OPENLOOP_RATE unset — set OPENLOOP_RATE=<rps> or install k6 for sweep"
+    err "industry: k6 not found and OPENLOOP_RATE unset — set OPENLOOP_RATE=<rps> or install k6 for sweep"
+    PHASE_RESULTS+=("FAIL industry (k6 missing and OPENLOOP_RATE unset)"); RUN_RC=1
     return 1
   else
     echo "industry: skipping sweep (no k6); using OPENLOOP_RATE=${OPENLOOP_RATE}"
     echo "vus,rps,p50,p95,p99,p99_9,failed" > "$DATA/sweep.csv"
     echo "0,${OPENLOOP_RATE},0,0,0,0,0" >> "$DATA/sweep.csv"
   fi
-  phase_openloop
+  run_phase openloop phase_openloop
   if command -v k6 >/dev/null 2>&1 || [[ -n "${K6:-}" && -x "${K6}" ]]; then
-    phase_mix
+    run_phase mix phase_mix
   else
     echo "industry: skipping mix (no k6)"
   fi
@@ -361,7 +462,7 @@ EOF
 
 # ---------------------------------------------------------------- Phase 3 WASM
 phase_wasm(){
-  [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling
+  [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling || return 1
   log "Phase 3.1 — WASM cost ladder (oha 50c, 0 ms backend) -> wasm_overhead.csv"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
   local tmp; tmp="$(mktemp -d)"
@@ -536,15 +637,7 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
 # snapshot comparable across rung-set changes.
 phase_gate(){
   log "Gate — invariant deltas, interleaved x${ROUNDS}, banded verdict -> gate.csv"
-  local ex
-  for ex in bench-server load-balancing; do
-    [[ -x "$WS/target/release/examples/$ex" ]] || {
-      echo "gate: missing release example '$ex' — build first (see bench/plan.md):"
-      echo "  cd plecto && cargo build --release -p plecto-server --features bench-harnesses \\"
-      echo "    --example load-balancing --example bench-server --example tls-http --example swap-bench"
-      return 1
-    }
-  done
+  # Binary existence AND freshness are enforced centrally (require_fresh, run preflight + launch).
   local tmp round r hdr
   tmp="$(mktemp -d)"
   local ladder=(baseline noop-pooled trusted)
@@ -630,7 +723,7 @@ phase_gate(){
 
 # ---------------------------------------------------------------- Phase 4 TLS
 phase_tls(){
-  [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling
+  [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling || return 1
   log "Phase 4 — TLS decomposition (oha) -> tls.csv"
   local tmp; tmp="$(mktemp -d)"
   # plain h1 baseline: read from ceiling.csv (same route, same server, same oha flags — measuring
@@ -791,11 +884,17 @@ phase_h3(){
   # numbers (see performance/README.md).
   log "Phase 4b — HTTP/3 functional check (curl --http3-only over QUIC) -> h3.txt"
   curl --version 2>/dev/null | grep -qi HTTP3 || { echo "curl lacks HTTP/3; skipping" | tee "$DATA/h3.txt"; return 0; }
-  launch tls-http "$TLS_ADDR" "" || return 1
-  for _ in $(seq 40); do curl -fsS -k "https://$TLS_ADDR/api/hello" >/dev/null 2>&1 && break; sleep 0.25; done
-  local out
+  # Real health wait (launch's own, pid-liveness checked) rather than a tolerant loop that falls
+  # through on failure: h3.txt is tracked, and an unreachable server once wrote `status=000` into it.
+  launch tls-http "$TLS_ADDR" "https://$TLS_ADDR/api/hello" || return 1
+  local out status
   out=$(curl -k -s -o /dev/null -w 'status=%{http_code} http_version=%{http_version}' --http3-only "https://$TLS_ADDR/api/hello" 2>/dev/null)
   stop_proxy
+  status="${out#status=}"; status="${status%% *}"
+  [[ -n "$status" && "$status" != 000 ]] || {
+    err "h3: curl --http3-only never reached the server ($out) — $DATA/h3.txt left untouched"
+    return 1
+  }
   echo "curl --http3-only /api/hello -> $out" | tee "$DATA/h3.txt"
 }
 
@@ -864,25 +963,38 @@ phase_ws(){
   cat "$DATA/ws_echo.csv"
 }
 
-rc=0
-case "${1:-all}" in
-  quick) phase_quick;; gate) phase_gate || rc=1;; ceiling) phase_ceiling;;
-  sweep) phase_sweep;; openloop) phase_openloop;; rr) phase_rr;; ejection) phase_ejection;; swap) phase_swap;;
-  wasm) phase_wasm;; v03) phase_v03;; tls) phase_tls;; h3) phase_h3;; ws) phase_ws;; footprint) phase_footprint;;
-  ratelimit) phase_ratelimit;; body) phase_body;; mix) phase_mix;; industry) phase_industry;;
+PHASE="${1:-all}"
+read -r -a NEEDED_EXAMPLES <<<"$(phase_examples "$PHASE")"
+(( ${#NEEDED_EXAMPLES[@]} )) && require_fresh "${NEEDED_EXAMPLES[@]}"
+
+case "$PHASE" in
+  quick) run_phase quick phase_quick;; gate) run_phase gate phase_gate;;
+  ceiling) run_phase ceiling phase_ceiling;;
+  sweep) run_phase sweep phase_sweep;; openloop) run_phase openloop phase_openloop;;
+  rr) run_phase rr phase_rr;; ejection) run_phase ejection phase_ejection;; swap) run_phase swap phase_swap;;
+  wasm) run_phase wasm phase_wasm;; v03) run_phase v03 phase_v03;; tls) run_phase tls phase_tls;;
+  h3) run_phase h3 phase_h3;; ws) run_phase ws phase_ws;; footprint) run_phase footprint phase_footprint;;
+  ratelimit) run_phase ratelimit phase_ratelimit;; body) run_phase body phase_body;;
+  mix) run_phase mix phase_mix;; industry) phase_industry;;
   all)
     # The four BACKEND_LATENCY_MS=0 bench-server phases share ONE launch (SHARE_PROXY +
     # memoized launch): footprint runs first because its idle-RSS read must precede any load
     # (ws's own footprint row is a held-tunnel DELTA, so it tolerates the shared warm proxy).
     SHARE_PROXY=1
-    phase_footprint; phase_ceiling; phase_ws; phase_wasm
+    run_phase footprint phase_footprint; run_phase ceiling phase_ceiling
+    run_phase ws phase_ws; run_phase wasm phase_wasm
     SHARE_PROXY=0; stop_proxy
-    phase_tls; phase_h3; phase_sweep; phase_openloop; phase_rr; phase_ejection; phase_swap
-    phase_ratelimit; phase_body; phase_mix
+    run_phase tls phase_tls; run_phase h3 phase_h3; run_phase sweep phase_sweep
+    run_phase openloop phase_openloop; run_phase rr phase_rr; run_phase ejection phase_ejection
+    run_phase swap phase_swap; run_phase ratelimit phase_ratelimit; run_phase body phase_body
+    run_phase mix phase_mix
     ;;
   # note: `v03` is opt-in (not in `all`) — run `bash bench/perf/run-perf.sh v03` after landing
   # ADR 000073/074/075 response features; see performance/README.md § v0.3.0 response ladder.
-  *) echo "unknown phase: $1"; exit 2;;
+  *) echo "unknown phase: $PHASE"; exit 2;;
 esac
-log "done: $1"
-exit "$rc"
+
+log "done: $PHASE"
+if (( ${#PHASE_RESULTS[@]} )); then printf '  %s\n' "${PHASE_RESULTS[@]}"; fi
+(( RUN_RC == 0 )) || err "run FAILED — see the phase summary above; measured data for failed phases is absent or partial"
+exit "$RUN_RC"

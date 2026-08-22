@@ -32,6 +32,27 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-22
+
+Patch release: routine dependency maintenance plus the reworked crates.io README. Nothing under
+`plecto/` changes but the lockfile and the packaged README — no WIT contract, manifest schema,
+CLI, or public API change — and `cargo semver-checks` against the crates.io 0.11.0 baseline
+reports no semver update required on each of `plecto-host` / `plecto-control` / `plecto-server`
+(default features). **Deployed filters do not need a rebuild**: the contract stays at
+`plecto:filter@0.4.0`.
+
+### Changed
+
+- **Workspace lockfile refresh**: thirteen in-range moves; the ones reaching a shipped binary
+  are the HTTP/2 termination path (`h2` 0.4.16 → 0.4.18), the TLS stack (`rustls-webpki`
+  0.103.14 → 0.103.15), `cc` 1.4.4, `either` 1.18.0, and the `icu_provider` / `zerovec` row.
+  The ADR 000114 pin held under the update: `wit-component` / `wit-parser` stay on wasmtime's
+  bundled 0.254 line (cargo reports them Unchanged behind 0.257), and the 0.257
+  `wasm-encoder` / `wasmparser` entries belong to the test-only `wat` dependency.
+- **The shared crates.io README is brought up to convention** (badges in the README itself, a
+  minimal-manifest quick start, versioning/MSRV/CHANGELOG pointers) — this release is what puts
+  it on the crates.io pages.
+
 ## [0.11.0] - 2026-08-21
 
 Minor release: the static contract gate for `plecto validate --resolve` (ADR 000114). Minor

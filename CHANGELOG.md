@@ -32,6 +32,31 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Runtime: wasmtime 48.0.0 → 48.0.1** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, per
+  the workspace's single-declaration rule; the streaming spike host in `spike/streaming-async`
+  follows in its own workspace). A patch on the same 48 line: it fixes context-slot bookkeeping in
+  component compositions and makes WASIp2 outgoing HTTP requests carry a `Host` header by
+  default. The ADR 000114 pin is untouched — 48.0.1 still bundles the 0.254 wasm-tools series, so
+  `wit-component` / `wit-parser` stay at 0.254 and the `wasm-tools` CLI pinned in CI / release
+  stays at 1.254.0 (the shelf encode path's series-parity invariant). The test-only `wat`
+  dependency moves 1.257.1 → 1.258.0 (its own `wasmparser` / `wasm-encoder` / `wast` 258 rows).
+- **Guest toolchain: wit-bindgen 0.60 → 0.61.1** across the Rust example filters, the filter
+  template, the host fixtures, and the streaming spike guest; guest lockfiles move the wasm-tools
+  family 254 → 258 in lockstep, and CI installs the sha256-pinned 0.61.1 CLI for the C guest.
+  `crates/host/build.rs` keeps wrapping the 0.61-generated core modules with the workspace's
+  0.254 `wit-component`, so the two series coexist as before. 0.61.0 briefly dropped
+  `cabi_realloc` on `wasm32-unknown-unknown` and restored it in the same release; 0.61.1 is the
+  first version with the non-Wasm link fix on top. The MoonBit guests' committed bindings are
+  not regenerated (the 0.61 MoonBit changes are to the async task / stream paths the
+  `plecto:filter` contract does not use).
+- **Polyglot CI toolchain: wasi-sdk 33 → 34** (clang 23) for the C guest, sha256-pinned; the two
+  JavaScript guests move `@bytecodealliance/componentize-js` 0.21.0 → 0.22.0 (destructor
+  metadata in the splicer). All seven polyglot guests rebuild with their `build.sh` import
+  assertions intact (Tier A zero-WASI, Tier B the `wasi:` allowlist), and the four conformance
+  suites pass unchanged.
+
 ## [0.11.1] - 2026-08-22
 
 Patch release: routine dependency maintenance plus the reworked crates.io README. Nothing under

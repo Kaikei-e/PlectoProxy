@@ -45,11 +45,11 @@ plecto-server = { path = "crates/server", version = "0.11.1" }
 # from 47 and the engine keeps turning both back off explicitly (deny-by-default,
 # crates/host/src/engine.rs). The async / bindgen API is still moving on this line, so we track
 # the latest 48 patch (Cargo.lock pins the resolved build).
-wasmtime = "48.0.0"
+wasmtime = "48.0.1"
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "48.0.0"
-wasmtime-wasi-http = "48.0.0"
+wasmtime-wasi = "48.0.1"
+wasmtime-wasi-http = "48.0.1"
 # wit-component must stay on the wasm-tools series `wasmtime` above bundles (48.0.x ⇒ 0.254):
 # `bindgen!(include_component_type)` encodes each world with wasmtime's own copy, and the static
 # contract gate decodes it through wasmtime's `wit_parser` re-export — two series would not even

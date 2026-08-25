@@ -204,8 +204,10 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 serde = { workspace = true, features = ["derive"] }
 base64 = "0.23"
 # wat: hand-write the pathological components the static contract gate has to classify (a guest
-# importing `wasi:*`, a bare core module) without needing a guest toolchain. The 1.254 line is the
-# CLI face of the 0.254 wasm-tools series `wit-component` above resolves to.
+# importing `wasi:*`, a bare core module) without needing a guest toolchain. Test-only and NOT held
+# to the 0.254 series `wit-component` above is pinned to: a text-format parser has no encoder parity
+# to keep, so it tracks the latest wasm-tools line (the duplicate `wasmparser` / `wasm-encoder`
+# entries in Cargo.lock are its).
 wat = "1.254"
 
 [[bench]]

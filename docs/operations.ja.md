@@ -304,7 +304,7 @@ Plecto は**二つのバージョン系列**を持ち、**両者は独立に動�
 
 ```console
 $ plecto --version
-plecto 0.11.1 (profile: minimal)
+plecto 0.11.2 (profile: minimal)
 filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0, plecto:filter@0.4.0
 ```
 

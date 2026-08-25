@@ -32,6 +32,15 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-08-26
+
+Patch release: the WebAssembly toolchain moves to the current releases — wasmtime 48.0.1 in the
+host, wit-bindgen 0.61.1 in the guests, wasi-sdk 34 / componentize-js 0.22.0 in the polyglot
+lanes. No WIT contract, manifest schema, CLI, or public API change, and `cargo semver-checks`
+against the crates.io 0.11.1 baseline reports no semver update required on each of
+`plecto-host` / `plecto-control` / `plecto-server` (default features). **Deployed filters do not
+need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
+
 ### Changed
 
 - **Runtime: wasmtime 48.0.0 → 48.0.1** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, per

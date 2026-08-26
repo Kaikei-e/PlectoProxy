@@ -68,6 +68,14 @@ CI に対応する feature 一括テスト（polyglot Tier A/B・tokenlimit・ou
 
 wit-bindgen / componentize-js / wasi-sdk / wasm-tools のいずれかを動かしたら、Phase 2 に加えて:
 
+- **reference filter shelf の版上げ**（最優先、tag を打つ前に）: wit-bindgen や依存の更新で
+  `filter-jwt` / `filter-cors` / `filter-apikey` / `filter-extauthz` のコンポーネントバイトが変わると、
+  release.yml の filter-publish が「同版で内容不一致」で fail-closed する（ADR 000080、tag は不変）。
+  `./scripts/build-reference-filters.sh <out>` の content-sha256 を、公開済み
+  （`wkg oci pull ghcr.io/kaikei-e/plecto/filters/<short>:<version>` → `wasm-tools strip` → sha256、
+  wasm-tools は CI pin と同版）と照合し、違う filter は Cargo.toml の version を patch 上げ →
+  `cargo update -w --offline` で Cargo.lock 追従 → `docs/reference-filters.md` の互換行列 → CHANGELOG に
+  「Reference-filter shelf republished」bullet。前例: `98e7fef`、`c0ada86`。
 - **vendored template**: `examples/filters/filter-template/` を変えたら `just sync-template-crate`。
   `crates/plecto/templates/filter-template/` はバイト一致が要件（`check_wit_vendoring.py`）。
 - **JS lockfile**: `just regen-js-lockfiles`。in-place の `npm install` は peer dep を nested-only に

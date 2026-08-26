@@ -92,7 +92,7 @@ cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyg
 - 言語: `bp-rust`, `bp-typescript`
 - アーキ/設計: `plecto-architecture`, `wit-contract-design`, `wasmtime-host`, `design-an-interface`,
   `improve-codebase-architecture`
-- プロセス: `tdd-workflow`, `security-auditor`, `full-review`, `grill-me`, `grill-with-docs`, `qa`,
+- プロセス: `tdd-workflow`, `release-prep`, `security-auditor`, `full-review`, `grill-me`, `grill-with-docs`, `qa`,
   `web-researcher`
 - ドキュメント: `plecto-adr-writer`, `plecto-postmortem-writer`
 

@@ -65,6 +65,12 @@ need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
   metadata in the splicer). All seven polyglot guests rebuild with their `build.sh` import
   assertions intact (Tier A zero-WASI, Tier B the `wasi:` allowlist), and the four conformance
   suites pass unchanged.
+- **Reference-filter shelf republished**: `filters/jwt` 0.1.6 → 0.1.7, `filters/cors` /
+  `filters/apikey` / `filters/extauthz` 0.1.4 → 0.1.5 (ADR 000080 — filter tags are immutable, and
+  the wit-bindgen 0.61 bindings above changed every shelf entry's stripped-component hash, so the
+  existing tags can't carry the new bytes; the first v0.11.2 release run failed closed at exactly
+  that guard). No filter source change. The compatibility matrix (`docs/reference-filters.md`) is
+  updated to match.
 
 ## [0.11.1] - 2026-08-22
 

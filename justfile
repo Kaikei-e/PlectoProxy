@@ -30,8 +30,7 @@ clippy:
 # fmt check + clippy
 lint: fmt-check clippy
 
-# run a guided demo end to end: quickstart | wasm-auth | load-balancing | filter-chain |
-# tls-http | hot-reload | canary | resilience | production
+# run a guided demo end to end: quickstart | wasm-auth | load-balancing | filter-chain | tls-http | hot-reload | canary | resilience | production
 demo NAME:
     cd {{plecto}} && ./examples/try.sh {{NAME}}
 
@@ -94,8 +93,9 @@ bench-build:
     cd {{plecto}} && cargo build --release -p plecto-server --features bench-harnesses \
         --example load-balancing --example bench-server --example tls-http --example swap-bench
 
-# T1 perf gate (~6-7 min): interleaved invariant deltas vs bench/perf/gate_tolerances.toml,
-# machine verdict (exit 0 = in band). Run on hot-path changes; see bench/methodology.md § tiers
+# Interleaved invariant deltas vs bench/perf/gate_tolerances.toml, machine verdict (exit 0 = in
+# band). Run on hot-path changes; see bench/methodology.md § tiers.
+# T1 perf gate (~6-7 min)
 gate:
     bash bench/perf/run-perf.sh gate
 

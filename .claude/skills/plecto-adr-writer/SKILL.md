@@ -38,25 +38,45 @@ ADR が実装の決定記録なら、書く前に最低限のテストで動作�
 
 ### 2.1 番号とテンプレート
 
+番号は手で数えない。`docdag` に採番させる:
+
 ```bash
-ls docs/ADR/ 2>/dev/null | grep -E '^[0-9]{6}\.md$' | sort | tail -1   # 最新番号を確認
+docdag new "<title>" --dry-run --format json   # => {"id": "000115", "path": "docs/ADR/000115.md", ...}
 ```
 
-最新 +1 の 6 桁ゼロ埋め（最初の ADR は `000001`）をファイル名にする。`docs/ADR/template.md` を Read で
-開き、そのセクション見出しをそのまま使う（勝手に増減しない）。無ければテンプレを先に作る。
+`--dry-run` は何も書かずに次の空き番号を予約し、`docdag.yaml` の `filename: "{id}.md"` に従った
+`docs/ADR/NNNNNN.md` を返す。`docs/ADR/template.md` は Go template ではなく日本語の雛形なので、
+本文生成は `docdag` にさせない——返ってきた `path` に、`template.md` を Read して**その見出しをその
+まま使い**（勝手に増減しない）Write する。
 
-### 2.2 Frontmatter
+### 2.2 既存 ADR の調べ方
+
+`ls` / `grep` でディレクトリを走査しない。グラフに聞く:
+
+| 知りたいこと | コマンド |
+|---|---|
+| ある ADR と、それが解決する先・近傍（Decision 抜粋つき） | `docdag context 000104 --budget 400` |
+| いま有効な決定の一覧（id / title / status） | `docdag query --binding --fields id,title,status` |
+| superseded な ADR の後継 | `docdag resolve 000021` |
+
+### 2.3 Frontmatter
 
 | フィールド | 値の決め方 |
 |---|---|
 | `title` | 動詞始まりの行動指向の一文。ADR 番号は含めない |
 | `date` | `YYYY-MM-DD`（当日） |
 | `status` | 新規は `proposed`、合意済みなら `accepted`。過去 ADR を無効化する場合のみ `superseded` |
-| `tags` | §2.4 の許可タグから最大 5 個 |
+| `tags` | §2.5 の許可タグから最大 5 個 |
 | `affected_components` | コンポーネント名と変更概要を 1 行/件で列挙（例: `host runtime — pooling 再利用を追加`） |
 | `aliases` | `ADR-NNN` と `ADR-000NNN` の 2 形式を必ず両方入れる（wikilink 解決用） |
+| `amends` / `supersedes` | 先行 ADR を精緻化・訂正するなら `amends: ["000052"]`、完全に置き換えるなら `supersedes: ["000037"]` |
 
-### 2.3 本文ルール
+`amends` を書いたら、**相手側の frontmatter に `amended_by: ["<新 ADR>"]` を追記する**（既にあれば
+末尾に足す）。これは `docdag.yaml` の `inverse: amended_by` が強制する相互性で、欠けると
+`inverse_mismatch` エラーになる。確定済み ADR に対して append-only 履歴が許す frontmatter 編集は
+この追記だけなので、**他のキーや本文には触らない**。
+
+### 2.4 本文ルール
 
 - **日本語で書く**。コンポーネント名 / コマンド / ライブラリ名 / WIT / ファイルパスは英語のまま。
 - **セクション順は `template.md` を尊重**。Status / Date / Affected Components / Context / Decision /
@@ -72,7 +92,7 @@ ls docs/ADR/ 2>/dev/null | grep -E '^[0-9]{6}\.md$' | sort | tail -1   # 最新�
 - **Related ADRs は wikilink `[[000NNN]] タイトル` 形式**で列挙（`ADR-000NNN (タイトル)` 形式は使わない）。
   `CLAUDE.md` への参照は通常リンクで良い。
 
-### 2.4 許可タグ
+### 2.5 許可タグ
 
 ```
 architecture, fast-path, extension-plane, filter, chain, decision,
@@ -83,9 +103,9 @@ security, observability, otel, oci, distribution, hot-reload, config,
 performance, async, testing, ci-cd
 ```
 
-この外のタグを増やしたくなったら、ADR ではなく先に `CLAUDE.md`（または本スキルの §2.4）を更新する。
+この外のタグを増やしたくなったら、ADR ではなく先に `CLAUDE.md`（または本スキルの §2.5）を更新する。
 
-### 2.5 情報衛生
+### 2.6 情報衛生
 
 Plecto はセルフホスト / データ主権志向の公開プロジェクト。以下を含めない:
 
@@ -95,10 +115,16 @@ Plecto はセルフホスト / データ主権志向の公開プロジェクト�
 
 `localhost:XXXX` と設定上のサービス名は OK。
 
-### 2.6 書き込み
+### 2.7 書き込み
 
 Write ツールで `docs/ADR/NNNNNN.md` を作る。heredoc や `cat > ...` は使わない。書き込み後に Read で
 自分の出力を読み返し、見出し / frontmatter / wikilink 形式を確認する。
+
+最後にグラフ側を通す。CI（`docs` ジョブ）と同じ検証で、ここで落ちたものは PR でも落ちる:
+
+```bash
+docdag validate --touching docs/ADR/NNNNNN.md   # 書いた ADR とその隣接だけを報告（exit code は corpus 全体）
+```
 
 ---
 

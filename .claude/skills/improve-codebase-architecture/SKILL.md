@@ -32,7 +32,7 @@ This skill is _informed_ by the project's domain model. The domain language (`CO
 
 ### 1. Explore
 
-Read the project's domain glossary, the relevant Forks/Tenets (summarised in `CLAUDE.md`), and any ADRs in the area you're touching first.
+Read the project's domain glossary, the relevant Forks/Tenets (summarised in `CLAUDE.md`), and any ADRs in the area you're touching first. Reach the ADRs through the graph rather than the directory: `docdag context <ref>` prints a decision, what supersedes it and its neighbourhood with each Decision quoted, and `docdag query --binding --fields id,title,status` lists what is currently in force.
 
 Then use the Agent tool with `subagent_type=Explore` to walk the codebase. Don't follow rigid heuristics — explore organically and note where you experience friction:
 

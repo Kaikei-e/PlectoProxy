@@ -23,7 +23,7 @@ requires). Scheduled jobs cover what neither needs to block on.
 | Supply-chain policy (licenses, advisories, sources) | `cargo-deny` (ci.yml) | every PR + main |
 | Public-API semver of the crates.io library crates, diffed against the newest published version | `semver-checks` (ci.yml) | every PR + main |
 | Workflow security lint (`zizmor`) over `.github/workflows/` | `workflow-lint` (ci.yml) | every PR + main |
-| ADR graph (append-only edges, wikilinks, frontmatter — `docdag validate` + `scripts/check_adr_graph.py`) **and** WIT/template vendoring drift (`scripts/check_wit_vendoring.py`) | `docs` / `fmt` (ci.yml) | every PR + main |
+| ADR graph, one gate (`docdag validate`): frontmatter YAML validity, typed-edge invariants, `amended_by` reciprocity, wikilink resolution in body and frontmatter, and — on a PR — append-only history against the base branch **and** WIT/template vendoring drift (`scripts/check_wit_vendoring.py`) | `docs` / `fmt` (ci.yml) | every PR + main |
 | Release-profile builds of both capability profiles | `release-parity` (ci.yml) | main only (merge-heavy) |
 | **Fuzzing** — every libfuzzer target (`plecto/fuzz/`), bounded run from the committed corpus | `fuzz` ([fuzz.yml](../.github/workflows/fuzz.yml)) | weekly + on demand |
 | Release gate: a tag only releases if `main` CI was green for that commit | `gate` ([release.yml](../.github/workflows/release.yml)) | every tag |

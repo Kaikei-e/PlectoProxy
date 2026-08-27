@@ -23,7 +23,7 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 | 供給網ポリシー（ライセンス・advisory・取得元） | `cargo-deny`（ci.yml） | 全 PR + main |
 | crates.io 公開ライブラリ 3 クレートの公開 API semver（最新公開版との差分） | `semver-checks`（ci.yml） | 全 PR + main |
 | workflow のセキュリティ lint（`zizmor`、`.github/workflows/` 全体） | `workflow-lint`（ci.yml） | 全 PR + main |
-| ADR グラフ（append-only エッジ・wikilink・frontmatter——`docdag validate` + `scripts/check_adr_graph.py`）**と** WIT / guest テンプレートの vendoring ドリフト（`scripts/check_wit_vendoring.py`） | `docs` / `fmt`（ci.yml） | 全 PR + main |
+| ADR グラフを `docdag validate` 一本で検証: frontmatter の YAML 妥当性・型付き辺の不変条件・`amended_by` の相互性・本文と frontmatter の wikilink 解決、および PR では base branch に対する append-only 履歴 **と** WIT / guest テンプレートの vendoring ドリフト（`scripts/check_wit_vendoring.py`） | `docs` / `fmt`（ci.yml） | 全 PR + main |
 | 両 capability profile の release ビルド | `release-parity`（ci.yml） | main のみ（merge-heavy） |
 | **Fuzzing** — `plecto/fuzz/` の全 libfuzzer ターゲットを、コミット済み corpus 起点で時間制限つき実行 | `fuzz`（[fuzz.yml](../.github/workflows/fuzz.yml)） | 週次 + 手動 |
 | release gate: その commit で `main` CI が green のときのみ tag がリリースされる | `gate`（[release.yml](../.github/workflows/release.yml)） | 全 tag |

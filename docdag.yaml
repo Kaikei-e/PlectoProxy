@@ -4,18 +4,28 @@
 # or correct it (the Decision body of the earlier ADR is never rewritten in place), and `supersedes`
 # replaces it entirely. Both edge types are declared in frontmatter and both must stay acyclic.
 #
-# Identifiers are six digits (`docs/ADR/NNNNNN.md`). Wikilinks `[[NNNNNN]]` in bodies stay in the
-# reference layer — prose can never fail this check.
+# Identifiers are six digits (`docs/ADR/NNNNNN.md`), so `filename: "{id}.md"` makes `docdag new`
+# write that bare-numeric name instead of the default `<id>-<kebab-title>.md`.
 #
-# `docdag new` is NOT used here: it writes `<id>-<kebab-title>.md`, while this repository's
-# convention is the bare `NNNNNN.md`. Author from `docs/ADR/template.md` instead and run
-# `docdag validate`.
+# `inverse: amended_by` states the reciprocity: an ADR declaring `amends: ["000052"]` obliges 000052
+# to carry `amended_by: ["000NNN"]`, and a missing entry is an `inverse_mismatch` error. Adding such
+# an entry is also the one frontmatter edit append-only history permits on a closed ADR, so
+# `docdag validate --immutable-since <rev>` allows exactly that and rejects every other change.
+#
+# `references:` lifts body and frontmatter wikilinks into a validated layer: `[[000104]]` must name a
+# real ADR. The `^(\d{6})$` pattern is deliberately narrow — manifest section pointers such as
+# `[[tls]]`, `[[route]]` and `[[upstream]]` are TOML syntax, not references, and stay out of it.
+#
+# This file is the whole ADR gate. `scripts/check_adr_graph.py` is retired: `docdag validate` now
+# covers what it used to (body wikilink resolution and `amended_by` reverse edges) on top of the
+# frontmatter and typed-edge invariants it already enforced.
 
 preset: adr
 dir: docs/ADR
 id_width: 6
 status_field: status
 status_values: [proposed, accepted, superseded]
+filename: "{id}.md"
 
 edges:
   - name: supersedes
@@ -26,9 +36,21 @@ edges:
     key: amends
     acyclic: true
     direction: forward
+    inverse: amended_by
 
 # A superseding ADR names its predecessor in frontmatter, so no status-string parsing is needed.
 derived_edges: []
+
+# `amends` and `supersedes` are one history, so a cycle that only their union closes is still a cycle.
+acyclic_union: true
+
+references:
+  dangling: error
+  pattern: '^(\d{6})$'
+  scan: [body, frontmatter]
+
+structural:
+  missing_frontmatter: error
 
 rules:
   - name: status_drift

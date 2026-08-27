@@ -13,6 +13,7 @@
       "Bash(wasm-tools:*)",
       "Bash(wkg:*)",
       "Bash(jco:*)",
+      "Bash(docdag *)",
       "Bash(npx tsc:*)",
       "Bash(npx vitest:*)",
       "Bash(npx biome:*)",

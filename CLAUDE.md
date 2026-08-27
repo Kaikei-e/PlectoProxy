@@ -3,7 +3,7 @@
 このファイルは Claude Code 用のプロジェクト規約であり、設計の要約と source of truth。設計思想の原典は
 [docs/design-principles.md](docs/design-principles.md)（英語・正）/ [docs/design-principles.ja.md](docs/design-principles.ja.md)
 （日本語・同期）——原則（P1–P12）・アーキテクチャ方針・配置決定木・非目標・進化の条件を三層で定礎する。
-個別判断の一次記録は `docs/ADR/`（`amends` / `supersedes` による append-only グラフ。CI で `docdag validate`（`docdag.yaml`、frontmatter の YAML 妥当性と型付き辺の不変条件）と `scripts/check_adr_graph.py`（本文 wikilink の解決と `amended_by` の逆辺）の二本立て検証）、
+個別判断の一次記録は `docs/ADR/`（`amends` / `supersedes` による append-only グラフ。CI の検証は `docdag validate`（`docdag.yaml`）一本で、frontmatter の YAML 妥当性・型付き辺の不変条件・`inverse: amended_by` による逆辺の相互性・本文と frontmatter の wikilink `[[NNNNNN]]` 解決を見る。PR ではさらに `--immutable-since` が base branch との差分を照合し、確定済み ADR への追記以外の書き換えを弾く）、
 **Tenet・設計原則は ADR から生成せず独立した規範層**（`design-principles.md` を直接更新）、契約の正文は `wit/`（現行 `plecto:filter@0.4.0`、0.1 / 0.2 / 0.3 は `wit/v0.1.0/` / `wit/v0.2.0/` / `wit/v0.3.0/` 凍結 + ロード時アダプタ、ADR 000071 / 000073 / 000098 / 000104）。
 
 ## Plecto Proxy とは

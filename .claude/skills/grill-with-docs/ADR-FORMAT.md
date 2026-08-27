@@ -39,8 +39,24 @@ For Plecto-shaped decisions, the **Fork form** (判断 / 根拠 /
 
 ## Numbering
 
-Scan `docs/ADR/` for the highest existing six-digit number and increment by one
-(`ls docs/ADR/ | grep -E '^[0-9]{6}\.md$' | sort | tail -1`). First ADR is `000001`.
+Do not count the directory by hand. `docdag new "<title>" --dry-run --format json` reserves the next
+free identifier and answers with the `id` and the `path` to write — `docs/ADR/NNNNNN.md`, because
+`docdag.yaml` sets `filename: "{id}.md"`. It writes nothing, so you author the file yourself from
+`docs/ADR/template.md` (that template is a Japanese skeleton, not a Go template, so `docdag` cannot
+fill it in). First ADR is `000001`.
+
+## Reading what is already decided
+
+Ask the graph instead of grepping the directory:
+
+- `docdag context <ref> --budget 400` — one ADR, what it resolves to, and its neighbourhood, each
+  entry quoting its Decision.
+- `docdag query --binding --fields id,title,status` — every decision currently in force.
+- `docdag resolve <ref>` — the successor of a superseded ADR.
+
+After writing, `docdag validate --touching docs/ADR/NNNNNN.md` reports what that file can break. An
+ADR that declares `amends: ["000052"]` obliges 000052 to gain `amended_by: ["<new id>"]` — that
+append is the only frontmatter edit a closed ADR permits.
 
 ## When to offer an ADR
 

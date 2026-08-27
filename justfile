@@ -59,10 +59,11 @@ sync-template-crate:
     cp {{plecto}}/examples/filters/filter-template/src/lib.rs {{plecto}}/crates/plecto/templates/filter-template/src/lib.rs
     @echo "synced crates/plecto/templates/filter-template from examples/filters/filter-template"
 
+# CI runs docdag with --immutable-since against the base branch; locally the graph check is enough.
 # the two cheap CI gates fmt/clippy/test don't cover: vendored WIT/template drift + ADR graph
 drift-check:
     python3 scripts/check_wit_vendoring.py
-    python3 scripts/check_adr_graph.py
+    docdag validate
 
 # An in-place update leaves peer deps nested-only, which newer npm rejects under `npm ci`.
 # regenerate the JS guests' package-lock.json from scratch (pins in package.json are kept)

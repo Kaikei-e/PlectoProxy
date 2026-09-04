@@ -169,7 +169,7 @@ h3-quinn = { workspace = true }
 # minimal features, window_log ≤ 23 (RFC 9659).
 # Re-examine when a pure-Rust encoder stabilises or upstream stops tracking libzstd releases.
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
@@ -194,7 +194,7 @@ tikv-jemallocator = "0.7"
 # flate2 / brotli / zstd: the DECODE oracles for the response-compression E2E — each test
 # decompresses the wire bytes with the reference decoder to prove the roundtrip.
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 zstd = "0.13"
 # sha1 + base64: the RFC 6455 `Sec-WebSocket-Accept` handshake for bench-server's `/ws` mock
 # upstream (ADR 000048's WS benchmark). Both are already transitive dependencies of this workspace

@@ -32,6 +32,55 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Workspace lockfile refresh**: twenty-nine in-range moves. The ones reaching a shipped binary
+  are the crypto backend (`aws-lc-rs` 1.18.0 → 1.18.1 over `aws-lc-sys` 0.44.0 → 0.45.0,
+  `cpufeatures` 0.3.0 → 0.3.1, and QUIC's `chacha20` 0.10.1 → 0.10.2), the HTTP termination path
+  (`hyper` 1.11.0 → 1.11.1, `h2` 0.4.18 → 0.4.19), the TLS acceptor (`tokio-rustls`
+  0.26.4 → 0.26.5), the tokio reactor (`mio` 1.2.2 → 1.2.3), the response-compression codecs
+  (`flate2` 1.1.9 → 1.1.10, whose `miniz_oxide` moves 0.8 → 0.9.1; `zstd-safe` 7.2.4 → 7.3.0;
+  `crc32fast` 1.5.0 → 1.5.1), the manifest reader (`toml` 1.1.4 → 1.1.5), and the
+  `log` / `indexmap` / `smallvec` / `tinyvec` / `uuid` / `memfd` rows. `rcgen` 0.14.9 → 0.14.10
+  and its new `pem` 4.0.0 are dev-only (the TLS E2E's self-signed cert generator); `cc`,
+  `syn`, `find-msvc-tools` and the `proc-macro-error3` pair are build/proc-macro rows;
+  `aws-lc-fips-sys`, `libredox` and flate2's optional `zlib-rs` 0.6.7 are lockfile rows that
+  no configuration in this workspace compiles.
+  Three dependencies are behind latest and stay there. `wit-component` / `wit-parser` hold at
+  0.254 against 0.258 — the ADR 000114 series-parity pin, and it still binds: `wasmtime`, with
+  `wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, is already at 48.0.1, the newest wasmtime
+  on crates.io, and the 48 line bundles 0.254. The 0.258 `wasm-encoder` / `wasmparser` rows in
+  the lockfile are still only the test-only `wat` dependency's, as before. `brotli` is handled
+  below. `generic-array` holds at 0.14.7 because `crypto-common` 0.1.7 pins it `=0.14.7` — an
+  upstream pin, not ours.
+- **Response compression: brotli 8.0.4 → 9.0.0** (ADR 000074's `br` codec, `[dependencies]` and
+  the decode oracle in `[dev-dependencies]` together). The major is an allocator-generation
+  break — `alloc-no-stdlib` 2.x → 3.x and `alloc-stdlib` 0.2 → 0.3, whose `Allocator` /
+  `SliceWrapper` traits are part of brotli's public API — plus an FFI prototype fix. Neither
+  reaches us: the compressor is constructed through `brotli::CompressorWriter::new`, which
+  brings its own stdlib allocator, and the `ffi-api` feature is off. Encoder output is
+  unchanged (9.0.0's new `portable-float` and `safe` features are both off by default), so the
+  compression E2E's byte-level roundtrips pass untouched. 9.0.0 also carries a soundness fix
+  in the FFI allocator (`SendableMemoryBlock<T>` no longer claims `Send` for a non-`Send` `T`).
+- **Benchmark guests: wit-bindgen 0.60 → 0.61.1** in `bench/filters/filter-noop` and
+  `bench/filters/filter-resp`, with their lockfiles' wasm-tools family 254 → 258. These two are
+  componentized by `crates/host/build.rs` like every other Rust guest, but they live under
+  `bench/` and were the last pair left behind by 0.11.2's toolchain move — the whole Rust guest
+  surface is on one wit-bindgen again.
+- **Satellite lockfiles refreshed** alongside the workspace one: the ten example filter guests,
+  the four host fixtures, `bench/loadgen`, and both halves of the streaming spike. The spike
+  host's wasm-tools family moves 257 → 258 in its own workspace (it is outside the ADR 000114
+  pin, which binds only the workspace that shares wasmtime's `wit_parser` re-export).
+- **`filter-jwt`'s RustCrypto stack is now documented as a deliberate hold.** `sha2` 0.10 /
+  `p256` 0.13 / `signature` 2 stay on the `digest` 0.10 generation because `rsa` 0.9 — still the
+  newest `rsa` — requires `sha2` ^0.10.6 and `signature` >2.0,<2.3, while `p256` 0.14 requires
+  `sha2` ^0.11 and `signature` ^3. Moving `p256` alone would link a second copy of
+  `sha2` / `digest` / `signature` / `pkcs8` / `spki` into a verify-only guest we publish as an
+  OCI artifact. The three move together once `rsa` reaches `digest` 0.11; the reason now lives
+  in the manifest so the next refresh does not have to re-derive it.
+- **Workflow linter: zizmor 1.29.0 → 1.30.0** (hash-pinned wheel updated in lockstep).
+  `.github/workflows/` is clean under the new version with the existing suppressions.
+
 ## [0.11.2] - 2026-08-26
 
 Patch release: the WebAssembly toolchain moves to the current releases — wasmtime 48.0.1 in the

@@ -21,6 +21,11 @@ wasi = "0.14"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+# The RustCrypto trio below is HELD on the digest 0.10 generation, deliberately: `rsa` 0.9 is
+# still the newest rsa, and it requires sha2 ^0.10.6 / signature >2.0,<2.3, while p256 0.14
+# requires sha2 ^0.11 / signature ^3. Moving p256 alone would link a SECOND copy of
+# sha2 / digest / signature / pkcs8 / spki into this guest's component — two hash stacks in a
+# verify-only filter we ship as an artifact. Move all three together once rsa reaches digest 0.11.
 sha2 = { version = "0.10", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
 rsa = { version = "0.9", default-features = false, features = ["sha2"] }

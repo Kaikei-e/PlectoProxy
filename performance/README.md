@@ -296,6 +296,7 @@ host noise. The `ceiling` phase now produces `ceiling.csv`; the [WASM ladder](#t
 re-measuring.
 
 ![Plain HTTP/1.1 ceiling](img/ceiling.webp)
+![Plain HTTP/1.1 ceiling, tail latency](img/ceiling_tail.webp)
 
 | Variant | KPI | req/s | p50 | p99 |
 | --- | --- | --- | --- | --- |
@@ -392,6 +393,7 @@ t=0 is already steady state) while a controller drives a fault timeline (`eject 
 every second:
 
 ![Load balancing under fault injection](img/ejection_timeline.webp)
+![Fail-closed 503s during total ejection](img/ejection_failed.webp)
 
 - **Even baseline.** ~4k req/s split three ways while healthy (1,333/1,334/1,333 this run).
 - **Graceful ejection.** When **b** is driven unhealthy its share falls to zero within ~1 s (a
@@ -448,6 +450,7 @@ multiplexing). `plain (h1)` is the [plain HTTP/1.1 ceiling](#plain-http11-ceilin
 not re-measured here.
 
 ![TLS vs plain](img/tls_vs_plain.webp)
+![TLS vs plain, tail latency](img/tls_tail.webp)
 
 | Variant | req/s | p50 | p99 | isolates |
 | --- | --- | --- | --- | --- |
@@ -752,6 +755,9 @@ only decides *whether* to consult the limiter and *on what key*. Driven through 
 | /baseline (no filter) | 146,402 | 0.24 ms | 1.33 ms |
 | /ratelimit (bucket) | 97,584 | 0.43 ms | 1.22 ms |
 
+![Rate-limit overhead](img/ratelimit_overhead.webp)
+![Rate-limit overhead, tail latency](img/ratelimit_overhead_tail.webp)
+
 The rate-limited route adds **~3.4 µs/req** over the no-filter baseline (~33 % of its throughput;
 p99 stays in the same ~1.2 ms band — the µs/req is the inverse-throughput delta at 50 VUs, well
 under ADR 000092's per-IP cap, unaffected). Four same-day measurements of this tax read **3.11 /
@@ -825,6 +831,7 @@ marker. A bodyless request, a filter-less route, and — since ADR 000038 — a 
 decides from the component's exports whether any filter reads the body, and buffers only then.
 
 ![Request body hook](img/body.webp)
+![Request body hook, tail latency](img/body_tail.webp)
 
 > B — 50 VUs, POST a `SIZE`-byte body at 1 KB / 100 KB / 1 MB (k6), to `/body` (filter-hello buffers +
 > transforms), `/body-headeronly` (a header-only filter — body streams through, ADR 000038), and
@@ -965,6 +972,7 @@ handshake and echoes every frame; `plecto-loadgen`'s `ws` subcommand drives thre
 | Tunnel footprint | idle RSS 77.6 MB → 90.1 MB with 1,000 held tunnels — **~12.8 KB/tunnel** |
 
 ![WebSocket echo throughput](img/ws_echo.webp)
+![WebSocket echo tail latency](img/ws_echo_tail.webp)
 
 | Payload | messages/s | throughput | p50 | p99 |
 | --- | --- | --- | --- | --- |

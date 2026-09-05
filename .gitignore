@@ -23,6 +23,10 @@ docs/feedback
 docs/plans
 docs/servey
 performance/data/*.csv
+# Scratch tables for Flint MCP (scrapes / transforms; do not commit)
+flint-data/
 # Local heavy-load LB benchmark harness (single-host, loopback; reproduces the
 # Tailscale heavy-load scenario standalone). Git-untracked like bench/.
 /test/
+
+.serena/

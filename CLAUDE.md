@@ -94,6 +94,7 @@ cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyg
   `improve-codebase-architecture`
 - プロセス: `tdd-workflow`, `release-prep`, `security-auditor`, `full-review`, `grill-me`, `grill-with-docs`, `qa`,
   `web-researcher`
+- 可観測性: `flint-chart`（Flint MCP で `/metrics`・bench CSV・access log をチャート化）
 - ドキュメント: `plecto-adr-writer`, `plecto-postmortem-writer`
 
 > 設計判断は常にプロジェクトの設計 tenets（上記コア原則 / `docs/design-principles.md` の原則 P1–P12）に

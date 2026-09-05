@@ -2552,7 +2552,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "plecto"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-control"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2609,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-host"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2650,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "plecto-server"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

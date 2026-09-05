@@ -32,6 +32,15 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-09-05
+
+Patch release: routine dependency maintenance — in-range lockfile refresh, brotli 8 → 9
+for the response-compression codec, and the leftover bench guests catching up to
+wit-bindgen 0.61.1. No WIT contract, manifest schema, CLI, or public API change, and
+`cargo semver-checks` against the crates.io 0.11.2 baseline reports no semver update
+required on each of `plecto-host` / `plecto-control` / `plecto-server` (default features).
+**Deployed filters do not need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
+
 ### Changed
 
 - **Workspace lockfile refresh**: twenty-nine in-range moves. The ones reaching a shipped binary
@@ -80,6 +89,13 @@ All notable changes to Plecto are documented here. The format follows
   in the manifest so the next refresh does not have to re-derive it.
 - **Workflow linter: zizmor 1.29.0 → 1.30.0** (hash-pinned wheel updated in lockstep).
   `.github/workflows/` is clean under the new version with the existing suppressions.
+- **Reference-filter shelf republished**: `filters/jwt` 0.1.7 → 0.1.8, `filters/cors` /
+  `filters/apikey` / `filters/extauthz` 0.1.5 → 0.1.6 (ADR 000080 — filter tags are immutable).
+  The satellite lockfile refresh above moved `indexmap` / `log` / `syn` in every shelf guest,
+  plus `rand` / `smallvec` / `num-integer` in `filter-jwt`; stripped-component hashes against
+  the published tags (rustc 1.97.1, wasm-tools 1.254.0) no longer match, so the existing tags
+  cannot carry the new bytes. No filter source change. The compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
 
 ## [0.11.2] - 2026-08-26
 

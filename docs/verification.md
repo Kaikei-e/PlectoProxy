@@ -20,7 +20,7 @@ requires). Scheduled jobs cover what neither needs to block on.
 | Test suite, capability superset + **polyglot conformance** (MoonBit / JS / C zero-WASI guests, Go/TinyGo fat guests — same assertions for every language) | `test-features` (ci.yml) | every PR + main |
 | Reference filters encode + import floor | `shelf` (ci.yml) | every PR + main |
 | Guest crate lints | `guest-lint` (ci.yml) | every PR + main |
-| Supply-chain policy (licenses, advisories, sources) | `cargo-deny` (ci.yml) | every PR + main |
+| Supply-chain policy: licenses, advisories, and sources for the primary workspace; RustSec advisories for every tracked independent `Cargo.lock` | `cargo-deny` (ci.yml) | every PR + main |
 | Public-API semver of the crates.io library crates, diffed against the newest published version | `semver-checks` (ci.yml) | every PR + main |
 | Workflow security lint (`zizmor`) over `.github/workflows/` | `workflow-lint` (ci.yml) | every PR + main |
 | ADR graph, one gate (`docdag validate`): frontmatter YAML validity, typed-edge invariants, `amended_by` reciprocity, wikilink resolution in body and frontmatter, and — on a PR — append-only history against the base branch **and** WIT/template vendoring drift (`scripts/check_wit_vendoring.py`) | `docs` / `fmt` (ci.yml) | every PR + main |
@@ -29,6 +29,12 @@ requires). Scheduled jobs cover what neither needs to block on.
 | Release gate: a tag only releases if `main` CI was green for that commit | `gate` ([release.yml](../.github/workflows/release.yml)) | every tag |
 | Signed artifacts: cargo-auditable binaries, SPDX SBOM, cosign keyless signatures **by digest**, provenance/SBOM attestations, the WIT contract as an OCI artifact, signed reference-filter OCI artifacts | `binaries` / `container-*` / `wit-publish` / `filter-publish` (release.yml) | every tag |
 | Unsolicited-PR policy (invitation-only contributions) | [pr-policy.yml](../.github/workflows/pr-policy.yml) | every PR when opened |
+
+The independent-lock gate discovers tracked lockfiles rather than keeping a hand-maintained list,
+so a newly committed guest or fixture workspace is covered automatically. Its only advisory exception
+is local to `filter-jwt`: `RUSTSEC-2023-0071` is accepted solely for that filter's public-key-only
+RSA verification path. It does not parse or operate on RSA private keys; adding such an operation or
+changing the RSA dependency requires re-evaluating and removing the exception where possible.
 
 Honest bounds, stated rather than implied:
 

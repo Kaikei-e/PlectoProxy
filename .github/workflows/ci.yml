@@ -537,6 +537,50 @@ jobs:
           # registry or git source early (A03). `licenses` uses deny.toml's allow-list so an
           # incompatible-license transitive cannot land silently with the SBOM release path.
           command: check advisories bans sources licenses
+      # `plecto/` contains the host workspace, but every filter guest and the fuzz/benchmark
+      # harnesses own a separate Cargo.lock. The reference-filter release job ships four of
+      # those guests, so leaving the root workspace as the only cargo-deny target would miss
+      # advisories in artifacts we publish. Discover every *tracked* lock in the repository
+      # instead of maintaining a fragile list: build outputs cannot affect the scan, and a
+      # newly committed independent workspace is automatically gated. The root workspace was
+      # checked by the action above and is deliberately skipped here.
+      - name: cargo-deny (every independent Rust lockfile)
+        working-directory: .
+        run: |
+          set -euo pipefail
+          version=0.20.2
+          archive="${RUNNER_TEMP}/cargo-deny.tar.gz"
+          tool_dir="${RUNNER_TEMP}/cargo-deny"
+          # Official EmbarkStudios release asset, SHA-256 pinned (not a mutable tag).
+          curl -fsSL -o "${archive}" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  ${archive}" | sha256sum -c -
+          mkdir -p "${tool_dir}"
+          tar xzf "${archive}" -C "${tool_dir}"
+          cargo_deny="${tool_dir}/cargo-deny-${version}-x86_64-unknown-linux-musl/cargo-deny"
+
+          scanned=0
+          while IFS= read -r -d '' lock; do
+            manifest="${lock%/Cargo.lock}/Cargo.toml"
+            if [ "${manifest}" = "plecto/Cargo.toml" ]; then
+              continue
+            fi
+            if [ ! -f "${manifest}" ]; then
+              echo "Cargo.lock without sibling Cargo.toml: ${lock}" >&2
+              exit 1
+            fi
+            crate_dir="$(dirname "${manifest}")"
+            args=(--manifest-path "${manifest}" --locked)
+            if [ -f "${crate_dir}/deny.toml" ]; then
+              args+=(--config "${crate_dir}/deny.toml")
+            fi
+            "${cargo_deny}" "${args[@]}" check advisories
+            scanned=$((scanned + 1))
+          done < <(git ls-files -z -- ':(glob)**/Cargo.lock' | sort -z)
+
+          # A checkout that has no independent lockfiles is unexpected, and would otherwise make
+          # this protection silently vacuous. New lockfiles need no count update: they are scanned.
+          [ "${scanned}" -gt 0 ]
 
   # semver compatibility of the crates.io-published library crates (ADR 000090/000091), BLOCKING.
   # Baseline defaults to the newest version already on crates.io, diffed against this checkout's

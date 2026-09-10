@@ -20,7 +20,7 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 | テストスイート、capability superset + **polyglot conformance**（MoonBit / JS / C の zero-WASI ゲストと Go/TinyGo fat ゲストを、全言語同一アサーションで検証） | `test-features`（ci.yml） | 全 PR + main |
 | reference filter の encode + import floor | `shelf`（ci.yml） | 全 PR + main |
 | guest crate の lint | `guest-lint`（ci.yml） | 全 PR + main |
-| 供給網ポリシー（ライセンス・advisory・取得元） | `cargo-deny`（ci.yml） | 全 PR + main |
+| 供給網ポリシー: 主 workspace のライセンス・advisory・取得元、および追跡される全独立 `Cargo.lock` の RustSec advisory | `cargo-deny`（ci.yml） | 全 PR + main |
 | crates.io 公開ライブラリ 3 クレートの公開 API semver（最新公開版との差分） | `semver-checks`（ci.yml） | 全 PR + main |
 | workflow のセキュリティ lint（`zizmor`、`.github/workflows/` 全体） | `workflow-lint`（ci.yml） | 全 PR + main |
 | ADR グラフを `docdag validate` 一本で検証: frontmatter の YAML 妥当性・型付き辺の不変条件・`amended_by` の相互性・本文と frontmatter の wikilink 解決、および PR では base branch に対する append-only 履歴 **と** WIT / guest テンプレートの vendoring ドリフト（`scripts/check_wit_vendoring.py`） | `docs` / `fmt`（ci.yml） | 全 PR + main |
@@ -29,6 +29,11 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 | release gate: その commit で `main` CI が green のときのみ tag がリリースされる | `gate`（[release.yml](../.github/workflows/release.yml)） | 全 tag |
 | 署名付き成果物: cargo-auditable バイナリ、SPDX SBOM、**digest への** cosign keyless 署名、provenance / SBOM attestation、WIT 契約の OCI artifact 公開、署名付き reference-filter OCI artifact | `binaries` / `container-*` / `wit-publish` / `filter-publish`（release.yml） | 全 tag |
 | unsolicited PR ポリシー（招待制コントリビューション） | [pr-policy.yml](../.github/workflows/pr-policy.yml) | PR open 時 |
+
+独立 lock の gate は手作業の一覧を持たず、追跡される lockfile を発見する。そのため新たに commit された
+guest / fixture workspace も自動的に対象になる。advisory の例外は `filter-jwt` ローカルの
+`RUSTSEC-2023-0071` だけであり、RSA 公開鍵だけを使う検証経路に限定して受理する。この filter は
+RSA 秘密鍵を parse も操作もしていない。秘密鍵操作の追加または RSA 依存の変更時には例外を再評価し、可能なら除去する。
 
 正直な限界（含意ではなく明記する）:
 

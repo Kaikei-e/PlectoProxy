@@ -1,0 +1,11 @@
+# This policy applies only to the independently locked, published filter-jwt guest. It is not
+# inherited by the plecto host workspace or any other filter.
+[advisories]
+version = 2
+# RUSTSEC-2023-0071 (CVE-2023-49092; GHSA-c38w-74pg-36hr and GHSA-4grx-2x9w-596c) reports
+# timing disclosure from RSA *private-key* operations. filter-jwt is deliberately verify-only:
+# it accepts PEM/JWK public keys and calls `rsa::pkcs1v15::VerifyingKey::verify`; it has no
+# `RsaPrivateKey`, signing, decryption, or private-key parsing path. The advisory has no patched
+# release, so retaining this narrowly scoped record is safer than a global ignore. Re-evaluate
+# and remove this exception before adding any RSA private-key operation or changing rsa versions.
+ignore = ["RUSTSEC-2023-0071"]

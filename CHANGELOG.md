@@ -32,6 +32,104 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-09-10
+
+Patch release: a security-review sweep over the boundaries where *authority* is chosen and where
+*resources* are counted — ingress authority, request admission and body ownership, outbound slot
+and socket lifetime, durable quota restoration, and OCI source resolution ([ADR
+000115](docs/ADR/000115.md), amending 000007 / 000016 / 000027 / 000036 / 000041 / 000060 /
+000092 / 000098). No WIT contract, manifest schema, or CLI surface change, and
+`cargo semver-checks` against the crates.io 0.11.3 baseline reports no semver update required on
+each of `plecto-host` / `plecto-control` / `plecto-server` (default features); the three new
+public items are additive (`plecto_control::MAX_REQUEST_BODY_BUFFER`,
+`plecto_host::KvBackendInventoryError`, `plecto_host::KvQuotaRestoreError`).
+**Deployed filters do not need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
+Two reference-filter shelf entries do change behaviour and republish at a new major — see
+**Reference filters** below.
+
+### Security
+
+- **One authority for the whole request path** (`plecto-server`). The URI authority and `Host` are
+  normalized and reconciled *before* routing, filtering, or forwarding, and a conflicting,
+  duplicate, or missing authority is rejected according to each transport's contract. Previously
+  route selection and the host handed upstream could be derived from different fields of the same
+  request, so a route's authentication policy could be chosen with one name and the request
+  forwarded under another.
+- **Admission and body reservations are held to the end of the work, not to the end of the
+  headers** (`plecto-server`). A whole-server in-flight cap (1024 requests) now spans filter
+  execution and downstream response delivery, and both it and the body-buffer budget stay held
+  through blocking hooks, drains, protocol upgrades, and DATA frames still retained inside a
+  transport. Inspection reservations attach *after* compression so an encoded clone keeps its
+  budget. Connection caps alone could not bound HTTP multiplexing, and a request that had
+  finished its headers could keep memory resident outside every ceiling.
+- **HTTP/3 request tasks are aborted when the peer disconnects** (`plecto-server`). An abrupt QUIC
+  disconnect previously left detached tasks running for a response with nowhere to go; the
+  graceful-drain path is unchanged.
+- **The request-body cap is re-checked after every filter** (`plecto-control`). A guest's
+  replacement body is revalidated against the shared 16 MiB buffer cap before the next filter or
+  the upstream can observe it, and an oversized replacement returns 502 with
+  `request-body-guest-oversize`. A chain of filters could otherwise expand a body past the cap one
+  hop at a time.
+- **OCI source resolution stays inside its declared root** (`plecto-control`). A source path must
+  be relative, non-empty and normal, and its canonical target must resolve within the root; a
+  symlink at an intermediate component no longer escapes. Bare-manifest paths and a symlinked root
+  itself keep working.
+- **Outbound HTTP slots live as long as their bodies** (`plecto-host`). A slot is released when the
+  response body reaches a terminal state or is dropped, rather than when the response headers
+  arrive, and the absolute request deadline now applies through body delivery — including a
+  consumer that stalls. The reserved-address floor additionally rejects deprecated IPv6 site-local
+  destinations.
+- **Live TCP sockets are counted, including the ones a trusted guest retains** (`plecto-host`).
+  Resource creation and destruction run through an accounting wrapper that tallies per Store and
+  per Host, so a trusted guest holding sockets across hook calls can no longer accumulate
+  descriptors outside the limit. The shared outbound runtime is owned through a wrapper that shuts
+  down in the background when its last reference drops, which is also safe from an async context.
+- **Durable quotas are restored before anything runs** (`plecto-host`). Namespace and host usage
+  are rebuilt from a consistent backend inventory before engines or runtimes start, an unsupported
+  inventory is rejected, legacy raw value lengths are accounted for, and state already over cap is
+  allowed to shrink. This closes the restriction ADR 000027 recorded — that a restart reset quota
+  accounting and made existing state free — and the 1,024-byte key limit is now applied uniformly
+  across KV, counters, and rate limits. The accounting is not free: the rate-limit filter's
+  closed-loop tax measures 4.60 ± 0.05 µs/req against 4.03 ± 0.05 µs on the previous release
+  (same host, same session), so the T1 gate band moves 4.2 → 5.0 µs for it. Counting what is
+  already stored is worth 0.6 µs on the filter path.
+- **`plecto validate` warns on a non-loopback admin listener** (`plecto` CLI). The separate admin
+  listener stays operator-configurable and has no authentication boundary, so a public bind is now
+  called out in the pre-flight command rather than left implicit. The bind itself is unchanged.
+- **Supply-chain advisories cover every workspace we ship from** (CI). `cargo-deny` advisory checks
+  now run over every tracked `Cargo.lock` in the repository, not only the host workspace — the
+  reference-filter guests each own one and four of them are published artifacts. The tool is
+  fetched from a version- and SHA-256-pinned release asset, and the RSA advisory exception stays
+  scoped to the public-key-only JWT guest.
+
+### Reference filters
+
+Two shelf entries change observable behaviour, so they republish at a new major of their own
+SemVer (ADR 000080; tags are immutable, and `docs/reference-filters.md` records the matrix):
+
+- **`filters/cors` 0.1.6 → 0.2.0.** The filter now owns the CORS response surface: it removes
+  upstream `Access-Control-*` response headers before adding only the operator-authorized grant,
+  so an upstream cannot widen a policy the operator did not configure. `Origin` and the preflight
+  request headers must occur exactly once and be valid UTF-8 — a duplicate or undecodable value
+  receives no grant instead of an arbitrarily chosen one — and every response, allowed or denied,
+  preserves the upstream `Vary` fields and adds `Origin` so caches keep the variants apart.
+- **`filters/extauthz` 0.1.6 → 0.2.0.** The authorization endpoint is read only from the
+  operator-owned `[filter.config] authz-url`; the `x-authz-url` request header is ignored. A client
+  must not be able to select which service decides its own request. An unset or empty value is a
+  403, like every other failure on this path. The host allowlist and SSRF floor are unchanged and
+  still enforced outside the guest.
+
+`filters/jwt` (0.1.8) and `filters/apikey` (0.1.6) are unchanged and are not republished.
+
+### Docs
+
+- [ADR 000115](docs/ADR/000115.md) records the authority, quota-restoration, cancellation, and
+  resource-ownership decisions with reciprocal amendment links to the eight ADRs they touch.
+- `docs/hardening.md` / `docs/hardening.ja.md` gain the guarantees this release verifies, and
+  `docs/verification.md` / `.ja.md` follow.
+- The performance README adds tail-latency figures for the HTTP/1.1 ceiling, outlier ejection,
+  TLS vs plain, rate-limit overhead, the request-body hook, and the WebSocket echo path.
+
 ## [0.11.3] - 2026-09-05
 
 Patch release: routine dependency maintenance — in-range lockfile refresh, brotli 8 → 9

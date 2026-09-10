@@ -47,7 +47,7 @@ const TAG_RATELIMIT: u8 = b'r';
 
 /// Largest value a filter may store under one KV key. A bigger `set` is dropped (fail-closed).
 const MAX_KV_VALUE_BYTES: usize = 256 * 1024;
-/// Largest filter-supplied key. A longer key is dropped (bounds the namespaced key itself).
+/// Largest filter-supplied host-state key. A longer key is rejected before namespace construction.
 const MAX_KV_KEY_BYTES: usize = 1024;
 /// Per-request cap on host-log lines a filter may emit (CWE-770). The last slot is a
 /// single truncation marker so overflow stays observable.
@@ -463,6 +463,9 @@ impl host_clock::Host for HostState {
 
 impl host_kv::Host for HostState {
     fn get(&mut self, key: String) -> Option<Vec<u8>> {
+        if key.len() > MAX_KV_KEY_BYTES {
+            return None;
+        }
         self.kv.get(&self.ns_key(TAG_KV, &key))
     }
     fn set(&mut self, key: String, value: Vec<u8>) {
@@ -492,6 +495,9 @@ impl host_kv::Host for HostState {
         );
     }
     fn delete(&mut self, key: String) {
+        if key.len() > MAX_KV_KEY_BYTES {
+            return;
+        }
         let nskey = self.ns_key(TAG_KV, &key);
         let kv = &self.kv;
         let key_len = key.len();
@@ -513,6 +519,12 @@ impl host_kv::Host for HostState {
 
 impl host_counter::Host for HostState {
     fn increment(&mut self, key: String, delta: i64) -> i64 {
+        // Keep counter keys within the same bound as host-kv before building the namespaced
+        // backend key. The host API is infallible to the guest, so an over-cap write fails closed
+        // as a no-op and an over-cap read sees the canonical zero value.
+        if key.len() > MAX_KV_KEY_BYTES {
+            return 0;
+        }
         let nskey = self.ns_key(TAG_COUNTER, &key);
         // A zero delta is a pure read (host-counter.get); it neither creates a key nor is charged.
         if delta == 0 {
@@ -531,10 +543,18 @@ impl host_counter::Host for HostState {
                 &self.kv_prefix,
                 &nskey,
                 || {
-                    if kv.get(&nskey).is_none() {
-                        (1isize, (key_len + 8) as isize)
-                    } else {
-                        (0isize, 0isize)
+                    match kv.get(&nskey) {
+                        None => (1isize, (key_len + 8) as isize),
+                        // A legacy/corrupt durable row need not be eight bytes. Restoration
+                        // charged its real length, so rewriting it to the canonical counter
+                        // encoding must release or charge the exact difference.
+                        Some(old) => {
+                            // Restored rows are rejected above `isize::MAX`; ordinary host
+                            // writes are capped far below it. The fallback is defensive for a
+                            // custom in-memory backend and preserves the closed-side outcome.
+                            let old_len = isize::try_from(old.len()).unwrap_or(isize::MAX);
+                            (0isize, 8isize.saturating_sub(old_len))
+                        }
                     }
                 },
                 || kv.increment(&nskey, delta),
@@ -544,6 +564,9 @@ impl host_counter::Host for HostState {
     fn get(&mut self, key: String) -> i64 {
         // increment-by-zero is an atomic read of the current value (and the canonical
         // wasi:keyvalue/atomics idiom); keeps the counter encoding inside the backend.
+        if key.len() > MAX_KV_KEY_BYTES {
+            return 0;
+        }
         self.kv.increment(&self.ns_key(TAG_COUNTER, &key), 0)
     }
 }
@@ -560,6 +583,15 @@ impl host_ratelimit::Host for HostState {
                 retry_after_ms: 0,
             };
         };
+        // Reject before namespacing so an oversized untrusted key cannot force an extra
+        // host-side allocation. The rate limiter's closed-side result is an ordinary deny.
+        if key.len() > MAX_KV_KEY_BYTES {
+            return host_ratelimit::Acquire {
+                allowed: false,
+                remaining: 0,
+                retry_after_ms: 0,
+            };
+        }
         let nskey = self.ns_key(TAG_RATELIMIT, &key);
         let kv = &self.kv;
         let key_len = key.len();
@@ -573,10 +605,16 @@ impl host_ratelimit::Host for HostState {
             &self.kv_prefix,
             &nskey,
             || {
-                if kv.get(&nskey).is_none() {
-                    (1isize, (key_len + 16) as isize)
-                } else {
-                    (0isize, 0isize)
+                match kv.get(&nskey) {
+                    None => (1isize, (key_len + 16) as isize),
+                    // As with counters, account for the exact stored length before the
+                    // limiter rewrites a malformed/legacy row to its 16-byte encoding.
+                    Some(old) => {
+                        // See the counter branch: restored values fit signed accounting; this
+                        // conservative fallback only protects a custom in-memory backend.
+                        let old_len = isize::try_from(old.len()).unwrap_or(isize::MAX);
+                        (0isize, 16isize.saturating_sub(old_len))
+                    }
                 }
             },
             || kv.try_acquire(&nskey, cost, spec, now_ms),
@@ -863,6 +901,144 @@ mod tests {
         );
         KvHost::set(&mut s, "ok".into(), vec![0u8; 128]);
         assert_eq!(KvHost::get(&mut s, "ok".into()), Some(vec![0u8; 128]));
+    }
+
+    #[test]
+    fn oversized_kv_keys_do_not_reach_the_backend() {
+        // A raw pre-existing backend entry distinguishes a no-op from a backend lookup/delete:
+        // host-kv reads must return absent and deletes must leave it intact before namespacing.
+        let prefix = "kv\u{1f}";
+        let oversized = "x".repeat(MAX_KV_KEY_BYTES + 1);
+        let raw_key = format!("{prefix}k\u{1f}{oversized}");
+        let backend = Arc::new(MemoryBackend::default());
+        backend.set(raw_key.as_bytes(), b"present".to_vec());
+        let mut s = HostState::new(
+            HostStateInit {
+                kv: backend.clone(),
+                ..init_for(prefix)
+            },
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
+        );
+
+        assert_eq!(KvHost::get(&mut s, oversized.clone()), None);
+        KvHost::delete(&mut s, oversized);
+        assert_eq!(backend.get(raw_key.as_bytes()), Some(b"present".to_vec()));
+
+        let at_cap = "y".repeat(MAX_KV_KEY_BYTES);
+        KvHost::set(&mut s, at_cap.clone(), b"ok".to_vec());
+        assert_eq!(KvHost::get(&mut s, at_cap), Some(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn counter_and_ratelimit_keys_over_cap_fail_closed() {
+        // Counter reads and rate-limit checks must reject an oversized key before constructing a
+        // namespaced backend key. Otherwise they bypass the KV key bound and make an avoidable
+        // host-side copy proportional to untrusted guest input.
+        use host_ratelimit::Host as RateLimitHost;
+
+        let oversized = "x".repeat(MAX_KV_KEY_BYTES + 1);
+        let counter_prefix = "counter\u{1f}";
+        let counter_backend = Arc::new(MemoryBackend::default());
+        let raw_counter_key = format!("{counter_prefix}c\u{1f}{oversized}");
+        counter_backend.set(raw_counter_key.as_bytes(), 7i64.to_le_bytes().to_vec());
+        let mut counter = HostState::new(
+            HostStateInit {
+                kv: counter_backend,
+                ..init_for(counter_prefix)
+            },
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
+        );
+        assert_eq!(
+            CounterHost::increment(&mut counter, oversized.clone(), 1),
+            0,
+            "an oversized counter increment must not create state"
+        );
+        assert_eq!(
+            CounterHost::get(&mut counter, oversized.clone()),
+            0,
+            "an oversized counter read must not reach the backend"
+        );
+        assert_eq!(CounterHost::increment(&mut counter, "ok".into(), 1), 1);
+
+        let mut ratelimit = HostState::new(
+            HostStateInit {
+                ratelimit_bucket: Some(Bucket {
+                    capacity: 1,
+                    refill_tokens: 0,
+                    refill_interval_ms: 0,
+                }),
+                ..init_for("ratelimit\u{1f}")
+            },
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
+        );
+        assert!(
+            !RateLimitHost::try_acquire(&mut ratelimit, oversized, 1).allowed,
+            "an oversized rate-limit key must be denied without reaching the backend"
+        );
+        assert!(
+            RateLimitHost::try_acquire(&mut ratelimit, "ok".into(), 1).allowed,
+            "a within-cap rate-limit key remains usable"
+        );
+    }
+
+    #[test]
+    fn noncanonical_persisted_counter_and_bucket_reconcile_to_canonical_lengths() {
+        use host_ratelimit::Host as RateLimitHost;
+
+        let counter_prefix = "counter\u{1f}";
+        let counter_backend = Arc::new(MemoryBackend::default());
+        let counter_key = format!("{counter_prefix}c\u{1f}hits");
+        counter_backend.set(counter_key.as_bytes(), vec![1; 4]);
+        let counter_quota = Arc::new(KvQuota::restore(counter_backend.as_ref()).unwrap());
+        let mut counter = HostState::new(
+            HostStateInit {
+                kv: counter_backend,
+                quota: counter_quota.clone(),
+                ..init_for(counter_prefix)
+            },
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
+        );
+        assert_eq!(
+            CounterHost::increment(&mut counter, "hits".into(), 1),
+            16_843_010
+        );
+        assert_eq!(counter_quota.usage_for_test(counter_prefix), (1, 4 + 8));
+
+        let bucket_prefix = "bucket\u{1f}";
+        let bucket_backend = Arc::new(MemoryBackend::default());
+        let bucket_key = format!("{bucket_prefix}r\u{1f}tenant");
+        bucket_backend.set(bucket_key.as_bytes(), vec![0; 20]);
+        let bucket_quota = Arc::new(KvQuota::restore(bucket_backend.as_ref()).unwrap());
+        let mut bucket = HostState::new(
+            HostStateInit {
+                kv: bucket_backend,
+                quota: bucket_quota.clone(),
+                ratelimit_bucket: Some(Bucket {
+                    capacity: 1,
+                    refill_tokens: 0,
+                    refill_interval_ms: 0,
+                }),
+                ..init_for(bucket_prefix)
+            },
+            #[cfg(feature = "outbound-http")]
+            outbound_http::PlectoHttpHooks::deny_all(),
+            #[cfg(feature = "outbound-tcp")]
+            crate::outbound_tcp::TcpGuard::deny_all(),
+        );
+        let _ = RateLimitHost::try_acquire(&mut bucket, "tenant".into(), 1);
+        assert_eq!(bucket_quota.usage_for_test(bucket_prefix), (1, 6 + 16));
     }
 
     #[test]

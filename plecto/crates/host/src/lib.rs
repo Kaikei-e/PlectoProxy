@@ -99,7 +99,9 @@ mod util;
 // dev/test-only fixture loader (test-support feature); not data-plane code
 pub mod test_support;
 
-pub use backend::{Acquire, Bucket, KvBackend, MemoryBackend, RedbBackend, apply_bucket};
+pub use backend::{
+    Acquire, Bucket, KvBackend, KvBackendInventoryError, MemoryBackend, RedbBackend, apply_bucket,
+};
 pub use conformance::{
     BatteryVersion, ConformanceCheck, ConformanceOptions, ConformanceReport, Verdict,
     check as run_conformance, check_with as run_conformance_with,
@@ -146,6 +148,7 @@ pub use errors::{LoadError, RunError};
 pub use filter::{BodyHooks, LoadedFilter};
 pub use host::Host;
 pub use options::{Isolation, LoadOptions};
+pub use quota::KvQuotaRestoreError;
 // `HostState` stays crate-internal (DECREE §2: minimal pub surface) — it has no public
 // constructor or methods and no external users; only `LogLine` crosses the crate boundary
 // (returned by `on_request`).

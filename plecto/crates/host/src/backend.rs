@@ -14,6 +14,7 @@
 //! the namespace.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
@@ -36,6 +37,20 @@ pub struct Acquire {
     pub retry_after_ms: u64,
 }
 
+/// Why a backend could not provide the startup inventory needed to reconstruct quota usage.
+///
+/// A host must not guess that an opaque backend is empty: doing so would make durable state
+/// written before a restart invisible to the resource caps. Backends which cannot provide a
+/// consistent inventory therefore fail host construction closed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum KvBackendInventoryError {
+    #[error("KV backend does not support a consistent startup inventory")]
+    Unsupported,
+    #[error("KV backend inventory failed: {0}")]
+    Backend(String),
+}
+
 /// The place a stateless filter's mutable state lives. Object-safe so the host can hold
 /// `Arc<dyn KvBackend>` and pick the backend at construction. Every method is internally
 /// synchronized and infallible from the filter's view — a backend error is logged and
@@ -51,6 +66,25 @@ pub trait KvBackend: Send + Sync {
     /// refill + counting stay host-native (ADR 000005) — they never cross the WASM
     /// boundary; the filter only decided to consult the limiter.
     fn try_acquire(&self, key: &[u8], cost: u64, spec: Bucket, now_ms: u64) -> Acquire;
+
+    /// Visit each opaque state key exactly once in a consistent snapshot, with its value length.
+    ///
+    /// This is used only while a [`crate::Host`] is being built, before it can serve requests,
+    /// to reconstruct the quota associated with durable state. `Break(())` stops the traversal.
+    /// The default deliberately fails closed: an external backend must opt in explicitly rather
+    /// than silently making pre-existing state free after restart.
+    ///
+    /// `visit` must not re-enter the backend: the in-memory implementation holds its map lock
+    /// while invoking it. A backend belongs to one host for its lifetime; callers must not build
+    /// a second host or mutate the backend externally while this startup snapshot is taken (or
+    /// while the first host serves), because quota accounting is host-owned rather than a
+    /// cross-host distributed lock.
+    fn visit_entries(
+        &self,
+        _visit: &mut dyn FnMut(&[u8], usize) -> ControlFlow<()>,
+    ) -> Result<(), KvBackendInventoryError> {
+        Err(KvBackendInventoryError::Unsupported)
+    }
 }
 
 // --- pure token-bucket math (host-native, deterministic against `now_ms`) ---
@@ -196,6 +230,19 @@ impl KvBackend for MemoryBackend {
         let (next, result) = apply_bucket(prev, cost, spec, now_ms);
         map.insert(key.to_vec(), encode_bucket(next));
         result
+    }
+
+    fn visit_entries(
+        &self,
+        visit: &mut dyn FnMut(&[u8], usize) -> ControlFlow<()>,
+    ) -> Result<(), KvBackendInventoryError> {
+        let map = self.map.lock();
+        for (key, value) in map.iter() {
+            if visit(key, value.len()).is_break() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -691,6 +738,32 @@ impl KvBackend for RedbBackend {
                 denied
             }
         }
+    }
+
+    fn visit_entries(
+        &self,
+        visit: &mut dyn FnMut(&[u8], usize) -> ControlFlow<()>,
+    ) -> Result<(), KvBackendInventoryError> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| KvBackendInventoryError::Backend(e.to_string()))?;
+        let table = match txn.open_table(STATE_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(KvBackendInventoryError::Backend(e.to_string())),
+        };
+        let entries = table
+            .iter()
+            .map_err(|e| KvBackendInventoryError::Backend(e.to_string()))?;
+        for entry in entries {
+            let (key, value) =
+                entry.map_err(|e| KvBackendInventoryError::Backend(e.to_string()))?;
+            if visit(key.value(), value.value().len()).is_break() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 

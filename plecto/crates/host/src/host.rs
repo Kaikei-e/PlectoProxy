@@ -110,6 +110,18 @@ impl Host {
 
     /// A host backed by a caller-supplied store (e.g. `RedbBackend` for durability).
     pub fn with_backend(trust: TrustPolicy, kv: Arc<dyn KvBackend>) -> Result<Self> {
+        // Restore before allocating engines, spawning the epoch ticker, or creating an outbound
+        // runtime. A backend whose durable rows cannot be inventoried must never start with a
+        // zero quota: that would make pre-existing state free after every restart.
+        let kv_quota = Arc::new(KvQuota::restore(kv.as_ref())?);
+        if let Some((namespaces, entries, bytes)) = kv_quota.over_cap_summary() {
+            tracing::warn!(
+                namespaces,
+                entries,
+                bytes,
+                "restored host state exceeds quota; growth is denied until entries are removed or shrunk"
+            );
+        }
         let trusted_engine = build_engine(Allocation::Pooling)?;
         let untrusted_engine = build_engine(Allocation::OnDemand)?;
         let _epoch_ticker =
@@ -129,7 +141,7 @@ impl Host {
             trusted_engine,
             untrusted_engine,
             kv,
-            kv_quota: Arc::new(KvQuota::new()),
+            kv_quota,
             trust,
             sink: Arc::new(NoopSink),
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
@@ -472,5 +484,150 @@ impl Host {
         );
 
         Ok(LoadedFilter { inner, trusted })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestSigner, bound_sbom, filter_hello_component};
+    use crate::{HttpRequest, RequestDecision, RequestTrace, SignedArtifact};
+    use redb::{Database, TableDefinition};
+
+    const STATE_TABLE_FOR_TEST: TableDefinition<'_, &[u8], &[u8]> =
+        TableDefinition::new("plecto_state");
+
+    struct NoInventoryBackend(crate::MemoryBackend);
+
+    impl KvBackend for NoInventoryBackend {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key)
+        }
+        fn set(&self, key: &[u8], value: Vec<u8>) {
+            self.0.set(key, value);
+        }
+        fn delete(&self, key: &[u8]) {
+            self.0.delete(key);
+        }
+        fn increment(&self, key: &[u8], delta: i64) -> i64 {
+            self.0.increment(key, delta)
+        }
+        fn try_acquire(
+            &self,
+            key: &[u8],
+            cost: u64,
+            spec: crate::Bucket,
+            now_ms: u64,
+        ) -> crate::Acquire {
+            self.0.try_acquire(key, cost, spec, now_ms)
+        }
+    }
+
+    #[test]
+    fn custom_backend_without_inventory_fails_closed_at_host_construction() {
+        let error = Host::with_backend(
+            TrustPolicy::empty(),
+            Arc::new(NoInventoryBackend(crate::MemoryBackend::default())),
+        )
+        .err()
+        .expect("a custom backend without a snapshot must not start with zero quota");
+        assert!(matches!(
+            error.downcast_ref::<crate::KvQuotaRestoreError>(),
+            Some(crate::KvQuotaRestoreError::Inventory(
+                crate::KvBackendInventoryError::Unsupported
+            ))
+        ));
+    }
+
+    fn request() -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            path_with_query: "/".to_string(),
+            authority: "example.test".to_string(),
+            scheme: "https".to_string(),
+            headers: vec![crate::Header {
+                name: "x-plecto-ratelimit".to_string(),
+                value: b"tenant".to_vec(),
+            }],
+        }
+    }
+
+    fn seed_full_namespace(path: &std::path::Path) {
+        let db = Database::create(path).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(STATE_TABLE_FOR_TEST).unwrap();
+            for i in 0..crate::quota::MAX_NS_ENTRIES {
+                let key = format!("filter-hello\x1fk\x1f{i}");
+                table.insert(key.as_bytes(), b"".as_slice()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+    }
+
+    fn remove_seeded_rows(path: &std::path::Path, count: usize) {
+        let db = Database::create(path).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(STATE_TABLE_FOR_TEST).unwrap();
+            for i in 0..count {
+                let key = format!("filter-hello\x1fk\x1f{i}");
+                table.remove(key.as_bytes()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+    }
+
+    fn load_hello(host: &Host, signer: &TestSigner) -> crate::LoadedFilter {
+        let component = filter_hello_component();
+        let component_signature = signer.sign(&component).unwrap();
+        let sbom = bound_sbom(&component);
+        let sbom_signature = signer.sign(&sbom).unwrap();
+        let artifact = SignedArtifact {
+            component_bytes: &component,
+            component_signature: &component_signature,
+            sbom: &sbom,
+            sbom_signature: &sbom_signature,
+        };
+        host.load(
+            "filter-hello",
+            &artifact,
+            LoadOptions::untrusted().with_ratelimit_bucket(1, 0, 0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn redb_restart_restores_quota_before_guest_growth_and_recovers_after_delete() {
+        // A real durable DB already at the per-filter entry cap must consume that capacity
+        // when Host::with_backend reopens it. The guest's untrusted init wants one counter and
+        // its request wants one bucket: both are denied until two legacy rows are removed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        seed_full_namespace(&path);
+        let signer = TestSigner::new().unwrap();
+        {
+            let backend = Arc::new(crate::RedbBackend::open(&path).unwrap());
+            let host = Host::with_backend(signer.trust_policy().unwrap(), backend).unwrap();
+            let filter = load_hello(&host, &signer);
+            let (decision, _) = filter
+                .on_request(&request(), &RequestTrace::root())
+                .unwrap();
+            assert!(
+                matches!(decision, RequestDecision::ShortCircuit(ref response) if response.status == 429),
+                "restored rows must deny new counter/bucket growth"
+            );
+        }
+        remove_seeded_rows(&path, 2);
+        let backend = Arc::new(crate::RedbBackend::open(&path).unwrap());
+        let host = Host::with_backend(signer.trust_policy().unwrap(), backend).unwrap();
+        let filter = load_hello(&host, &signer);
+        let (decision, _) = filter
+            .on_request(&request(), &RequestTrace::root())
+            .unwrap();
+        assert!(
+            matches!(decision, RequestDecision::Continue),
+            "deleting durable legacy rows must make quota capacity available again"
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! End-to-end behaviour of the outbound HTTP capability (ADR 000036) through the real
 //! `filter-extauthz` wasm guest. Compiled only with the `outbound-http` feature (OFF by default).
 //!
-//! The guest calls an external authorization endpoint (URL from the `x-authz-url` header) over
+//! The guest calls the operator-configured external authorization endpoint over
 //! `wasi:http/outgoing-handler`; the host gates every call by the operator allowlist + the SSRF
 //! guard, and the guest fails closed (403) on any error. These tests pin the two gates end-to-end:
 //!   - a destination NOT on the allowlist is denied before any DNS/socket (`HttpRequestDenied`);
@@ -10,6 +10,7 @@
 //!     rebinding defense, proven through a real guest.
 #![cfg(feature = "outbound-http")]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 
@@ -56,17 +57,23 @@ fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
     (host, filter)
 }
 
-fn request(authz_url: &str) -> HttpRequest {
+fn request() -> HttpRequest {
     HttpRequest {
         method: "GET".to_string(),
         path_with_query: "/protected".to_string(),
         authority: "gateway.test".to_string(),
         scheme: "https".to_string(),
-        headers: vec![Header {
-            name: "x-authz-url".to_string(),
-            value: authz_url.as_bytes().to_vec(),
-        }],
+        headers: vec![],
     }
+}
+
+fn request_with_authz_url(authz_url: &str) -> HttpRequest {
+    let mut request = request();
+    request.headers.push(Header {
+        name: "x-authz-url".to_string(),
+        value: authz_url.as_bytes().to_vec(),
+    });
+    request
 }
 
 fn outbound_opts(allow: Vec<AllowEntry>) -> LoadOptions {
@@ -78,6 +85,13 @@ fn outbound_opts(allow: Vec<AllowEntry>) -> LoadOptions {
         Some(64 * 1024),
         Some(8),
     )
+}
+
+fn config(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
 }
 
 fn short_circuit_body(f: &LoadedFilter, r: &HttpRequest) -> (u16, String) {
@@ -100,10 +114,11 @@ fn unlisted_destination_is_denied_before_any_connection() {
         scheme: Scheme::Https,
         host: "authz.allowed.test".to_string(),
         port: 443,
-    }]);
+    }])
+    .with_config(config(&[("authz-url", "https://evil.example.test/authz")]));
     let (_host, filter) = signed_load(opts);
 
-    let (status, body) = short_circuit_body(&filter, &request("https://evil.example.test/authz"));
+    let (status, body) = short_circuit_body(&filter, &request());
     assert_eq!(status, 403, "an unlisted destination must fail closed");
     assert!(
         body.contains("HttpRequestDenied"),
@@ -116,15 +131,16 @@ fn allowlisted_name_resolving_to_loopback_is_ssrf_blocked() {
     // The SSRF/rebinding defense end-to-end: allowlist `localhost:PORT`, run a real server there, but
     // the guard rejects the resolved 127.0.0.1 — the guest never reaches the listener.
     let addr = spawn_ok_server();
+    let url = format!("http://localhost:{}/authz", addr.port());
     let opts = outbound_opts(vec![AllowEntry {
         scheme: Scheme::Http,
         host: "localhost".to_string(),
         port: addr.port(),
-    }]);
+    }])
+    .with_config(config(&[("authz-url", &url)]));
     let (_host, filter) = signed_load(opts);
 
-    let url = format!("http://localhost:{}/authz", addr.port());
-    let (status, body) = short_circuit_body(&filter, &request(&url));
+    let (status, body) = short_circuit_body(&filter, &request());
     assert_eq!(status, 403, "a loopback-resolving target must fail closed");
     assert!(
         body.contains("DestinationIpProhibited"),
@@ -133,7 +149,7 @@ fn allowlisted_name_resolving_to_loopback_is_ssrf_blocked() {
 }
 
 #[test]
-fn no_authz_url_fails_closed() {
+fn missing_operator_authz_url_fails_closed() {
     // Defensive: a request the filter can't authorize (no target) must not be allowed through.
     let opts = outbound_opts(vec![AllowEntry {
         scheme: Scheme::Https,
@@ -142,13 +158,33 @@ fn no_authz_url_fails_closed() {
     }]);
     let (_host, filter) = signed_load(opts);
 
-    let req = HttpRequest {
-        method: "GET".to_string(),
-        path_with_query: "/protected".to_string(),
-        authority: "gateway.test".to_string(),
-        scheme: "https".to_string(),
-        headers: vec![],
-    };
+    let req = request();
     let (status, _body) = short_circuit_body(&filter, &req);
     assert_eq!(status, 403);
+}
+
+#[test]
+fn request_headers_cannot_choose_the_authorization_endpoint() {
+    let addr = spawn_ok_server();
+    let opts = outbound_opts(vec![AllowEntry {
+        scheme: Scheme::Http,
+        host: "localhost".to_string(),
+        port: addr.port(),
+    }])
+    .with_config(config(&[(
+        "authz-url",
+        "https://operator-selected.example.test/authz",
+    )]));
+    let (_host, filter) = signed_load(opts);
+
+    // The request points at an allowlisted endpoint, but the operator's configured endpoint is
+    // not allowlisted. A secure ext_authz filter must therefore deny at the operator-selected
+    // destination, without consulting this client-controlled header.
+    let client_url = format!("http://localhost:{}/authz", addr.port());
+    let (status, body) = short_circuit_body(&filter, &request_with_authz_url(&client_url));
+    assert_eq!(status, 403);
+    assert!(
+        body.contains("HttpRequestDenied"),
+        "the operator-selected endpoint, rather than x-authz-url, must determine the check (body: {body:?})"
+    );
 }

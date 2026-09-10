@@ -4,10 +4,11 @@
 //!   - any other status, or ANY outbound error (allowlist deny / SSRF block / timeout / protocol) →
 //!     short-circuit 403. A failed or blocked authz check is NEVER treated as "allow" (fail-closed).
 //!
-//! The target URL is taken from the `x-authz-url` request header so a test can point it at different
-//! destinations; in production it would be fixed in the filter. Built for wasm32-wasip2 — unlike the
-//! header-only filters it imports `wasi:http/outgoing-handler` (via the `wasi` crate). The host still
-//! gates every call by the operator allowlist + SSRF guard; this guest cannot widen that.
+//! The target URL is supplied by the operator as the read-only `authz-url` filter configuration.
+//! It is never taken from a request header: a client must not be able to select which authorization
+//! service decides its request. Built for wasm32-wasip2 — unlike the header-only filters it imports
+//! `wasi:http/outgoing-handler` (via the `wasi` crate). The host still gates every call by the
+//! operator allowlist + SSRF guard; this guest cannot widen either boundary.
 #![allow(clippy::all)]
 
 wit_bindgen::generate!({
@@ -15,22 +16,15 @@ wit_bindgen::generate!({
     world: "filter",
 });
 
-use crate::plecto::filter::host_log;
 use crate::plecto::filter::types::Header;
+use crate::plecto::filter::{host_config, host_log};
 
 use wasi::http::outgoing_handler;
 use wasi::http::types::{Fields, Method, OutgoingRequest, Scheme};
 
 struct FilterExtAuthz;
 
-const AUTHZ_URL_HEADER: &str = "x-authz-url";
-
-fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
-    req.headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case(name))
-        .and_then(|h| std::str::from_utf8(&h.value).ok())
-}
+const AUTHZ_URL_CONFIG: &str = "authz-url";
 
 fn forbid(reason: &str) -> RequestDecision {
     RequestDecision::ShortCircuit(HttpResponse {
@@ -97,11 +91,11 @@ impl Guest for FilterExtAuthz {
         host_log::log(host_log::Level::Info, "filter-extauthz: init");
     }
 
-    fn on_request(req: HttpRequest) -> RequestDecision {
-        let Some(url) = header(&req, AUTHZ_URL_HEADER) else {
+    fn on_request(_req: HttpRequest) -> RequestDecision {
+        let Some(url) = host_config::get(AUTHZ_URL_CONFIG).filter(|url| !url.is_empty()) else {
             return forbid("no authz url");
         };
-        match authorize(url) {
+        match authorize(&url) {
             Ok(status) if (200..300).contains(&status) => RequestDecision::Continue,
             Ok(status) => forbid(&format!("authz status {status}")),
             Err(reason) => forbid(&reason),

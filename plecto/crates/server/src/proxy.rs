@@ -22,12 +22,14 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::body::{
     INBOUND_BODY_READ_TIMEOUT, MAX_REQUEST_BODY_BUFFER, ResponseBufferOutcome,
-    UPSTREAM_BODY_READ_TIMEOUT, buffer_request_body, buffer_response_body, hold_budget, prefixed,
+    UPSTREAM_BODY_READ_TIMEOUT, buffer_request_body, buffer_response_body, hold_budget,
+    hold_request_permit, prefixed,
 };
 use crate::error::ServerError;
 use crate::forward::{ForwardBody, ForwardOutcome, ForwardRequest, forward_with_retry};
 use crate::headers::{
-    copy_headers, copy_headers_direct, headers_to_vec, set_forwarded, to_http_request,
+    copy_headers, copy_headers_direct, headers_to_vec, normalize_ingress_authority, set_forwarded,
+    to_http_request,
 };
 use crate::metrics::InspectionSkip;
 use crate::respond::{
@@ -47,6 +49,21 @@ pub(crate) async fn proxy_core(
     mut parts: hyper::http::request::Parts,
     body: ReqBody,
 ) -> Result<Response<ResponseBody>, ServerError> {
+    let admission = match state.request_limit.clone().try_acquire_owned() {
+        Ok(permit) => Arc::new(permit),
+        Err(_) => {
+            // Rejected work does not enter the active-work gauge, but it remains a client-visible
+            // 503 and belongs in the RED request/status counters.
+            state
+                .metrics
+                .record_request(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Duration::ZERO);
+            return Ok(synth(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &fault::REQUEST_OVERLOADED,
+                b"server overloaded",
+            ));
+        }
+    };
     /// Decrements the in-flight gauge on drop: hyper drops this future when the client
     /// connection dies mid-request (h2 RST_STREAM, disconnect), so a plain post-`.await`
     /// decrement would leak and the gauge would drift upward monotonically. The RED tally
@@ -76,6 +93,12 @@ pub(crate) async fn proxy_core(
         scheme,
         state.trusted_proxy.as_ref(),
     );
+
+    // Bind routing, the filter contract, access logging, and the filterless forwarding path to
+    // one validated authority before any of them can observe the inbound request. A filter may
+    // still deliberately rewrite Host later (ADR 000015); this only eliminates client-supplied
+    // URI/Host interpretation conflicts at ingress.
+    let authority_valid = normalize_ingress_authority(&mut parts, scheme).is_ok();
 
     // Capture the access-log fields BEFORE the core consumes `parts`, and only when logging is on —
     // a disabled access log allocates nothing on the hot path.
@@ -115,16 +138,24 @@ pub(crate) async fn proxy_core(
     // did (ADR 000098). The metric is tallied where the decision is made; this carries the reason
     // out to the access log, so a skip is attributable to a request and not only to a counter.
     let mut inspection_skipped: Option<InspectionSkip> = None;
-    let result = proxy_core_inner(
-        state.clone(),
-        scheme,
-        client,
-        trace,
-        parts,
-        body,
-        &mut inspection_skipped,
-    )
-    .await;
+    let result = if authority_valid {
+        proxy_core_inner(
+            state.clone(),
+            scheme,
+            client,
+            trace,
+            hyper::Request::from_parts(parts, body),
+            &mut inspection_skipped,
+            admission.clone(),
+        )
+        .await
+    } else {
+        Ok(synth(
+            StatusCode::BAD_REQUEST,
+            &fault::BAD_AUTHORITY,
+            b"bad request authority",
+        ))
+    };
 
     drop(in_flight);
     let status = match &result {
@@ -153,7 +184,10 @@ pub(crate) async fn proxy_core(
             &trace, &method, &path, scheme, status, started, elapsed,
         ));
     }
-    result
+    result.map(|resp| {
+        let (parts, body) = resp.into_parts();
+        Response::from_parts(parts, hold_request_permit(body, admission))
+    })
 }
 
 /// The transaction core proper: route → chain (request side) → forward → chain (response side).
@@ -164,10 +198,11 @@ async fn proxy_core_inner(
     scheme: &'static str,
     client: IpAddr,
     trace: RequestTrace,
-    mut parts: hyper::http::request::Parts,
-    body: ReqBody,
+    request: hyper::Request<ReqBody>,
     inspection_skipped: &mut Option<InspectionSkip>,
+    admission: Arc<OwnedSemaphorePermit>,
 ) -> Result<Response<ResponseBody>, ServerError> {
+    let (mut parts, body) = request.into_parts();
     let mut http_req = to_http_request(&parts, scheme);
     // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
     // body moves: only a bodyless request can be an Upgrade handshake (ADR 000048), and bodyless
@@ -239,6 +274,7 @@ async fn proxy_core_inner(
             snapshot: &snapshot,
             idx,
             has_filters: route.has_filters,
+            admission,
         };
 
         // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
@@ -246,8 +282,12 @@ async fn proxy_core_inner(
         // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax.
         let mut forward = if route.has_filters {
             let snap_req = snapshot.clone();
-            match tokio::task::spawn_blocking(move || snap_req.dispatch_request(idx, http_req))
-                .await?
+            let admission = chain.admission.clone();
+            match tokio::task::spawn_blocking(move || {
+                let _admission = admission;
+                snap_req.dispatch_request(idx, http_req)
+            })
+            .await?
             {
                 ChainOutcome::Respond(resp) => {
                     return Ok(Routed::Synthesised(http_response(resp)));
@@ -306,12 +346,7 @@ async fn proxy_core_inner(
             ForwardBody::OneShot(body)
         };
 
-        // The buffer permit must outlive the BUFFER, not just the read: the buffered bytes live on
-        // in `ForwardBody::Replayable` through the whole forward/retry/response phase, so a permit
-        // dropped inside the hook would bound concurrent *reads* while resident buffered-body
-        // memory grew past `MAX_INFLIGHT_BODY_BUFFERS × MAX_REQUEST_BODY_BUFFER` under slow
-        // upstreams. Bound at transaction scope so it drops with the transaction.
-        let _buf_permit = match request_body_hook(
+        match request_body_hook(
             &state,
             &chain,
             route.body_hooks.request,
@@ -320,7 +355,7 @@ async fn proxy_core_inner(
         )
         .await?
         {
-            BodyHookOutcome::Proceed(permit) => permit,
+            BodyHookOutcome::Proceed => {}
             BodyHookOutcome::Respond(resp) => return Ok(Routed::Synthesised(resp)),
         };
 
@@ -381,6 +416,7 @@ async fn proxy_core_inner(
             upstream_path: &upstream_path,
             traceparent: &snapshot.traceparent(),
             upgrade_token: upgrade.as_ref().map(|(t, _, _)| t.as_str()),
+            admission: chain.admission.clone(),
         };
         // The client for this group's security context (ADR 000042): the shared plain client, or
         // the pooled TLS client for its `[upstream.tls]` config. A cheap clone (shared pool
@@ -467,8 +503,23 @@ async fn proxy_core_inner(
     // and never transformed (ADR 000075 decision 1).
     Ok(match routed {
         Routed::Synthesised(resp) => with_declared_headers(resp, &route),
-        Routed::Forwarded(resp) => {
-            crate::compression::apply(with_declared_headers(resp, &route), &route, &parts)
+        Routed::Forwarded {
+            response,
+            body_budget,
+        } => {
+            let response =
+                crate::compression::apply(with_declared_headers(response, &route), &route, &parts);
+            // Compression allocates new DATA: a permit attached only to its input Bytes would
+            // disappear at the encoder's EOF while the transport still owns encoded output.
+            // Keep the reservation alongside the response until all transformations are built,
+            // then attach it to the final DATA allocations and their clones (ADR 000115).
+            match body_budget {
+                Some(permit) => {
+                    let (parts, body) = response.into_parts();
+                    Response::from_parts(parts, hold_budget(body, permit))
+                }
+                None => response,
+            }
         }
     })
 }
@@ -482,7 +533,28 @@ enum Routed {
     /// fail-closed 5xx, the native 429, a forward-side 5xx, or an upgrade handshake.
     Synthesised(Response<ResponseBody>),
     /// The upstream's response, streamed back through the (possibly empty) response chain.
-    Forwarded(Response<ResponseBody>),
+    Forwarded {
+        response: Response<ResponseBody>,
+        /// Kept outside the body until the final representation has been chosen. Both full
+        /// inspection and the two over-cap forwarding modes must retain their reservation.
+        body_budget: Option<OwnedSemaphorePermit>,
+    },
+}
+
+impl Routed {
+    fn forwarded(response: Response<ResponseBody>) -> Self {
+        Self::Forwarded {
+            response,
+            body_budget: None,
+        }
+    }
+
+    fn buffered(response: Response<ResponseBody>, permit: OwnedSemaphorePermit) -> Self {
+        Self::Forwarded {
+            response,
+            body_budget: Some(permit),
+        }
+    }
 }
 
 /// Stamp a route's declared `[route.headers]` (ADR 000100) onto an about-to-be-sent response.
@@ -504,6 +576,7 @@ struct ChainRef<'a> {
     snapshot: &'a ConfigSnapshot,
     idx: usize,
     has_filters: bool,
+    admission: Arc<OwnedSemaphorePermit>,
 }
 
 /// What a granted HTTP/1.1 Upgrade opt-in (ADR 000048) carries to the switch: the allowlisted
@@ -531,11 +604,11 @@ fn upgrade_intent(
     Some((token, on_upgrade, cfg.idle_timeout()))
 }
 
-/// What the request-side body hook settled on: proceed to forwarding (carrying the buffer
-/// permit for as long as the buffered bytes stay resident), or answer the client now — a
+/// What the request-side body hook settled on: proceed to forwarding (the buffered `Bytes` owns
+/// its reservation for as long as any transport retains it), or answer the client now — a
 /// filter's short-circuit or one of the buffering path's fail-closed statuses.
 enum BodyHookOutcome {
-    Proceed(Option<OwnedSemaphorePermit>),
+    Proceed,
     Respond(Response<ResponseBody>),
 }
 
@@ -552,10 +625,10 @@ async fn request_body_hook(
     headers: &mut Vec<plecto_control::Header>,
 ) -> Result<BodyHookOutcome, ServerError> {
     if !reads_body {
-        return Ok(BodyHookOutcome::Proceed(None));
+        return Ok(BodyHookOutcome::Proceed);
     }
     let Some(b) = real_body.take_oneshot() else {
-        return Ok(BodyHookOutcome::Proceed(None));
+        return Ok(BodyHookOutcome::Proceed);
     };
     // Bound concurrent buffered-body memory and the time spent reading one body
     // (slow-body slowloris): reserve this body's cap out of the shared byte budget and read under
@@ -614,11 +687,14 @@ async fn request_body_hook(
     // body hook's `modified` decision can edit them (ADR 000098), and the edit has to land on the
     // request this transaction is about to forward.
     let chain_headers = std::mem::take(headers);
-    match tokio::task::spawn_blocking(move || {
-        snap_body.dispatch_request_body(idx, buffered, chain_headers)
+    let admission = chain.admission.clone();
+    let (outcome, permit) = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let outcome = snap_body.dispatch_request_body(idx, buffered, chain_headers);
+        (outcome, permit)
     })
-    .await?
-    {
+    .await?;
+    match outcome {
         RequestBodyOutcome::Respond(resp) => Ok(BodyHookOutcome::Respond(http_response(resp))),
         // The buffered, filter-edited bytes are replayable by definition (ADR 000058):
         // `Vec<u8>` → `Bytes` is a move, and each retry attempt shares it by reference count.
@@ -626,9 +702,15 @@ async fn request_body_hook(
             body: edited,
             headers: edited_headers,
         } => {
-            *real_body = ForwardBody::Replayable(bytes::Bytes::from(edited));
+            // The reservation is owned by the actual allocation handed to Hyper.  A transport
+            // may retain this `Bytes` after the request future completes on early response
+            // headers, so a transaction-local permit would release the budget too soon.
+            *real_body = ForwardBody::Replayable(crate::body::bytes_with_permit(
+                bytes::Bytes::from(edited),
+                Arc::new(permit),
+            ));
             *headers = edited_headers;
-            Ok(BodyHookOutcome::Proceed(Some(permit)))
+            Ok(BodyHookOutcome::Proceed)
         }
     }
 }
@@ -651,6 +733,9 @@ fn strip_inspection_hostile_headers(headers: &mut Vec<plecto_control::Header>) {
 fn budget_permits(bytes: usize) -> u32 {
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod admission_tests;
 
 /// True when the upstream's 101 names the token we offered (case-insensitive, RFC 9110 §7.8).
 fn upstream_switched_to(headers: &hyper::HeaderMap, token: &str) -> bool {
@@ -707,7 +792,9 @@ async fn upgrade_switch(
         };
         let snap_resp = chain.snapshot.clone();
         let idx = chain.idx;
+        let admission = chain.admission.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
             snap_resp.dispatch_response(idx, &forward, http_resp)
         })
         .await?;
@@ -750,6 +837,7 @@ async fn upgrade_switch(
     let drain = state.drain.clone();
     let metrics = state.metrics.clone();
     let tunnel_active = crate::metrics::TunnelActive::new(metrics.clone());
+    let admission = chain.admission.clone();
     tokio::spawn(async move {
         // Long-lived tunnels stay inside the existing resource accounting (ADR 000048): the
         // breaker permit (ADR 000028), the LB pick guard (least-request in-flight) and the
@@ -758,6 +846,7 @@ async fn upgrade_switch(
         let _permit = permit;
         let _pick = pick;
         let _active = tunnel_active;
+        let _admission = admission;
         let (down, up) = crate::tunnel::run(downstream_on, upstream_on, idle, drain).await;
         metrics.add_tunnel_bytes(down, up);
     });
@@ -780,7 +869,7 @@ async fn respond_through_chain(
 ) -> Result<Routed, ServerError> {
     let (uparts, ubody) = upstream_resp.into_parts();
     if !chain.has_filters {
-        return Ok(Routed::Forwarded(stream_response_direct(
+        return Ok(Routed::forwarded(stream_response_direct(
             uparts.status,
             &uparts.headers,
             ubody,
@@ -806,7 +895,9 @@ async fn respond_through_chain(
     // runs after this one, is handed the same snapshot.
     let snap_resp = chain.snapshot.clone();
     let idx = chain.idx;
+    let admission = chain.admission.clone();
     let (outcome, forward) = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         let outcome = snap_resp.dispatch_response(idx, &forward, http_resp);
         (outcome, forward)
     })
@@ -821,7 +912,7 @@ async fn respond_through_chain(
     let edited = match outcome {
         ResponseOutcome::Forward(edited) => edited,
         ResponseOutcome::Respond(resp) => {
-            discard_upstream_body(ubody);
+            discard_upstream_body(ubody, chain.admission.clone());
             return Ok(Routed::Synthesised(http_response(resp)));
         }
     };
@@ -831,7 +922,7 @@ async fn respond_through_chain(
         // scope: the body streams through untouched, exactly as before this hook existed. The
         // upstream's original headers ride along so framing stays host-owned (the chain cannot
         // desync `Content-Length` from the streamed body).
-        None | Some(Inspectability::OutOfScope) => Ok(Routed::Forwarded(stream_response(
+        None | Some(Inspectability::OutOfScope) => Ok(Routed::forwarded(stream_response(
             edited.status,
             &edited.headers,
             &uparts.headers,
@@ -841,14 +932,14 @@ async fn respond_through_chain(
             state.metrics.inc_inspection_skipped(reason);
             *inspection_skipped = Some(reason);
             match route.response_body.uninspectable() {
-                UninspectableMode::Passthrough => Ok(Routed::Forwarded(stream_response(
+                UninspectableMode::Passthrough => Ok(Routed::forwarded(stream_response(
                     edited.status,
                     &edited.headers,
                     &uparts.headers,
                     ubody,
                 ))),
                 UninspectableMode::Reject => {
-                    discard_upstream_body(ubody);
+                    discard_upstream_body(ubody, chain.admission.clone());
                     Ok(Routed::Synthesised(synth(
                         StatusCode::BAD_GATEWAY,
                         &fault::RESPONSE_BODY_UNINSPECTABLE,
@@ -963,7 +1054,7 @@ async fn inspect_response_body(
     {
         Ok(permit) => permit,
         Err(_) => {
-            discard_upstream_body(ubody);
+            discard_upstream_body(ubody, chain.admission.clone());
             return Ok(Routed::Synthesised(synth(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &fault::RESPONSE_BODY_BUFFER_UNAVAILABLE,
@@ -1007,7 +1098,7 @@ async fn inspect_response_body(
             *inspection_skipped = Some(InspectionSkip::OverCap);
             match cfg.over_cap() {
                 OverCapMode::Reject => {
-                    discard_upstream_body(rest);
+                    discard_upstream_body(rest, chain.admission.clone());
                     return Ok(Routed::Synthesised(synth(
                         StatusCode::BAD_GATEWAY,
                         &fault::RESPONSE_BODY_TOO_LARGE,
@@ -1015,12 +1106,15 @@ async fn inspect_response_body(
                     )));
                 }
                 OverCapMode::Passthrough => {
-                    return Ok(Routed::Forwarded(stream_response(
-                        status,
-                        &edited.headers,
-                        &upstream_headers,
-                        hold_budget(prefixed(Bytes::from(head), rest), permit),
-                    )));
+                    return Ok(Routed::buffered(
+                        stream_response(
+                            status,
+                            &edited.headers,
+                            &upstream_headers,
+                            prefixed(Bytes::from(head), rest),
+                        ),
+                        permit,
+                    ));
                 }
                 OverCapMode::ProcessPartial => (head, Some(rest)),
             }
@@ -1029,15 +1123,18 @@ async fn inspect_response_body(
 
     let snap = chain.snapshot.clone();
     let idx = chain.idx;
-    let outcome = tokio::task::spawn_blocking(move || {
-        snap.dispatch_response_body(idx, &forward, edited, body)
+    let admission = chain.admission.clone();
+    let (outcome, permit) = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let outcome = snap.dispatch_response_body(idx, &forward, edited, body);
+        (outcome, permit)
     })
     .await?;
 
     match outcome {
         ResponseBodyOutcome::Respond(resp) => {
             if let Some(rest) = rest {
-                discard_upstream_body(rest);
+                discard_upstream_body(rest, chain.admission.clone());
             }
             Ok(Routed::Synthesised(http_response(resp)))
         }
@@ -1049,35 +1146,34 @@ async fn inspect_response_body(
             // The whole body was inspected: send exactly the bytes the chain settled on, framed by
             // the host from those bytes (the upstream's own `Content-Length` is deliberately NOT
             // carried over — it describes bytes a transform may have replaced).
-            None => {
-                let (parts, body) = http_response(HttpResponse {
+            None => Ok(Routed::buffered(
+                http_response(HttpResponse {
                     status,
                     headers,
                     body,
-                })
-                .into_parts();
-                Ok(Routed::Forwarded(Response::from_parts(
-                    parts,
-                    hold_budget(body, permit),
-                )))
-            }
+                }),
+                permit,
+            )),
             // `process-partial`: the hooks saw a prefix. Forwarding a rewrite of a prefix followed
             // by an untouched remainder would send a body no filter ever asked for, so a transform
             // here fails closed; inspection alone passes through.
             Some(rest) if transformed => {
-                discard_upstream_body(rest);
+                discard_upstream_body(rest, chain.admission.clone());
                 Ok(Routed::Synthesised(synth(
                     StatusCode::BAD_GATEWAY,
                     &fault::RESPONSE_BODY_PARTIAL_MODIFIED,
                     b"filter rewrote a partially inspected response body",
                 )))
             }
-            Some(rest) => Ok(Routed::Forwarded(stream_response(
-                status,
-                &headers,
-                &upstream_headers,
-                hold_budget(prefixed(Bytes::from(body), rest), permit),
-            ))),
+            Some(rest) => Ok(Routed::buffered(
+                stream_response(
+                    status,
+                    &headers,
+                    &upstream_headers,
+                    prefixed(Bytes::from(body), rest),
+                ),
+                permit,
+            )),
         },
     }
 }
@@ -1086,6 +1182,95 @@ async fn inspect_response_body(
 mod tests {
     use super::*;
     use hyper::header::HeaderValue;
+    use plecto_control::{Control, Host, Manifest, MemoryStore};
+    use plecto_host::test_support::TestSigner;
+    use tokio::sync::{Semaphore, watch};
+
+    fn capped_test_state(cap: usize) -> Arc<ServerState> {
+        let signer = TestSigner::new().unwrap();
+        let manifest = Manifest::from_toml("").unwrap();
+        let control = Arc::new(
+            Control::load(
+                Host::new(signer.trust_policy().unwrap()).unwrap(),
+                &manifest,
+                Box::new(MemoryStore::new()),
+            )
+            .unwrap(),
+        );
+        let (_, drain) = watch::channel(false);
+        let (_, ready) = watch::channel(true);
+        Arc::new(ServerState {
+            control,
+            clients: crate::upstream_client::UpstreamClients::new(),
+            alt_svc: None,
+            trusted_proxy: None,
+            conn_limit: Arc::new(Semaphore::new(crate::MAX_CONNECTIONS)),
+            per_ip_conn_limit: Arc::new(crate::conn_limit::PerIpConnLimit::new(
+                crate::MAX_CONNECTIONS_PER_IP,
+            )),
+            body_buffer_budget: Arc::new(Semaphore::new(1)),
+            request_limit: Arc::new(Semaphore::new(cap)),
+            metrics: Arc::new(crate::metrics::ServerMetrics::new()),
+            otlp: None,
+            drain,
+            ready,
+        })
+    }
+
+    fn no_route_parts() -> hyper::http::request::Parts {
+        hyper::Request::builder()
+            .uri("http://example.test/")
+            .header(hyper::header::HOST, "example.test")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    #[tokio::test]
+    async fn admission_holds_a_real_proxy_response_until_its_body_is_dropped() {
+        let state = capped_test_state(1);
+        let first = proxy_core(
+            state.clone(),
+            "http",
+            "127.0.0.1:1".parse().unwrap(),
+            no_route_parts(),
+            crate::body::empty_req(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+
+        let rejected = proxy_core(
+            state.clone(),
+            "http",
+            "127.0.0.1:1".parse().unwrap(),
+            no_route_parts(),
+            crate::body::empty_req(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rejected
+                .headers()
+                .get("x-plecto-fault")
+                .map(|v| v.as_bytes()),
+            Some(b"request-overloaded".as_slice())
+        );
+
+        drop(first);
+        let readmitted = proxy_core(
+            state,
+            "http",
+            "127.0.0.1:1".parse().unwrap(),
+            no_route_parts(),
+            crate::body::empty_req(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(readmitted.status(), StatusCode::NOT_FOUND);
+    }
 
     fn cfg() -> ResponseBodyConfig {
         ResponseBodyConfig::default()

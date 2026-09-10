@@ -29,7 +29,10 @@ use crate::h3::{build_h3_endpoint, serve_h3};
 use crate::health::serve_health_checks;
 use crate::metrics::ServerMetrics;
 use crate::upstream_client::UpstreamClients;
-use crate::{MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP, ServerState, admin};
+use crate::{
+    MAX_CONCURRENT_STREAMS, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP, MAX_INFLIGHT_REQUESTS,
+    ServerState, admin,
+};
 
 /// Explicit cap on inbound request header lines. hyper's http1 default (~100) is documented
 /// as not API-stable, so pin it — as `MAX_CONCURRENT_STREAMS` already does for h2.
@@ -135,6 +138,7 @@ async fn serve_inner(
         conn_limit: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         per_ip_conn_limit: Arc::new(PerIpConnLimit::new(MAX_CONNECTIONS_PER_IP)),
         body_buffer_budget: Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BUFFER_BYTES)),
+        request_limit: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
         metrics: Arc::new(ServerMetrics::new()),
         otlp: otlp_export.as_ref().map(|(_, buffer)| buffer.clone()),
         drain: drain_rx.clone(),

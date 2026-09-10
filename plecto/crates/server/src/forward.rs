@@ -3,6 +3,7 @@
 //! `C: UpstreamClient` (audunhalland pattern — static dispatch), so this can be exercised against a
 //! `FakeUpstreamClient` without a real socket.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -75,12 +76,13 @@ impl ForwardBody {
 
     /// The body for the NEXT attempt. A `OneShot` moves out on the first call (subsequent calls
     /// yield an empty body, but a one-shot attempt is never retried, so none happen).
-    fn attempt_body(&mut self) -> ReqBody {
-        match self {
+    fn attempt_body(&mut self, admission: Arc<tokio::sync::OwnedSemaphorePermit>) -> ReqBody {
+        let body = match self {
             ForwardBody::Bodyless => crate::body::empty_req(),
             ForwardBody::OneShot(body) => std::mem::replace(body, crate::body::empty_req()),
             ForwardBody::Replayable(bytes) => crate::body::req_full(bytes.clone()),
-        }
+        };
+        crate::body::permit_request_body(body, admission)
     }
 }
 
@@ -136,6 +138,9 @@ pub(crate) struct ForwardRequest<'a> {
     /// `Some(token)` when this is an allowlisted Upgrade handshake (ADR 000048): the exact
     /// (lower-cased) token to re-issue toward the upstream. `None` for every plain request.
     pub(crate) upgrade_token: Option<&'a str>,
+    /// Held by outbound data frames after an early upstream response has let this request future
+    /// complete; see `body::permit_request_body`.
+    pub(crate) admission: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -162,7 +167,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
             retry::PerTryTimeout::Bounded(d) => d,
         };
 
-        let attempt_body = body.attempt_body();
+        let attempt_body = body.attempt_body(forward.admission.clone());
         // The scheme is the GROUP's (ADR 000042): `https` re-encrypts via the TLS client the
         // caller selected for this group, `http` keeps the plain pre-000042 leg.
         let uri = format!(
@@ -295,6 +300,8 @@ mod tests {
     use crate::metrics::ServerMetrics;
     use crate::upstream_client::SendErrorKind;
     use crate::upstream_client::fake::{FakeUpstreamClient, Scripted};
+    use http_body_util::BodyExt;
+    use std::sync::Mutex;
 
     /// A real `plecto_control::UpstreamGroup` with `addrs.len()` healthy instances, reconciled
     /// through the same `UpstreamRegistry` production code uses — no fake/mock LB state, only the
@@ -341,7 +348,82 @@ mod tests {
             upstream_path: "/",
             traceparent: "test-trace",
             upgrade_token: None,
+            admission: test_admission(),
         }
+    }
+
+    fn test_admission() -> Arc<tokio::sync::OwnedSemaphorePermit> {
+        Arc::new(
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("test admission"),
+        )
+    }
+
+    /// Models a transport which accepts a request data frame, returns final headers immediately,
+    /// and retains that frame after the caller's request future has completed.
+    struct EarlyResponseClient {
+        retained: Mutex<Option<hyper::body::Frame<Bytes>>>,
+    }
+
+    impl UpstreamClient for EarlyResponseClient {
+        async fn request(
+            &self,
+            mut req: Request<ReqBody>,
+        ) -> Result<hyper::Response<ResponseBody>, UpstreamSendError> {
+            let frame = req
+                .body_mut()
+                .frame()
+                .await
+                .expect("outbound data")
+                .expect("outbound body success");
+            *self.retained.lock().expect("retained frame lock") = Some(frame);
+            Ok(hyper::Response::new(crate::body::full(Vec::new())))
+        }
+    }
+
+    #[tokio::test]
+    async fn early_response_keeps_admission_while_transport_retains_upload_frame() {
+        let group = test_group(&["127.0.0.1:1"], 0);
+        let pick = group.pick(None).unwrap();
+        let client = EarlyResponseClient {
+            retained: Mutex::new(None),
+        };
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let admission = Arc::new(limit.clone().try_acquire_owned().unwrap());
+        let headers = HeaderMap::new();
+        let forward = ForwardRequest {
+            method: "POST",
+            headers: AttemptHeaders::Chain(&[]),
+            original_headers: &headers,
+            authority: "test-authority",
+            upstream_path: "/",
+            traceparent: "test-trace",
+            upgrade_token: None,
+            admission,
+        };
+
+        let outcome = forward_with_retry(
+            &client,
+            &ServerMetrics::new(),
+            &group,
+            pick,
+            None,
+            forward,
+            ForwardBody::Replayable(Bytes::from_static(b"upload")),
+            Duration::from_secs(1),
+            None,
+            0,
+        )
+        .await;
+        drop(outcome);
+        assert_eq!(
+            limit.available_permits(),
+            0,
+            "retained transport frame owns admission"
+        );
+        drop(client.retained.lock().unwrap().take());
+        assert_eq!(limit.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -676,6 +758,7 @@ mod tests {
             upstream_path: "/",
             traceparent: "test-trace",
             upgrade_token: None,
+            admission: test_admission(),
         };
 
         let outcome = forward_with_retry(
@@ -721,6 +804,7 @@ mod tests {
             upstream_path: "/",
             traceparent: "test-trace",
             upgrade_token: None,
+            admission: test_admission(),
         };
 
         let outcome = forward_with_retry(

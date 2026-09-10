@@ -31,8 +31,8 @@ wit_bindgen::generate!({
     world: "filter-body",
 });
 
-use crate::plecto::filter::host_log;
 use crate::plecto::filter::types::{Header, RequestBodyEdit, ResponseBodyEdit};
+use crate::plecto::filter::{host_counter, host_log};
 
 struct FilterV04;
 
@@ -56,6 +56,12 @@ impl Guest for FilterV04 {
     }
 
     fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
+        if body.starts_with(b"admission-request-spin") {
+            host_counter::increment("body-start", 1);
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         if body.starts_with(b"expand-then-deny") {
             let mut expanded = b"deny-body".to_vec();
             expanded.resize((16 << 20) + 1, b'x');
@@ -106,6 +112,12 @@ impl Guest for FilterV04 {
         _resp: HttpResponse,
         body: Vec<u8>,
     ) -> ResponseBodyDecision {
+        if req.path_with_query.contains("admission-response-spin") {
+            host_counter::increment("body-start", 1);
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         if req.path_with_query.contains("respbody=replace") {
             return ResponseBodyDecision::Replace(HttpResponse {
                 status: 418,

@@ -4,8 +4,12 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::str::FromStr;
 
 use hyper::header::{HeaderName, HeaderValue};
+use hyper::http::Uri;
+use hyper::http::Version;
+use hyper::http::uri::{Authority, Scheme};
 use plecto_control::{Header, HttpRequest, TrustedProxyTrust};
 
 /// Hop-by-hop headers a proxy must not forward (RFC 9110 §7.6.1). Stripped both ways so the
@@ -186,6 +190,144 @@ pub(crate) fn set_forwarded(
     client
 }
 
+/// Reject inbound authority ambiguity and leave a canonical `Host` header whenever the request
+/// names an authority. This runs once at the transport-neutral proxy ingress; later filter edits
+/// remain deliberate policy actions (ADR 000015).
+///
+/// HTTP/1.1 requires exactly one `Host`. HTTP/2 and HTTP/3 use URI authority when it is available;
+/// a literal `Host`, when present, must name the same endpoint, and is the fallback when an
+/// adapter exposes origin-form URI data. HTTP/1.0 retains compatibility with origin-form requests
+/// that have neither field. For an absolute-form request, the URI is the canonical representation
+/// retained in `Host`, as RFC 9112 §3.2.2 requires for forwarding.
+pub(crate) fn normalize_ingress_authority(
+    parts: &mut hyper::http::request::Parts,
+    wire_scheme: &str,
+) -> Result<(), ()> {
+    let uri_authority = parts
+        .uri
+        .authority()
+        .map(|authority| parse_authority(authority.as_str()))
+        .transpose()?;
+
+    let mut hosts = parts.headers.get_all(hyper::header::HOST).iter();
+    let host_authority = match hosts.next() {
+        Some(value) => Some(parse_authority(value.to_str().map_err(|_| ())?)?),
+        None => None,
+    };
+    if hosts.next().is_some() {
+        return Err(());
+    }
+
+    let scheme = parts.uri.scheme_str().unwrap_or(wire_scheme);
+    let transport_host_fallback = !matches!(parts.version, Version::HTTP_10 | Version::HTTP_11)
+        && uri_authority.is_none()
+        && host_authority.is_some();
+    let selected = match parts.version {
+        Version::HTTP_10 => match (uri_authority.as_deref(), host_authority.as_deref()) {
+            (Some(uri), Some(host)) if !authorities_match(uri, host, scheme) => return Err(()),
+            (Some(uri), _) => Some(uri),
+            (None, Some(host)) => Some(host),
+            (None, None) => None,
+        },
+        Version::HTTP_11 => {
+            let host = host_authority.as_deref().ok_or(())?;
+            match uri_authority.as_deref() {
+                Some(uri) if !authorities_match(uri, host, scheme) => return Err(()),
+                Some(uri) => Some(uri),
+                None => Some(host),
+            }
+        }
+        _ => match (uri_authority.as_deref(), host_authority.as_deref()) {
+            (Some(uri), Some(host)) if !authorities_match(uri, host, scheme) => return Err(()),
+            (Some(uri), _) => Some(uri),
+            // RFC 9113 §8.3.1 requires direct h2 clients to send `:authority` when they have
+            // authority information, but an adapter can expose a valid origin-form request with
+            // the corresponding single Host field. Treat it as the one authority rather than
+            // inventing a second interpretation; H3 shares this transport-neutral path.
+            (None, Some(host)) => Some(host),
+            (None, None) => return Err(()),
+        },
+    };
+
+    match selected {
+        Some(authority) => {
+            let value = HeaderValue::from_str(authority).map_err(|_| ())?;
+            parts.headers.insert(hyper::header::HOST, value);
+            // A transport adapter can expose authority solely as Host beside an origin-form Uri.
+            // Materialize that same validated authority in the Uri so every later consumer reads
+            // one canonical value.
+            if transport_host_fallback {
+                let mut uri_parts = parts.uri.clone().into_parts();
+                uri_parts.scheme = Some(Scheme::from_str(wire_scheme).map_err(|_| ())?);
+                uri_parts.authority = Some(Authority::from_str(authority).map_err(|_| ())?);
+                parts.uri = Uri::from_parts(uri_parts).map_err(|_| ())?;
+            }
+        }
+        None => {
+            parts.headers.remove(hyper::header::HOST);
+        }
+    }
+    Ok(())
+}
+
+fn parse_authority(value: &str) -> Result<String, ()> {
+    // URI authority permits userinfo, but Host field values do not (RFC 9110 §7.2).
+    if value.is_empty() || value.contains('@') {
+        return Err(());
+    }
+    let authority = Authority::from_str(value).map_err(|_| ())?;
+    // `Authority` permits a non-numeric or out-of-range port as generic URI syntax, while an
+    // HTTP Host field's port is decimal `port` (RFC 3986 §3.2.3). Do not collapse either into
+    // the same `None` as an absent port during equivalence checks.
+    if !has_valid_port_syntax(value)
+        || (authority.port().is_some() && authority.port_u16().is_none())
+    {
+        return Err(());
+    }
+    Ok(authority.to_string())
+}
+
+fn has_valid_port_syntax(authority: &str) -> bool {
+    let port = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((_, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        match suffix.strip_prefix(':') {
+            Some(port) => port,
+            None if suffix.is_empty() => return true,
+            None => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((_, port)) => port,
+            None => return true,
+        }
+    };
+    !port.is_empty() && port.parse::<u16>().is_ok()
+}
+
+fn authorities_match(left: &str, right: &str, scheme: &str) -> bool {
+    let Ok(left) = Authority::from_str(left) else {
+        return false;
+    };
+    let Ok(right) = Authority::from_str(right) else {
+        return false;
+    };
+    let left_host = left.host().strip_suffix('.').unwrap_or(left.host());
+    let right_host = right.host().strip_suffix('.').unwrap_or(right.host());
+    if !left_host.eq_ignore_ascii_case(right_host) {
+        return false;
+    }
+    match (left.port_u16(), right.port_u16()) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        (Some(port), None) | (None, Some(port)) => {
+            (scheme.eq_ignore_ascii_case("http") && port == 80)
+                || (scheme.eq_ignore_ascii_case("https") && port == 443)
+        }
+    }
+}
+
 /// Build a header-only `HttpRequest` (the chain's view) from the inbound request parts. The body
 /// is handled separately (streamed), so it is absent here — the v0.1 contract is header-only.
 ///
@@ -335,6 +477,105 @@ mod tests {
             to_http_request(&parts(false), "http").authority,
             "h1.example"
         );
+    }
+
+    fn request_parts(version: Version, uri: &str, hosts: &[&str]) -> hyper::http::request::Parts {
+        let mut builder = Request::builder().method("GET").version(version).uri(uri);
+        for host in hosts {
+            builder = builder.header(hyper::header::HOST, *host);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    #[test]
+    fn ingress_authority_rejects_ambiguous_or_invalid_http11_host() {
+        for (uri, hosts) in [
+            ("http://public.example/", vec!["protected.example"]),
+            ("/", vec!["public.example", "public.example"]),
+            ("/", vec![]),
+            ("/", vec!["user@public.example"]),
+            ("/", vec!["public.example:abc"]),
+            ("/", vec!["public.example:65536"]),
+            ("/", vec!["public.example:"]),
+        ] {
+            let mut parts = request_parts(Version::HTTP_11, uri, &hosts);
+            assert!(
+                normalize_ingress_authority(&mut parts, "http").is_err(),
+                "{uri:?} with {hosts:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_authority_canonicalizes_matching_authorities_for_all_transports() {
+        let cases = [
+            (
+                Version::HTTP_11,
+                "http://EXAMPLE.test./",
+                "example.test:80",
+                "EXAMPLE.test.",
+            ),
+            (
+                Version::HTTP_2,
+                "https://[2001:db8::1]/",
+                "[2001:DB8::1]:443",
+                "[2001:db8::1]",
+            ),
+        ];
+        for (version, uri, host, want) in cases {
+            let mut parts = request_parts(version, uri, &[host]);
+            normalize_ingress_authority(&mut parts, "https").unwrap();
+            assert_eq!(
+                parts
+                    .headers
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok()),
+                Some(want),
+                "{uri:?} must replace its matching literal Host with the URI authority"
+            );
+        }
+
+        let mut h2_without_host = request_parts(Version::HTTP_2, "https://h2.example/", &[]);
+        normalize_ingress_authority(&mut h2_without_host, "https").unwrap();
+        assert_eq!(
+            h2_without_host
+                .headers
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("h2.example")
+        );
+
+        for version in [Version::HTTP_2, Version::HTTP_3] {
+            let mut origin_form = request_parts(version, "/from-adapter", &["h2.example"]);
+            normalize_ingress_authority(&mut origin_form, "https").unwrap();
+            assert_eq!(
+                origin_form
+                    .headers
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok()),
+                Some("h2.example"),
+                "a single Host remains the authority when {version:?} adapter URI is origin-form"
+            );
+            assert_eq!(
+                origin_form.uri.authority().map(Authority::as_str),
+                Some("h2.example")
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_authority_rejects_non_default_port_conflicts_and_preserves_http10_compatibility() {
+        let mut non_default = request_parts(
+            Version::HTTP_11,
+            "http://example.test/",
+            &["example.test:8080"],
+        );
+        assert!(normalize_ingress_authority(&mut non_default, "http").is_err());
+
+        let mut legacy = request_parts(Version::HTTP_10, "/", &[]);
+        normalize_ingress_authority(&mut legacy, "http").unwrap();
+        assert!(legacy.headers.get(hyper::header::HOST).is_none());
+        assert_eq!(request_authority(&legacy), "");
     }
 
     fn header(name: &str, value: &str) -> Header {

@@ -22,6 +22,9 @@ pub(crate) mod fault {
     use hyper::header::HeaderValue;
 
     pub(crate) static BAD_PATH: HeaderValue = HeaderValue::from_static("bad-path");
+    pub(crate) static BAD_AUTHORITY: HeaderValue = HeaderValue::from_static("bad-authority");
+    pub(crate) static REQUEST_OVERLOADED: HeaderValue =
+        HeaderValue::from_static("request-overloaded");
     pub(crate) static NO_ROUTE: HeaderValue = HeaderValue::from_static("no-route");
     pub(crate) static RATE_LIMITED: HeaderValue = HeaderValue::from_static("rate-limited");
     pub(crate) static NO_HEALTHY_UPSTREAM: HeaderValue =
@@ -84,11 +87,15 @@ pub(crate) fn http_response(resp: HttpResponse) -> Response<ResponseBody> {
 /// the background so the pooled upstream connection can be reused; anything over the drain cap
 /// (or a drain error) drops the remainder and hyper closes the socket — correct for "we do not
 /// want these bytes" after a `replace` / fail-closed synthesised response (ADR 000073 review).
-pub(crate) fn discard_upstream_body(mut body: ResponseBody) {
+pub(crate) fn discard_upstream_body(
+    mut body: ResponseBody,
+    admission: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+) {
     /// Bytes we are willing to read just to return a connection to the pool. Larger leftovers
     /// are not worth the bandwidth; dropping the body closes the socket instead.
     const DRAIN_CAP: usize = 64 << 10; // 64 KiB
     tokio::spawn(async move {
+        let _admission = admission;
         use http_body_util::BodyExt;
         let mut drained = 0usize;
         while drained < DRAIN_CAP {

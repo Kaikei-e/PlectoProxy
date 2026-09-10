@@ -9,15 +9,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
+pub(crate) use plecto_control::MAX_REQUEST_BODY_BUFFER;
+use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{BoxError, ReqBody, ResponseBody};
-
-/// The cap on a request body buffered for the `on-request-body` hook (ADR 000025). Buffer-then-
-/// decide must bound memory: an unbounded buffer is a trivial OOM DoS, so a body larger than this
-/// fails closed (413) rather than being read into RAM. A per-route override is a follow-up; the
-/// constant keeps v1 safe. Header-only / bodyless requests never reach this path.
-pub(crate) const MAX_REQUEST_BODY_BUFFER: usize = 16 << 20; // 16 MiB
 
 /// The whole process's budget for bodies held in memory for a body hook, counted in BYTES and
 /// shared by BOTH directions (ADR 000098). It replaces the old per-direction count of concurrent
@@ -100,6 +96,86 @@ pub(crate) fn req_full(bytes: Bytes) -> ReqBody {
         .boxed()
 }
 
+/// A `Bytes` allocation plus the reservation which accounts for it.  `Bytes::from_owner` keeps
+/// this object alive when hyper retains a data frame in a transport write buffer after the body
+/// adapter itself has reached EOF or been dropped.
+struct PermittedBytes {
+    bytes: Bytes,
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for PermittedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Attach a reservation to bytes which may escape a body adapter into a downstream transport.
+pub(crate) fn bytes_with_permit(bytes: Bytes, permit: Arc<OwnedSemaphorePermit>) -> Bytes {
+    Bytes::from_owner(PermittedBytes {
+        bytes,
+        _permit: permit,
+    })
+}
+
+/// Keep a permit through the outbound request body and every data frame it yields.  The wrapper
+/// is needed for one-shot bodies; buffered replayable bodies carry their byte-budget permit
+/// directly as an owner as well.
+pub(crate) fn permit_request_body(body: ReqBody, permit: Arc<OwnedSemaphorePermit>) -> ReqBody {
+    PermittedRequestBody {
+        inner: body,
+        permit: Some(permit),
+    }
+    .boxed()
+}
+
+struct PermittedRequestBody {
+    inner: ReqBody,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
+}
+
+impl hyper::body::Body for PermittedRequestBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let Some(permit) = this.permit.as_ref().cloned() else {
+            return std::task::Poll::Ready(None);
+        };
+        let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match poll {
+            std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                    bytes_with_permit(data, permit),
+                )))),
+                Err(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            },
+            terminal @ std::task::Poll::Ready(None | Some(Err(_))) => {
+                this.permit = None;
+                this.inner = empty_req();
+                terminal
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.permit.is_none() || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.permit.is_none() {
+            hyper::body::SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
+    }
+}
+
 /// How long the server spends reading a buffered response body before failing closed (ADR 000098).
 /// The response plane needs its own bound for the same reason the request plane does: the headers
 /// are being held, so a trickling upstream would hold them forever.
@@ -169,14 +245,75 @@ pub(crate) fn prefixed(prefix: Bytes, rest: ResponseBody) -> ResponseBody {
 pub(crate) fn hold_budget(body: ResponseBody, permit: OwnedSemaphorePermit) -> ResponseBody {
     BudgetedBody {
         inner: body,
-        _permit: permit,
+        permit: Some(Arc::new(permit)),
     }
     .boxed_unsync()
 }
 
+/// Keep a request-admission permit until the response stream reaches a terminal state.  The
+/// permit is shared because a response body, a detached drain, or an upgrade tunnel can each be
+/// the remaining owner of the request's work.
+pub(crate) fn hold_request_permit(
+    body: ResponseBody,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> ResponseBody {
+    RequestPermittedBody {
+        inner: body,
+        permit: Some(permit),
+    }
+    .boxed_unsync()
+}
+
+struct RequestPermittedBody {
+    inner: ResponseBody,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
+}
+
+impl hyper::body::Body for RequestPermittedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let Some(permit) = this.permit.as_ref().cloned() else {
+            return std::task::Poll::Ready(None);
+        };
+        let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match poll {
+            std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                    bytes_with_permit(data, permit),
+                )))),
+                Err(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            },
+            terminal @ std::task::Poll::Ready(None | Some(Err(_))) => {
+                this.permit = None;
+                this.inner = full(Vec::new());
+                terminal
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.permit.is_none() || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.permit.is_none() {
+            hyper::body::SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
+    }
+}
+
 struct BudgetedBody {
     inner: ResponseBody,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl hyper::body::Body for BudgetedBody {
@@ -187,7 +324,25 @@ impl hyper::body::Body for BudgetedBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+        let this = self.get_mut();
+        let Some(permit) = this.permit.as_ref().cloned() else {
+            return std::task::Poll::Ready(None);
+        };
+        let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match poll {
+            std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                    bytes_with_permit(data, permit),
+                )))),
+                Err(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            },
+            terminal @ std::task::Poll::Ready(None | Some(Err(_))) => {
+                this.permit = None;
+                this.inner = full(Vec::new());
+                terminal
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
@@ -195,7 +350,7 @@ impl hyper::body::Body for BudgetedBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.permit.is_none() || self.inner.is_end_stream()
     }
 }
 
@@ -250,9 +405,104 @@ impl hyper::body::Body for PrefixedBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Semaphore;
 
     /// A response body delivered as several frames, so the cap can be crossed mid-frame.
     struct Frames(std::collections::VecDeque<Bytes>);
+
+    #[tokio::test]
+    async fn request_permit_stays_until_response_eof() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(limit.clone().try_acquire_owned().unwrap());
+        let mut body = hold_request_permit(full(b"ok".to_vec()), permit);
+        assert!(limit.clone().try_acquire_owned().is_err());
+        use http_body_util::BodyExt;
+        assert!(body.frame().await.is_some());
+        assert!(limit.clone().try_acquire_owned().is_err());
+        assert!(body.frame().await.is_none());
+        assert!(limit.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn dropping_an_unread_response_returns_its_request_permit() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(limit.clone().try_acquire_owned().unwrap());
+        let body = hold_request_permit(full(b"unread".to_vec()), permit);
+        assert_eq!(limit.available_permits(), 0);
+        drop(body);
+        assert_eq!(limit.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_error_returns_request_permit_and_stays_terminal() {
+        struct FailingBody;
+        impl hyper::body::Body for FailingBody {
+            type Data = Bytes;
+            type Error = BoxError;
+
+            fn poll_frame(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+                std::task::Poll::Ready(Some(Err(std::io::Error::other("body failed").into())))
+            }
+        }
+
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(limit.clone().try_acquire_owned().unwrap());
+        let mut body = hold_request_permit(FailingBody.boxed_unsync(), permit);
+        assert!(body.frame().await.unwrap().is_err());
+        assert_eq!(limit.available_permits(), 1);
+        assert!(hyper::body::Body::is_end_stream(&body));
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_frame_keeps_admission_after_body_eof_and_drop() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(limit.clone().try_acquire_owned().unwrap());
+        let mut body = permit_request_body(
+            Full::new(Bytes::from_static(b"upload"))
+                .map_err(|e: Infallible| -> BoxError { match e {} })
+                .boxed(),
+            permit,
+        );
+
+        let frame = body.frame().await.expect("data").expect("ok");
+        assert!(body.frame().await.is_none(), "body reached EOF");
+        drop(body);
+        assert_eq!(limit.available_permits(), 0, "transport can retain frame");
+        drop(frame);
+        assert_eq!(limit.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_frame_keeps_admission_after_body_eof_and_drop() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(limit.clone().try_acquire_owned().unwrap());
+        let mut body = hold_request_permit(full(b"response".to_vec()), permit);
+
+        let frame = body.frame().await.expect("data").expect("ok");
+        assert!(body.frame().await.is_none(), "body reached EOF");
+        drop(body);
+        assert_eq!(limit.available_permits(), 0, "transport can retain frame");
+        drop(frame);
+        assert_eq!(limit.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_frame_keeps_byte_budget_after_body_eof_and_drop() {
+        let budget = Arc::new(Semaphore::new(1));
+        let permit = budget.clone().try_acquire_owned().unwrap();
+        let mut body = hold_budget(full(b"response".to_vec()), permit);
+
+        let frame = body.frame().await.expect("data").expect("ok");
+        assert!(body.frame().await.is_none(), "body reached EOF");
+        drop(body);
+        assert_eq!(budget.available_permits(), 0, "transport can retain frame");
+        drop(frame);
+        assert_eq!(budget.available_permits(), 1);
+    }
 
     impl hyper::body::Body for Frames {
         type Data = Bytes;

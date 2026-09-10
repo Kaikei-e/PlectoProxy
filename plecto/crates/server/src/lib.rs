@@ -218,6 +218,10 @@ fn unix_raise_nofile_limit() -> std::io::Result<(u64, u64)> {
 /// pin it explicitly.
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 100;
 
+/// Whole-server cap on requests which still own data-plane work.  Unlike the connection and
+/// per-upstream breaker caps this includes filter execution and downstream response delivery.
+pub(crate) const MAX_INFLIGHT_REQUESTS: usize = 1024;
+
 /// Shared per-server state: the control plane (filters, routes, reload), the upstream clients, and
 /// the `Alt-Svc` header value advertising HTTP/3 (ADR 000016) — `Some` only when a QUIC listener is
 /// bound, and added to TCP (HTTP/1.1 + HTTP/2) responses to steer capable clients to h3.
@@ -243,6 +247,9 @@ pub(crate) struct ServerState {
     /// for as long as the bytes stay resident, so the two directions compete for one bounded pool
     /// instead of multiplying into two independent ceilings.
     body_buffer_budget: Arc<Semaphore>,
+    /// Global request-work admission.  A permit remains held through the response body (and any
+    /// background work that still owns its upstream stream), rather than merely until headers.
+    request_limit: Arc<Semaphore>,
     /// Native data-plane metrics (Stage A observability, ADR 000009): RED signals tallied per
     /// request and served on the admin endpoint. Always recorded (cheap atomics); whether anyone
     /// can scrape them is gated by `[observability] admin_addr`.

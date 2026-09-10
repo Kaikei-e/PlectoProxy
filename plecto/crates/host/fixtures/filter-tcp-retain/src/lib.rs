@@ -1,6 +1,10 @@
 //! Test-only outbound-TCP guest which retains native socket resources across hook calls.
 //! It proves that the host, rather than guest cooperation, owns the descriptor lifetime limit.
 
+// wit-bindgen flattens records into many core-wasm ABI args, so generated FFI shims trip
+// clippy::too_many_arguments. This allow scopes ONLY to generated code.
+#![allow(clippy::too_many_arguments)]
+
 wit_bindgen::generate!({
     path: "../../../../wit/v0.3.0",
     world: "filter",

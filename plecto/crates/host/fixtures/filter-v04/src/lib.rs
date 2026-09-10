@@ -9,6 +9,9 @@
 //!   - a body starting with `rewrite` returns `modified(request-body-edit)`: the transformed
 //!     body PLUS the header edits a body transform usually forces (`x-plecto-body-edited` set,
 //!     `x-drop-me` removed);
+//!   - `expand-then-deny` returns an over-cap body beginning with `deny-body`, so a two-filter
+//!     chain can prove the host refuses it before a later hook sees it;
+//!   - `expand-exact` returns exactly the host cap, pinning the accepted side of that boundary;
 //!   - a body carrying the `deny-body` marker short-circuits 403 before upstream;
 //!   - `on-response-body` reads the buffered UPSTREAM body and answers on all three arms — bare
 //!     `%continue`, `modified(response-body-edit)` redacting a marker, and `replace` discarding
@@ -53,6 +56,24 @@ impl Guest for FilterV04 {
     }
 
     fn on_request_body(body: Vec<u8>) -> RequestBodyDecision {
+        if body.starts_with(b"expand-then-deny") {
+            let mut expanded = b"deny-body".to_vec();
+            expanded.resize((16 << 20) + 1, b'x');
+            return RequestBodyDecision::Modified(RequestBodyEdit {
+                body: expanded,
+                set_headers: vec![],
+                remove_headers: vec![],
+            });
+        }
+        if body.starts_with(b"expand-exact") {
+            let mut expanded = b"exact-body".to_vec();
+            expanded.resize(16 << 20, b'x');
+            return RequestBodyDecision::Modified(RequestBodyEdit {
+                body: expanded,
+                set_headers: vec![],
+                remove_headers: vec![],
+            });
+        }
         if body
             .windows(9)
             .any(|w| w.eq_ignore_ascii_case(b"deny-body"))

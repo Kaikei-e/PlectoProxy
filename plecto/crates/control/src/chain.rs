@@ -10,6 +10,11 @@ use plecto_host::{
     ResponseDecision, ResponseEdit,
 };
 
+/// The fixed host-wide cap for a request body buffered for `on-request-body`. The server reserves
+/// this exact amount from its shared body-buffer budget before dispatching the chain, so every
+/// filter-produced replacement must fit it too.
+pub const MAX_REQUEST_BODY_BUFFER: usize = 16 << 20; // 16 MiB
+
 /// The result of driving a request through the chain.
 pub enum ChainOutcome {
     /// Respond now without reaching upstream: a filter short-circuited, or the chain failed
@@ -95,6 +100,13 @@ pub(crate) fn dispatch_request_body(
         match filter.on_request_body(&body, trace) {
             Ok((RequestBodyDecision::Continue, _logs)) => {}
             Ok((RequestBodyDecision::Modified(edit), _logs)) => {
+                // The initial client body was bounded before it entered the chain. Re-check every
+                // replacement before mutating headers or calling the next filter: otherwise a
+                // guest can turn the shared reservation into a suggestion and hand an unbounded
+                // Vec to the replayable upstream path.
+                if edit.body.len() > MAX_REQUEST_BODY_BUFFER {
+                    return RequestBodyOutcome::Respond(oversize_guest_request_body_response());
+                }
                 body = apply_request_body_edit(&mut headers, edit)
             }
             Ok((RequestBodyDecision::ShortCircuit(response), _logs)) => {
@@ -105,6 +117,20 @@ pub(crate) fn dispatch_request_body(
         }
     }
     RequestBodyOutcome::Forward { body, headers }
+}
+
+/// The fail-closed answer when a request-body filter returns more bytes than the host reserved.
+/// This is a filter fault, rather than the client's over-cap input (which the server reports as
+/// 413 before the chain), so it uses the same 502 vocabulary as response guest-output refusal.
+fn oversize_guest_request_body_response() -> HttpResponse {
+    HttpResponse {
+        status: 502,
+        headers: vec![Header {
+            name: "x-plecto-fault".to_string(),
+            value: b"request-body-guest-oversize".to_vec(),
+        }],
+        body: b"filter returned an oversized request body".to_vec(),
+    }
 }
 
 pub(crate) fn dispatch_response(

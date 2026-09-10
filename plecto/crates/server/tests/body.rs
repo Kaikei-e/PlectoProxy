@@ -18,7 +18,9 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
-use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
+use plecto_control::{
+    Control, Host, MAX_REQUEST_BODY_BUFFER, Manifest, MemoryStore, ResolvedArtifact,
+};
 use plecto_host::test_support::{
     TestSigner, bound_sbom, filter_hello_component, filter_v04_component,
 };
@@ -122,32 +124,52 @@ fn control_for_addrs(addrs: &[SocketAddr]) -> Arc<Control> {
 /// The same route wired to an arbitrary body-reading filter component, so the frozen-0.3 guest
 /// and the 0.4.0-native one run the identical fast path.
 fn control_for_component(component: Vec<u8>, addrs: &[SocketAddr]) -> Arc<Control> {
+    control_for_component_chain(&[component], addrs)
+}
+
+/// Like [`control_for_component`], but wires an ordered set of body-reading filters. This makes
+/// the oversize-output regression prove the chain stops before the next filter as well as before
+/// the upstream.
+fn control_for_component_chain(components: &[Vec<u8>], addrs: &[SocketAddr]) -> Arc<Control> {
     let signer = TestSigner::new().unwrap();
-    let component_signature = signer.sign(&component).unwrap();
-    let sbom = bound_sbom(&component);
-    let sbom_signature = signer.sign(&sbom).unwrap();
     let mut store = MemoryStore::new();
-    let digest = store.insert(
-        "fh",
-        ResolvedArtifact {
-            component,
-            component_signature,
-            sbom,
-            sbom_signature,
-        },
-    );
+    let mut filter_blocks = String::new();
+    let mut filter_ids = Vec::with_capacity(components.len());
+    for (index, component) in components.iter().enumerate() {
+        let id = format!("fh{index}");
+        let component_signature = signer.sign(component).unwrap();
+        let sbom = bound_sbom(component);
+        let sbom_signature = signer.sign(&sbom).unwrap();
+        let digest = store.insert(
+            &id,
+            ResolvedArtifact {
+                component: component.clone(),
+                component_signature,
+                sbom,
+                sbom_signature,
+            },
+        );
+        filter_blocks.push_str(&format!(
+            r#"
+[[filter]]
+id = "{id}"
+source = "{id}"
+digest = "{digest}"
+isolation = "trusted"
+request_deadline_ms = 1000
+"#
+        ));
+        filter_ids.push(format!("\"{id}\""));
+    }
     let addr_list = addrs
         .iter()
         .map(|a| format!("\"{a}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let filter_ids = filter_ids.join(", ");
     let toml = format!(
         r#"
-[[filter]]
-id = "fh"
-source = "fh"
-digest = "{digest}"
-isolation = "trusted"
+{filter_blocks}
 
 [[upstream]]
 name = "echo"
@@ -157,7 +179,7 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
-filters = ["fh"]
+filters = [{filter_ids}]
 upstream = "echo"
 strip_prefix = "/api"
 [route.match]
@@ -314,6 +336,56 @@ async fn a_040_guests_bare_continue_forwards_the_buffered_body_unchanged() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "leave me alone");
+}
+
+#[tokio::test]
+async fn oversized_guest_request_body_stops_the_chain_before_the_next_filter_and_upstream() {
+    let upstream = spawn_upstream().await;
+    let component = filter_v04_component();
+    let proxy = spawn_proxy(control_for_component_chain(
+        &[component.clone(), component],
+        &[upstream],
+    ))
+    .await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, headers, _body) = post(&client, proxy, "/api/hello", b"expand-then-deny").await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a guest body over the host cap must fail closed before the next hook can short-circuit"
+    );
+    assert_eq!(
+        headers.get("x-plecto-fault").map(|v| v.as_bytes()),
+        Some(b"request-body-guest-oversize".as_slice())
+    );
+    assert!(
+        !headers.contains_key("x-from"),
+        "the oversized body must never reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn guest_request_body_at_the_shared_cap_is_forwarded() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_component(filter_v04_component(), &[upstream])).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, headers, body) = post(&client, proxy, "/api/hello", b"expand-exact").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("x-from").and_then(|value| value.to_str().ok()),
+        Some("upstream")
+    );
+    assert_eq!(
+        body.len(),
+        MAX_REQUEST_BODY_BUFFER,
+        "the exact shared reservation is accepted"
+    );
 }
 
 #[tokio::test]

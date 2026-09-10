@@ -7,6 +7,48 @@ requests it personally handled. This is a deliberate design boundary ([ADR 00005
 not a gap: it keeps the core single-binary and self-hostable ([ADR 000008](ADR/000008.md)) instead
 of quietly depending on an external coordination service.
 
+## Current security boundaries
+
+These boundaries are enforced by the current implementation. Keep them in mind when placing a
+front proxy, granting outbound capabilities, or preparing an operator manifest.
+
+- **Ingress authority:** Plecto Proxy normalizes the request URI authority and `Host` before route
+  selection, filters, and forwarding. Ambiguous or conflicting authority/`Host` input is rejected
+  with 400. HTTP/1.0's legacy request form without `Host` remains supported. For compatibility,
+  an HTTP/2 or HTTP/3 adapter that supplies an origin-form URI and a single valid `Host` also
+  has that host normalized into the URI authority. Both absent, duplicate `Host` values, and
+  conflicting authorities are rejected for HTTP/2 and HTTP/3.
+- **Request admission:** each server admits at most 1,024 request lifetimes across HTTP/1.1,
+  HTTP/2, and HTTP/3. Saturation returns 503 with `x-plecto-fault: request-overloaded` without
+  queueing filter work. Blocking filter calls, upload/response data retained by the transport,
+  background body drains, and upgrade tunnels keep their request's slot until they finish or
+  release their data. This limit is separate from the existing `plecto_requests_in_flight`
+  metric, which tracks processing until response headers are ready.
+- **Buffered bodies:** request and response inspection share a 1 GiB reservation budget. The
+  request body cap is 16 MiB, including each filter's transformed output; guest output over the
+  cap fails closed with 502 before the next filter or upstream. Cancellation and an early upstream
+  response do not release reservations while blocking filters or transport buffers retain the data.
+  Response compression retains the same reservation on its encoded output, including DATA clones
+  that outlive the response body.
+- **Outbound resources:** outbound HTTP `max_concurrent` counts a response until its body is read
+  to EOF or dropped; retaining an unread body continues to consume the slot. Its dispatcher also
+  has an absolute deadline that stops the driver even when the guest stops polling. Outbound TCP
+  has live-socket ceilings of 64 per Store and 1,024 per Host. The existing `max_connections`
+  option remains a per-request connection-attempt budget, not a live-socket setting.
+- **Host state:** keys passed to every host state API are limited to 1,024 bytes. Do not use
+  unbounded client-derived material as a state key.
+- **Operator-owned inputs:** an OCI `source` must be a relative normal path and its canonical path
+  must remain below the declared root. The `filter-extauthz` authorization target is the
+  operator-owned `[filter.config] authz-url`, never a request header. `plecto validate` warns when
+  the admin listener binds a non-loopback address; bind it privately and restrict network access.
+- **CORS policy:** the reference CORS filter replaces upstream CORS grants with its operator policy.
+  Rejected or ambiguous origins receive no grant, and upstream credentials grants cannot override
+  `allow-credentials`. Existing cache constraints in `Vary` are preserved.
+- **Streaming body preview:** `streaming-body` is off by default and is not connected to the
+  production request path. It does not currently provide a wall-clock I/O timeout. Before wiring
+  it into production, add an outer timeout and cancellation tests that prove stalled I/O releases
+  its resources.
+
 ## What "node-local" covers
 
 | State | Where | ADR |
@@ -18,6 +60,28 @@ of quietly depending on an external coordination service.
 
 None of these are shared across replicas. A counter, bucket, or cached ticket key on instance A is
 invisible to instance B.
+
+## Restoring persistent state quotas
+
+At startup, `Host::with_backend` inventories stored KV values, counters, and rate-limit buckets
+before creating the runtime. Each filter's namespace is limited to 100,000 entries and 64 MiB;
+the Host totals are 5,000,000 entries and 1 GiB. Accounting includes guest-key bytes and raw value
+bytes across all three primitives. These are logical state limits, not a limit on the redb file's
+physical size. Restarting the process does not reset the usage of surviving entries.
+
+An unreadable inventory, malformed namespace, or accounting overflow prevents startup. Existing
+usage above a cap is counted and reported with a warning: growth is denied until usage falls
+within the limits, while same-size updates, shrinking, and deletion remain possible through the
+supported APIs. Legacy keys longer than 1,024 bytes, or keys that cannot be expressed as UTF-8,
+cannot be reached through those APIs. Back up the database and migrate or clean those entries
+offline with the proxy stopped; there is no built-in cleanup CLI. Startup scans every entry and
+keeps one tally per namespace, so a large legacy database also increases startup time.
+
+Custom `KvBackend` implementations must implement `visit_entries` as a consistent inventory that
+visits each entry exactly once. The default returns `KvBackendInventoryError::Unsupported`, so
+existing implementations still compile but cannot start a Host until they support inventory.
+The callback must not re-enter the backend. One Host must own mutations to its backend throughout
+initialization and serving; external writers or another Host bypass that Host's quota accounting.
 
 ## Client identity behind a front proxy
 

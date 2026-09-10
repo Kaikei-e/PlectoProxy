@@ -6,6 +6,44 @@ Plecto Proxy を単一インスタンス以上の構成で運用するための�
 欠落ではなく意図的な設計境界であり（[ADR 000053](ADR/000053.md)）、外部の協調サービスに暗黙に依存する
 代わりに、コアをセルフホスト可能な単一バイナリのまま保つ（[ADR 000008](ADR/000008.md)）ための判断である。
 
+## 現在のセキュリティ境界
+
+以下は現行実装が強制する境界である。前段プロキシの配置、outbound capability の貸与、operator manifest の
+準備ではこの意味論を前提にする。
+
+- **Ingress authority:** Plecto Proxy は route 選択・filter・転送より前に、request URI の authority と `Host` を
+  正規化する。曖昧または矛盾する authority / `Host` は 400 で拒否する。`Host` を持たない HTTP/1.0 の legacy
+  request form は引き続き受理する。互換経路として、HTTP/2・HTTP/3 adapter が origin-form URI と単一の
+  有効な `Host` を渡す場合も、その host を唯一の authority として URI へ正規化する。HTTP/2・HTTP/3 で
+  両方が欠落している場合、`Host` が複数ある場合、authority が矛盾する場合は拒否する。
+- **Outbound resource:** outbound HTTP の `max_concurrent` は response body を EOF まで読了するか drop するまで
+  数え続ける。未読 body を保持している間も slot を消費する。dispatcher には guest が polling を止めても
+  driver を停止する absolute deadline がある。outbound TCP の live socket 上限は Store あたり 64、Host あたり
+  1,024。既存の `max_connections` は live socket の設定ではなく、従来どおり per-request の接続試行 budget である。
+- **Host state:** すべての host state API に渡す key は 1,024 bytes 以下に制限される。無制限の client-derived
+  material を state key にしてはならない。
+- **Operator-owned input:** OCI の `source` は relative normal path でなければならず、その canonical path は
+  宣言した root の配下に残らなければならない。`filter-extauthz` の認可先は request header ではなく、
+  operator-owned な `[filter.config] authz-url` である。`plecto validate` は admin listener が non-loopback に
+  bind すると警告する。admin は private に bind し、network access を制限する。
+- **CORS policy:** reference CORS filter は upstream の CORS 許可を operator 設定に置き換える。拒否した Origin や
+  曖昧な Origin には許可を返さず、upstream の credentials 許可で `allow-credentials` を上書きさせない。
+  `Vary` の既存の cache 制約は維持する。
+- **Streaming body preview:** `streaming-body` は既定で off であり、production request path には未接続である。
+  現時点では wall-clock I/O timeout を提供しない。production へ配線する前に outer timeout と、stalled I/O が
+  resource を解放することを証明する cancellation test を追加する。
+
+リクエストの受付枠は、各 server の HTTP/1.1・HTTP/2・HTTP/3 を合算して最大 1,024 です。飽和時は
+filter 処理を queue に積まず、`x-plecto-fault: request-overloaded` 付きの 503 を返します。blocking filter 呼び出し、
+transport に残る upload／response データ、background body drain、upgrade tunnel が完了またはデータを解放するまで、
+そのリクエストの枠を保持します。この上限は、response headers が確定するまでを計る既存の
+`plecto_requests_in_flight` metric とは別です。
+
+request／response body 検査の予約予算は合算 1 GiB です。request body は filter の変換出力も含めて 16 MiB までとし、
+各 filter の出力が超過した場合は、次の filter や upstream へ渡す前に 502 で拒否します。キャンセルや upstream の早期応答が
+あっても、blocking filter や transport buffer がデータを保持する間は予約枠を返却しません。
+response を圧縮した場合も、body より長生きする DATA の clone を含め、圧縮後の出力に同じ予約を保持します。
+
 ## 「ノードローカル」が指すもの
 
 | 状態 | 場所 | ADR |
@@ -17,6 +55,25 @@ Plecto Proxy を単一インスタンス以上の構成で運用するための�
 
 これらはいずれもレプリカ間で共有されない。あるインスタンス A 上のカウンタ・バケット・チケット鍵は
 インスタンス B からは見えない。
+
+## 永続状態の quota 復元
+
+`Host::with_backend` は runtime の生成前に、保存済み KV・counter・rate-limit bucket を走査します。
+上限は filter namespace ごとに 100,000 entries／64 MiB、Host 全体で 5,000,000 entries／1 GiB です。
+3 種の primitive を合算し、guest key と raw value のバイト数を計上します。これは論理的な状態量の上限で、
+redb ファイルの物理サイズの上限ではありません。プロセスを再起動しても、残存 entry の使用量はリセットされません。
+
+inventory の読み取り失敗、不正な namespace、計数の overflow は起動を失敗させます。既存の使用量が上限を
+超えていても計上して警告し、上限内に戻るまで増加を拒否します。同サイズ更新・縮小・削除は対応 API から
+実行できます。ただし、旧データの 1,024 bytes 超の key や UTF-8 で表せない key は現在の API から操作できません。
+データベースをバックアップし、proxy を停止した状態で offline migration／cleanup を行う必要があります。
+組み込みの cleanup CLI はありません。起動時は全 entry を走査し、namespace ごとに tally を保持するため、
+巨大な旧データベースでは起動時間も増えます。
+
+独自の `KvBackend` 実装は、整合した inventory の各 entry をちょうど一度列挙する `visit_entries` に対応する
+必要があります。既定実装は `KvBackendInventoryError::Unsupported` を返すため、従来の実装はコンパイルできても、
+inventory 対応までは Host を起動できません。callback から backend に再入してはいけません。初期化中も稼働中も、
+backend の更新は一つの Host に所有させてください。外部 writer や別の Host による更新はその Host の quota 計数を通りません。
 
 ## 前段プロキシ配下でのクライアント同一性
 

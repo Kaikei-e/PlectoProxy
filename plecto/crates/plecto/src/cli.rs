@@ -4,7 +4,7 @@
 //! these are commands, not data-plane logging.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
@@ -83,9 +83,20 @@ fn note_restart_only_fields(path: &str) -> anyhow::Result<()> {
     // Re-read what validation already parsed: `ValidateOutcome` is a published type, and one
     // operator hint is not worth widening it.
     let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
-    let fields = plecto_control::Manifest::from_toml(&raw)
-        .map_err(|e| anyhow::anyhow!("parse {path}: {e}"))?
-        .restart_only_fields();
+    let manifest = plecto_control::Manifest::from_toml(&raw)
+        .map_err(|e| anyhow::anyhow!("parse {path}: {e}"))?;
+    if let Some(admin_addr) = manifest.observability.admin_addr.as_deref()
+        && let Ok(addr) = admin_addr.parse::<SocketAddr>()
+        && !addr.ip().is_loopback()
+    {
+        // The separate admin listener is deliberately operator-configurable, but it has no
+        // authentication boundary. Keep the opt-in valid while making a public bind explicit
+        // in the pre-flight command operators use before serving.
+        println!(
+            "warning: [observability] admin_addr {admin_addr} is non-loopback and exposes unauthenticated /metrics, /healthz, and /readyz; restrict network access outside Plecto"
+        );
+    }
+    let fields = manifest.restart_only_fields();
     if fields.is_empty() {
         return Ok(());
     }

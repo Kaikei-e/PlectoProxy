@@ -205,6 +205,36 @@ window_ms = 5000
 }
 
 #[test]
+fn validate_warns_when_the_unauthenticated_admin_listener_is_public() {
+    // The admin listener is an intentional operator opt-in, but its endpoints have no
+    // authentication layer. `validate` must make a non-loopback bind visible before the
+    // process starts, without rejecting an operator's deliberately network-reachable setup.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = format!(
+        r#"
+[observability]
+admin_addr = "0.0.0.0:9090"
+{VALID_MANIFEST}"#
+    );
+    std::fs::write(dir.path().join("plecto.toml"), manifest).unwrap();
+
+    let out = run(&["validate", "plecto.toml"], dir.path());
+
+    assert!(
+        out.status.success(),
+        "a public admin bind remains an explicit valid operator choice: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("warning:")
+            && stdout.contains("admin_addr")
+            && stdout.contains("unauthenticated"),
+        "validate warns before exposing the admin listener, got: {stdout:?}"
+    );
+}
+
+#[test]
 fn validate_stays_quiet_when_no_startup_fixed_field_is_declared() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("plecto.toml"), VALID_MANIFEST).unwrap();

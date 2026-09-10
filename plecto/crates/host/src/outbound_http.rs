@@ -29,12 +29,12 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::{BodyExt, Empty, Limited};
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::{Request, Response, Uri};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
-use tokio::time::{Sleep, timeout};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, Sleep, sleep_until, timeout, timeout_at};
 use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::{DnsErrorPayload, ErrorCode};
@@ -44,8 +44,9 @@ use wasmtime_wasi_http::{Error as WasiHttpError, RequestOptions, WasiBody, WasiH
 use crate::outbound::{AddrVerdict, OutboundPolicy, Scheme};
 use crate::resolver::Resolver;
 
-/// The companion future returned alongside the response: wasmtime-wasi-http spawns it and retains
-/// it for the response body's lifetime, so it is where the connection driver's handle must live.
+/// The companion future returned alongside the response. The p2 adapter eagerly spawns it, but the
+/// response body itself owns the connection driver and concurrency permit so its lifetime cannot
+/// end at response headers.
 type IoFuture = Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>;
 
 /// What [`WasiHttpHooks::send_request`] returns: the whole send, resolving to a response plus its
@@ -149,6 +150,9 @@ impl WasiHttpHooks for PlectoHttpHooks {
 
 impl PlectoHttpHooks {
     fn dispatch(&mut self, request: Request<WasiBody>) -> SendFuture {
+        // This is an absolute call deadline, including an unread response body. It is deliberately
+        // fixed before any policy or socket work so a request cannot reset its total budget.
+        let deadline = Instant::now() + self.policy.total_timeout;
         // 48 dropped the `use_tls` flag from the send seam; the scheme now rides on the request
         // URI. Anything but http/https can match no allowlist entry, so refuse it outright.
         let scheme = match request.uri().scheme_str() {
@@ -184,9 +188,8 @@ impl PlectoHttpHooks {
         let between_bytes = total;
 
         Box::new(async move {
-            let _permit = permit; // held for the whole call, bounding concurrency
-            let outcome = timeout(
-                total,
+            let outcome = timeout_at(
+                deadline,
                 resolve_and_connect(
                     &resolver,
                     &host,
@@ -201,16 +204,119 @@ impl PlectoHttpHooks {
             )
             .await;
             let (resp, worker) = outcome.unwrap_or(Err(ErrorCode::ConnectionTimeout))?;
-            // Park the connection driver's handle in the companion future rather than dropping it:
-            // wasmtime-wasi-http keeps that future alive for the body's lifetime and aborts it with
-            // the body, which is exactly the driver's required lifetime.
-            let io: IoFuture = Box::new(async move {
-                worker.await;
-                Ok(())
+            // A body may remain in the ResourceTable without being polled. Run the deadline
+            // watchdog now, independently of the p2 companion future, so that state cannot leave
+            // the TCP driver alive past the operator's absolute timeout.
+            let watchdog = watch_driver_until_deadline(worker, deadline);
+            let resp = resp.map(|body| {
+                BodyWithRequestLifetime::new(body, deadline, permit, watchdog).boxed_unsync()
             });
+            // Wasmtime's p2 adapter spawns this future and treats `Ok(())` as normal completion.
+            // The body wrapper above owns the actual driver for its full guest-visible lifetime.
+            let io: IoFuture = Box::new(std::future::ready(Ok(())));
             Ok((resp, io))
         })
     }
+}
+
+/// Owns an outbound permit and its connection driver's watchdog for exactly as long as a response
+/// body remains usable. Dropping this lifetime cancels the driver and releases the permit.
+struct RequestLifetime {
+    _permit: OwnedSemaphorePermit,
+    _watchdog: AbortOnDropJoinHandle<()>,
+}
+
+/// Wraps the capped/per-frame-limited response body with its absolute deadline and owned request
+/// lifetime. EOF, an error, or guest resource destruction all release the permit and abort I/O.
+struct BodyWithRequestLifetime {
+    inner: WasiBody,
+    deadline: Pin<Box<Sleep>>,
+    lifetime: Option<RequestLifetime>,
+}
+
+impl BodyWithRequestLifetime {
+    fn new(
+        inner: WasiBody,
+        deadline: Instant,
+        permit: OwnedSemaphorePermit,
+        watchdog: AbortOnDropJoinHandle<()>,
+    ) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(wasmtime_wasi::runtime::with_ambient_tokio_runtime(|| {
+                sleep_until(deadline)
+            })),
+            lifetime: Some(RequestLifetime {
+                _permit: permit,
+                _watchdog: watchdog,
+            }),
+        }
+    }
+
+    fn release(&mut self) {
+        if self.lifetime.take().is_some() {
+            // Do not retain response buffers after their terminal result. Replacing also gives all
+            // later polls a stable EOF rather than a different timeout/error.
+            let _ = std::mem::replace(&mut self.inner, empty_wasi_body());
+        }
+    }
+}
+
+impl Drop for BodyWithRequestLifetime {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl Body for BodyWithRequestLifetime {
+    type Data = Bytes;
+    type Error = WasiHttpError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, WasiHttpError>>> {
+        let me = Pin::into_inner(self);
+        if me.lifetime.is_none() {
+            return Poll::Ready(None);
+        }
+        if me.deadline.as_mut().poll(cx).is_ready() {
+            me.release();
+            return Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)));
+        }
+        let result = Pin::new(&mut me.inner).poll_frame(cx);
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
+            me.release();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.lifetime.is_none() || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn empty_wasi_body() -> WasiBody {
+    Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync()
+}
+
+/// Keep the hyper connection task alive until it completes, the body is dropped (which drops this
+/// task), or the absolute deadline fires. In the latter two cases dropping `worker` aborts it.
+fn watch_driver_until_deadline(
+    worker: AbortOnDropJoinHandle<()>,
+    deadline: Instant,
+) -> AbortOnDropJoinHandle<()> {
+    wasmtime_wasi::runtime::spawn(async move {
+        let mut worker = worker;
+        tokio::select! {
+            _ = sleep_until(deadline) => {}
+            _ = &mut *worker => {}
+        }
+    })
 }
 
 /// Pure: does EVERY resolved address classify as allowed? A legitimate endpoint resolves only to
@@ -489,8 +595,7 @@ fn client_config() -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
 /// An empty outgoing body for requests without one (test helper).
 #[cfg(test)]
 fn empty_out_body() -> WasiBody {
-    use http_body_util::Empty;
-    Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync()
+    empty_wasi_body()
 }
 
 #[cfg(test)]
@@ -500,6 +605,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
 
     fn test_policy(allow: Vec<AllowEntry>) -> OutboundPolicy {
         OutboundPolicy {
@@ -602,6 +708,23 @@ mod tests {
         addr
     }
 
+    /// Bind an upstream on the container's routed private address rather than loopback, which the
+    /// SSRF floor correctly refuses even in tests. UDP `connect` only selects the source route; it
+    /// sends no packet. The returned listener accepts the actual TCP test traffic below.
+    async fn private_test_listener() -> (tokio::net::TcpListener, IpAddr) {
+        let route = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        route.connect("192.0.2.1:80").await.unwrap();
+        let ip = route.local_addr().unwrap().ip();
+        assert!(
+            !ip.is_loopback(),
+            "test requires a routed, non-loopback address"
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+            .await
+            .unwrap();
+        (listener, ip)
+    }
+
     #[tokio::test]
     async fn connect_and_send_plaintext_success() {
         let addr = spawn_server(b"hello".to_vec()).await;
@@ -674,6 +797,165 @@ mod tests {
             resp.into_body().collect().await,
             Err(WasiHttpError::ConnectionReadTimeout)
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_keeps_permit_and_aborts_unread_body_at_total_deadline() {
+        let (listener, ip) = private_test_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let (headers_sent_tx, headers_sent_rx) = oneshot::channel();
+        let (eof_tx, eof_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::with_capacity(1024);
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..n]);
+                assert!(request.len() <= 8192, "test request headers stay bounded");
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            let _ = headers_sent_tx.send(());
+            let mut byte = [0; 1];
+            if socket.read(&mut byte).await.unwrap_or(1) == 0 {
+                let _ = eof_tx.send(());
+            }
+        });
+
+        let mut policy = test_policy(vec![allow("authz.internal", addr.port(), Scheme::Http)]);
+        policy.total_timeout = Duration::from_millis(300);
+        policy.max_concurrent = 1;
+        policy.allow_private = vec![format!("{ip}/32").parse().unwrap()];
+        let resolver = Resolver::Static(HashMap::from([("authz.internal".to_string(), vec![ip])]));
+        let state = OutboundState::new_with_resolver(policy, resolver);
+        let mut hooks = state.hooks();
+        let (response, _io) = Pin::from(hooks.send_request(
+            req(&format!("http://authz.internal:{}/", addr.port())),
+            None,
+            no_io(),
+        ))
+        .await
+        .expect("headers arrive before the body");
+        headers_sent_rx.await.unwrap();
+
+        let mut second = state.hooks();
+        let second = second.send_request(
+            req(&format!("http://authz.internal:{}/", addr.port())),
+            None,
+            no_io(),
+        );
+        assert!(matches!(
+            timeout(Duration::from_millis(50), send_err(second)).await,
+            Ok(WasiHttpError::ConnectionLimitReached)
+        ));
+
+        // Keep `response` unread: the independent total-deadline watchdog must still close TCP.
+        let response = response;
+        timeout(Duration::from_secs(2), eof_rx)
+            .await
+            .expect("the absolute deadline closes the upstream TCP connection")
+            .expect("the upstream observed EOF rather than being cancelled");
+        assert_eq!(
+            state.permits.available_permits(),
+            0,
+            "an unread body remains charged after its driver is stopped"
+        );
+        drop(response);
+        assert_eq!(state.permits.available_permits(), 1);
+        server.await.unwrap();
+    }
+
+    fn body_with_lifetime(
+        inner: WasiBody,
+        permits: Arc<Semaphore>,
+        deadline: Instant,
+    ) -> BodyWithRequestLifetime {
+        let permit = permits.try_acquire_owned().unwrap();
+        let worker = wasmtime_wasi::runtime::spawn(async { std::future::pending::<()>().await });
+        BodyWithRequestLifetime::new(
+            inner,
+            deadline,
+            permit,
+            watch_driver_until_deadline(worker, deadline),
+        )
+    }
+
+    struct OneError {
+        sent: bool,
+    }
+
+    impl Body for OneError {
+        type Data = Bytes;
+        type Error = WasiHttpError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, WasiHttpError>>> {
+            if self.sent {
+                Poll::Ready(None)
+            } else {
+                self.sent = true;
+                Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_lifetime_releases_permit_on_eof_error_timeout_and_drop() {
+        let permits = Arc::new(Semaphore::new(1));
+
+        let mut eof = body_with_lifetime(
+            empty_wasi_body(),
+            permits.clone(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert!(eof.frame().await.is_none());
+        assert_eq!(permits.available_permits(), 1);
+        assert!(eof.frame().await.is_none(), "EOF stays terminal");
+
+        let error = OneError { sent: false }.boxed_unsync();
+        let mut error = body_with_lifetime(
+            error,
+            permits.clone(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(matches!(
+            error.frame().await,
+            Some(Err(WasiHttpError::ConnectionReadTimeout))
+        ));
+        assert_eq!(permits.available_permits(), 1);
+        assert!(error.frame().await.is_none(), "errors stay terminal");
+
+        let mut timed_out = body_with_lifetime(
+            empty_wasi_body(),
+            permits.clone(),
+            Instant::now() + Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(matches!(
+            timed_out.frame().await,
+            Some(Err(WasiHttpError::ConnectionReadTimeout))
+        ));
+        assert_eq!(permits.available_permits(), 1);
+        assert!(timed_out.frame().await.is_none(), "timeouts stay terminal");
+
+        let dropped = body_with_lifetime(
+            empty_wasi_body(),
+            permits.clone(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(permits.available_permits(), 0);
+        drop(dropped);
+        assert_eq!(permits.available_permits(), 1);
     }
 
     #[tokio::test]

@@ -228,6 +228,7 @@ fn v6_always_blocked(a: Ipv6Addr) -> bool {
         || a.is_unspecified()// ::
         || a.is_multicast()  // ff00::/8
         || (seg[0] & 0xffc0) == 0xfe80                 // fe80::/10 link-local
+        || (seg[0] & 0xffc0) == 0xfec0                 // fec0::/10 deprecated site-local
         || (seg[0] == 0x2001 && seg[1] == 0x0db8)      // 2001:db8::/32 documentation
         || (seg[0] == 0x2001 && seg[1] == 0x0000)      // 2001::/32 Teredo (embeds a v4 endpoint)
         || (seg[0] == 0x0064 && seg[1] == 0xff9b)      // 64:ff9b::/96 NAT64 (embeds a v4 endpoint)
@@ -368,6 +369,10 @@ mod tests {
             classify(ip("127.0.0.1"), &optin),
             AddrVerdict::BlockedReserved
         );
+        // RFC 3879 site-local addresses are ambiguous across sites too.
+        for s in ["fec0::1", "feff:ffff::1"] {
+            assert_eq!(classify(ip(s), &optin), AddrVerdict::BlockedReserved, "{s}");
+        }
     }
 
     #[test]

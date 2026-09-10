@@ -7,7 +7,7 @@
 //! Hand-rolled over `oci-spec` types + `sha2` (no openssl / tokio): the spec-correct types do
 //! the structure; we own the sha256 digest verification we are fail-closed on anyway.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use oci_spec::image::{
@@ -55,9 +55,61 @@ impl OciLayoutStore {
     }
 }
 
+/// `Path::parent()` returns an empty path for a bare relative filename such as `plecto.toml`.
+/// Treat that spelling as the process working directory, which is how every other relative
+/// manifest path is resolved.
+fn store_root(root: &Path) -> &Path {
+    if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    }
+}
+
 impl ArtifactStore for OciLayoutStore {
     fn resolve(&self, source: &str, pinned_digest: &str) -> Result<ResolvedArtifact, ControlError> {
-        read_layout(&self.root.join(source), source, pinned_digest)
+        let relative = Path::new(source);
+        // A manifest source names an OCI layout *below* this store's configured root. Reject
+        // absolute, parent, and prefix components before joining so a typo or compromised
+        // manifest cannot turn the artifact loader into a reader for arbitrary host layouts.
+        if source.is_empty()
+            || !relative.is_relative()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(artifact_err(
+                source,
+                "OCI layout source must be a non-empty relative path below the configured root",
+            ));
+        }
+        // Lexical checks above reject `..`; canonical paths additionally prevent an intermediate
+        // symlink under the root from redirecting a valid-looking source to a layout elsewhere.
+        // Keep a configured root symlink usable by canonicalising it first (common for atomic
+        // deployment-directory swaps), then require the selected layout to remain inside it.
+        let configured_root = store_root(&self.root);
+        let root = configured_root.canonicalize().map_err(|e| {
+            artifact_err(
+                source,
+                format!(
+                    "canonicalize OCI layout root {}: {e}",
+                    configured_root.display()
+                ),
+            )
+        })?;
+        let layout = root.join(relative).canonicalize().map_err(|e| {
+            artifact_err(
+                source,
+                format!("canonicalize OCI layout source {}: {e}", relative.display()),
+            )
+        })?;
+        if !layout.starts_with(&root) {
+            return Err(artifact_err(
+                source,
+                "OCI layout source resolves outside the configured root",
+            ));
+        }
+        read_layout(&layout, source, pinned_digest)
     }
 }
 

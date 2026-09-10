@@ -4,7 +4,8 @@
 
 use plecto_control::oci::{OciLayoutStore, write_layout};
 use plecto_control::{
-    ChainOutcome, Control, ControlError, Host, HttpRequest, Manifest, ResolvedArtifact,
+    ArtifactStore, ChainOutcome, Control, ControlError, Host, HttpRequest, Manifest,
+    ResolvedArtifact,
 };
 use plecto_host::Header;
 use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
@@ -304,4 +305,82 @@ fn oci_layout_missing_source_directory_is_fail_closed() {
         Ok(_) => panic!("a missing layout directory must fail closed"),
         Err(e) => assert!(matches!(e, ControlError::Artifact { .. }), "got {e}"),
     }
+}
+
+#[test]
+fn oci_layout_source_cannot_escape_its_configured_root() {
+    // `source` is declared as a path relative to the OCI store root. Even an operator mistake
+    // must not make the loader resolve a valid signed layout outside that root.
+    let dir = tempdir().unwrap();
+    let (_signer, artifact) = signed_artifact();
+    let outside = dir.path().join("outside");
+    let digest = write_layout(&outside, &artifact).unwrap();
+
+    let store = OciLayoutStore::new(dir.path().join("root"));
+    let err = store
+        .resolve("../outside", &digest)
+        .expect_err("a relative source must remain below the configured OCI root");
+    assert!(matches!(err, ControlError::Artifact { .. }), "got {err}");
+    assert!(
+        err.to_string().contains("relative"),
+        "the rejection explains the source-root contract: {err}"
+    );
+}
+
+#[test]
+fn empty_store_root_resolves_below_the_working_directory() {
+    // A bare relative manifest filename has `Path::parent() == Some("")`. Its OCI source must
+    // retain the ordinary relative-path meaning (the current directory), while still taking the
+    // same lexical and canonical containment path as every other store root.
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let (_signer, artifact) = signed_artifact();
+    let digest = write_layout(dir.path(), &artifact).unwrap();
+    let source = dir.path().file_name().unwrap().to_str().unwrap();
+
+    let resolved = OciLayoutStore::new("")
+        .resolve(source, &digest)
+        .expect("an empty root represents the current directory");
+    assert_eq!(resolved.component, artifact.component);
+}
+
+#[cfg(unix)]
+#[test]
+fn oci_layout_source_cannot_escape_the_root_through_a_symlink() {
+    // Resolving `root/link` lexically is insufficient: its target must also remain within the
+    // configured root, while the root itself may still be an operator-managed deployment link.
+    let dir = tempdir().unwrap();
+    let (_signer, artifact) = signed_artifact();
+    let outside = dir.path().join("outside");
+    let digest = write_layout(&outside, &artifact).unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+
+    let err = OciLayoutStore::new(&root)
+        .resolve("linked", &digest)
+        .expect_err("a source symlink must not escape the OCI root");
+    assert!(matches!(err, ControlError::Artifact { .. }), "got {err}");
+    assert!(
+        err.to_string().contains("outside"),
+        "the rejection identifies the escaped root: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oci_layout_store_allows_an_operator_managed_root_symlink() {
+    // Deployments commonly swap one top-level `active` link atomically. Canonicalising the root
+    // must preserve that pattern while still rejecting a selected child that escapes it.
+    let dir = tempdir().unwrap();
+    let (_signer, artifact) = signed_artifact();
+    let active = dir.path().join("release-42");
+    let layout = active.join("fh");
+    let digest = write_layout(&layout, &artifact).unwrap();
+    let configured_root = dir.path().join("active");
+    std::os::unix::fs::symlink(&active, &configured_root).unwrap();
+
+    let resolved = OciLayoutStore::new(&configured_root)
+        .resolve("fh", &digest)
+        .expect("an OCI layout below an operator-managed root symlink resolves");
+    assert_eq!(resolved.component, artifact.component);
 }

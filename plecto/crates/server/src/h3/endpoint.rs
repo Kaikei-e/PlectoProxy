@@ -221,7 +221,11 @@ async fn serve_h3_connection(
             }
         }
     }
-    // A non-drain exit can leave live request tasks (the client vanished mid-request): let them
-    // run out on their own rather than aborting them with the JoinSet.
-    requests.detach_all();
+    // A peer close or connection error makes every remaining response stream unusable. Abort the
+    // request tasks rather than detaching them: a detached bodyless request can be awaiting an
+    // upstream response without polling its H3 receive stream, so it would otherwise outlive the
+    // QUIC connection and escape the connection/IP admission limits. On the normal drain path the
+    // loop only reaches here after `requests` is empty, so already-accepted requests still finish
+    // under GOAWAY as promised.
+    requests.abort_all();
 }

@@ -106,9 +106,76 @@ async fn spawn_slow_upstream(delay: Duration) -> SocketAddr {
     addr
 }
 
+/// A slow upstream whose `/slow` handler never answers. Its drop guard gives the test a direct
+/// signal that cancelling Plecto's request future propagated to the upstream connection. Health
+/// probes and ordinary paths stay responsive so the route can join rotation first.
+async fn spawn_cancellable_upstream() -> (SocketAddr, oneshot::Receiver<()>, oneshot::Receiver<()>)
+{
+    struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (cancelled_tx, cancelled_rx) = oneshot::channel();
+    let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let cancelled_tx = Arc::new(std::sync::Mutex::new(Some(cancelled_tx)));
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let started_tx = started_tx.clone();
+            let cancelled_tx = cancelled_tx.clone();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |req: Request<Incoming>| {
+                            let started_tx = started_tx.clone();
+                            let cancelled_tx = cancelled_tx.clone();
+                            async move {
+                                if req.uri().path() == "/slow" {
+                                    if let Some(tx) = started_tx.lock().unwrap().take() {
+                                        let _ = tx.send(());
+                                    }
+                                    let _cancel_on_drop =
+                                        NotifyOnDrop(cancelled_tx.lock().unwrap().take());
+                                    std::future::pending::<()>().await;
+                                    unreachable!("the slow upstream only ends when cancelled");
+                                }
+                                echo(req).await
+                            }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (addr, started_rx, cancelled_rx)
+}
+
 /// A manifest declaring filter-hello, a `/api`→echo route, and a default (host-less) `[[tls]]`
 /// cert. `extra` is appended — the drain settings under test (`[listen.drain]`, ADR 000059).
 fn manifest_toml(upstream: SocketAddr, digest: &str, cert: &TestCert, extra: &str) -> String {
+    manifest_toml_with_upstream_options(upstream, digest, cert, "", extra)
+}
+
+/// [`manifest_toml`] with options that belong inside `[[upstream]]`, before its health table.
+/// The cancellation regression disables both forwarding timeouts here, so its pass condition
+/// cannot be the normal timeout expiring instead of client-disconnect cancellation.
+fn manifest_toml_with_upstream_options(
+    upstream: SocketAddr,
+    digest: &str,
+    cert: &TestCert,
+    upstream_options: &str,
+    extra: &str,
+) -> String {
     format!(
         r#"
 [[filter]]
@@ -120,6 +187,7 @@ isolation = "trusted"
 [[upstream]]
 name = "echo"
 addresses = ["{upstream}"]
+{upstream_options}
 [upstream.health]
 path = "/healthz"
 interval_ms = 50
@@ -418,6 +486,66 @@ async fn h3_drain_window_cuts_requests_that_outlive_it() {
 
     drop(send_request);
     let _ = drive.await;
+}
+
+#[tokio::test]
+async fn h3_disconnect_cancels_a_bodyless_unbounded_upstream_request() {
+    // A client disconnect must cancel work already forwarded upstream. In particular, this covers
+    // the bodyless fast path: `Content-Length: 0` means forwarding does not poll the H3 receive
+    // stream while it awaits upstream response headers, so closing QUIC alone cannot provide the
+    // cancellation unless the server owns and aborts the request task. Both upstream forwarding
+    // timeouts are disabled to make an upstream-future drop, rather than a timer, the only way
+    // `cancelled` can resolve.
+    let cert = make_cert();
+    let (upstream, started, cancelled) = spawn_cancellable_upstream().await;
+    let control = loaded_control(&manifest_toml_with_upstream_options(
+        upstream,
+        "{digest}",
+        &cert,
+        "request_timeout_ms = 0\noverall_timeout_ms = 0\nmax_retries = 0",
+        "",
+    ));
+    let proxy = spawn_proxy(Arc::new(control)).await;
+
+    // Let the active health check promote the upstream before opening the request under test.
+    let ready = drive_h3_ready(proxy, cert.cert_der.clone()).await;
+    assert_eq!(ready.status, 200);
+
+    let endpoint = h3_client_endpoint(cert.cert_der.clone());
+    let conn = endpoint.connect(proxy, "localhost").unwrap().await.unwrap();
+    let close_conn = conn.clone();
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let req = hyper::http::Request::builder()
+        .method("GET")
+        .uri("https://localhost/api/slow")
+        .header(hyper::header::CONTENT_LENGTH, "0")
+        .body(())
+        .unwrap();
+    let mut stream = send_request.send_request(req).await.unwrap();
+    stream.finish().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), started)
+        .await
+        .expect("the bodyless request reaches the slow upstream")
+        .expect("the upstream start signal is delivered");
+
+    // Retain a clone of Quinn's raw connection specifically so this is a peer CONNECTION_CLOSE,
+    // not merely a local drop of an H3 request handle.
+    close_conn.close(0u32.into(), b"test client disconnect");
+    drop(stream);
+    drop(send_request);
+
+    tokio::time::timeout(Duration::from_secs(3), cancelled)
+        .await
+        .expect("client disconnect must cancel the unbounded upstream request")
+        .expect("the upstream handler's drop guard reports cancellation");
+
+    drive.abort();
+    let _ = drive.await;
+    endpoint.wait_idle().await;
 }
 
 /// A repetitive, over-threshold body — compression is observable by size, not just headers

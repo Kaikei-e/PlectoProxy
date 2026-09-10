@@ -12,7 +12,8 @@ use plecto_control::{
 };
 use plecto_host::Header;
 use plecto_host::test_support::{
-    TestSigner, bound_sbom, filter_hello_component, filter_quickstart_component,
+    TestSigner, bound_sbom, filter_cors_component, filter_hello_component,
+    filter_quickstart_component,
 };
 
 fn req(headers: &[(&str, &str)]) -> HttpRequest {
@@ -29,6 +30,14 @@ fn req(headers: &[(&str, &str)]) -> HttpRequest {
             })
             .collect(),
     }
+}
+
+fn header_value<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .and_then(|header| std::str::from_utf8(&header.value).ok())
 }
 
 /// filter-hello, signed with a fresh ephemeral key (the returned signer trusts it).
@@ -261,6 +270,83 @@ fn response_chain_applies_edit() {
             panic!("a modified (not replace) response should forward")
         }
     }
+}
+
+#[test]
+fn cors_chain_makes_operator_policy_authoritative_over_upstream_grants() {
+    let signer = TestSigner::new().unwrap();
+    let mut store = MemoryStore::new();
+    let digest = store.insert("cors", signed(filter_cors_component(), &signer));
+    let manifest = Manifest::from_toml(&format!(
+        r#"
+[[filter]]
+id = "cors"
+source = "cors"
+digest = "{digest}"
+isolation = "untrusted"
+
+[filter.config]
+allowed-origins = "https://app.example.test"
+
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
+filters = ["cors"]
+upstream = "be"
+[route.match]
+path_prefix = "/"
+"#
+    ))
+    .unwrap();
+    let control = Control::load(
+        Host::new(signer.trust_policy().unwrap()).unwrap(),
+        &manifest,
+        Box::new(store),
+    )
+    .unwrap();
+    let upstream = || HttpResponse {
+        status: 200,
+        headers: vec![
+            Header {
+                name: "access-control-allow-origin".to_string(),
+                value: b"*".to_vec(),
+            },
+            Header {
+                name: "access-control-allow-credentials".to_string(),
+                value: b"true".to_vec(),
+            },
+            Header {
+                name: "x-upstream".to_string(),
+                value: b"kept".to_vec(),
+            },
+        ],
+        body: vec![],
+    };
+    let duplicate = req(&[
+        ("origin", "https://app.example.test"),
+        ("origin", "https://evil.example.test"),
+    ]);
+    let ResponseOutcome::Forward(denied) = run_response(&control, &duplicate, upstream()) else {
+        panic!("CORS response edits must forward the upstream response");
+    };
+    assert!(header_value(&denied, "access-control-allow-origin").is_none());
+    assert!(header_value(&denied, "access-control-allow-credentials").is_none());
+    assert_eq!(header_value(&denied, "x-upstream"), Some("kept"));
+
+    let allowed = req(&[("origin", "https://app.example.test")]);
+    let ResponseOutcome::Forward(allowed) = run_response(&control, &allowed, upstream()) else {
+        panic!("CORS response edits must forward the upstream response");
+    };
+    assert_eq!(
+        header_value(&allowed, "access-control-allow-origin"),
+        Some("https://app.example.test")
+    );
+    assert!(header_value(&allowed, "access-control-allow-credentials").is_none());
+    assert_eq!(header_value(&allowed, "x-upstream"), Some("kept"));
 }
 
 #[test]

@@ -13,8 +13,8 @@
 //! The policy is the general CORS protocol shape (WHATWG Fetch): a *preflight* (`OPTIONS` +
 //! `Origin` + `Access-Control-Request-Method`) is answered by the gateway; an *actual* request
 //! flows upstream and its response gains the `Access-Control-Allow-*` headers when the origin is
-//! allowed. A disallowed origin simply gets **no** CORS headers — the browser enforces the block
-//! (fail-safe: a missing/empty allowlist means no header is ever added).
+//! allowed. A disallowed origin gets **no CORS grant** — the browser enforces the block — while
+//! `Vary: Origin` keeps cache entries separated (a missing/empty allowlist grants nothing).
 //!
 //! Operator config (`[filter.config]`, ADR 000066 — the filter cannot widen its own policy):
 //!   - `allowed-origins`  comma-separated exact origins, or `*` (required for any effect)
@@ -42,11 +42,44 @@ struct FilterCors;
 
 const DEFAULT_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 
-fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
+// The filter owns the CORS protocol surface. Response edits remove every CORS response header
+// before adding the operator-authorized subset, so an upstream cannot widen the policy with a
+// stale or independently configured grant.
+const CORS_RESPONSE_HEADERS: &[&str] = &[
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-max-age",
+];
+
+fn remove_cors_response_headers() -> Vec<String> {
+    CORS_RESPONSE_HEADERS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// Return a header value only when the request has exactly one valid UTF-8 occurrence. CORS
+/// policy headers are security boundaries; choosing an arbitrary duplicate lets another hop
+/// interpret a different value.
+fn unique_header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
+    let mut headers = req
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(name));
+    let header = headers.next()?;
+    if headers.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(&header.value).ok()
+}
+
+fn has_header(req: &HttpRequest, name: &str) -> bool {
     req.headers
         .iter()
-        .find(|h| h.name.eq_ignore_ascii_case(name))
-        .and_then(|h| std::str::from_utf8(&h.value).ok())
+        .any(|h| h.name.eq_ignore_ascii_case(name))
 }
 
 fn h(name: &str, value: &str) -> Header {
@@ -85,13 +118,55 @@ fn allows_credentials() -> bool {
     host_config::get("allow-credentials").as_deref() == Some("true")
 }
 
-/// The CORS headers shared by preflight and actual responses. `Vary: Origin` marks the response
-/// as origin-dependent for caches whenever the echo form (not the literal `*`) is used.
-fn common_headers(allow_origin: &str) -> Vec<Header> {
-    let mut out = vec![h("access-control-allow-origin", allow_origin)];
-    if allow_origin != "*" {
-        out.push(h("vary", "Origin"));
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn vary(existing: &[Header], additions: &[&str]) -> Header {
+    let mut values = Vec::new();
+    for header in existing
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("vary"))
+    {
+        let Ok(value) = std::str::from_utf8(&header.value) else {
+            // Dropping an unparseable upstream Vary weakens its cache constraint. `*` is the
+            // conservative representation when this filter cannot preserve it exactly.
+            return h("vary", "*");
+        };
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if token == "*" {
+                return h("vary", "*");
+            }
+            if !token.as_bytes().iter().copied().all(is_tchar) {
+                return h("vary", "*");
+            }
+            if !values
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(token))
+            {
+                values.push(token.to_string());
+            }
+        }
     }
+    for addition in additions {
+        if !values
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(addition))
+        {
+            values.push((*addition).to_string());
+        }
+    }
+    h("vary", &values.join(", "))
+}
+
+/// The CORS headers shared by preflight and actual responses. `Vary` marks the response's CORS
+/// policy inputs as cache variants.
+fn common_headers(allow_origin: &str, vary: Header) -> Vec<Header> {
+    let mut out = vec![h("access-control-allow-origin", allow_origin), vary];
     if allows_credentials() {
         out.push(h("access-control-allow-credentials", "true"));
     }
@@ -108,34 +183,55 @@ impl Guest for FilterCors {
         if !req.method.eq_ignore_ascii_case("OPTIONS") {
             return RequestDecision::Continue;
         }
-        let (Some(origin), Some(_)) = (
-            header(&req, "origin"),
-            header(&req, "access-control-request-method"),
-        ) else {
+        if !has_header(&req, "origin") || !has_header(&req, "access-control-request-method") {
             return RequestDecision::Continue;
+        }
+        let (Some(origin), Some(_)) = (
+            unique_header(&req, "origin"),
+            unique_header(&req, "access-control-request-method"),
+        ) else {
+            return RequestDecision::ShortCircuit(HttpResponse {
+                status: 204,
+                headers: vec![vary(&[], &["Origin", "Access-Control-Request-Headers"])],
+                body: Vec::new(),
+            });
         };
+        if has_header(&req, "access-control-request-headers")
+            && unique_header(&req, "access-control-request-headers").is_none()
+        {
+            return RequestDecision::ShortCircuit(HttpResponse {
+                status: 204,
+                headers: vec![vary(&[], &["Origin", "Access-Control-Request-Headers"])],
+                body: Vec::new(),
+            });
+        }
 
-        let mut headers = match allow_origin_value(origin) {
-            Some(allow) => common_headers(&allow),
+        let Some(allow) = allow_origin_value(origin) else {
             // Disallowed origin: answer the preflight with NO CORS headers — the browser
             // fails the check. The preflight still never reaches upstream (it is addressed
             // to the gateway's CORS layer, not the application).
-            None => Vec::new(),
+            return RequestDecision::ShortCircuit(HttpResponse {
+                status: 204,
+                headers: vec![vary(&[], &["Origin", "Access-Control-Request-Headers"])],
+                body: Vec::new(),
+            });
         };
-        if !headers.is_empty() {
-            let methods = host_config::get("allow-methods")
-                .unwrap_or_else(|| DEFAULT_ALLOW_METHODS.to_string());
-            headers.push(h("access-control-allow-methods", &methods));
-            let requested = header(&req, "access-control-request-headers");
-            if let Some(allow_headers) = host_config::get("allow-headers")
-                .or_else(|| requested.map(str::to_string))
-                .filter(|v| !v.is_empty())
-            {
-                headers.push(h("access-control-allow-headers", &allow_headers));
-            }
-            if let Some(max_age) = host_config::get("max-age").filter(|v| !v.is_empty()) {
-                headers.push(h("access-control-max-age", &max_age));
-            }
+        let mut headers = common_headers(
+            &allow,
+            vary(&[], &["Origin", "Access-Control-Request-Headers"]),
+        );
+        let methods =
+            host_config::get("allow-methods").unwrap_or_else(|| DEFAULT_ALLOW_METHODS.to_string());
+        headers.push(h("access-control-allow-methods", &methods));
+        let requested = unique_header(&req, "access-control-request-headers");
+        if let Some(allow_headers) = host_config::get("allow-headers")
+            .or_else(|| requested.map(str::to_string))
+            .filter(|v| !v.is_empty())
+        {
+            headers.push(h("access-control-allow-headers", &allow_headers));
+        }
+        if let Some(max_age) = host_config::get("max-age").filter(|v| !v.is_empty()) {
+            headers.push(h("access-control-max-age", &max_age));
         }
         RequestDecision::ShortCircuit(HttpResponse {
             status: 204,
@@ -144,19 +240,28 @@ impl Guest for FilterCors {
         })
     }
 
-    fn on_response(req: HttpRequest, _resp: HttpResponse) -> ResponseDecision {
+    fn on_response(req: HttpRequest, resp: HttpResponse) -> ResponseDecision {
         // Dynamic origin echo (ADR 000073): the request's Origin is read from the as-forwarded
         // snapshot — no guest global, no host query, works on any pooled instance.
-        let Some(origin) = header(&req, "origin") else {
-            return ResponseDecision::Continue;
+        let vary = vary(&resp.headers, &["Origin"]);
+        let Some(origin) = unique_header(&req, "origin") else {
+            return ResponseDecision::Modified(ResponseEdit {
+                set_status: None,
+                set_headers: vec![vary],
+                remove_headers: remove_cors_response_headers(),
+            });
         };
         let Some(allow) = allow_origin_value(origin) else {
-            return ResponseDecision::Continue;
+            return ResponseDecision::Modified(ResponseEdit {
+                set_status: None,
+                set_headers: vec![vary],
+                remove_headers: remove_cors_response_headers(),
+            });
         };
         ResponseDecision::Modified(ResponseEdit {
             set_status: None,
-            set_headers: common_headers(&allow),
-            remove_headers: vec![],
+            set_headers: common_headers(&allow, vary),
+            remove_headers: remove_cors_response_headers(),
         })
     }
 }

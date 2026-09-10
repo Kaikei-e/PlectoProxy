@@ -20,6 +20,16 @@ That pair would otherwise echo **every** `Origin` under credentialed CORS — a 
 footgun. This filter **ignores** the `*` entry when credentials are enabled; list concrete origins
 instead. A misconfigured pair grants nothing (fail-safe), not a wildcard credentialed echo.
 
+## Request ambiguity and caches
+
+`Origin` and CORS preflight request headers must each occur exactly once. Duplicate or non-UTF-8
+values receive no CORS grant, so this filter and downstream services cannot choose different
+values. Preflight responses vary by `Origin` and by requested headers; every actual response
+preserves the upstream `Vary` fields and adds `Origin`, including rejected origins. The filter
+owns CORS response policy: it removes upstream `Access-Control-*` response headers before adding
+only the operator-authorized `Access-Control-Allow-Origin` and, when configured, credentials
+grant. Other upstream response headers are preserved.
+
 ## Chain order
 
 Response filters run in reverse request order. A later filter's `replace` skips earlier ones on

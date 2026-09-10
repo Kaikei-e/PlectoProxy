@@ -10,9 +10,9 @@
 //!   - a preflight from a disallowed origin short-circuits 204 with NO CORS headers (the
 //!     browser enforces the block);
 //!   - an actual response gains `Access-Control-Allow-Origin` echoing the allowed origin;
-//!   - a disallowed / absent origin leaves the response untouched (`continue`);
+//!   - a disallowed / absent origin adds no CORS grant but still emits `Vary: Origin`;
 //!   - the operator's config is the policy source (`[filter.config]`, ADR 000066): with no
-//!     `allowed-origins` the filter adds nothing (fail-safe).
+//!     `allowed-origins` the filter adds no grant (fail-safe).
 
 use std::collections::BTreeMap;
 
@@ -78,6 +78,32 @@ fn plain_response() -> HttpResponse {
     }
 }
 
+fn response_with_vary(value: &str) -> HttpResponse {
+    let mut response = plain_response();
+    response.headers.push(Header {
+        name: "vary".to_string(),
+        value: value.as_bytes().to_vec(),
+    });
+    response
+}
+
+/// Apply a response edit with the same non-repeatable-header replacement semantics as the
+/// production chain. Keeping this local makes the reference-filter test prove the complete
+/// guest-decision outcome without reaching into control's private helper.
+fn apply_response_edit_like_chain(response: &mut HttpResponse, edit: &plecto_host::ResponseEdit) {
+    for name in &edit.remove_headers {
+        response
+            .headers
+            .retain(|header| !header.name.eq_ignore_ascii_case(name));
+    }
+    for header in &edit.set_headers {
+        response
+            .headers
+            .retain(|existing| !existing.name.eq_ignore_ascii_case(&header.name));
+        response.headers.push(header.clone());
+    }
+}
+
 fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -122,7 +148,10 @@ fn preflight_from_an_allowed_origin_short_circuits_with_the_grant() {
                 header_value(&resp.headers, "access-control-max-age"),
                 Some("600")
             );
-            assert_eq!(header_value(&resp.headers, "vary"), Some("Origin"));
+            assert_eq!(
+                header_value(&resp.headers, "vary"),
+                Some("Origin, Access-Control-Request-Headers")
+            );
         }
         other => panic!("a preflight must short-circuit, got {other:?}"),
     }
@@ -146,8 +175,299 @@ fn preflight_from_a_disallowed_origin_gets_no_cors_headers() {
                 header_value(&resp.headers, "access-control-allow-origin").is_none(),
                 "a disallowed origin must not receive a grant — the browser enforces the block"
             );
+            assert_eq!(
+                header_value(&resp.headers, "vary"),
+                Some("Origin, Access-Control-Request-Headers")
+            );
         }
         other => panic!("a preflight must short-circuit, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_origin_never_receives_a_cors_grant() {
+    let (_host, filter) = signed_load(&[("allowed-origins", "https://app.example.test")]);
+    let preflight = request(
+        "OPTIONS",
+        &[
+            ("origin", "https://app.example.test"),
+            ("origin", "https://evil.example.test"),
+            ("access-control-request-method", "POST"),
+        ],
+    );
+    let (decision, _logs) = filter
+        .on_request(&preflight, &RequestTrace::root())
+        .unwrap();
+    match decision {
+        RequestDecision::ShortCircuit(resp) => {
+            assert_eq!(resp.status, 204);
+            assert!(header_value(&resp.headers, "access-control-allow-origin").is_none());
+            assert_eq!(
+                header_value(&resp.headers, "vary"),
+                Some("Origin, Access-Control-Request-Headers")
+            );
+        }
+        other => panic!("an ambiguous preflight must not reach upstream, got {other:?}"),
+    }
+
+    let actual = request(
+        "GET",
+        &[
+            ("origin", "https://app.example.test"),
+            ("origin", "https://evil.example.test"),
+        ],
+    );
+    let (decision, _logs) = filter
+        .on_response(&actual, &plain_response(), &RequestTrace::root())
+        .unwrap();
+    match decision {
+        ResponseDecision::Modified(edit) => {
+            assert_eq!(header_value(&edit.set_headers, "vary"), Some("Origin"));
+            assert!(header_value(&edit.set_headers, "access-control-allow-origin").is_none());
+        }
+        other => panic!("an ambiguous actual Origin must not receive a grant, got {other:?}"),
+    }
+}
+
+#[test]
+fn operator_policy_replaces_upstream_cors_grants_on_actual_responses() {
+    let (_host, filter) = signed_load(&[("allowed-origins", "https://app.example.test")]);
+    let duplicate_origin = request(
+        "GET",
+        &[
+            ("origin", "https://app.example.test"),
+            ("origin", "https://evil.example.test"),
+        ],
+    );
+    let upstream = HttpResponse {
+        status: 200,
+        headers: vec![
+            Header {
+                name: "access-control-allow-origin".to_string(),
+                value: b"*".to_vec(),
+            },
+            Header {
+                name: "access-control-allow-credentials".to_string(),
+                value: b"true".to_vec(),
+            },
+            Header {
+                name: "access-control-expose-headers".to_string(),
+                value: b"x-secret".to_vec(),
+            },
+            Header {
+                name: "x-upstream".to_string(),
+                value: b"kept".to_vec(),
+            },
+        ],
+        body: vec![],
+    };
+    let (decision, _logs) = filter
+        .on_response(&duplicate_origin, &upstream, &RequestTrace::root())
+        .unwrap();
+    let ResponseDecision::Modified(edit) = decision else {
+        panic!("an ambiguous Origin must produce an authoritative response edit");
+    };
+    let mut denied = upstream.clone();
+    apply_response_edit_like_chain(&mut denied, &edit);
+    assert!(header_value(&denied.headers, "access-control-allow-origin").is_none());
+    assert!(header_value(&denied.headers, "access-control-allow-credentials").is_none());
+    assert!(header_value(&denied.headers, "access-control-expose-headers").is_none());
+    assert_eq!(header_value(&denied.headers, "x-upstream"), Some("kept"));
+    assert_eq!(header_value(&denied.headers, "vary"), Some("Origin"));
+
+    let allowed_origin = request("GET", &[("origin", "https://app.example.test")]);
+    let (decision, _logs) = filter
+        .on_response(&allowed_origin, &upstream, &RequestTrace::root())
+        .unwrap();
+    let ResponseDecision::Modified(edit) = decision else {
+        panic!("an allowed Origin must produce an authoritative response edit");
+    };
+    let mut allowed = upstream.clone();
+    apply_response_edit_like_chain(&mut allowed, &edit);
+    assert_eq!(
+        header_value(&allowed.headers, "access-control-allow-origin"),
+        Some("https://app.example.test")
+    );
+    assert!(header_value(&allowed.headers, "access-control-allow-credentials").is_none());
+    assert!(header_value(&allowed.headers, "access-control-expose-headers").is_none());
+    assert_eq!(header_value(&allowed.headers, "x-upstream"), Some("kept"));
+
+    let (_host, credentialed) = signed_load(&[
+        ("allowed-origins", "https://app.example.test"),
+        ("allow-credentials", "true"),
+    ]);
+    let (decision, _logs) = credentialed
+        .on_response(&allowed_origin, &upstream, &RequestTrace::root())
+        .unwrap();
+    let ResponseDecision::Modified(edit) = decision else {
+        panic!("an allowed credentialed Origin must produce an authoritative response edit");
+    };
+    let mut credentialed_headers = upstream;
+    apply_response_edit_like_chain(&mut credentialed_headers, &edit);
+    assert_eq!(
+        header_value(&credentialed_headers.headers, "access-control-allow-origin"),
+        Some("https://app.example.test")
+    );
+    assert_eq!(
+        header_value(
+            &credentialed_headers.headers,
+            "access-control-allow-credentials"
+        ),
+        Some("true")
+    );
+    assert!(
+        header_value(
+            &credentialed_headers.headers,
+            "access-control-expose-headers"
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn every_rejected_actual_response_strips_upstream_cors_grants() {
+    let upstream = HttpResponse {
+        status: 200,
+        headers: vec![
+            Header {
+                name: "access-control-allow-origin".to_string(),
+                value: b"*".to_vec(),
+            },
+            Header {
+                name: "access-control-allow-credentials".to_string(),
+                value: b"true".to_vec(),
+            },
+            Header {
+                name: "access-control-expose-headers".to_string(),
+                value: b"x-secret".to_vec(),
+            },
+            Header {
+                name: "x-upstream".to_string(),
+                value: b"kept".to_vec(),
+            },
+        ],
+        body: vec![],
+    };
+    let cases = vec![
+        (
+            "disallowed Origin",
+            vec![("allowed-origins", "https://app.example.test")],
+            request("GET", &[("origin", "https://evil.example.test")]),
+        ),
+        (
+            "missing Origin",
+            vec![("allowed-origins", "https://app.example.test")],
+            request("GET", &[]),
+        ),
+        (
+            "missing allowlist",
+            vec![],
+            request("GET", &[("origin", "https://app.example.test")]),
+        ),
+        (
+            "credentialed wildcard",
+            vec![("allowed-origins", "*"), ("allow-credentials", "true")],
+            request("GET", &[("origin", "https://app.example.test")]),
+        ),
+    ];
+
+    for (name, config, request) in cases {
+        let (_host, filter) = signed_load(&config);
+        let (decision, _logs) = filter
+            .on_response(&request, &upstream, &RequestTrace::root())
+            .unwrap();
+        let ResponseDecision::Modified(edit) = decision else {
+            panic!("{name} must produce an authoritative response edit");
+        };
+        let mut response = upstream.clone();
+        apply_response_edit_like_chain(&mut response, &edit);
+        for cors_header in [
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "access-control-expose-headers",
+        ] {
+            assert!(
+                header_value(&response.headers, cors_header).is_none(),
+                "{name} must remove upstream {cors_header}"
+            );
+        }
+        assert_eq!(header_value(&response.headers, "x-upstream"), Some("kept"));
+        assert_eq!(header_value(&response.headers, "vary"), Some("Origin"));
+    }
+}
+
+#[test]
+fn preflight_reflection_and_actual_responses_keep_cache_variants_distinct() {
+    let (_host, filter) = signed_load(&[("allowed-origins", "https://app.example.test")]);
+    let preflight = request(
+        "OPTIONS",
+        &[
+            ("origin", "https://app.example.test"),
+            ("access-control-request-method", "POST"),
+            ("access-control-request-headers", "x-tenant"),
+        ],
+    );
+    let (decision, _logs) = filter
+        .on_request(&preflight, &RequestTrace::root())
+        .unwrap();
+    match decision {
+        RequestDecision::ShortCircuit(resp) => assert_eq!(
+            header_value(&resp.headers, "vary"),
+            Some("Origin, Access-Control-Request-Headers")
+        ),
+        other => panic!("preflight must short-circuit, got {other:?}"),
+    }
+
+    let actual = request("GET", &[("origin", "https://app.example.test")]);
+    let (decision, _logs) = filter
+        .on_response(
+            &actual,
+            &response_with_vary("Accept-Language"),
+            &RequestTrace::root(),
+        )
+        .unwrap();
+    match decision {
+        ResponseDecision::Modified(edit) => assert_eq!(
+            header_value(&edit.set_headers, "vary"),
+            Some("Accept-Language, Origin"),
+            "CORS must add Origin without discarding upstream cache variants"
+        ),
+        other => panic!("an allowed origin must modify the response, got {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_or_wildcard_upstream_vary_remains_cache_prohibitive() {
+    let (_host, filter) = signed_load(&[("allowed-origins", "https://app.example.test")]);
+    let actual = request("GET", &[("origin", "https://app.example.test")]);
+
+    let mut malformed = response_with_vary("Accept-Language");
+    malformed.headers.push(Header {
+        name: "vary".to_string(),
+        value: b"x-tenant\x80".to_vec(),
+    });
+    let (decision, _logs) = filter
+        .on_response(&actual, &malformed, &RequestTrace::root())
+        .unwrap();
+    match decision {
+        ResponseDecision::Modified(edit) => assert_eq!(
+            header_value(&edit.set_headers, "vary"),
+            Some("*"),
+            "an invalid Vary member must not be discarded"
+        ),
+        other => panic!("an allowed origin must modify the response, got {other:?}"),
+    }
+
+    let (decision, _logs) = filter
+        .on_response(&actual, &response_with_vary("*"), &RequestTrace::root())
+        .unwrap();
+    match decision {
+        ResponseDecision::Modified(edit) => assert_eq!(
+            header_value(&edit.set_headers, "vary"),
+            Some("*"),
+            "an upstream Vary wildcard remains cache-prohibitive"
+        ),
+        other => panic!("an allowed origin must modify the response, got {other:?}"),
     }
 }
 
@@ -218,27 +538,42 @@ fn wildcard_answers_star_but_credentials_refuse_the_wildcard() {
     let (decision, _logs) = creds
         .on_response(&req, &plain_response(), &RequestTrace::root())
         .unwrap();
-    assert!(
-        matches!(decision, ResponseDecision::Continue),
-        "credentialed wildcard must not grant, got {decision:?}"
-    );
+    match decision {
+        ResponseDecision::Modified(edit) => {
+            assert_eq!(header_value(&edit.set_headers, "vary"), Some("Origin"));
+            assert!(header_value(&edit.set_headers, "access-control-allow-origin").is_none());
+        }
+        other => panic!("credentialed wildcard must not grant, got {other:?}"),
+    }
 }
 
 #[test]
-fn disallowed_or_absent_origin_and_missing_config_all_leave_the_response_untouched() {
+fn every_actual_response_varies_by_origin_even_without_a_cors_grant() {
     let (_host, filter) = signed_load(&[("allowed-origins", "https://app.example.test")]);
 
     let disallowed = request("GET", &[("origin", "https://evil.example.test")]);
     let (decision, _logs) = filter
         .on_response(&disallowed, &plain_response(), &RequestTrace::root())
         .unwrap();
-    assert!(matches!(decision, ResponseDecision::Continue));
+    match decision {
+        ResponseDecision::Modified(edit) => {
+            assert_eq!(header_value(&edit.set_headers, "vary"), Some("Origin"));
+            assert!(header_value(&edit.set_headers, "access-control-allow-origin").is_none());
+        }
+        other => panic!("a disallowed Origin must still vary the response, got {other:?}"),
+    }
 
     let no_origin = request("GET", &[]);
     let (decision, _logs) = filter
         .on_response(&no_origin, &plain_response(), &RequestTrace::root())
         .unwrap();
-    assert!(matches!(decision, ResponseDecision::Continue));
+    match decision {
+        ResponseDecision::Modified(edit) => {
+            assert_eq!(header_value(&edit.set_headers, "vary"), Some("Origin"));
+            assert!(header_value(&edit.set_headers, "access-control-allow-origin").is_none());
+        }
+        other => panic!("an absent Origin must still vary the response, got {other:?}"),
+    }
 
     // No allowed-origins declared at all: fail-safe — the filter grants nothing.
     let (_host, unconfigured) = signed_load(&[]);
@@ -246,5 +581,11 @@ fn disallowed_or_absent_origin_and_missing_config_all_leave_the_response_untouch
     let (decision, _logs) = unconfigured
         .on_response(&allowed_shape, &plain_response(), &RequestTrace::root())
         .unwrap();
-    assert!(matches!(decision, ResponseDecision::Continue));
+    match decision {
+        ResponseDecision::Modified(edit) => {
+            assert_eq!(header_value(&edit.set_headers, "vary"), Some("Origin"));
+            assert!(header_value(&edit.set_headers, "access-control-allow-origin").is_none());
+        }
+        other => panic!("an unconfigured filter must still vary the response, got {other:?}"),
+    }
 }

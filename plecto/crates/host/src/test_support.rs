@@ -135,6 +135,12 @@ pub fn filter_tcp_gate_component() -> Vec<u8> {
     std::fs::read(env!("FILTER_TCP_GATE_COMPONENT")).expect("read filter-tcp-gate component")
 }
 
+/// Test-only component that deliberately retains raw TCP socket resources across calls.
+#[cfg(feature = "outbound-tcp")]
+pub fn filter_tcp_retain_component() -> Vec<u8> {
+    std::fs::read(env!("FILTER_TCP_RETAIN_COMPONENT")).expect("read filter-tcp-retain component")
+}
+
 /// The compiled `filter-ratelimit-redis` component bytes — the global-layer reference filter of
 /// the local-floor × global two-tier rate-limit model (ADR 000061), built by this crate's
 /// `build.rs` when the `outbound-tcp` feature is on (it consults its backend over outbound TCP).

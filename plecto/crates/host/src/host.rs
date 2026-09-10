@@ -22,6 +22,8 @@ use crate::outbound_http;
 use crate::outbound_tcp;
 use crate::pool::{LoadedInner, TrustedPool};
 use crate::quota::KvQuota;
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+use crate::runtime::OutboundRuntime;
 use crate::runtime::{FilterPreBinding, FilterRuntime, WasmtimeRuntime};
 #[cfg(any(
     feature = "outbound-http",
@@ -45,6 +47,9 @@ pub struct Host {
     kv: Arc<dyn KvBackend>,
     /// Per-namespace host-state accounting + caps, shared into every loaded filter.
     kv_quota: Arc<KvQuota>,
+    /// Descriptor budget shared by every outbound-TCP Store loaded through this Host.
+    #[cfg(feature = "outbound-tcp")]
+    tcp_socket_quota: Arc<outbound_tcp::TcpSocketQuota>,
     /// Public keys this host trusts to sign filters (ADR 000006). Verified at every `load`.
     trust: TrustPolicy,
     /// Where loaded filters emit their per-execution spans (ADR 000009). Default `NoopSink`
@@ -55,7 +60,7 @@ pub struct Host {
     /// Cloned into each outbound filter at `load`; unused by (and invisible to) filters without an
     /// outbound policy.
     #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
-    outbound_rt: Arc<tokio::runtime::Runtime>,
+    outbound_rt: Arc<OutboundRuntime>,
     /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
     _epoch_ticker: EpochTicker,
 }
@@ -131,17 +136,14 @@ impl Host {
         // threads — a current-thread runtime serializes/contends there. Two workers suffice (outbound
         // is I/O-bound, not CPU-bound) and bound the extra thread count (security-auditor F-001).
         #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
-        let outbound_rt = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()?,
-        );
+        let outbound_rt = Arc::new(OutboundRuntime::new()?);
         Ok(Self {
             trusted_engine,
             untrusted_engine,
             kv,
             kv_quota,
+            #[cfg(feature = "outbound-tcp")]
+            tcp_socket_quota: Arc::new(outbound_tcp::TcpSocketQuota::new()),
             trust,
             sink: Arc::new(NoopSink),
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
@@ -321,7 +323,7 @@ impl Host {
                 #[cfg(not(feature = "test-support"))]
                 crate::resolver::Resolver::System
             };
-            outbound_tcp::OutboundTcpState::new(policy, resolver)
+            outbound_tcp::OutboundTcpState::new(policy, resolver, self.tcp_socket_quota.clone())
         });
         #[cfg(any(
             feature = "outbound-http",
@@ -367,11 +369,14 @@ impl Host {
                 &mut linker,
                 getter,
             )?;
-            sockets::tcp_create_socket::add_to_linker::<HostState, WasiSockets>(
+            sockets::tcp_create_socket::add_to_linker::<HostState, outbound_tcp::PlectoTcpSockets>(
                 &mut linker,
-                getter,
+                HostState::tcp_sockets,
             )?;
-            sockets::tcp::add_to_linker::<HostState, WasiSockets>(&mut linker, getter)?;
+            sockets::tcp::add_to_linker::<HostState, outbound_tcp::PlectoTcpSockets>(
+                &mut linker,
+                HostState::tcp_sockets,
+            )?;
             sockets::ip_name_lookup::add_to_linker::<HostState, outbound_tcp::PlectoTcpLookup>(
                 &mut linker,
                 HostState::tcp_lookup,

@@ -18,7 +18,9 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 
-use plecto_host::test_support::{TestSigner, bound_sbom, filter_tcp_gate_component};
+use plecto_host::test_support::{
+    TestSigner, bound_sbom, filter_tcp_gate_component, filter_tcp_retain_component,
+};
 use plecto_host::{
     Header, Host, HttpRequest, LoadOptions, LoadedFilter, RequestDecision, RequestTrace,
     SignedArtifact, TcpAllowEntry,
@@ -42,7 +44,10 @@ fn spawn_tcp_server(bind: IpAddr, reply: &'static [u8]) -> std::io::Result<Socke
 /// Sign + load filter-tcp-gate with the given options. The `Host` owns the epoch ticker and the
 /// outbound tokio runtime, so it must outlive the filter — returned alongside.
 fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
-    let bytes = filter_tcp_gate_component();
+    signed_load_component("filter-tcp-gate", filter_tcp_gate_component(), opts)
+}
+
+fn signed_load_component(id: &str, bytes: Vec<u8>, opts: LoadOptions) -> (Host, LoadedFilter) {
     let signer = TestSigner::new().unwrap();
     let component_signature = signer.sign(&bytes).unwrap();
     let sbom = bound_sbom(&bytes);
@@ -55,7 +60,7 @@ fn signed_load(opts: LoadOptions) -> (Host, LoadedFilter) {
         sbom_signature: &sbom_signature,
     };
     let filter = host
-        .load("filter-tcp-gate", &artifact, opts)
+        .load(id, &artifact, opts)
         .expect("load filter-tcp-gate");
     (host, filter)
 }
@@ -213,6 +218,62 @@ fn no_target_fails_closed() {
     };
     let (status, _body) = short_circuit_body(&filter, &req);
     assert_eq!(status, 503);
+}
+
+#[test]
+fn retained_guest_sockets_are_bounded_across_trusted_requests_and_reusable_after_drop() {
+    // This component creates native sockets but deliberately retains their guest resources. The
+    // bound belongs to the Store, not to a request's connect budget, so call 65 fails closed.
+    let opts = LoadOptions::trusted()
+        .with_trusted_pool_size(1)
+        .with_max_requests_per_instance(1_000)
+        .with_outbound_tcp(vec![allow("8.8.8.8", 53)], vec![], Some(1), Some(5_000));
+    let (_host, filter) =
+        signed_load_component("filter-tcp-retain", filter_tcp_retain_component(), opts);
+    let req = HttpRequest {
+        method: "GET".to_string(),
+        path_with_query: "/".to_string(),
+        authority: "gateway.test".to_string(),
+        scheme: "https".to_string(),
+        headers: vec![Header {
+            name: "x-tcp-retain".to_string(),
+            value: b"hold".to_vec(),
+        }],
+    };
+    for attempt in 1..=64 {
+        let (decision, _) = filter
+            .on_request(&req, &RequestTrace::root())
+            .expect("guest call");
+        assert!(
+            matches!(decision, RequestDecision::Continue),
+            "retained socket {attempt}: {decision:?}"
+        );
+    }
+    let (decision, _) = filter
+        .on_request(&req, &RequestTrace::root())
+        .expect("bounded guest call");
+    assert!(
+        matches!(decision, RequestDecision::ShortCircuit(ref r) if r.status == 503),
+        "the 65th retained socket must fail closed: {decision:?}"
+    );
+    let clear = HttpRequest {
+        headers: vec![Header {
+            name: "x-tcp-retain".to_string(),
+            value: b"clear".to_vec(),
+        }],
+        ..req.clone()
+    };
+    let (decision, _) = filter
+        .on_request(&clear, &RequestTrace::root())
+        .expect("clear guest resources");
+    assert!(matches!(decision, RequestDecision::Continue));
+    let (decision, _) = filter
+        .on_request(&req, &RequestTrace::root())
+        .expect("reused socket slot");
+    assert!(
+        matches!(decision, RequestDecision::Continue),
+        "a dropped socket must return its slot: {decision:?}"
+    );
 }
 
 /// ADR 000063 Decision 4's other half: the fat-guest grant (`wasi = "minimal"`) lends ONLY the

@@ -100,11 +100,61 @@ pub(crate) struct WasmtimeRuntime {
     /// The shared tokio runtime, cloned from the `Host`, present only for outbound-using filters —
     /// their guest calls block on real I/O the pollster executor cannot drive.
     #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
-    pub(crate) rt: Option<Arc<tokio::runtime::Runtime>>,
+    pub(crate) rt: Option<Arc<OutboundRuntime>>,
     /// This filter's manifest `wasi = "minimal"` declaration (ADR 000063), copied from
     /// `LoadOptions::wasi_minimal` at `Host::load`.
     #[cfg(feature = "fat-guest")]
     pub(crate) wasi_minimal: bool,
+}
+
+/// The shared executor lent to outbound-capable loaded filters.
+///
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+pub(crate) struct OutboundRuntime {
+    // `Runtime::drop` blocks waiting for its workers and panics from an async context. The runtime
+    // is taken only by this wrapper's final `Drop`, which instead uses Tokio's non-blocking
+    // shutdown path. Every live Host / WasmtimeRuntime owns an Arc of this wrapper, so it cannot
+    // be absent while a call can reach `block_on`.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+impl OutboundRuntime {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map(|runtime| Self {
+                runtime: Some(runtime),
+            })
+    }
+
+    pub(crate) fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        match &self.runtime {
+            Some(runtime) => runtime.block_on(fut),
+            None => unreachable!("outbound runtime is taken only during its final Drop"),
+        }
+    }
+
+    #[cfg(feature = "outbound-tcp")]
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Runtime {
+        match &self.runtime {
+            Some(runtime) => runtime,
+            None => unreachable!("outbound runtime is taken only during its final Drop"),
+        }
+    }
+}
+
+#[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+impl Drop for OutboundRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            // This starts Tokio's non-blocking shutdown; it avoids an async-context Drop panic but
+            // does not synchronously reclaim a running blocking DNS/I/O operation.
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl WasmtimeRuntime {
@@ -142,7 +192,7 @@ impl WasmtimeRuntime {
     ) -> wasmtime::Result<T> {
         #[cfg(feature = "outbound-tcp")]
         if let (Some(rt), Some(state)) = (&self.rt, &self.outbound_tcp) {
-            return block_on_with_deadline(rt, state.io_deadline(), fut);
+            return block_on_with_deadline(rt.runtime(), state.io_deadline(), fut);
         }
         self.drive(fut)
     }
@@ -514,5 +564,64 @@ mod deadline_tests {
         });
         let err = out.expect_err("a hung call must be cancelled");
         assert!(err.to_string().contains("io deadline"));
+    }
+}
+
+#[cfg(all(test, any(feature = "outbound-http", feature = "outbound-tcp")))]
+mod outbound_runtime_lifecycle_tests {
+    use std::sync::Arc;
+
+    use super::OutboundRuntime;
+
+    #[tokio::test]
+    async fn final_owner_can_drop_the_outbound_runtime_inside_async_context() {
+        let runtime = Arc::new(OutboundRuntime::new().unwrap());
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn loaded_filter_owner_keeps_the_executor_usable_then_shuts_down_its_pending_task() {
+        let host_owner = Arc::new(OutboundRuntime::new().unwrap());
+        let loaded_filter_owner = host_owner.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let pending = host_owner
+            .runtime
+            .as_ref()
+            .unwrap()
+            .handle()
+            .spawn(async move {
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .expect("the pending task must start")
+            .expect("the pending task must keep its start notifier alive");
+
+        drop(host_owner);
+        let (loaded_filter_owner, answer) = tokio::task::spawn_blocking(move || {
+            let answer = loaded_filter_owner.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                42
+            });
+            (loaded_filter_owner, answer)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            answer, 42,
+            "the loaded filter keeps the shared executor alive"
+        );
+
+        drop(loaded_filter_owner);
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("background shutdown must resolve runtime tasks");
+        assert!(
+            joined
+                .expect_err("pending task must be cancelled at final runtime drop")
+                .is_cancelled(),
+            "the final owner triggers Tokio shutdown rather than leaking the task"
+        );
     }
 }

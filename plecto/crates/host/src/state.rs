@@ -349,6 +349,17 @@ impl HostState {
         }
     }
 
+    /// The accounting wrapper for the two `wasi:sockets` TCP resource interfaces. Clone the
+    /// Store guard before taking the WASI projection, which borrows the same state and table.
+    #[cfg(feature = "outbound-tcp")]
+    pub(crate) fn tcp_sockets(&mut self) -> outbound_tcp::TcpSocketsView<'_> {
+        use wasmtime_wasi::sockets::WasiSocketsView;
+
+        let guard = self.tcp.clone();
+        let sockets = <Self as WasiSocketsView>::sockets(self);
+        outbound_tcp::TcpSocketsView { sockets, guard }
+    }
+
     /// Namespace a filter-supplied key into `{filter_id}\u{1f}{tag}\u{1f}{key}` bytes.
     fn ns_key(&self, tag: u8, key: &str) -> Vec<u8> {
         let mut k = Vec::with_capacity(self.kv_prefix.len() + 2 + key.len());

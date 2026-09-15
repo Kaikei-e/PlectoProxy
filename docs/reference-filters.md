@@ -23,8 +23,10 @@ Release](https://github.com/Kaikei-e/PlectoProxy/releases)'s notes; sign/attest 
 
 **Version tags are immutable.** Changing a filter's source without bumping its `Cargo.toml`
 version fails the release job closed (stripped-component content hash ≠ published). Bump the
-filter version to ship a new digest. Hashes ignore custom sections (`wasm-tools strip`) so
-benign toolchain metadata noise does not force a bump.
+filter version to ship a new digest. Hashes are taken after `wasm-tools strip`, which drops
+custom sections such as `producers` but keeps the `name` section: metadata-only toolchain noise
+does not force a bump, but a guest-toolchain bump that renames symbols (a wit-bindgen minor
+changes its versioned `cabi_realloc` symbol) does, even with no source change.
 
 **First push of each `filters/<name>` package on GHCR lands private** — flip it Public once in
 the package settings (same quirk as the WIT packages, ADR 000064).
@@ -33,10 +35,10 @@ the package settings (same quirk as the WIT packages, ADR 000064).
 
 | Artifact | Crate | Version | Contract (world) | Guest target | Imports beyond `plecto:filter` | Required runtime profile | Manifest requirements |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `filters/jwt` | `filter-jwt` | 0.1.8 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps — outgoing calls happen only on the JWKS-at-init path; the static PEM/JWK path never calls out | **capabilities** | `isolation = "trusted"` (ADR 000070); `outbound-http` allowlist for the JWKS path, `allow = []` for static keys |
-| `filters/cors` | `filter-cors` | 0.2.0 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
-| `filters/apikey` | `filter-apikey` | 0.1.6 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
-| `filters/extauthz` | `filter-extauthz` | 0.2.0 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps | **capabilities** | operator-owned `[filter.config] authz-url` plus an `outbound-http` allowlist naming that endpoint |
+| `filters/jwt` | `filter-jwt` | 0.1.9 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps — outgoing calls happen only on the JWKS-at-init path; the static PEM/JWK path never calls out | **capabilities** | `isolation = "trusted"` (ADR 000070); `outbound-http` allowlist for the JWKS path, `allow = []` for static keys |
+| `filters/cors` | `filter-cors` | 0.2.1 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
+| `filters/apikey` | `filter-apikey` | 0.1.7 | `plecto:filter@0.3.0` (`filter`) | `wasm32-unknown-unknown` | none (zero-WASI) | any (minimal or capabilities) | — |
+| `filters/extauthz` | `filter-extauthz` | 0.2.1 | `plecto:filter@0.3.0` (`filter`) | `wasm32-wasip2` | `wasi:http` (outgoing-handler, types) + the `wasi:io` / `wasi:cli` slices the wasip2 target bootstraps | **capabilities** | operator-owned `[filter.config] authz-url` plus an `outbound-http` allowlist naming that endpoint |
 
 Every shelf entry is still built against `plecto:filter@0.3.0` while the host's current contract
 is `plecto:filter@0.4.0`, and that is deliberate rather than a backlog item: the shelf IS the

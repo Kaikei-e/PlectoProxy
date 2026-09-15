@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      # plecto-host pulls wasmtime 46 / cranelift (a large build); free the runner's preinstalled
+      # plecto-host pulls wasmtime / cranelift (a large build); free the runner's preinstalled
       # bloat so it fits. Best-effort, no third-party action (supply-chain stance). Guarded to
       # GitHub-hosted runners (ephemeral VM); on a self-hosted runner this rm would gut a
       # persistent machine.

@@ -10,7 +10,7 @@
 #
 # Writes one component per shelf entry to <out-dir>/<short>.component.wasm and a
 # <out-dir>/manifest.tsv of short, kind, profile, content-sha256, path. The sha256 is
-# taken after `wasm-tools strip` so custom-section noise does not fake a content
+# taken after `wasm-tools strip` so producers-style metadata noise does not fake a content
 # mismatch on republish. Fails closed if a zero-WASI guest imports wasi:http or a
 # capabilities guest lacks it.
 set -euo pipefail
@@ -26,8 +26,9 @@ mkdir -p "${OUT}"
 content_sha() {
   local src="$1" stripped
   stripped="$(mktemp)"
-  # strip drops custom sections (names / producers / dwarfish noise) that commonly
-  # differ across otherwise-identical release builds.
+  # strip drops custom sections (producers / dwarfish noise) that commonly differ across
+  # otherwise-identical release builds, but keeps `name` — so a guest-toolchain bump that
+  # renames symbols (wit-bindgen's versioned cabi_realloc) still changes the hash.
   wasm-tools strip "${src}" -o "${stripped}"
   sha256sum "${stripped}" | awk '{print $1}'
   rm -f "${stripped}"

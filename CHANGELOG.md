@@ -32,6 +32,34 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Runtime: wasmtime 48.0.1 → 48.0.2** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep; the
+  streaming spike host in `spike/streaming-async` follows in its own workspace). A patch on the
+  same 48 line with no advisory attached: wasmtime vendors the filesystem layer it used to take
+  from `cap-std`, so the lockfile drops `cap-std` / `cap-fs-ext` (Plecto lends no filesystem, so
+  the vendored code is unreachable from a filter), and `bindgen!` output compiles on current
+  nightly. No host source change. The ADR 000114 pin is untouched — 48.0.2 still bundles the
+  0.254 wasm-tools series, so `wit-component` / `wit-parser` stay at 0.254 and the `wasm-tools`
+  CLI pinned in CI / release stays at 1.254.0.
+- **Guest toolchain: wit-bindgen 0.61 → 0.62.0** across the Rust example filters, the filter
+  template, the host fixtures, the benchmark guests, and the streaming spike guest; guest
+  lockfiles move the wasm-tools family 258 → 259 in lockstep (the bindgen macro stack takes
+  `syn` 3.0.5 / `prettyplease` 0.3 / `macro-string` 0.3 with it), and CI installs the
+  sha256-pinned 0.62.0 CLI for the C guest. The 0.62 generator changes are confined to async
+  stream / future vtables and error plumbing, which the synchronous `plecto:filter` worlds do not
+  reach: the C guest's stripped component is byte-identical to its 0.61.1 build, and regenerating
+  the MoonBit bindings yields the committed code modulo declaration order, so they are not
+  regenerated. `crates/host/build.rs` keeps wrapping the 0.62-generated core modules with the
+  workspace's 0.254 `wit-component`.
+- **Reference-filter shelf republished**: `filters/jwt` 0.1.8 → 0.1.9, `filters/cors` 0.2.0 →
+  0.2.1, `filters/apikey` 0.1.6 → 0.1.7, `filters/extauthz` 0.2.0 → 0.2.1 (ADR 000080 — filter
+  tags are immutable). No filter source change: the content hash is taken after `wasm-tools
+  strip`, which keeps the core module's `name` section, and wit-bindgen's versioned
+  `cabi_realloc` symbol lands there, so the bump above changes every shelf entry's hash — verified
+  locally for `cors` / `apikey` against their published digests. The compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
+
 ## [0.11.4] - 2026-09-10
 
 Patch release: a security-review sweep over the boundaries where *authority* is chosen and where

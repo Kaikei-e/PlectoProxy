@@ -35,11 +35,12 @@ All notable changes to Plecto are documented here. The format follows
 ## [0.11.5] - 2026-09-15
 
 Patch release: the WebAssembly toolchain moves to the current releases — wasmtime 48.0.2 in the
-host, wit-bindgen 0.62.0 in the guests — and the reference-filter shelf is republished for the
-rebuilt bindings. No WIT contract, manifest schema, CLI, or public API change, and `cargo
-semver-checks` against the crates.io 0.11.4 baseline reports no semver update required on each of
-`plecto-host` / `plecto-control` / `plecto-server` (default features). **Deployed filters do not
-need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
+host, wit-bindgen 0.62.0 in the guests — the reference-filter shelf is republished for the
+rebuilt bindings, and rustls moves to 0.23.45 for RUSTSEC-2026-0285. No WIT contract, manifest
+schema, CLI, or public API change, and `cargo semver-checks` against the crates.io 0.11.4
+baseline reports no semver update required on each of `plecto-host` / `plecto-control` /
+`plecto-server` (default features). **Deployed filters do not need a rebuild**: the contract stays
+at `plecto:filter@0.4.0`.
 
 ### Changed
 
@@ -73,6 +74,17 @@ need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
   same-session A/B put the previous release (0.11.4, wasmtime 48.0.1) at 4.67 ± 0.12 µs and this
   release at 2.76 ± 0.12 / 4.64 ± 0.09 µs, so the excursion is a bimodal host state that
   reproduces on unchanged code, not a cost of the wasmtime bump. The band stays provisional.
+
+### Security
+
+- **rustls 0.23.43 → 0.23.45** for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285) (GHSA-2mjx-qc3c-rqvc):
+  TLS 1.3 handshake messages were accepted across a key change within the same record (for
+  example a plaintext `EncryptedExtensions` packed after `ServerHello`), where RFC 8446 §5.1
+  requires an `unexpected_message` alert. The handshake transcript stays authenticated, so a peer
+  cannot alter or complete a handshake through it. Plecto terminates TLS and dials TLS upstreams
+  through rustls, so both sides take the fix; `bench/loadgen` follows in its own lockfile. No
+  source change.
 
 ## [0.11.4] - 2026-09-10
 

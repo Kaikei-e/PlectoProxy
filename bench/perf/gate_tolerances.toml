@@ -13,9 +13,13 @@
 # interleave measured 2.45 ± 0.16 µs on 2026-07-11 (different host state, and baseline measured
 # in-session rather than borrowed from ceiling.csv). Band spans both until 2-3 more gate runs
 # tighten it — PROVISIONAL.
+# 2026-09-15: four same-session gate runs landed at 4.68 ± 0.09, 2.76 ± 0.12 and 4.64 ± 0.09 µs on
+# 0.11.5 (wasmtime 48.0.2) and 4.67 ± 0.12 µs on the previous release (0.11.4, wasmtime 48.0.1),
+# interleaved B/A/B. The upper mode reproduces on unchanged code, so it is host state (powersave
+# governor, loaded neighbours) rather than the runtime bump; hi moves 4.6 → 5.0. Still PROVISIONAL.
 [dispatch_floor_us]
 lo = 2.0
-hi = 4.6
+hi = 5.0
 
 # trusted − noop-pooled, closed-loop µs/req: the apikey filter's own per-request work.
 # 2026-07-06 interleaved A/B: 0.6 ± 0.2 µs; 2026-07-11 single-window: 0.86 µs.

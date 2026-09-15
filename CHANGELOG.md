@@ -32,6 +32,15 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-09-15
+
+Patch release: the WebAssembly toolchain moves to the current releases — wasmtime 48.0.2 in the
+host, wit-bindgen 0.62.0 in the guests — and the reference-filter shelf is republished for the
+rebuilt bindings. No WIT contract, manifest schema, CLI, or public API change, and `cargo
+semver-checks` against the crates.io 0.11.4 baseline reports no semver update required on each of
+`plecto-host` / `plecto-control` / `plecto-server` (default features). **Deployed filters do not
+need a rebuild**: the contract stays at `plecto:filter@0.4.0`.
+
 ### Changed
 
 - **Runtime: wasmtime 48.0.1 → 48.0.2** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep; the
@@ -59,6 +68,11 @@ All notable changes to Plecto are documented here. The format follows
   `cabi_realloc` symbol lands there, so the bump above changes every shelf entry's hash — verified
   locally for `cors` / `apikey` against their published digests. The compatibility matrix
   (`docs/reference-filters.md`) is updated to match.
+- **T1 perf gate: the `dispatch_floor_us` band's upper bound moves 4.6 → 5.0 µs**
+  (`bench/perf/gate_tolerances.toml`). The release gate measured 4.68 ± 0.09 µs; a same-host,
+  same-session A/B put the previous release (0.11.4, wasmtime 48.0.1) at 4.67 ± 0.12 µs and this
+  release at 2.76 ± 0.12 / 4.64 ± 0.09 µs, so the excursion is a bimodal host state that
+  reproduces on unchanged code, not a cost of the wasmtime bump. The band stays provisional.
 
 ## [0.11.4] - 2026-09-10
 

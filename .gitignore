@@ -31,3 +31,4 @@ flint-data/
 /test/
 
 .serena/
+.mcp.json

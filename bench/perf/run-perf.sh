@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Plecto perf runbook — emits performance/data/*.csv consumed by performance/plot.py. Fully local,
+# Plecto perf runbook — emits performance/data/*.csv consumed by performance/flint/plot.mjs. Fully local,
 # loopback. Plecto (+ its in-process backends) is pinned to one set of CPU cores and every load
 # generator to a disjoint set via taskset, so the generator never steals the proxy's cores. No host
 # tuning is applied (governor/turbo left as-is), so absolute throughput is bounded by this host and

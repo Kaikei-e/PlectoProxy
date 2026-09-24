@@ -211,7 +211,7 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   where realistic proportions matter (WASM short-circuit); a sized-body backend for the body sweep.
 - The LB figures are **plaintext HTTP/1.1**, except the dedicated [TLS run](#tls-termination).
 - **No comparative claims.** Mature proxies are referenced only for shared methodology, never ranking.
-- Charts rendered with matplotlib → WebP; an optional InfluxDB + Grafana stack (`INFLUX=1`) provides
+- Charts compiled with Flint (flint-chart) from the CSVs in performance/data; an optional InfluxDB + Grafana stack (`INFLUX=1`) provides
   live dashboards during k6 runs (its images are a one-time setup pull; the load stays on loopback).
 
 ---
@@ -295,8 +295,8 @@ host noise. The `ceiling` phase now produces `ceiling.csv`; the [WASM ladder](#t
 `baseline` row and [TLS termination](#tls-termination)'s `plain (h1)` row cite it instead of
 re-measuring.
 
-![Plain HTTP/1.1 ceiling](img/ceiling.webp)
-![Plain HTTP/1.1 ceiling, tail latency](img/ceiling_tail.webp)
+![Plain HTTP/1.1 ceiling](img/ceiling.png)
+![Plain HTTP/1.1 ceiling, tail latency](img/ceiling_tail.png)
 
 | Variant | KPI | req/s | p50 | p99 |
 | --- | --- | --- | --- | --- |
@@ -323,8 +323,8 @@ load-bearing; this is the plaintext analogue of the [TLS handshake-per-request r
 Closed-loop sweep (k6 `constant-vus`) — a fixed number of virtual users, each issuing its next
 request only after the previous response. Rising concurrency walks the load curve.
 
-![Throughput vs concurrency](img/throughput_vs_concurrency.webp)
-![Latency percentiles vs concurrency](img/latency_vs_concurrency.webp)
+![Throughput vs concurrency](img/throughput_vs_concurrency.png)
+![Latency percentiles vs concurrency](img/latency_vs_concurrency.png)
 
 | VUs | req/s | p50 | p95 | p99 | p99.9 | failed |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -379,7 +379,7 @@ lag under load); the ~28 ms p99 is the queueing tail to track.
 
 ## Round-robin distribution
 
-![Round-robin distribution](img/rr_distribution.webp)
+![Round-robin distribution](img/rr_distribution.png)
 
 Over a steady window with all three upstreams healthy, **120,000** requests split **40,000 /
 40,000 / 40,000** — even to a single request (33.3 % each). Round-robin holds under load.
@@ -392,8 +392,8 @@ t=0 is already steady state) while a controller drives a fault timeline (`eject 
 `eject all` → `restore all`) and the driver buckets each upstream's served-count and the 503/s
 every second:
 
-![Load balancing under fault injection](img/ejection_timeline.webp)
-![Fail-closed 503s during total ejection](img/ejection_failed.webp)
+![Load balancing under fault injection](img/ejection_timeline.png)
+![Fail-closed 503s during total ejection](img/ejection_failed.png)
 
 - **Even baseline.** ~4k req/s split three ways while healthy (1,333/1,334/1,333 this run).
 - **Graceful ejection.** When **b** is driven unhealthy its share falls to zero within ~1 s (a
@@ -422,7 +422,7 @@ reload — is isolated in the companion criterion micro-benchmark,
 swap churn (the worst case; an unchanged tick short-circuits to one atomic load + compare and isn't
 exercised there).
 
-![Endpoint-set swap under load](img/swap_timeline.webp)
+![Endpoint-set swap under load](img/swap_timeline.png)
 
 > Re-measured 2026-08-15 (v0.9.0 snapshot): a steady ~4k req/s open-loop while, at
 > t=15 s (post-warmup), the manifest is rewritten `[a, b, c]` → `[a, b, d]` and SIGHUP-reloaded
@@ -449,8 +449,8 @@ of each layer is separable (oha; h1 client isolates the record/handshake split f
 multiplexing). `plain (h1)` is the [plain HTTP/1.1 ceiling](#plain-http11-ceiling)'s keep-alive row,
 not re-measured here.
 
-![TLS vs plain](img/tls_vs_plain.webp)
-![TLS vs plain, tail latency](img/tls_tail.webp)
+![TLS vs plain](img/tls_vs_plain.png)
+![TLS vs plain, tail latency](img/tls_tail.png)
 
 | Variant | req/s | p50 | p99 | isolates |
 | --- | --- | --- | --- | --- |
@@ -516,8 +516,8 @@ the irreducible dispatch floor.
 
 ## The WASM cost ladder — isolating each cost
 
-![Throughput by decision path](img/wasm_throughput.webp)
-![Per-request latency by decision path](img/wasm_latency.webp)
+![Throughput by decision path](img/wasm_throughput.png)
+![Per-request latency by decision path](img/wasm_latency.png)
 
 > W1 — fixed 50 connections, 0 ms backend, valid key (oha, warm-up burned in a discarded 5 s
 > pre-run). Full-throttle: read these rows as **throughput ceilings**; the honest latencies are in
@@ -615,7 +615,7 @@ concurrent macro run exposes (the knee above). The layers agree once that kernel
 
 ## Short-circuit: rejecting bad traffic at the edge
 
-![Accept vs reject latency](img/wasm_shortcircuit.webp)
+![Accept vs reject latency](img/wasm_shortcircuit.png)
 
 > W2 — fixed 2000 req/s, 15 ms backend, ~90 % valid / ~10 % bad keys (k6). 108,034 accepted, 11,997
 > rejected, **0 status-less** — a **90.0 % / 10.0 %** split, matching the script's own key roll.
@@ -755,8 +755,8 @@ only decides *whether* to consult the limiter and *on what key*. Driven through 
 | /baseline (no filter) | 146,402 | 0.24 ms | 1.33 ms |
 | /ratelimit (bucket) | 97,584 | 0.43 ms | 1.22 ms |
 
-![Rate-limit overhead](img/ratelimit_overhead.webp)
-![Rate-limit overhead, tail latency](img/ratelimit_overhead_tail.webp)
+![Rate-limit overhead](img/ratelimit_overhead.png)
+![Rate-limit overhead, tail latency](img/ratelimit_overhead_tail.png)
 
 The rate-limited route adds **~3.4 µs/req** over the no-filter baseline (~33 % of its throughput;
 p99 stays in the same ~1.2 ms band — the µs/req is the inverse-throughput delta at 50 VUs, well
@@ -771,7 +771,7 @@ filter's bucket count bounded.
 
 ### Enforcement — does it actually hold the rate?
 
-![Rate-limit enforcement](img/ratelimit_enforce.webp)
+![Rate-limit enforcement](img/ratelimit_enforce.png)
 
 > R2 — a **tight** bucket (refill 1000 tok/s, burst 2000), offered **5000 req/s** open-loop at one
 > key for 30 s (k6).
@@ -797,7 +797,7 @@ exactly the 5,000/s × 30 s offered, with **zero status-less responses**.
 
 ### Fairness — one key cannot starve another
 
-![Rate-limit fairness](img/ratelimit_fairness.webp)
+![Rate-limit fairness](img/ratelimit_fairness.png)
 
 > R3 — same tight bucket; two keys concurrently: a **hot** key offered 4000/s and a **light** key
 > offered 500/s (k6).
@@ -830,8 +830,8 @@ marker. A bodyless request, a filter-less route, and — since ADR 000038 — a 
 **all header-only** (none exports `on-request-body`) keep the zero-copy streaming path: the host
 decides from the component's exports whether any filter reads the body, and buffers only then.
 
-![Request body hook](img/body.webp)
-![Request body hook, tail latency](img/body_tail.webp)
+![Request body hook](img/body.png)
+![Request body hook, tail latency](img/body_tail.png)
 
 > B — 50 VUs, POST a `SIZE`-byte body at 1 KB / 100 KB / 1 MB (k6), to `/body` (filter-hello buffers +
 > transforms), `/body-headeronly` (a header-only filter — body streams through, ADR 000038), and
@@ -971,8 +971,8 @@ handshake and echoes every frame; `plecto-loadgen`'s `ws` subcommand drives thre
 | Handshake rate | 10,000/10,000 Upgrades succeeded at the paced 500/s target — **0 % failed** over 20 s |
 | Tunnel footprint | idle RSS 77.6 MB → 90.1 MB with 1,000 held tunnels — **~12.8 KB/tunnel** |
 
-![WebSocket echo throughput](img/ws_echo.webp)
-![WebSocket echo tail latency](img/ws_echo_tail.webp)
+![WebSocket echo throughput](img/ws_echo.png)
+![WebSocket echo tail latency](img/ws_echo_tail.png)
 
 | Payload | messages/s | throughput | p50 | p99 |
 | --- | --- | --- | --- | --- |
@@ -1097,14 +1097,13 @@ subcommands (`bench/loadgen/`, built lazily by the runbook). The open-loop drive
 schedule-latency into an HDR histogram (fixed footprint at any rate/window) and dumps the FULL
 distribution alongside the summary (`--hist-out`, written to `performance/data/openloop_hist.csv`
 by the runbook) — so a p99 move can be attributed to a second mode appearing vs one mode's tail
-stretching, without a re-run. Charts are regenerated from the measured CSVs:
+stretching, without a re-run. Charts are compiled with Flint (flint-chart) from the CSVs in performance/data:
 
 ```bash
-python3 performance/plot.py     # reads performance/data/*.csv -> performance/img/*.webp
+cd performance/flint && npm ci && npm run plot
 ```
 
-(`matplotlib` brings `numpy` + `Pillow`; Pillow supplies the WebP encoder. The benchmark *method* —
-the runbook, scenarios, the Rust loadgen, plotting — is tracked, as are the rendered charts and this
+(The benchmark *method* — the runbook, scenarios, the Rust loadgen, plotting — is tracked, as are the rendered charts and this
 report; the measured CSVs are regenerable working data and stay untracked, like `bench/`'s raw run
 artifacts. See `bench/plan.md`.)
 

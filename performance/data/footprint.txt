@@ -1,3 +1,3 @@
-idle VmRSS: 46840 kB
-RSS with 250 held conns: 53044 kB
-bytes/conn ≈ 25412 (over 250 held connections)
+idle VmRSS: 49876 kB
+RSS with 250 held conns: 56136 kB
+bytes/conn ≈ 25641 (over 250 held connections)

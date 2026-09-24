@@ -9,7 +9,7 @@ Plecto の二つの半身——**native fast path**（接続・TLS・HTTP・rout
 
 - **canonical runner は1本**: [`perf/run-perf.sh`](perf/run-perf.sh)。core-pin（`taskset`）で proxy と
   generator を**互いに素な CPU 集合**に固定し、generator が proxy の core を奪わないようにする。
-  出力は `performance/data/*.csv` → [`../performance/plot.py`](../performance/plot.py) → `performance/img/*.webp`。
+  出力は `performance/data/*.csv` → [`../performance/flint/plot.mjs`](../performance/flint/plot.mjs) → `performance/img/*.png`。
 - **負荷はこのマシン内で完結**: generator → proxy → in-process upstream はすべて loopback。telemetry は無効
   （`K6_NO_USAGE_REPORT=true`、Influx/Grafana の phone-home off）。**負荷実行時に外部へ通信しない**。
   `REQUIRE_OFFLINE=1` でデフォルト IPv4 ルートがあると拒否（netns ラボ）。Docker image / generator binary の
@@ -117,7 +117,7 @@ PROXY_CPUS=0-7 GEN_CPUS=8-15 bash bench/perf/run-perf.sh sweep
 INFLUX=1 bash bench/perf/run-perf.sh all   # http://localhost:3000/d/plecto-lb-k6
 
 # CSV からグラフ再生成
-python3 performance/plot.py                # performance/data/*.csv -> performance/img/*.webp
+(cd performance/flint && npm ci && npm run plot)   # performance/data/*.csv -> performance/img/*.png
 ```
 
 ## 統廃合の経緯
@@ -149,7 +149,7 @@ python3 performance/plot.py                # performance/data/*.csv -> performan
 
 ## 出力ファイル
 
-- 追跡（コミット対象）: `performance/img/*.webp`・`performance/README.md`・`performance/data/*.txt` /
+- 追跡（コミット対象）: `performance/img/*.png`・`performance/README.md`・`performance/data/*.txt` /
   `*.json`（`footprint.txt` / `h3.txt` / `openloop.json` — CSV ほど大きくない単発の結果）。
 - 非追跡（regenerable working data、ルート `.gitignore` の `performance/data/*.csv`）: 各シナリオの CSV・
   生 k6/oha 出力・HTML・log・download binary・machine-spec 入りの write-up。`gate.csv`（判定結果）と

@@ -46,7 +46,7 @@ MCP 呼び出しの前に `user-flint` 名前空間のスキーマを `GetDynami
 |---|---|---|
 | admin `/metrics` | Prometheus text exposition v0.0.4（`plecto/crates/server/src/metrics.rs`） | **否。** パース → ロング表へ。カウンタはプロセス起動以来の累積 |
 | アクセスログ | `[observability] access_log = true` の JSON 行（契約は `docs/operations.md`） | 否。JSONL → 表。`path` のカーディナリティは落とす |
-| ベンチ CSV | `performance/data/*.csv`（列は `performance/plot.py` が正） | 列がチャート形なら可。wide は先に畳む |
+| ベンチ CSV | `performance/data/*.csv`（列は `performance/flint/plot.mjs` が正） | 列がチャート形なら可。wide は先に畳む |
 | OTLP | traces のみ（ADR 000040）。metrics の OTLP 化は未決 | スパン表に落としてから。生 protobuf は渡さない |
 
 ライブスクレイプ例（admin はデータプレーンと別ポート、manifest の `admin_addr`）:
@@ -188,4 +188,4 @@ Plecto 本体（Rust プロキシ）に npm 依存を足さない。
 - 正文: `flint://agent-skill` / `flint://theme-skill`
 - メトリクス実装: `plecto/crates/server/src/metrics.rs`
 - 運用契約: `docs/operations.md`
-- ベンチ列: `performance/plot.py`、方法: `performance/README.md` / `bench/methodology.md`
+- ベンチ列: `performance/flint/plot.mjs`、方法: `performance/README.md` / `bench/methodology.md`

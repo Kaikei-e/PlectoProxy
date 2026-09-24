@@ -1,0 +1,11 @@
+{
+  "name": "plecto-performance-charts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "plot": "node plot.mjs"
+  },
+  "dependencies": {
+    "flint-chart-mcp": "0.5.1"
+  }
+}

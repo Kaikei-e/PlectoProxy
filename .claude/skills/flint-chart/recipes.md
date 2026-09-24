@@ -225,7 +225,7 @@ long: `{ signal, count }`。`circuit_open` / `rate_limited` / `retries` は別�
 
 ## 8. Ceiling RR vs CRR
 
-`ceiling.csv`: `variant` / `kpi` / `rps` / `p50` / `p99`（`performance/plot.py` と README 表を正とする。列が違えば CSV ヘッダに合わせる）。
+`ceiling.csv`: `variant` / `kpi` / `rps` / `p50` / `p99`（`performance/flint/plot.mjs` と README 表を正とする。列が違えば CSV ヘッダに合わせる）。
 
 ```json
 {

@@ -53,7 +53,23 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 ## TL;DR
 
-> **Measurement history** (newest first). **2026-08-15 (v0.9.0 snapshot)** — a full refresh of the
+> **Measurement history** (newest first). **2026-09-25 (v0.11.5+ snapshot)** — a full refresh of the
+> fast path at commit `a2725da` (**v0.11.5** plus the unreleased ADR 000112 per-route `route` label on
+> request counters; wasmtime 48.0.2; later ADR 000116 alters route name computation at manifest build time
+> only — no hot-path change): T2 `bash bench/perf/run-perf.sh all` (all its phases) and the T1 `gate` twice
+> on the same single commodity host over loopback with unchanged pinning and methodology. NOT re-run: the T3
+> `v03` phase (`v03_*.csv`, 2026-08-15), full-vs-resumed TLS (`tls_full.csv` / `tls_resumed.csv`, 2026-07-05),
+> PMU (not enabled), and criterion/gungraun micro layers (no saved `main` baseline — skipped). Charts are now
+> rendered with Flint as PNG. **Verdicts this pass**: T1 `gate` run 1 (same session, same binary) failed one
+> band on the fast side: `apikey_tail_p50_ms` was −0.027 ms (band −0.02..0.15 → FAIL, below the band, i.e.
+> the trusted route measured faster than noop-pooled; the same run's noop-pooled fixed-rate tail had a 10.5 ms
+> p99.9 outlier; dispatch_floor_us 4.48 ±0.36, apikey_cost_us 1.09 ±0.09, pooled_tail_p50_ms 0.137,
+> respctx_tail_p50_ms −0.042, ratelimit_tax_us 3.15 ±0.64, enforce_allowed_ratio 0.917, rr_spread 0,
+> ejection_transition_s 1, stray_failed 0). Gate run 2 passed every invariant in band (`gate.csv`:
+> dispatch_floor_us 4.69 ±0.09, apikey_cost_us 1.14 ±0.17, pooled_tail_p50_ms 0.103, apikey_tail_p50_ms 0.052,
+> respctx_tail_p50_ms 0.012, ratelimit_tax_us 4.24 ±0.03, enforce_allowed_ratio 0.917, rr_spread 0,
+> ejection_transition_s 1, stray_failed 0). Reported honestly: run 1 failed one band on the fast side,
+> run 2 passed; treated as interleave noise, and claiming no more. **2026-08-15 (v0.9.0 snapshot)** — a full refresh of the
 > fast path at commit `b2a89be` (**v0.9.0**): T2 `all`, T3 `v03`, the T1 `gate` three times, and both
 > micro layers (criterion + gungraun instruction counts, each saved as a local `main` baseline). The
 > harness repairs described next landed on top of that commit and touch no crate source, so every
@@ -79,59 +95,35 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 > three same-day measurements at 3.11 / 3.42 / 3.79 µs. This host was *not* idle (a browser,
 > cadvisor and a clickhouse-server were resident; 15-min load average ~10), which is the honest
 > explanation for a between-session excursion the interleave cannot cancel; the band was left
-> untouched. **2026-07-20 (v0.5.1/v0.5.2 patch confirmation)** — a
-> full refresh: T1 `gate` (**PASS**, every invariant in band), a full `bash bench/perf/run-perf.sh
-> all` (T2), and `v03` (T3). Measured at commit `c635ed3` (tag **v0.5.1**); tag **v0.5.2** landed
-> on top moments later as an unintended early release — version strings and three reference-filter
-> patch bumps only (`filter-cors` / `filter-apikey` / `filter-extauthz` 0.1.1 → 0.1.2), no
-> `plecto-server` / `plecto-control` / `plecto-host` source changed, so every figure below stands
-> for v0.5.2 as shipped too. The entire load run executed inside an unprivileged network namespace
-> (`unshare -rn`, `ip link set lo up`, no default route) rather than relying only on the runbook's
-> own `REQUIRE_OFFLINE=1` self-check — a kernel-enforced guarantee that nothing left the host during
-> the run, verified beforehand (`curl http://example.com` fails at DNS resolution inside the
-> namespace, before any route is even consulted). **New finding this pass** — ADR 000092's
-> per-source-IP connection cap (**256** concurrent connections/IP, landed 2026-07-15, after the
-> prior 07-11 snapshot) now intersects several k6 open-loop scenarios whose `preAllocatedVUs` pool
-> exceeds 256, because the generator and Plecto Proxy share one loopback source IP on this harness.
-> Confirmed two ways: the closed-loop **sweep** fails cleanly above the threshold (0 % at VU ≤ 200,
-> **28 % / 47 %** at VU 400/800 — reproduced identically with and without the netns sandbox, ruling
-> the isolation method out as the cause), and the **rate-limit enforcement / fairness (hot key)**
-> scenarios silently drop **43–49 %** of offered load from their own accepted/limited accounting (a
-> refused connection returns no HTTP status, so k6's `status === 200 | 429` branches never see it).
-> Affected numbers are flagged inline below; every oha-driven section (ceiling, WASM ladder, TLS,
-> footprint — all `-c 50`), the low-VU k6 scenarios (body, rate-limit overhead — `VUS=50`), and every
-> `plecto-loadgen` scenario (open-loop, round-robin, ejection, swap, WebSocket — all ≤ 64 workers)
-> stay well under the cap and are clean, comparable figures. *(The harness half of that finding is
-> fixed in the 08-15 pass above; the numbers it flagged have been re-measured.)* **Older
-> generations** (2026-07-11 v0.3.0 feature costs … 07-02) live in [`HISTORY.md`](HISTORY.md) — this
-> TL;DR keeps only the newest two.
+> untouched. **Older generations** (2026-07-20 v0.5.1/v0.5.2 patch confirmation … 07-02) live in
+> [`HISTORY.md`](HISTORY.md) — this TL;DR keeps only the newest two.
 > **µs/req deltas are what to track across snapshots**, not raw throughput — and the tracked
 > invariant set is machine-checked by the T1 gate (`bash bench/perf/run-perf.sh gate`, bands in
 > `bench/perf/gate_tolerances.toml`).
 
 **Load-balancing fast path** (plaintext HTTP/1.1, 3 upstreams, trivial 0 ms backend; k6 / loadgen / oha):
 
-- Closed-loop throughput peaks at **~140.3k req/s** (VU 100 this run) with **p99 ≈ 1.3–4.8 ms** and
-  zero failures through VU 200. **VU 400/800 show 27.8 % / 51.7 % "failed"** — this is **not** proxy
+- Closed-loop throughput peaks at **~128.0k req/s** (VU 100 this run) with **p99 ≈ 1.5–4.8 ms** and
+  zero failures through VU 200. **VU 400/800 show 27.8 % / 46.8 % "failed"** — this is **not** proxy
   overload: it is the sweep's own concurrency (400/800 simultaneous connections, all from the
   generator's single loopback IP) crossing ADR 000092's **256-connections-per-source-IP**
   admission cap, which those two rungs cross deliberately — see the measurement-history callout
   above and [the sweep section](#throughput--latency-vs-concurrency). Under the
   cap (VU ≤ 200) the curve still declines gracefully with no cliff.
-- Open-loop at the auto **98.2k/s** (70 % of closed-loop peak) **achieves 98,221/s exactly** with
-  **p50 1.7 ms, p95 12.5 ms, p99 27.8 ms, p99.9 41.1 ms, 0 dropped, 0 % failed** — schedule-latency
+- Open-loop at the auto **89.6k/s** (70 % of closed-loop peak ≈128,001 req/s) **achieves 89,600/s exactly** with
+  **p50 1.8 ms, p95 12.0 ms, p99 23.5 ms, p99.9 43.1 ms, 0 dropped, 0 % failed** — schedule-latency
   (`plecto-loadgen openloop`, 64 workers — well under the per-IP cap, unaffected).
-- Round-robin across three upstreams is **even to within one request** (33.3 % each, 120,000 reqs).
+- Round-robin across three upstreams is **even to within zero requests** (33.3 % each, 40,000 / 40,000 / 40,000, 120,000 reqs).
 - **Resilience is as designed**: ejecting one upstream drops its share to zero in ~1 s and the
   survivors absorb the load with **no client-visible errors**; a *total* outage **fails closed
   with HTTP 503** and the pool **recovers within ~1 s** of health returning.
-- TLS termination (**aws-lc-rs**, ADR 000051): within-TLS, keep-alive **~107.7k** (~50 % of the
-  plaintext ceiling) vs handshake/req **~23.1k** (~21 % of keep-alive) and h2 **~99.2k** (~92 % of
+- TLS termination (**aws-lc-rs**, ADR 000051): within-TLS, keep-alive **~90.8k** (~50 % of the
+  plaintext ceiling) vs handshake/req **~22.1k** (~24 % of keep-alive) and h2 **~88.1k** (~97 % of
   keep-alive) — the path is **crypto-/TLS-I/O-bound**, ordering clean. A resumption-isolated
   measurement (carried from 07-05, not re-run this pass) puts a **true full handshake at ~22.1k/s**
   vs **~29.8k/s resumed (93 %)** — see [TLS](#tls-termination).
-- A **kept-alive** connection (**RR**) serves **~215.9k req/s** this run; forcing a **TCP
-  handshake per request** (**CRR**) costs **~50 % throughput and +0.80 ms p99** — connection
+- A **kept-alive** connection (**RR**) serves **~180.0k req/s** this run; forcing a **TCP
+  handshake per request** (**CRR**) costs **~49 % throughput and +0.92 ms p99** — connection
   reuse is still load-bearing (see [the plain HTTP/1.1 ceiling](#plain-http11-ceiling)).
 
 **WASM extension plane** (the cost of running a decision as a sandboxed component; oha / k6):
@@ -139,24 +131,22 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 - A **cost ladder** isolates each cost by adjacent delta (oha, `-c 50` — well under the per-IP cap,
   clean). This run's full-throttle ceiling is clean (`baseline` **>** every WASM rung), so the raw
   floor reads directly: **baseline → noop-pooled costs ~47 % throughput** full-throttle
-  (**≈ 4.17 µs/req** inverse-throughput delta, matching the interleaved T1 gate's **3.90–4.06 µs**
-  dispatch-floor invariant); the **fixed-rate tail** (2,209 req/s, the portable queueing-honest read)
-  puts it at **+0.10 ms p50 / +0.33 ms p99** over native. A **real filter's own work**
-  (`filter-apikey` on top of the pooled no-op) is **≈ 1.09 µs** — bracketing the gate's **0.87–1.06 µs**
+  (**≈ 4.91 µs/req** inverse-throughput delta, matching the interleaved T1 gate's **4.48–4.69 µs**
+  dispatch-floor invariant across the two gate runs); the **fixed-rate tail** (2,119 req/s, the portable queueing-honest read)
+  puts it at **+0.13 ms p50 / +0.16 ms p99** over native. A **real filter's own work**
+  (`filter-apikey` on top of the pooled no-op) is **≈ 0.95 µs** — bracketing the gate's **1.09–1.14 µs**
   apikey-cost invariant; running that filter **fresh-per-request** instead of pooled
-  costs **~31×** throughput — the price of re-paying `init` every request.
+  costs **~25×** throughput — the price of re-paying `init` every request.
 - These macro deltas **reconcile with the criterion [micro-benchmarks](#0-micro-benchmarks-in-process-criterion)**
-  in direction and order of magnitude, and with the T1 gate, which returned **PASS twice and FAIL
-  once** across three runs this pass — the single excursion being `ratelimit_tax_us` on a host with
-  unrelated resident load (`bash bench/perf/run-perf.sh gate`, bands in
-  `bench/perf/gate_tolerances.toml`; every other invariant was in band on all three runs).
-- **v0.3.0 response / compression (opt-in `v03` phase, re-run 2026-08-15):** reading the
-  as-forwarded request snapshot on `on-response` costs **≈ +0.22 µs/req** over pooled no-op this
-  pass (small enough that the ceiling's own run-to-run movement is a comparable term — see
+  in direction and order of magnitude, and with the T1 gate, which returned **FAIL once (fast-side miss on apikey tail p50) and PASS once**
+  across two runs this pass (`bash bench/perf/run-perf.sh gate`, bands in
+  `bench/perf/gate_tolerances.toml`; run 2 had every invariant in band).
+- **v0.3.0 response / compression (opt-in `v03` phase, measured 2026-08-15 on v0.9.0):** reading the
+  as-forwarded request snapshot on `on-response` costs **≈ +0.22 µs/req** over pooled no-op
+  (small enough that the ceiling's own run-to-run movement is a comparable term — see
   [the section itself](#v030-response-ladder--compression)); gzip on a 4 KiB compressible body costs
-  **≈ −31 % ceiling / +2.3 µs/req** vs the same body uncompressed, the third pass in a row within
-  ~0.25 µs of the same figure.
-- A rejected request (**HTTP 401 short-circuit**) is decided in **~0.32 ms and never reaches the
+  **≈ −31 % ceiling / +2.3 µs/req** vs the same body uncompressed, within ~0.25 µs across snapshots.
+- A rejected request (**HTTP 401 short-circuit**) is decided in **~0.33 ms and never reaches the
   backend** — bad traffic is shed **~51× faster** than good traffic is forwarded through a 15 ms
   backend. With the harness fixed, the split matches the design mix again — **90.0 % accepted /
   10.0 % rejected, zero status-less responses** — see
@@ -164,12 +154,12 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 **Host-enforced rate limiting** (token bucket, spec host-configured in the manifest; k6):
 
-- The rate-limited route costs **~3.4 µs/req** (~33 % throughput, p99 unchanged) over a no-filter
+- The rate-limited route costs **~5.4 µs/req** (~41 % throughput, p99 moving slightly from 1.43 to 1.74 ms) over a no-filter
   baseline when the bucket never denies (`VUS=50`, well under the per-IP cap, clean) — the filter
   dispatch floor plus the host-native bucket consult (and its multi-tenant quota check).
 - Offered **5× over the configured rate**, the **allowed throughput converges correctly to the
-  bucket's refill rate** (**1,033/s** for a 1000-token/s bucket) and the run now accounts for
-  **every** offered request — 31,000 allowed + 119,000 shed = the full 150,000 attempted, **0
+  bucket's refill rate** (**1,033/s** for a 1000-token/s bucket) and the run accounts for
+  **every** offered request — 31,000 allowed + 118,991 shed = 149,991 accounted for out of 150,000 attempted, **0
   status-less** — putting the shed fraction at **79.3 %**, the same figure the pre-cap 07-11
   snapshot measured.
 - Buckets are **per key**: a hot key offered 4× its limit is throttled to its own refill rate
@@ -179,13 +169,13 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 **Request-body hook** (buffer-then-decide, ADR 000025; export-presence zero-copy bypass, ADR 000038; k6):
 
-- A filter that **reads** the body (`/body`, filter-hello) costs **~49 % throughput at 1 KB** and
-  scales with payload: **~60 % at 100 KB**, **~67 % at 1 MB**, versus the streaming passthrough
+- A filter that **reads** the body (`/body`, filter-hello) costs **~47 % throughput at 1 KB** and
+  scales with payload: **~57 % at 100 KB**, **~67 % at 1 MB**, versus the streaming passthrough
   (`VUS=50`, well under the per-IP cap, clean).
   A **header-only filter** (`/body-headeronly`) **streams the body through**: at 1 MB it lands
-  **within ~1 % of `/baseline`** (ADR 000038, within noise); at 100 KB the gap is **~11 %**
+  **within ~0.3 % of `/baseline`** (ADR 000038, within noise); at 100 KB the gap is **~12 %**
   and at 1 KB the gap is the ordinary **WASM dispatch floor** on a tiny request, not a body cost.
-- RSS at 1 MB × 50 VUs (`MALLOC_ARENA_MAX=4`): **~101 MB `/baseline` · ~177 MB `/body` · ~97 MB
+- RSS at 1 MB × 50 VUs (`MALLOC_ARENA_MAX=4`): **~114 MB `/baseline` · ~196 MB `/body` · ~122 MB
   `/body-headeronly`**. The header-only bypass stays near baseline; the buffer stays bounded (16 MiB
   cap, fail-closed 413).
 
@@ -194,15 +184,14 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 - **Machine specs intentionally omitted.** Single commodity host, loopback, everything
   co-resident. Absolute throughput is contended and clock-variable; treat figures as relative /
   regression signals.
-- **The host was not idle this pass (2026-08-15).** Unrelated resident workloads (a browser,
-  cadvisor, a clickhouse-server; 15-minute load average ~10) shared the machine with the run. Core
-  pinning keeps the proxy and the generators off each other's cores but cannot fence out a third
-  party, so absolute figures this pass sit below an idle-host run and one gate invariant took a
-  between-session excursion (see the [TL;DR](#tldr)). Ratios, shapes and time-constants — what this
-  report actually tracks — are unaffected, and the interleaved gate cancels drift *within* a session.
+- **Single host and pinning method.** Measured on the same single commodity host over loopback with
+  the core-pinning setup described above. T1 `gate` ran twice: run 1 failed one invariant on the fast
+  side (`apikey_tail_p50_ms` −0.027 ms vs −0.02..0.15 band; noop-pooled fixed-rate tail had a 10.5 ms p99.9 outlier)
+  while run 2 passed every invariant in band (`gate.csv`). Reported honestly as interleave noise.
+  Ratios, shapes and time-constants — what this report actually tracks — remain the durable signal.
 - **Generator-bound where noted.** The closed-loop sweep tops out near the *generator's* ceiling on
-  its cores, not the proxy's: absolute peaks move with host/generator noise (this run ~140.3k k6
-  peak vs ~215.9k oha ceiling keep-alive — different generators, different ceilings). The sweep
+  its cores, not the proxy's: absolute peaks move with host/generator noise (this run ~128.0k k6
+  peak vs ~180.0k oha ceiling keep-alive — different generators, different ceilings). The sweep
   curve's *shape* is the signal, not
   its absolute peak (below the per-IP admission cap — see the [TL;DR callout](#tldr) for VU ≥ 400).
   Open-loop tails use `plecto-loadgen` so they are no longer k6-VU-bound.
@@ -248,11 +237,11 @@ allocation contending for the same cache lines every tick; reported as measured,
 | cold `load` (verify + instantiate + init) | ~27.3 ms | cosign signature + SBOM verification dominates |
 
 The ~15× pooled→fresh gap here is the same one the [macro ladder](#the-wasm-cost-ladder--isolating-each-cost)
-shows end-to-end (~31× this snapshot, with the HTTP layer and its own run-to-run noise around it) —
+shows end-to-end (~25× this snapshot, with the HTTP layer and its own run-to-run noise around it) —
 the two layers agree in direction and order of magnitude, so a divergence between them would be a
-real bug. (Both tables freshly re-run 2026-08-15 and saved as the local `main` baseline for future
-`--baseline main` comparisons; absolute values only this pass, unpinned governor and a non-idle host
-— day-to-day drift of ±10–20 % is expected per
+real bug. (Criterion tables measured 2026-08-15 at commit `b2a89be` (tag **v0.9.0**); not re-run on
+2026-09-25 (commit `a2725da` / v0.11.5+) because no saved `main` baseline was present. Kept as the local
+in-process baseline — day-to-day drift of ±10–20 % is expected per
 [`bench/methodology.md`](../bench/methodology.md) § Measurement tiers.)
 
 **The frequency-invariant twin — instruction counts** (gungraun/callgrind, feature
@@ -273,7 +262,8 @@ Note what this layer *cannot* see: the pooled→fresh gap is only **1.11×** in 
 ~15× in wall-clock, because per-request instantiation's real cost is `mmap`/`munmap` and the TLB
 shootdowns they trigger — waiting, not executing (the [knee](#the-same-ladder-at-one-fixed-rate--honest-tails)
 below). Instruction-count invariance is not wall-clock invariance; both layers are kept for that
-reason. (Saved as the local `main` baseline 2026-08-15; **0 regressions** reported.)
+reason. (Instruction counts measured 2026-08-15 at commit `b2a89be` (tag **v0.9.0**); not re-run on
+2026-09-25. Kept as the frequency-invariant CI baseline.)
 
 ---
 
@@ -300,15 +290,13 @@ re-measuring.
 
 | Variant | KPI | req/s | p50 | p99 |
 | --- | --- | --- | --- | --- |
-| keep-alive       | RR  | 215,858 | 0.22 ms | 0.46 ms |
-| cold (TCP/req)   | CRR | 107,031 | 0.40 ms | 1.26 ms |
+| keep-alive       | RR  | 180,020 | 0.27 ms | 0.46 ms |
+| cold (TCP/req)   | CRR | 91,444  | 0.48 ms | 1.38 ms |
 
-*(Re-measured 2026-08-15 (v0.9.0 snapshot) — `bash bench/perf/run-perf.sh all` / `ceiling`.
-Absolute keep-alive reads below the 07-20 pass (248.2k → 215.9k) on a host carrying unrelated
-resident load this time (see [Scope & honesty notes](#scope--honesty-notes)); cold/keep-alive
-**ratio** and the RR/CRR split are the durable signal.)*
+*(Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+) — `bash bench/perf/run-perf.sh all` / `ceiling`.
+Cold/keep-alive **ratio** and the RR/CRR split are the durable signal.)*
 
-A TCP handshake per request costs **~50 % throughput and +0.80 ms p99** even on loopback (where the
+A TCP handshake per request costs **~49 % throughput and +0.92 ms p99** even on loopback (where the
 handshake is nearly free) — over a real network the gap widens with RTT. Connection reuse is
 load-bearing; this is the plaintext analogue of the [TLS handshake-per-request row](#tls-termination) below.
 
@@ -328,13 +316,13 @@ request only after the previous response. Rising concurrency walks the load curv
 
 | VUs | req/s | p50 | p95 | p99 | p99.9 | failed |
 | --- | --- | --- | --- | --- | --- | --- |
-| 50  | 133,696 | 0.26 ms | 0.74 ms | 1.30 ms | 2.58 ms | 0% |
-| 100 | **140,317** | 0.53 ms | 1.38 ms | 2.49 ms | 4.99 ms | 0% |
-| 200 | 125,941 | 1.07 ms | 2.64 ms | 4.77 ms | 9.83 ms | 0% |
-| 400 | 104,574 | 0.84 ms | 4.24 ms | 7.31 ms | 14.45 ms | **27.8%** |
-| 800 | 86,356  | 1.28 ms | 6.06 ms | 11.01 ms | 22.28 ms | **51.7%** |
+| 50  | 117,055 | 0.30 ms | 0.85 ms | 1.52 ms | 2.81 ms | 0% |
+| 100 | **128,002** | 0.56 ms | 1.58 ms | 2.79 ms | 5.71 ms | 0% |
+| 200 | 121,974 | 0.97 ms | 2.77 ms | 4.82 ms | 9.35 ms | 0% |
+| 400 | 94,636  | 0.90 ms | 4.50 ms | 7.88 ms | 15.57 ms | **27.8%** |
+| 800 | 76,299  | 1.49 ms | 6.81 ms | 12.05 ms | 22.31 ms | **46.8%** |
 
-Throughput peaks at **~140.3k at VU 100 this run** (the k6 generator's own ceiling on its cores —
+Throughput peaks at **~128.0k at VU 100 this run** (the k6 generator's own ceiling on its cores —
 which VU count wins the peak is host/generator noise, not a proxy change) and, **through VU 200**,
 declines gracefully with latency rising in proportion and zero failures — the shape this section has
 always shown.
@@ -354,7 +342,7 @@ always shown.
 > namespace (28.0 %/47.0 % outside vs 27.9 %/47.1 % inside, back-to-back on the same host state), and
 > the threshold crossing lines up exactly with the cap - 0 % at VU 200 (under 256), a jump at VU 400
 > (over 256). This is a **benchmark-harness / feature interaction**, not a regression in the load
-> balancer itself. **Reproduced unchanged on 2026-08-15** (27.8 % / 51.7 %), and *kept* here rather
+> balancer itself. **Reproduced on 2026-09-25** (27.8 % / 46.8 %), and *kept* here rather
 > than tuned away: unlike the open-loop scenarios — whose oversized VU pools were pure artifact and
 > are now [bounded below the cap](#tldr) — these two rungs exist to walk the concurrency curve, so
 > crossing the cap is the honest thing for them to do. Read VU 400/800 as "one source IP past its
@@ -368,22 +356,22 @@ queueing surfaces in the tail instead of being hidden — the *coordinated-omiss
 
 | Model | target | achieved | p50 | p95 | p99 | p99.9 | dropped | failed |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| open-loop, 0 ms backend (`plecto-loadgen`) | 98,221/s | **98,221/s** | 1.74 ms | 12.54 ms | 27.79 ms | 41.09 ms | **0** | 0% |
+| open-loop, 0 ms backend (`plecto-loadgen`) | 89,600/s | **89,600/s** | 1.75 ms | 12.02 ms | 23.50 ms | 43.07 ms | **0** | 0% |
 
-The auto target (70 % of the closed-loop peak, **98.2k/s** this run) is **achieved exactly** with
+The auto target (70 % of the closed-loop peak, **89.6k/s** this run, based on closed-loop peak ≈128,001 req/s) is **achieved exactly** with
 **zero dropped slots** under schedule-latency measurement (`plecto-loadgen openloop`, 64 workers —
 well under ADR 000092's per-IP cap, unaffected; wrk2 model — see
 [`bench/methodology.md`](../bench/methodology.md)). A co-resident Rust generator sustains the
-auto rate without inventing its own queueing tail. p50 is a couple of milliseconds (honest schedule
-lag under load); the ~28 ms p99 is the queueing tail to track.
+auto rate without inventing its own queueing tail. p50 is ~1.75 ms (honest schedule
+lag under load); the ~23.5 ms p99 is the queueing tail to track.
 
 ## Round-robin distribution
 
 ![Round-robin distribution](img/rr_distribution.png)
 
 Over a steady window with all three upstreams healthy, **120,000** requests split **40,000 /
-40,000 / 40,000** — even to a single request (33.3 % each). Round-robin holds under load.
-(Re-measured 2026-08-15; `plecto-loadgen rr`, 48 workers — well under the per-IP cap, unaffected.)
+40,000 / 40,000** — exact across all three instances (33.3 % each, 0 spread). Round-robin holds under load.
+(Re-measured 2026-09-25; `plecto-loadgen rr`, 48 workers — well under the per-IP cap, unaffected.)
 
 ## Resilience: ejection & fail-closed
 
@@ -397,13 +385,15 @@ every second:
 
 - **Even baseline.** ~4k req/s split three ways while healthy (1,333/1,334/1,333 this run).
 - **Graceful ejection.** When **b** is driven unhealthy its share falls to zero within ~1 s (a
-  one-second mixed transition bucket — `a=1660, b=680, c=1660` at t=15, then clean) and the
+  one-second mixed transition bucket — `a=1580, b=840, c=1580` at t=15, then clean) and the
   survivors (a + c) absorb the full load **with zero failed requests** — this run they split it
   **evenly** (2,000/2,000), round-robin over two survivors landing on an even split.
 - **Fail-closed, not fail-open.** With **every** instance unhealthy, Plecto Proxy returns **HTTP 503**
   promptly (no hang, no blind forward); the 503/s line jumps to the full offered rate (4,000/s here).
 - **Fast recovery.** Restoring health returns instances to rotation within ~1 s (a one-second mixed
-  bucket, then clean).
+  bucket at t=60 — `a=360, b=360, c=360, failed=2920`, then clean 1,333/1,334/1,333 at t=61).
+
+*(Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+). Over the full fault-timeline run: 160,000 responses, 24,040 failed (15.03 %) during total ejection, across events eject b / rejoin b / eject all / restore all.)*
 
 ## Endpoint-set swap under load (ADR 000044)
 
@@ -424,7 +414,7 @@ exercised there).
 
 ![Endpoint-set swap under load](img/swap_timeline.png)
 
-> Re-measured 2026-08-15 (v0.9.0 snapshot): a steady ~4k req/s open-loop while, at
+> Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+): a steady ~4k req/s open-loop while, at
 > t=15 s (post-warmup), the manifest is rewritten `[a, b, c]` → `[a, b, d]` and SIGHUP-reloaded
 > (64 workers — well under the per-IP cap, unaffected; same shape as every prior pass).
 
@@ -433,7 +423,7 @@ exercised there).
   to fail closed: `a` and `b` are unchanged addresses, so `reconcile` reuses their `Arc`s and
   health outright (ADR 000017's reuse rule), and only `d` starts pessimistic.
 - **The swap completes within one second.** The transition second (t=15) shows a brief mixed
-  bucket (`a=1581, b=1579, c=13, d=827`) as in-flight requests to `c` finish and the reconciled
+  bucket (`a=1574, b=1573, c=13, d=840`) as in-flight requests to `c` finish and the reconciled
   pool takes over mid-second; by t=16 the split is already clean — `c=0`, and `a` / `b` / `d` even
   at ~1,333 each — the same ~1 s time constant [ejection](#resilience-ejection--fail-closed) shows,
   because both paths funnel through the same `ArcSwap<Endpoints>` replacement.
@@ -454,27 +444,26 @@ not re-measured here.
 
 | Variant | req/s | p50 | p99 | isolates |
 | --- | --- | --- | --- | --- |
-| plain (h1)               | 215,858 | 0.22 ms | 0.46 ms | [ceiling](#plain-http11-ceiling) keep-alive |
-| TLS h1, keep-alive       | 107,711 | 0.44 ms | 0.90 ms | record layer + TLS I/O path |
-| TLS h1, handshake/req    | 23,085  | 1.90 ms | 5.66 ms | oha, shared `ClientConfig` — see caveat below |
-| TLS (h2)                 | 99,213  | 0.48 ms | 0.95 ms | h2 multiplexing over TLS |
+| plain (h1)               | 180,020 | 0.27 ms | 0.46 ms | [ceiling](#plain-http11-ceiling) keep-alive |
+| TLS h1, keep-alive       | 90,767  | 0.53 ms | 0.96 ms | record layer + TLS I/O path |
+| TLS h1, handshake/req    | 22,086  | 2.08 ms | 5.83 ms | oha, shared `ClientConfig` — see caveat below |
+| TLS (h2)                 | 88,080  | 0.55 ms | 0.97 ms | h2 multiplexing over TLS |
 
-The decomposition is the point. This run's ordering is clean — plain h1 keep-alive (215.9k) sits
-above the TLS keep-alive rung (107.7k, ~50 % of plaintext): **within-TLS ratios** are the signal:
-handshake/req is **~21 % of TLS keep-alive**, and **h2 is clean** (99.2k/s, ~92 % of TLS
-keep-alive, p99 0.95 ms — the closest h2 has read to the h1 rung in this report's history, and a
-reminder that this ratio moves with host state). The TLS-terminated path remains **crypto-/TLS-I/O-bound**;
+The decomposition is the point. This run's ordering is clean — plain h1 keep-alive (180.0k) sits
+above the TLS keep-alive rung (90.8k, ~50 % of plaintext): **within-TLS ratios** are the signal:
+handshake/req is **~24 % of TLS keep-alive**, and **h2 is clean** (88.1k/s, ~97 % of TLS
+keep-alive, p99 0.97 ms). The TLS-terminated path remains **crypto-/TLS-I/O-bound**;
 native-path optimisations don't reach it. A client that funnels many VUs over a handful of
 multiplexed connections can make h2 *look* far worse (head-of-line queueing, not server work);
 measuring with a connection-per-concurrency client removes that artifact.
 
-*(Re-measured 2026-08-15 (v0.9.0 snapshot) on **aws-lc-rs** (ADR 000051), `-c 50` —
+*(Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+) on **aws-lc-rs** (ADR 000051), `-c 50` —
 well under the per-IP cap, unaffected. Qualitative story unchanged across every snapshot so far.)*
 
 ### Full vs resumed handshake (ADR 000052)
 
-*(Not re-run this pass either — `bench/perf/run-perf.sh`'s `tls` phase doesn't drive this
-rung automatically; the numbers below are carried over unchanged from 2026-07-05.)*
+*(Not re-run this pass — `bench/perf/run-perf.sh`'s `tls` phase doesn't drive this
+rung automatically; the numbers below are carried over unchanged from 2026-07-05 at commit `c635ed3`, tag **v0.5.0**.)*
 
 The `handshake/req` row above no longer isolates a *true* full handshake: oha shares one rustls
 `ClientConfig` across connections, and against a server issuing stateless TLS 1.3 session tickets
@@ -529,58 +518,57 @@ pure **no-op** WASM filter (no host-API calls) is the key addition — it separa
 
 | Route | Decision path | req/s | p50 | p99 |
 | --- | --- | --- | --- | --- |
-| `/baseline` | native fast path (no filter) | 215,858 | 0.22 ms | 0.46 ms |
-| `/noop-pooled` | a **pure no-op** WASM filter, pooled | 113,509 | 0.42 ms | 0.81 ms |
-| `/noop-fresh` | the same no-op, **fresh instance / request** | 3,684 | 14.32 ms | 29.17 ms |
-| `/trusted` | the real `filter-apikey`, pooled | 101,050 | 0.47 ms | 0.95 ms |
-| `/ondemand` | `filter-apikey`, fresh instance / request | 3,714 | 14.29 ms | 28.87 ms |
+| `/baseline` | native fast path (no filter) | 180,020 | 0.27 ms | 0.46 ms |
+| `/noop-pooled` | a **pure no-op** WASM filter, pooled | 95,554  | 0.51 ms | 0.89 ms |
+| `/noop-fresh` | the same no-op, **fresh instance / request** | 3,840   | 13.38 ms | 28.80 ms |
+| `/trusted` | the real `filter-apikey`, pooled | 87,602  | 0.56 ms | 0.94 ms |
+| `/ondemand` | `filter-apikey`, fresh instance / request | 3,534   | 15.38 ms | 28.50 ms |
 
-*(Re-measured 2026-08-15 (v0.9.0 snapshot), `-c 50` — well under the per-IP cap,
+*(Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+), `-c 50` — well under the per-IP cap,
 clean. `/baseline` is sourced from [ceiling.csv](#plain-http11-ceiling); the other four rungs are
 measured together in the same session. This run's ordering is clean — `baseline` > every
 WASM rung, no under-read artifact — so the full-throttle floor reads directly; the fixed-rate tails
 below remain the honest queueing-free read.)*
 
 - **baseline → noop-pooled** = the **irreducible extension-plane dispatch cost**. Full-throttle,
-  this run shows a **~47 % throughput** cost (215.9k → 113.5k, **≈ 4.18 µs/req** inverse-throughput
-  delta — matching the T1 gate's interleaved **3.90–4.06 µs** dispatch-floor invariant across three
-  runs); the fixed-rate tails put the queueing-free floor at **+0.10 ms p50 / +0.33 ms p99**. Every
+  this run shows a **~47 % throughput** cost (180.0k → 95.6k, **≈ 4.91 µs/req** inverse-throughput
+  delta — matching the T1 gate's interleaved **4.48–4.69 µs** dispatch-floor invariant across the two
+  gate runs); the fixed-rate tails put the queueing-free floor at **+0.13 ms p50 / +0.16 ms p99**. Every
   WASM filter pays this floor.
 - **noop-pooled → noop-fresh** = the **per-request instantiation cost**, cleanly isolated from any
-  host work: throughput collapses **~31×** (113.5k → 3.7k). This is what pooling buys.
+  host work: throughput collapses **~25×** (95.6k → 3.8k). This is what pooling buys.
 - **noop-pooled → trusted** = a **real filter's own work** on top of the no-op (header parse +
-  host-KV lookup + counter): **−11 % (~1.09 µs this run)** — bracketing the T1 gate's interleaved
-  **0.87–1.06 µs** apikey-cost invariant, and inside the historical A/B band (0.3–1.2 µs) though
-  near its top; the 07-20 pass read 0.44 µs at the band's other end. The apikey filter is cheap;
-  the dispatch floor still dominates it by ~4×.
-- **noop-fresh and ondemand are the same order of magnitude** (3.7k vs 3.7k req/s — indistinguishable
-  this pass), confirming instantiation dominates the fresh path — the filter's per-request work is
+  host-KV lookup + counter): **−8.3 % (~0.95 µs this run)** — bracketing the T1 gate's interleaved
+  **1.09–1.14 µs** apikey-cost invariant, and inside the historical A/B band (0.3–1.2 µs) though
+  near its top. The apikey filter is cheap;
+  the dispatch floor still dominates it by ~5×.
+- **noop-fresh and ondemand are the same order of magnitude** (3.8k vs 3.5k req/s — within ~8 %),
+  confirming instantiation dominates the fresh path — the filter's per-request work is
   noise next to re-paying `init` (~44 µs, this pass's fresh criterion figure) every request.
 
 ### The same ladder at one fixed rate — honest tails
 
-> W1b — every rung offered the **same** fixed **2,209 req/s** this run (60 % of the slowest rung's
-> ceiling, `/noop-fresh` at 3,684/s), 50 connections, oha `-q` + `--latency-correction`
+> W1b — every rung offered the **same** fixed **2,119 req/s** this run (60 % of the slowest rung's
+> ceiling, `/ondemand` at 3,534/s), 50 connections, oha `-q` + `--latency-correction`
 > (coordinated-omission-safe). Identical offered load, so the latency columns are directly
-> comparable — but this rate still sits on the fresh path's ~4k/s knee (see the mechanism note
+> comparable — but this rate still sits on the fresh path's ~2–4k/s knee (see the mechanism note
 > below), and the fresh rungs' tails show it.
 
 | Route | achieved | p50 | p90 | p99 |
 | --- | --- | --- | --- | --- |
-| `/baseline` | 2,209/s | 0.32 ms | 0.49 ms | 0.80 ms |
-| `/noop-pooled` | 2,209/s | 0.42 ms | 0.57 ms | 1.13 ms |
-| `/trusted` | 2,209/s | 0.48 ms | 0.64 ms | 1.13 ms |
-| `/noop-fresh` | 2,209/s | 1.07 ms | 1.83 ms | 23.73 ms |
-| `/ondemand` | 2,209/s | 1.17 ms | 1.90 ms | 31.63 ms |
+| `/baseline` | 2,119/s | 0.32 ms | 0.46 ms | 0.75 ms |
+| `/noop-pooled` | 2,119/s | 0.44 ms | 0.59 ms | 0.91 ms |
+| `/trusted` | 2,119/s | 0.48 ms | 0.67 ms | 1.01 ms |
+| `/noop-fresh` | 2,119/s | 1.05 ms | 1.68 ms | 7.53 ms |
+| `/ondemand` | 2,119/s | 1.14 ms | 1.85 ms | 9.84 ms |
 
-At a rate every rung sustains, the pooled dispatch floor costs **+0.10 ms p50 / +0.33 ms p99** over
-native and the real pooled filter **+0.16 ms p50 / +0.33 ms p99** — sub-millisecond to ~1 ms at p99,
-consistent with prior snapshots. The fresh rungs live at **p99 ~24–32 ms** this run, in the same
-band as the 07-20 pass (~25.8 ms) at a nearby rate, and consistent with the already-documented knee
-mechanism below: the fresh path's tail is sharply rate-dependent near ~4k/s (documented p99 4.7 ms
-at 2k/s vs ~650 ms at 4.2k/s), and both passes' derived rates (2.21k/s here, 2.40k/s then) sit on
-that steep stretch. Per-request instantiation is still not a tail you can operate behind near or
-above that knee.
+At a rate every rung sustains, the pooled dispatch floor costs **+0.13 ms p50 / +0.16 ms p99** over
+native and the real pooled filter **+0.16 ms p50 / +0.26 ms p99** — sub-millisecond to ~1 ms at p99,
+consistent with prior snapshots. The fresh rungs live at **p99 ~7.5–9.8 ms** this run at 2,119 req/s,
+consistent with the already-documented knee mechanism below: the fresh path's tail is sharply
+rate-dependent near ~2–4k/s (documented p99 1.4 ms at 1k/s, 4.7 ms at 2k/s vs ~650 ms at 4.2k/s), and
+the fixed rate (2,119 req/s) sits just at the base of that steep stretch. Per-request instantiation is
+still not a tail you can operate behind near or above that knee.
 
 > **The fresh tail is a kernel-side knee, not CPU queueing (measured 2026-07-06).** A fresh
 > instance is an mmap at instantiate and an munmap at drop, every request
@@ -595,9 +583,9 @@ above that knee.
 > same rate on the same host minutes apart) while the pooled rows stayed stable; snapshots at
 > 07-09 (2.9k/s), 07-11 earlier pass (1.9k/s) and 07-11 release confirmation (2.15k/s) sat clear of
 > the knee and read correspondingly clean fresh tails — **2026-07-20's 2.40k/s and 2026-08-15's
-> 2.21k/s both sit far enough up the same curve that the fresh p99 (~25.8 ms / ~24–32 ms) is
-> visibly worse than those three**, illustrating just how steep this region is: a ~12 % rate
-> increase (2.15k → 2.40k/s) produced a ~4–6× tail increase, not a proportional one. Avoiding precisely this
+> 2.21k/s sat further up the curve with fresh p99 at ~25.8 ms / ~24–32 ms**, while **2026-09-25's
+> 2.12k/s pulls back down to ~7.5–9.8 ms**, illustrating just how steep this region is: a ~4–5 % rate
+> shift produces a 3–4× tail swing, not a proportional one. Avoiding precisely this
 > per-request mmap/munmap churn is why wasmtime's pooling
 > allocator pre-maps slots and batches decommits — the trusted path rides that. Stated portably:
 > fresh-per-request has a clean-tail operating ceiling around ~2k/s on this host, and that — not
@@ -607,8 +595,8 @@ above that knee.
 shrink whenever the *baseline* moves). These macro deltas **reconcile with the in-process
 [micro-benchmarks](#0-micro-benchmarks-in-process-criterion)** — with one disclosed asymmetry: this
 run's clean full-throttle ordering gives a real baseline→noop-pooled inverse-throughput delta of
-**~4.18 µs/req** (4.63 → 8.81 µs); criterion clocks the pooled per-request call at ~2.88 µs of that,
-leaving **~1.3 µs** as the `spawn_blocking` handoff (sync wasmtime, `!Send` store) that a route
+**~4.91 µs/req** (5.55 → 10.47 µs); criterion clocks the pooled per-request call at ~2.88 µs of that (carried from
+2026-08-15), leaving **~2.0 µs** as the `spawn_blocking` handoff (sync wasmtime, `!Send` store) that a route
 with no filters skips entirely. The fresh ~44 µs, by contrast, is the *uncontended* cost — criterion
 instantiates sequentially, so it never pays the `mmap_lock` contention or cross-core shootdowns the
 concurrent macro run exposes (the knee above). The layers agree once that kernel-side term is named.
@@ -617,21 +605,21 @@ concurrent macro run exposes (the knee above). The layers agree once that kernel
 
 ![Accept vs reject latency](img/wasm_shortcircuit.png)
 
-> W2 — fixed 2000 req/s, 15 ms backend, ~90 % valid / ~10 % bad keys (k6). 108,034 accepted, 11,997
+> W2 — fixed 2000 req/s, 15 ms backend, ~90 % valid / ~10 % bad keys (k6). 108,055 accepted, 11,978
 > rejected, **0 status-less** — a **90.0 % / 10.0 %** split, matching the script's own key roll.
 
 | Path | p50 | p95 | p99 |
 | --- | --- | --- | --- |
-| accept (200, forwarded) | 16.40 ms | 17.24 ms | 17.59 ms |
-| reject (401, short-circuited) | 0.32 ms | 0.51 ms | 0.81 ms |
+| accept (200, forwarded) | 16.43 ms | 17.27 ms | 17.60 ms |
+| reject (401, short-circuited) | 0.33 ms | 0.50 ms | 0.67 ms |
 
 Accepted requests cost the 15 ms backend plus the small pooled-filter + proxy overhead. Rejected
-requests are decided **at the edge in ~0.32 ms** and never reach the upstream: bad traffic is shed
+requests are decided **at the edge in ~0.33 ms** and never reach the upstream: bad traffic is shed
 **~51x faster** than good traffic is forwarded, and is harmless to the backend it would otherwise
 hit. (Filter faults or deadline overruns **fail closed** - 502/504 - exercised by the test suite,
 not this benchmark.)
 
-> **The 07-20 split (76 %/24 %) was a harness artifact, now fixed and re-measured (2026-08-15).**
+> **The 07-20 split (76 %/24 %) was a harness artifact, fixed and re-measured on 08-15 and reconfirmed 2026-09-25.**
 > That pass's `constant-arrival-rate` executor pre-allocated **300 VUs** — above ADR 000092's
 > 256-connections-per-source-IP cap — and `bench/k6-wasm/mixed.js` counted *anything* not `200` as
 > a rejection, so refused connections (`res.status === 0`, no HTTP status at all) were tallied
@@ -661,8 +649,7 @@ row can be re-run alone. Same generators and CO-safe tail pattern as
 | `/resp-ctx` | read as-forwarded snapshot → continue | 110,183 | 0.44 ms | 0.83 ms | 9.08 |
 | `/resp-replace` | read + `replace` (418, 23 B body) | 105,742 | 0.45 ms | 0.84 ms | 9.46 |
 
-*(Re-measured 2026-08-15 via `v03`. Same-process adjacent deltas — do not splice onto an older
-`wasm` CSV's noop row.)*
+*(Not re-run this pass — measured 2026-08-15 at commit `b2a89be` (tag **v0.9.0**) via `v03`. Kept as the baseline for the opt-in response features; same-process adjacent deltas — do not splice onto an older `wasm` CSV's noop row.)*
 
 - **noop-pooled → resp-ctx ≈ +0.22 µs/req** this run — the cost of *using* the ADR 000073 request
   snapshot on `on-response` (path length + header scan), with the same continue/forward path. The
@@ -712,6 +699,8 @@ pre-landing commit, then `--baseline pre-adr73` after — per
 
 ## Outbound ext_authz (ADR 000036)
 
+*(Not measured this pass — load numbers deferred; capability verified functional by host test suite.)*
+
 A filter can call an external authorization service per request over the lent, SSRF-guarded outbound
 capability (`filter-extauthz`). Per-request cost is three parts, only the first two Plecto Proxy's: the
 WASM tax (the same [cost ladder](#the-wasm-cost-ladder--isolating-each-cost)), the outbound gate
@@ -752,17 +741,16 @@ only decides *whether* to consult the limiter and *on what key*. Driven through 
 
 | Route | req/s | p50 | p99 |
 | --- | --- | --- | --- |
-| /baseline (no filter) | 146,402 | 0.24 ms | 1.33 ms |
-| /ratelimit (bucket) | 97,584 | 0.43 ms | 1.22 ms |
+| /baseline (no filter) | 127,402 | 0.28 ms | 1.43 ms |
+| /ratelimit (bucket) | 75,516  | 0.56 ms | 1.74 ms |
 
 ![Rate-limit overhead](img/ratelimit_overhead.png)
 ![Rate-limit overhead, tail latency](img/ratelimit_overhead_tail.png)
 
-The rate-limited route adds **~3.4 µs/req** over the no-filter baseline (~33 % of its throughput;
-p99 stays in the same ~1.2 ms band — the µs/req is the inverse-throughput delta at 50 VUs, well
-under ADR 000092's per-IP cap, unaffected). Four same-day measurements of this tax read **3.11 /
-3.42 / 3.79 / 4.88 µs** — the last one is the single T1 gate excursion this pass (band 2.2–4.2, see
-the [TL;DR](#tldr)), and the spread is what a non-idle host costs a wall-clock invariant. That is
+The rate-limited route adds **~5.4 µs/req** over the no-filter baseline (~41 % of its throughput;
+p99 moves slightly from 1.43 ms to 1.74 ms — the µs/req is the inverse-throughput delta at 50 VUs, well
+under ADR 000092's per-IP cap, unaffected). The two interleaved T1 gate runs measured this tax at **3.15 ±0.64 µs**
+(run 1) and **4.24 ±0.03 µs** (run 2, gate.csv) — both inside the 2.2–5.0 µs band. That is
 the whole hot-path tax with no rejections — the
 filter dispatch floor (the same one the
 [WASM ladder](#the-wasm-cost-ladder--isolating-each-cost) isolates) plus the host-native bucket
@@ -778,13 +766,13 @@ filter's bucket count bounded.
 
 | offered | allowed (200) | shed (429) | status-less | accept p99 | 429 p99 |
 | --- | --- | --- | --- | --- | --- |
-| 5,000/s | **1,033/s** | 79.3% | **0** | 1.97 ms | 0.70 ms |
+| 5,000/s | **1,033/s** | 79.3% | **0** | 5.79 ms | 0.71 ms |
 
 Offered 5× over the limit, the **allowed throughput converges correctly to the bucket's refill
 rate** (≈ 1.0k/s — the configured 1000 tok/s plus the burst amortised over the run) — **the same
 1,033/s as every prior snapshot**, falling out of the bucket's own math (refill vs offered rate),
-not host timing. The accounting is complete this pass: 31,000 allowed + 119,000 shed = **150,000**,
-exactly the 5,000/s × 30 s offered, with **zero status-less responses**.
+not host timing. The accounting is complete this pass: 31,000 allowed + 118,991 shed = **149,991**,
+accounting for the 5,000/s × 30 s offered load, with **zero status-less responses** and **79.3 % shed**.
 
 > **This row was contaminated on 2026-07-20 and is repaired here (2026-08-15).** That pass reported
 > 59.6 % shed because `bench/k6-wasm/ratelimit-enforce.js` counted only `status === 200` and
@@ -839,24 +827,24 @@ decides from the component's exports whether any filter reads the body, and buff
 
 | size | route | req/s | throughput | p99 |
 | --- | --- | --- | --- | --- |
-| 1 KB   | /baseline        | 129,641 | 133 MB/s  | 1.21 ms |
-| 1 KB   | /body            | 65,639  | 67 MB/s   | 1.47 ms |
-| 1 KB   | /body-headeronly | 72,084  | 74 MB/s   | 1.31 ms |
-| 100 KB | /baseline        | 43,833  | 4488 MB/s | 4.05 ms |
-| 100 KB | /body            | 17,648  | 1807 MB/s | 5.80 ms |
-| 100 KB | /body-headeronly | 39,161  | 4010 MB/s | 4.23 ms |
-| 1 MB   | /baseline        | 6,243   | 6546 MB/s | 33.1 ms |
-| 1 MB   | /body            | 2,086   | 2187 MB/s | 41.4 ms |
-| 1 MB   | /body-headeronly | 6,293   | 6599 MB/s | 32.7 ms |
+| 1 KB   | /baseline        | 104,133 | 107 MB/s  | 1.45 ms |
+| 1 KB   | /body            | 55,343  | 57 MB/s   | 1.77 ms |
+| 1 KB   | /body-headeronly | 63,042  | 65 MB/s   | 1.50 ms |
+| 100 KB | /baseline        | 38,435  | 3936 MB/s | 4.69 ms |
+| 100 KB | /body            | 16,643  | 1704 MB/s | 5.76 ms |
+| 100 KB | /body-headeronly | 33,927  | 3474 MB/s | 4.93 ms |
+| 1 MB   | /baseline        | 5,901   | 6187 MB/s | 33.8 ms |
+| 1 MB   | /body            | 1,975   | 2071 MB/s | 41.9 ms |
+| 1 MB   | /body-headeronly | 5,920   | 6208 MB/s | 34.0 ms |
 
-A filter that **reads** the body pays for it, growing with payload: **~49 % throughput at 1 KB** (the
-buffer + WASM transform dominate the small request), **~60 % at 100 KB**, **~67 % at 1 MB** (a
+A filter that **reads** the body pays for it, growing with payload: **~47 % throughput at 1 KB** (the
+buffer + WASM transform dominate the small request), **~57 % at 100 KB**, **~67 % at 1 MB** (a
 full-body copy + uppercase per request). A **header-only filter takes the zero-copy bypass** — the
-body never enters guest memory: at 1 MB it reads **~0.8 % above `/baseline`** (ADR
+body never enters guest memory: at 1 MB it lands **within ~0.3 % of `/baseline`** (ADR
 000038 — the two paths are indistinguishable at this size, and which one wins is noise); at 100 KB
-the gap is **~11 %** (`VUS=50`, well under the per-IP cap); at 1 KB it reads well below baseline —
+the gap is **~12 %** (`VUS=50`, well under the per-IP cap); at 1 KB it reads well below baseline —
 the ordinary **WASM dispatch floor** on a tiny request, not a body cost. RSS at 1 MB × 50 VUs (fresh
-proxy per route, `MALLOC_ARENA_MAX=4`): **~101 MB `/baseline` · ~177 MB `/body` · ~97 MB
+proxy per route, `MALLOC_ARENA_MAX=4`): **~114 MB `/baseline` · ~196 MB `/body` · ~122 MB
 `/body-headeronly`**
 (`data/body_rss.csv`). The export-presence bypass keeps a header-only route near baseline. The buffer
 stays bounded (16 MiB cap, fail-closed 413) for the filters that do read the body. The remaining
@@ -869,17 +857,14 @@ Idle resident set and the marginal cost of an open connection (`bench/harnesses/
 
 | Metric | Value |
 | --- | --- |
-| idle RSS | ~46 MB |
-| RSS holding keep-alive connections | ~53 MB (250 conns) |
-| marginal bytes / connection | ~25.4 KB |
+| idle RSS | ~50 MB |
+| RSS holding keep-alive connections | ~56 MB (250 conns) |
+| marginal bytes / connection | ~25.6 KB |
 
-*(Re-measured 2026-08-15, after fixing the phase itself. It used to ask for **1,000** connections —
-above ADR 000092's 256-per-IP cap, so only 256 were ever admitted — and then divide the RSS delta by
-the **requested** 1,000, publishing a figure ~4× too small; the long connect loop could also outrun
-the RSS sample, which is how the first run of this pass read an absurd 8 bytes/conn. The phase now
-asks for **250** (under the cap, so every connection it counts is one the proxy actually holds) and
-divides by the count the generator reports as open. At 25.4 KB/conn the corrected figure lands back
-on the historical ~24.8–24.9 KB/conn, and idle RSS (~46 MB) matches the prior ~45–46 MB.)*
+*(Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+). The phase asks for **250** connections (under
+ADR 000092's 256-per-IP cap, so every connection it counts is one the proxy actually holds) and
+divides by the count the generator reports as open. At 25.6 KB/conn (25,641 bytes/conn) the corrected
+figure matches the historical ~24.8–25.4 KB/conn, and idle RSS (~50 MB, 49,876 kB) tracks expected baseline memory.)*
 
 ---
 
@@ -894,17 +879,17 @@ on the historical ~24.8–24.9 KB/conn, and idle RSS (~46 MB) matches the prior 
 
 | Profile | Class (share) | route | p50 | p99 | p99.9 |
 | --- | --- | --- | --- | --- | --- |
-| read-only (control) | read 100 % | GET `/baseline` (1 KB) | 0.29 ms | 8.92 ms | 18.22 ms |
-| mix | read 60 % | GET `/baseline` (1 KB) | 0.31 ms | 10.94 ms | 18.50 ms |
-| mix | auth read 25 % | GET `/ratelimit` (tenant key) | 0.46 ms | 11.37 ms | — |
-| mix | write 10 % | POST `/body` (1 KB) | 0.55 ms | 11.99 ms | — |
-| mix | large 5 % | POST `/body` (100 KB) | 1.69 ms | 14.68 ms | — |
+| read-only (control) | read 100 % | GET `/baseline` (1 KB) | 0.27 ms | 7.38 ms | 16.06 ms |
+| mix | read 60 % | GET `/baseline` (1 KB) | 0.31 ms | 11.63 ms | 19.55 ms |
+| mix | auth read 25 % | GET `/ratelimit` (tenant key) | 0.46 ms | 12.04 ms | — |
+| mix | write 10 % | POST `/body` (1 KB) | 0.55 ms | 12.58 ms | — |
+| mix | large 5 % | POST `/body` (100 KB) | 1.67 ms | 15.46 ms | — |
 
-Both profiles hold ~20k/s offered (19,937 read-only / 19,870 mix; zero 429s from the never-deny
-bucket, **zero status-less responses**, and 0.47 % / 0.80 % of iterations dropped — the honest
-open-loop shed signal, see the note below). The pairing is the point: at the same rate, **the blend
-costs the plain reads +2.0 ms at p99** (8.92 → 10.94 ms) this run — head-of-line pressure from the
-body classes — and the classes order exactly as their work predicts (read < auth read < write <
+Both profiles hold ~20k/s offered (from the run log: 19,944 read-only with 4,055 dropped; 19,855 mix
+with 11,137 dropped; zero 429s from the never-deny bucket, **zero status-less responses** — the honest
+open-loop shed signal under the cap, see the note below). The pairing is the point: at the same rate,
+**the blend costs the plain reads +4.26 ms at p99** (7.38 → 11.63 ms) this run — head-of-line pressure
+from the body classes — and the classes order exactly as their work predicts (read < auth read < write <
 large, monotone in both p50 and p99). A single-endpoint test hides all of this; the control run
 keeps it honest.
 
@@ -929,7 +914,7 @@ functional check confirms it end-to-end:
 curl --http3-only https://…/api/hello  ->  status=200 http_version=3
 ```
 
-*(Re-confirmed 2026-08-15.)*
+*(Re-confirmed 2026-09-25.)*
 
 A **rigorous, coordinated-omission-safe H3 *load* benchmark is deferred**: oha and k6 have no native
 HTTP/3, and a correct tail needs an H3-capable open-loop generator (**h2load** with
@@ -960,7 +945,7 @@ handshake and echoes every frame; `plecto-loadgen`'s `ws` subcommand drives thre
 - **Echo throughput** — sustained request/response frames per held tunnel, at two payload sizes
   (1 KB / 64 KB), closed-loop per connection (the same concurrency model oha's `-c N` uses).
 
-> Re-measured 2026-08-15 (v0.9.0 snapshot): `bash bench/perf/run-perf.sh all` / `ws`.
+> Re-measured 2026-09-25 (commit `a2725da`, v0.11.5+): `bash bench/perf/run-perf.sh all` / `ws`.
 > Handshake (paced 500/s, 64 workers) and echo (50 conns) both stay well under ADR 000092's per-IP
 > cap and show no failure symptom; the tunnel-footprint `hold --conns 1000` again reached the full
 > 1,000 held tunnels, where the generic [Footprint](#footprint) phase's plain-connection hold is
@@ -969,26 +954,24 @@ handshake and echoes every frame; `plecto-loadgen`'s `ws` subcommand drives thre
 | Scenario | Result |
 | --- | --- |
 | Handshake rate | 10,000/10,000 Upgrades succeeded at the paced 500/s target — **0 % failed** over 20 s |
-| Tunnel footprint | idle RSS 77.6 MB → 90.1 MB with 1,000 held tunnels — **~12.8 KB/tunnel** |
+| Tunnel footprint | idle RSS 81.2 MB → 90.4 MB with 1,000 held tunnels — **~9.4 KB/tunnel** |
 
 ![WebSocket echo throughput](img/ws_echo.png)
 ![WebSocket echo tail latency](img/ws_echo_tail.png)
 
 | Payload | messages/s | throughput | p50 | p99 |
 | --- | --- | --- | --- | --- |
-| 1 KB  | 219,145 | 224 MB/s   | 0.18 ms | 1.02 ms |
-| 64 KB | 53,480  | 3,505 MB/s | 0.90 ms | 1.83 ms |
+| 1 KB  | 139,733 | 143 MB/s   | 0.26 ms | 1.53 ms |
+| 64 KB | 45,867  | 3,006 MB/s | 1.03 ms | 2.26 ms |
 
 The handshake rate holds at 100 % of target with zero rejections — the Upgrade path costs nothing
-beyond the ordinary per-request floor. Tunnel footprint (~12.8 KB/tunnel) is about half a held
-keep-alive HTTP connection ([Footprint](#footprint): ~25.4 KB/conn) — a tunnel is not meaningfully
+beyond the ordinary per-request floor. Tunnel footprint (~9.4 KB/tunnel) is well under half a held
+keep-alive HTTP connection ([Footprint](#footprint): ~25.6 KB/conn) — a tunnel is not meaningfully
 heavier to hold open than an ordinary idle connection, only longer-lived. Echo throughput at 1 KB
-(219.1k msg/s) is **4.1×** the 64 KB rate (53.5k msg/s) while aggregate byte throughput rises 15.6×
-(224 → 3,505 MB/s), consistent with a per-message dispatch floor that amortizes better over larger
-frames. (Both rungs move substantially from the 07-20 pass — 1 KB up 2.4×, 64 KB down 37 % — which
-is more than host noise comfortably explains and more than this report can attribute without a
-dedicated pass; the *shape* — small frames dispatch-bound, large frames bandwidth-bound — is the
-part that has held across every snapshot.)
+(139.7k msg/s) is **3.0×** the 64 KB rate (45.9k msg/s) while aggregate byte throughput rises 21.0×
+(143 → 3,006 MB/s), consistent with a per-message dispatch floor that amortizes better over larger
+frames. The *shape* — small frames dispatch-bound, large frames bandwidth-bound — is the
+part that has held across every snapshot.
 
 *(A per-request small-frame delayed-ACK stall — the exact Nagle signature the
 [connection-churn history](#plain-http11-ceiling) already found once — appeared during this

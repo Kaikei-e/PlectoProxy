@@ -5,6 +5,32 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-07-20 (v0.5.1/v0.5.2 patch confirmation)
+
+A full refresh: T1 `gate` (**PASS**, every invariant in band), a full `bash bench/perf/run-perf.sh
+all` (T2), and `v03` (T3). Measured at commit `c635ed3` (tag **v0.5.1**); tag **v0.5.2** landed
+on top moments later as an unintended early release — version strings and three reference-filter
+patch bumps only (`filter-cors` / `filter-apikey` / `filter-extauthz` 0.1.1 → 0.1.2), no
+`plecto-server` / `plecto-control` / `plecto-host` source changed, so every figure stands for
+v0.5.2 as shipped too. The entire load run executed inside an unprivileged network namespace
+(`unshare -rn`, `ip link set lo up`, no default route) rather than relying only on the runbook's
+own `REQUIRE_OFFLINE=1` self-check — a kernel-enforced guarantee that nothing left the host during
+the run, verified beforehand (`curl http://example.com` fails at DNS resolution inside the
+namespace, before any route is even consulted). **New finding this pass** — ADR 000092's
+per-source-IP connection cap (**256** concurrent connections/IP, landed 2026-07-15, after the
+prior 07-11 snapshot) now intersects several k6 open-loop scenarios whose `preAllocatedVUs` pool
+exceeds 256, because the generator and Plecto Proxy share one loopback source IP on this harness.
+Confirmed two ways: the closed-loop **sweep** fails cleanly above the threshold (0 % at VU ≤ 200,
+**28 % / 47 %** at VU 400/800 — reproduced identically with and without the netns sandbox, ruling
+the isolation method out as the cause), and the **rate-limit enforcement / fairness (hot key)**
+scenarios silently drop **43–49 %** of offered load from their own accepted/limited accounting (a
+refused connection returns no HTTP status, so k6's `status === 200 | 429` branches never see it).
+Affected numbers are flagged inline; every oha-driven section (ceiling, WASM ladder, TLS,
+footprint — all `-c 50`), the low-VU k6 scenarios (body, rate-limit overhead — `VUS=50`), and every
+`plecto-loadgen` scenario (open-loop, round-robin, ejection, swap, WebSocket — all ≤ 64 workers)
+stay well under the cap and are clean, comparable figures. *(The harness half of that finding is
+fixed in the 08-15 pass; the numbers it flagged have been re-measured.)*
+
 ## 2026-07-11 (v0.3.0 feature costs) — targeted `v03` pass
 
 Targeted `bash bench/perf/run-perf.sh v03` (not a full `all` refresh): fills the previously-unmeasured

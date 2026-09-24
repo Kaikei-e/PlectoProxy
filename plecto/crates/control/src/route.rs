@@ -106,7 +106,7 @@ impl CompiledRoute {
         filters: &std::collections::HashMap<String, Arc<LoadedFilter>>,
     ) -> Self {
         Self {
-            name: Arc::from(r.resolved_name()),
+            name: Arc::from(r.resolved_name().as_ref()),
             // Pre-normalise the compiled match dimensions so per-request matching is
             // allocation-free (ADR 000034): host + header names lower-cased (case-insensitive),
             // method upper-cased (exact upper-case token), query names kept as-is
@@ -542,7 +542,7 @@ pub(crate) fn validate_routes<'a>(
     upstream_names: &HashSet<&str>,
 ) -> Result<Vec<ValidatedRoute<'a>>, ControlError> {
     let mut validated = Vec::with_capacity(routes.len());
-    let mut seen_names = HashSet::with_capacity(routes.len());
+    let mut seen_names: HashSet<Cow<'a, str>> = HashSet::with_capacity(routes.len());
     for r in routes {
         // Validate route name (ADR 000112): fail closed if an explicit name is empty or
         // whitespace-only, if the resolved name matches the reserved `UNMATCHED_ROUTE` sentinel,
@@ -558,7 +558,7 @@ pub(crate) fn validate_routes<'a>(
             });
         }
         let resolved_name = r.resolved_name();
-        if resolved_name == UNMATCHED_ROUTE {
+        if resolved_name.as_ref() == UNMATCHED_ROUTE {
             return Err(ControlError::InvalidRoute {
                 path_prefix: r.matcher.path_prefix.clone(),
                 reason: format!(
@@ -566,7 +566,7 @@ pub(crate) fn validate_routes<'a>(
                 ),
             });
         }
-        if !seen_names.insert(resolved_name) {
+        if !seen_names.insert(resolved_name.clone()) {
             return Err(ControlError::InvalidRoute {
                 path_prefix: r.matcher.path_prefix.clone(),
                 reason: format!(
@@ -1653,6 +1653,56 @@ mod tests {
         let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
 
         assert!(validate_routes(&routes, &filters, &upstream_names).is_ok());
+    }
+
+    #[test]
+    fn validate_routes_accepts_unnamed_routes_with_different_hosts_on_same_prefix() {
+        // ADR 000116: two unnamed routes on `path_prefix = "/"` with different `match.host`
+        // resolve to different default names (<host><path_prefix>) and must be accepted.
+        let mut r1 = manifest_route(Some("real"), vec![], vec![], None);
+        r1.matcher.host = Some("public.example".to_string());
+        r1.matcher.path_prefix = "/".to_string();
+
+        let mut r2 = manifest_route(Some("real"), vec![], vec![], None);
+        r2.matcher.host = Some("protected.example".to_string());
+        r2.matcher.path_prefix = "/".to_string();
+
+        let routes = vec![r1, r2];
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        assert!(validate_routes(&routes, &filters, &upstream_names).is_ok());
+    }
+
+    #[test]
+    fn validate_routes_rejects_unnamed_routes_with_same_host_and_prefix_differing_only_by_method() {
+        // ADR 000116: two unnamed routes with the same host + same prefix differing only by method
+        // resolve to the same default name; uniqueness stays fail-closed, and the diagnostic
+        // must mention setting an explicit `name`.
+        let mut r1 = manifest_route(Some("real"), vec![], vec![], None);
+        r1.matcher.host = Some("api.example".to_string());
+        r1.matcher.path_prefix = "/v1".to_string();
+        r1.matcher.method = Some("GET".to_string());
+
+        let mut r2 = manifest_route(Some("real"), vec![], vec![], None);
+        r2.matcher.host = Some("api.example".to_string());
+        r2.matcher.path_prefix = "/v1".to_string();
+        r2.matcher.method = Some("POST".to_string());
+
+        let routes = vec![r1, r2];
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
+        match err {
+            ControlError::InvalidRoute { reason, .. } => {
+                assert!(
+                    reason.contains("name"),
+                    "rejection reason should mention setting an explicit name, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRoute error, got: {other:?}"),
+        }
     }
 
     #[test]

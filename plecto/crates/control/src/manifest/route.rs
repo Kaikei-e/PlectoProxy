@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// Operator-facing name for the `route` metric label and access-log field (ADR 000112).
-    /// When absent, defaults to `match.path_prefix`. Resolved names across all routes in a
+    /// When absent, defaults to `<host lower-cased><path_prefix>` when `match.host` is declared,
+    /// else `match.path_prefix` (ADR 000116). Resolved names across all routes in a
     /// manifest must be unique; `"unmatched"` is reserved for requests matching no route.
     #[serde(default)]
     pub name: Option<String>,
@@ -366,10 +367,11 @@ fn default_weight() -> u32 {
 pub(crate) const MAX_BACKEND_WEIGHT: u32 = 1_000_000;
 
 impl Route {
-    /// The resolved operator-facing route name (ADR 000112): returns the explicit `name` if set,
-    /// otherwise falls back to `match.path_prefix`.
-    pub fn resolved_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.matcher.path_prefix)
+    /// The resolved operator-facing route name (ADR 000112, amended by ADR 000116): returns the
+    /// explicit `name` if set, otherwise `<host lower-cased><path_prefix>` when `match.host` is
+    /// declared, else `match.path_prefix` (ADR 000116).
+    pub fn resolved_name(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.name.as_deref().unwrap_or(&self.matcher.path_prefix))
     }
 
     /// This route's forwarding targets as `(upstream_name, weight)` pairs (ADR 000034): the single
@@ -682,5 +684,51 @@ path_prefix = "/api/v1"
         )
         .unwrap();
         assert_eq!(default.routes[0].resolved_name(), "/api/v1");
+    }
+
+    #[test]
+    fn resolved_name_defaults_to_lower_cased_host_plus_path_prefix_when_host_set() {
+        // ADR 000116: when `name` is absent and `match.host` is declared, default to
+        // `<host lower-cased><path_prefix>`.
+        let host_root = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+host = "Public.Example"
+path_prefix = "/"
+"#,
+        )
+        .unwrap();
+        assert_eq!(host_root.routes[0].resolved_name(), "public.example/");
+
+        let host_prefix = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+host = "api.example"
+path_prefix = "/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(host_prefix.routes[0].resolved_name(), "api.example/v1");
+
+        // Explicit name still wins over host
+        let explicit_with_host = Manifest::from_toml(
+            r#"
+[[route]]
+name = "my-named-route"
+upstream = "a"
+[route.match]
+host = "api.example"
+path_prefix = "/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_with_host.routes[0].resolved_name(),
+            "my-named-route"
+        );
     }
 }

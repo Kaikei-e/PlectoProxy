@@ -104,6 +104,45 @@ async fn wait_admin(client: &Client<HttpConnector, Empty<Bytes>>, admin: SocketA
     panic!("admin endpoint never came up within the window");
 }
 
+async fn get_with_host(
+    client: &Client<HttpConnector, Empty<Bytes>>,
+    addr: SocketAddr,
+    path: &str,
+    host: &str,
+) -> (StatusCode, String) {
+    let resp = client
+        .request(
+            Request::builder()
+                .method("GET")
+                .uri(format!("http://{addr}{path}"))
+                .header("Host", host)
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .expect("request");
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    (parts.status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Poll a forwarding path until the upstream's first health probe passes with a given Host header.
+async fn wait_ready_with_host(
+    client: &Client<HttpConnector, Empty<Bytes>>,
+    proxy: SocketAddr,
+    path: &str,
+    host: &str,
+) {
+    for _ in 0..150 {
+        let (status, _) = get_with_host(client, proxy, path, host).await;
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("upstream never became healthy within the readiness window");
+}
+
 #[tokio::test]
 async fn metrics_expose_per_route_labels_and_unmatched_route_series() {
     let upstream = spawn_upstream().await;
@@ -309,5 +348,90 @@ path_prefix = "/new"
     assert_eq!(
         old_val_after, old_val,
         "dropped route series value must stay frozen across reload"
+    );
+}
+
+#[tokio::test]
+async fn host_split_routes_default_to_host_plus_prefix_names() {
+    let upstream = spawn_upstream().await;
+    let admin = free_addr().await;
+
+    let toml = format!(
+        r#"
+[observability]
+admin_addr = "{admin}"
+
+[[upstream]]
+name = "echo"
+addresses = ["{upstream}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+upstream = "echo"
+[route.match]
+host = "public.example"
+path_prefix = "/"
+
+[[route]]
+upstream = "echo"
+[route.match]
+host = "protected.example"
+path_prefix = "/"
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let control = Arc::new(Control::from_manifest(&manifest, std::path::Path::new(".")).unwrap());
+
+    let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let data_addr = data_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve(control, data_listener).await;
+    });
+
+    let client = client();
+    wait_ready_with_host(&client, data_addr, "/", "public.example").await;
+
+    let (s_pub, _) = get_with_host(&client, data_addr, "/", "public.example").await;
+    assert_eq!(s_pub, StatusCode::OK);
+    let (s_prot, _) = get_with_host(&client, data_addr, "/", "protected.example").await;
+    assert_eq!(s_prot, StatusCode::OK);
+
+    wait_admin(&client, admin).await;
+
+    let (mstatus, metrics) = get(&client, admin, "/metrics").await;
+    assert_eq!(mstatus, StatusCode::OK);
+
+    let pub_2xx = metrics
+        .lines()
+        .find(|l| {
+            l.starts_with("plecto_requests_total{route=\"public.example/\",status_class=\"2xx\"}")
+        })
+        .expect(
+            "plecto_requests_total{route=\"public.example/\",status_class=\"2xx\"} series present",
+        );
+    let pub_2xx_val: u64 = pub_2xx
+        .rsplit(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("counter line ends in a number");
+    assert!(
+        pub_2xx_val >= 1,
+        "public.example/ 2xx count >= 1, got {pub_2xx_val}"
+    );
+
+    let prot_2xx = metrics
+        .lines()
+        .find(|l| l.starts_with("plecto_requests_total{route=\"protected.example/\",status_class=\"2xx\"}"))
+        .expect("plecto_requests_total{route=\"protected.example/\",status_class=\"2xx\"} series present");
+    let prot_2xx_val: u64 = prot_2xx
+        .rsplit(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("counter line ends in a number");
+    assert!(
+        prot_2xx_val >= 1,
+        "protected.example/ 2xx count >= 1, got {prot_2xx_val}"
     );
 }

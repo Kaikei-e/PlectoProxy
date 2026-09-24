@@ -148,6 +148,7 @@ weight = 10
 # The tester route: `x-canary: always` goes straight to v2. A header match makes this route more
 # specific than the split above (same prefix), so it wins whenever the header is present.
 [[route]]
+name = "tester"
 upstream = "checkout-v2"
 [route.match]
 path_prefix = "/"

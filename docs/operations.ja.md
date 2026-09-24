@@ -116,6 +116,33 @@ admin `/metrics` は RED シグナルに加えて次を出す:
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — トンネルが中継した
   バイト数（down = upstream → client、up = client → upstream）。各トンネルの close 時に加算。
 
+## route 別リクエストメトリクス
+
+2 つのリクエスト系メトリクス系列に `route` ラベルが付与される（[ADR 000112](ADR/000112.md)）:
+
+- `plecto_requests_total{route="<name>",status_class="<1xx..5xx>"}` — 解決された route 名と HTTP ステータスクラス別のリクエスト完了カウンタ（以前は `status_class` のみ）。
+- `plecto_rate_limited_total{route="<name>"}` — native token-bucket レートリミッタにより拒否されたリクエストの route 別カウンタ（以前はラベルなし）。
+
+`plecto_request_duration_seconds` は**変更なし**で `route` ラベルを持たない。classic ヒストグラムに route ラベルを付与すると `routes × (buckets + 2)` 系列が必要になり、カウンタに比べて約一桁上のコストがかかるため、per-route のレイテンシ内訳は具体的な運用要求が立つまで先送りされている。
+
+どの宣言 route にもマッチしなかったリクエスト（no-route の **404**、ingress で拒否された authority や path の **400**、ルーティング前の過負荷 **503**）は、固定センチネル `route="unmatched"` として計上される。これにより `plecto_requests_total` の合計値はリクエスト総数と一致し続ける。`plecto_rate_limited_total` は matched route にのみ適用されるため、`unmatched` に対して**決して出力されない**。センチネル値は常に固定文字列 `"unmatched"` であり、リクエスト由来の生 path や Host ヘッダがメトリクスラベルに入ることは決してない。
+
+宣言された全 route の系列は、スクレイプ時に現行マニフェストから `0` で事前登録される（存在しない系列による PromQL の欠落系列問題を防止）。`SIGHUP` reload で route が削除された場合、そのメトリクス系列はスクレイプ露出に残り、最後の値のまま**凍結**される（プロセス再起動まで）。これにより、Prometheus の `rate()` や `increase()` が route 削除をカウンタのリセットやデータ欠落と誤認することを防ぐ。
+
+### 系列予算（Series budget）
+
+`plecto_requests_total` は、メトリクス系列のカーディナリティを 10 未満に保つという Prometheus の一般的な経験則を意図的に超過する（[ADR 000112](ADR/000112.md) 決定 6）。このカーディナリティはマニフェストの宣言によって厳密に有界であり、リクエストトラフィックによって無制限に増加することはない。
+
+系列予算の計算式:
+
+`(プロセス起動以降に宣言された route 数 + 1) × 5`（`plecto_requests_total` 用）＋ プロセス起動以降に登録された route 名ごとに 1 系列（`plecto_rate_limited_total` 用）
+
+例えば、20 ルートの構成では:
+
+`(20 + 1) × 5 = 105` 系列（`plecto_requests_total`）＋ `20` 系列（`plecto_rate_limited_total`）＝ **125 系列**
+
+reload で追加された route はこの予算を増やし、削除された route はプロセス再起動まで凍結系列として残る。
+
 ## アクセスログ: フィールド契約
 
 アクセスログは opt-in で、既定では**無効**。`[observability] access_log` で有効にする
@@ -132,7 +159,7 @@ access_log = true
 オブジェクトを展開せずに、そのまま型付きスロットへ写せる。
 
 ```json
-{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
+{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","route":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
 ```
 
 > **平坦化前のリリースからの移行:** 同じフィールドはかつて `fields` オブジェクトの中にあった
@@ -146,6 +173,7 @@ access_log = true
 | `method` | string | 受信したままのリクエストメソッド。 |
 | `authority` | string | リクエストの host authority。 |
 | `path` | string | リクエストパス。**クエリ文字列は落とす**。 |
+| `route` | string | 解決された route 名（`name` が設定されていればその値、未設定なら `match.path_prefix`）、またはどの route にもマッチしなかったリクエスト（no-route 404、拒否された authority/path 400、過負荷 503）の場合は `unmatched`（[ADR 000112](ADR/000112.md)）。メトリクスの `route` ラベルと常に一致する。 |
 | `status` | number | クライアントへ返したステータス。プロキシが応答できなかった転送エラーは `502` として記録する。 |
 | `duration_ms` | number | トランザクション開始から応答ヘッダまでのミリ秒（整数）。 |
 | `trace_id` | string | W3C trace id（小文字 hex 32 桁）。呼び出し元が `traceparent` を送っていればその値、なければ Plecto が採番した値。 |
@@ -183,6 +211,32 @@ access_log = true
 [observability]
 otlp_endpoint = "http://127.0.0.1:4318"  # ローカル collector が以降の TLS を張る
 ```
+
+## route の命名: `name` キー
+
+各 `[[route]]` は、ログやメトリクスで識別するための任意の `name` 文字列を宣言できる（[ADR 000112](ADR/000112.md)）:
+
+```toml
+[[route]]
+upstream = "app"
+[route.match]
+path_prefix = "/api/items"
+method = "GET"
+
+[[route]]
+name = "items-write"
+upstream = "app"
+[route.match]
+path_prefix = "/api/items"
+method = "POST"
+```
+
+- **既定値**: `name` を省略した場合、解決後の名前は `match.path_prefix` の値になる（上の `GET` route なら `"/api/items"`）。`path_prefix` は全 route で必須のため、既定値は常に定まる。
+- **一意性の強制（fail-closed）**: 解決後の route 名はマニフェスト全体で一意でなければならない。同一の `path_prefix` を共有する route（HTTP メソッド・ヘッダ・クエリパラメータで分岐したもの）で両方を無名のままにすると名前が衝突する。解決後の名前が衝突するマニフェストは `plecto validate`・起動・`SIGHUP` reload で fail-closed に拒否される。運用者は少なくとも一方に明示的な `name` を設定して曖昧さを解消しなければならない。
+- **空文字および空白のみの名前は拒否**: `name` に空文字や空白のみの文字列を指定することはできない（Prometheus データモデルにおいて空ラベル値はラベル不在と同値であり、系列の一貫性を損なうため）。
+- **`unmatched` は予約語**: `name = "unmatched"` の宣言は fail-closed で拒否され、route 外で応答されたリクエスト用のセンチネルとして予約されている。
+
+解決された route 名はアクセスログ（`route` フィールド）およびメトリクス系列（`plecto_requests_total` と `plecto_rate_limited_total` の `route` ラベル）に出力され、マニフェストの並び替えでダッシュボードが壊れることなく、ログ行やメトリクス系列を設定宣言と直接結びつける。
 
 ## 宣言したレスポンスヘッダ: どの応答に乗るか
 

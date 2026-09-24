@@ -329,9 +329,16 @@ impl Control {
     }
 
     /// The resolved names of the active configuration's routes in manifest order (ADR 000112).
-    /// Used to pre-register the `route` metric label series at startup and reload.
+    /// Read at scrape time by the admin `/metrics` handler to register the route series
+    /// (not at startup/reload), which is observationally equivalent to pre-registration because
+    /// every scrape registers before rendering.
     pub fn route_names(&self) -> Vec<Arc<str>> {
-        Vec::new()
+        self.active
+            .load()
+            .routes
+            .iter()
+            .map(|r| r.name.clone())
+            .collect()
     }
 }
 

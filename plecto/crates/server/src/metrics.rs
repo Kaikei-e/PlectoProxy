@@ -6,10 +6,12 @@
 //! data plane and the extension plane. Recording is lock-free and cheap enough to run on every
 //! request unconditionally; rendering is a cold path (an admin scrape).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use plecto_control::{MetricsSnapshot, UpstreamGroup};
 
 /// Upper bounds (seconds) of the request-latency histogram buckets. Prometheus convention: each
@@ -35,9 +37,9 @@ fn instance_state(healthy: bool, ejected: bool) -> usize {
     }
 }
 
-/// Escape a label value per the Prometheus text exposition format. Upstream names come from the
-/// manifest and are the only dynamic label value in this exposition; an unescaped quote in one
-/// would corrupt the whole scrape, not just its own series.
+/// Escape a label value per the Prometheus text exposition format. Upstream names and route names
+/// come from the manifest and are dynamic label values in this exposition; an unescaped quote or
+/// backslash in one would corrupt the whole scrape, not just its own series (ADR 000099 / 000112).
 fn escape_label_value(value: &str) -> String {
     if !value.contains(['\\', '"', '\n']) {
         return value.to_string();
@@ -87,21 +89,36 @@ impl Histogram {
     }
 }
 
-/// The fast path's native request metrics (Stage A, ADR 000009). Counters are monotonic; the gauge
-/// tracks in-flight requests. One instance lives on `ServerState`, shared across all transports.
-pub(crate) struct ServerMetrics {
-    /// Requests completed, indexed by response status class: `[1xx, 2xx, 3xx, 4xx, 5xx]`.
+/// Per-route counters for the RED request-rate and rate-limiting metrics (ADR 000112).
+struct RouteCounters {
+    /// Requests completed on this route, indexed by response status class: `[1xx, 2xx, 3xx, 4xx, 5xx]`.
     status_class: [AtomicU64; 5],
+    /// Requests on this route rejected by a native route rate limit (ADR 000033).
+    rate_limited: AtomicU64,
+}
+
+impl RouteCounters {
+    fn new() -> Self {
+        Self {
+            status_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            rate_limited: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The fast path's native request metrics (Stage A, ADR 000009 / ADR 000112). Counters are monotonic;
+/// the gauge tracks in-flight requests. Per-route counters (`routes`) are keyed by route name
+/// using a lock-free ArcSwap registry. One instance lives on `ServerState`, shared across all transports.
+pub(crate) struct ServerMetrics {
+    /// Per-route request and rate-limit counters (ADR 000112). A lock-free registry mapping
+    /// route names to their per-route atomic counters, sorted for deterministic exposition.
+    routes: ArcSwap<BTreeMap<Arc<str>, Arc<RouteCounters>>>,
     /// Requests currently being served (incremented at entry, decremented at exit).
     in_flight: AtomicI64,
     /// Upstream retries onto another instance (ADR 000023).
     retries: AtomicU64,
     /// Requests shed by an upstream circuit breaker (ADR 000028) — a fast-fail 503 at the cap.
     circuit_open: AtomicU64,
-    /// Requests rejected by a native route rate limit (ADR 000033) — a fast-fail 429 at the front
-    /// door. Distinct from `circuit_open` (503, upstream saturated): this is the client over its
-    /// inbound rate floor, before the chain or any forward.
-    rate_limited: AtomicU64,
     /// Instances ejected from rotation by outlier detection (ADR 000032).
     outlier_ejections: AtomicU64,
     /// Upgrade tunnels currently open (ADR 000059). A separate gauge from `in_flight`: a tunnel
@@ -188,18 +205,50 @@ impl Drop for TunnelActive {
 
 impl ServerMetrics {
     pub(crate) fn new() -> Self {
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            Arc::from(plecto_control::UNMATCHED_ROUTE),
+            Arc::new(RouteCounters::new()),
+        );
         Self {
-            status_class: std::array::from_fn(|_| AtomicU64::new(0)),
+            routes: ArcSwap::from_pointee(routes),
             in_flight: AtomicI64::new(0),
             retries: AtomicU64::new(0),
             circuit_open: AtomicU64::new(0),
-            rate_limited: AtomicU64::new(0),
             outlier_ejections: AtomicU64::new(0),
             tunnels_active: AtomicI64::new(0),
             tunnel_bytes_down: AtomicU64::new(0),
             tunnel_bytes_up: AtomicU64::new(0),
             inspection_skipped: std::array::from_fn(|_| AtomicU64::new(0)),
             duration: Histogram::new(),
+        }
+    }
+
+    /// Lazily insert a route counters entry via RCU on lookup miss (ADR 000112).
+    fn insert_route_lazy(&self, route: &str) -> Arc<RouteCounters> {
+        self.routes.rcu(|current| {
+            if current.contains_key(route) {
+                return Arc::clone(current);
+            }
+            let mut map = (**current).clone();
+            map.insert(Arc::from(route), Arc::new(RouteCounters::new()));
+            Arc::new(map)
+        });
+        self.routes
+            .load()
+            .get(route)
+            .cloned()
+            // Unreachable in practice since routes are never removed, but kept total to avoid panicking on the data plane.
+            .unwrap_or_else(|| Arc::new(RouteCounters::new()))
+    }
+
+    fn counters(&self, route: &str) -> Arc<RouteCounters> {
+        let routes = self.routes.load();
+        if let Some(counters) = routes.get(route) {
+            counters.clone()
+        } else {
+            drop(routes);
+            self.insert_route_lazy(route)
         }
     }
 
@@ -233,24 +282,58 @@ impl ServerMetrics {
         self.circuit_open.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn inc_rate_limited(&self, _route: &str) {
-        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    /// Record one request rejected by a native route rate limit (ADR 000033 / 000112).
+    pub(crate) fn inc_rate_limited(&self, route: &str) {
+        self.counters(route)
+            .rate_limited
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Pre-register route names for the `route` metric label (ADR 000112).
-    /// Stubs out behavior for RED phase; routes are registered before render.
-    pub(crate) fn register_routes(&self, _names: &[Arc<str>]) {}
+    ///
+    /// Inserts any missing name with zeroed counters (rcu); never removes existing
+    /// routes so series of dropped routes stay frozen for the process lifetime (decision 5).
+    pub(crate) fn register_routes(&self, names: &[Arc<str>]) {
+        let current = self.routes.load();
+        let any_missing = names
+            .iter()
+            .any(|name| !current.contains_key(name.as_ref()));
+        if !any_missing {
+            return;
+        }
+        drop(current);
+
+        self.routes.rcu(|current| {
+            let mut missing = Vec::new();
+            for name in names {
+                if !current.contains_key(name.as_ref()) {
+                    missing.push(name.clone());
+                }
+            }
+            if missing.is_empty() {
+                return Arc::clone(current);
+            }
+            let mut map = (**current).clone();
+            for name in missing {
+                map.entry(name)
+                    .or_insert_with(|| Arc::new(RouteCounters::new()));
+            }
+            Arc::new(map)
+        });
+    }
 
     pub(crate) fn inc_outlier_ejection(&self) {
         self.outlier_ejections.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one completed request: tally its status class and observe its total duration. The
-    /// class index is clamped into `[1,5]` then offset, and the read is bounds-checked, so an
-    /// out-of-range status (a hostile filter could synthesise any `u16`) never panics.
-    pub(crate) fn record_request(&self, _route: &str, status: u16, elapsed: Duration) {
+    /// Record one completed request: tally its status class for the given route and observe its
+    /// total duration (ADR 000112). The class index is clamped into `[1,5]` then offset, and the read is
+    /// bounds-checked, so an out-of-range status (a hostile filter could synthesise any `u16`)
+    /// never panics. A route not yet registered is lazily inserted via RCU.
+    pub(crate) fn record_request(&self, route: &str, status: u16, elapsed: Duration) {
         let idx = (status / 100).clamp(1, 5) as usize - 1;
-        if let Some(slot) = self.status_class.get(idx) {
+        let counters = self.counters(route);
+        if let Some(slot) = counters.status_class.get(idx) {
             slot.fetch_add(1, Ordering::Relaxed);
         }
         self.duration.observe(elapsed.as_secs_f64());
@@ -271,16 +354,21 @@ impl ServerMetrics {
         const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
         let mut out: Vec<String> = Vec::new();
 
+        let routes = self.routes.load();
+
         out.push(
-            "# HELP plecto_requests_total Total client requests handled, by response status class."
+            "# HELP plecto_requests_total Total client requests handled, by route and response status class."
                 .to_string(),
         );
         out.push("# TYPE plecto_requests_total counter".to_string());
-        for (class, slot) in CLASSES.iter().zip(self.status_class.iter()) {
-            out.push(format!(
-                "plecto_requests_total{{status_class=\"{class}\"}} {}",
-                slot.load(Ordering::Relaxed)
-            ));
+        for (route, counters) in routes.iter() {
+            let escaped_route = escape_label_value(route);
+            for (class, slot) in CLASSES.iter().zip(counters.status_class.iter()) {
+                out.push(format!(
+                    "plecto_requests_total{{route=\"{escaped_route}\",status_class=\"{class}\"}} {}",
+                    slot.load(Ordering::Relaxed)
+                ));
+            }
         }
 
         out.push("# HELP plecto_requests_in_flight Requests currently being served.".to_string());
@@ -328,14 +416,20 @@ impl ServerMetrics {
         ));
 
         out.push(
-            "# HELP plecto_rate_limited_total Requests rejected by a native route rate limit (ADR 000033)."
+            "# HELP plecto_rate_limited_total Requests rejected by a native route rate limit, by route (ADR 000033 / 000112)."
                 .to_string(),
         );
         out.push("# TYPE plecto_rate_limited_total counter".to_string());
-        out.push(format!(
-            "plecto_rate_limited_total {}",
-            self.rate_limited.load(Ordering::Relaxed)
-        ));
+        for (route, counters) in routes.iter() {
+            if route.as_ref() == plecto_control::UNMATCHED_ROUTE {
+                continue;
+            }
+            let escaped_route = escape_label_value(route);
+            out.push(format!(
+                "plecto_rate_limited_total{{route=\"{escaped_route}\"}} {}",
+                counters.rate_limited.load(Ordering::Relaxed)
+            ));
+        }
 
         out.push(
             "# HELP plecto_outlier_ejections_total Instances ejected from rotation by outlier detection (ADR 000032)."

@@ -369,7 +369,7 @@ impl Route {
     /// The resolved operator-facing route name (ADR 000112): returns the explicit `name` if set,
     /// otherwise falls back to `match.path_prefix`.
     pub fn resolved_name(&self) -> &str {
-        todo!()
+        self.name.as_deref().unwrap_or(&self.matcher.path_prefix)
     }
 
     /// This route's forwarding targets as `(upstream_name, weight)` pairs (ADR 000034): the single

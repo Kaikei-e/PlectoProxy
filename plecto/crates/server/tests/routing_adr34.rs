@@ -130,6 +130,7 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
+name = "writes"
 upstream = "writes"
 [route.match]
 path_prefix = "/"
@@ -178,6 +179,7 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
+name = "v2"
 upstream = "v2"
 [route.match]
 path_prefix = "/"
@@ -227,6 +229,7 @@ path = "/healthz"
 interval_ms = 50
 
 [[route]]
+name = "beta"
 upstream = "beta"
 [route.match]
 path_prefix = "/"

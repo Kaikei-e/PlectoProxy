@@ -101,6 +101,8 @@ async fn admin_handle(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let (status, content_type, body) = match req.uri().path() {
         "/metrics" => {
+            // Register the active manifest's routes at scrape time so every declared route series
+            // exists at 0 (ADR 000112 decision 5).
             state.metrics.register_routes(&state.control.route_names());
             (
                 StatusCode::OK,

@@ -120,6 +120,47 @@ The admin `/metrics` endpoint exposes, alongside the RED signals:
   downstream (upstream → client) and upstream (client → upstream) by tunnels, recorded as
   each tunnel closes.
 
+## Per-route request metrics
+
+Two RED metric families carry a `route` label ([ADR 000112](ADR/000112.md)):
+
+- `plecto_requests_total{route="<name>",status_class="<1xx..5xx>"}` — counts completed requests by resolved
+  route name and HTTP status class (previously labeled only with `status_class`).
+- `plecto_rate_limited_total{route="<name>"}` — counts requests rejected by the native token-bucket rate limiter,
+  labeled by route (previously unlabelled).
+
+`plecto_request_duration_seconds` is **unchanged** and carries no `route` label. Classic histograms require
+`routes × (buckets + 2)` series (about an order of magnitude more than counters); per-route duration histograms
+are deferred until concrete demand warrants the cardinality cost.
+
+Requests that no route answered — a no-route **404**, an ingress-rejected authority or path **400**, or an overload
+**503** before a route is selected — count under the fixed sentinel `route="unmatched"`. This keeps the sum of
+`plecto_requests_total` equal to the total request count. `plecto_rate_limited_total` is **never emitted** for
+`unmatched` (rate limits attach only to declared routes). The sentinel value is always the literal string
+`"unmatched"`; raw request paths or host headers are never placed into metric labels.
+
+Every declared route's series exist at `0` upon scrape (registered at scrape time from the active manifest, avoiding
+missing-series PromQL issues). When a route is removed during a `SIGHUP` reload, its existing metric series remain in
+exposition, **frozen** at their last counter value, until the process restarts. This ensures Prometheus `rate()` and
+`increase()` do not mistake route removal for a counter reset or missing data.
+
+### Series budget
+
+`plecto_requests_total` deliberately exceeds Prometheus's usual rule of thumb of keeping metric cardinality below
+10 series per family ([ADR 000112](ADR/000112.md), Decision 6). The series count is strictly bounded by the
+manifest — it is declared by the operator and cannot grow from request traffic.
+
+The series budget is:
+
+`(declared routes since process start + 1) × 5` for `plecto_requests_total`, plus one `plecto_rate_limited_total`
+series per route name registered since process start.
+
+For example, a configuration with 20 routes produces:
+
+`(20 + 1) × 5 = 105` `plecto_requests_total` series + `20` `plecto_rate_limited_total` series = **125 series**.
+
+Routes added across reloads expand this budget, while removed routes retain their frozen series until process restart.
+
 ## The access log: field contract
 
 The access log is opt-in and **off by default**. Turn it on with `[observability] access_log`
@@ -136,7 +177,7 @@ beside `timestamp` / `level` / `target` — an ingestion layer can map them stra
 slots without unwrapping a nested object first.
 
 ```json
-{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
+{"timestamp":"...","level":"INFO","client":"203.0.113.7","scheme":"https","method":"GET","authority":"api.example.com","path":"/v1/items","route":"/v1/items","status":200,"duration_ms":12,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","message":"access","target":"plecto::access"}
 ```
 
 > **Migrating from a release before this line was flattened:** the same fields used to sit inside
@@ -150,6 +191,7 @@ slots without unwrapping a nested object first.
 | `method` | string | The request method as received. |
 | `authority` | string | The request's host authority. |
 | `path` | string | The request path **without its query string**. |
+| `route` | string | The resolved route name (the explicit `name` if declared, otherwise `match.path_prefix`), or `unmatched` if no route answered the request (no-route 404, rejected authority/path 400, overload 503) ([ADR 000112](ADR/000112.md)). Matches the `route` metric label. |
 | `status` | number | The status Plecto returned to the client. A transport error the proxy could not answer is recorded as `502`. |
 | `duration_ms` | number | Whole milliseconds from the start of the transaction to the response head. |
 | `trace_id` | string | W3C trace id (32 lowercase hex chars) — the caller's, when it sent a `traceparent`, otherwise one Plecto minted. |
@@ -188,6 +230,42 @@ OpenTelemetry Collector beside the proxy (the agent pattern), point `otlp_endpoi
 [observability]
 otlp_endpoint = "http://127.0.0.1:4318"  # the local collector originates TLS onward
 ```
+
+## Naming a route: the `name` key
+
+Every `[[route]]` entry can declare an optional `name` string to identify it in logs and metrics
+([ADR 000112](ADR/000112.md)):
+
+```toml
+[[route]]
+upstream = "app"
+[route.match]
+path_prefix = "/api/items"
+method = "GET"
+
+[[route]]
+name = "items-write"
+upstream = "app"
+[route.match]
+path_prefix = "/api/items"
+method = "POST"
+```
+
+- **Default value**: if `name` is omitted, the resolved name defaults to the route's `match.path_prefix`
+  (for example, `"/api/items"` on the `GET` route above). Because `path_prefix` is mandatory on every route,
+  a default is always available.
+- **Uniqueness is enforced fail-closed**: resolved route names must be unique across the entire manifest.
+  When two routes share a `path_prefix` (such as routes split by HTTP method, headers, or query parameters),
+  leaving both unnamed causes a collision. Manifests with colliding resolved names fail `plecto validate`,
+  startup, and `SIGHUP` reload fail-closed; the operator must assign an explicit `name` to disambiguate.
+- **Empty and whitespace-only names are rejected**: a route name cannot be empty or consist only of whitespace
+  (Prometheus treats empty label values as absent labels, which would violate metric family consistency).
+- **`unmatched` is reserved**: declaring `name = "unmatched"` is rejected fail-closed, preserving that name
+  for requests answered outside any route.
+
+The resolved route name appears in the access log (`route` field) and in metric series (`route` label on
+`plecto_requests_total` and `plecto_rate_limited_total`), linking log lines and metric series directly to
+the manifest declaration without dashboard drift when routes are reordered.
 
 ## Declared response headers: which responses they land on
 

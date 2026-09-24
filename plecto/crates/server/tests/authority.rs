@@ -51,12 +51,14 @@ path = "/healthz"
 interval_ms = 10
 
 [[route]]
+name = "public"
 upstream = "origin"
 [route.match]
 host = "public.example"
 path_prefix = "/"
 
 [[route]]
+name = "protected"
 upstream = "origin"
 [route.match]
 host = "protected.example"

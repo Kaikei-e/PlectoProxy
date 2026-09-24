@@ -38,6 +38,14 @@ use crate::respond::{
 };
 use crate::{ReqBody, ResponseBody, ServerState, access_log};
 
+/// What the transaction core reports back to `proxy_core` for the RED tally and the access log —
+/// the chosen route (ADR 000112) and why a response body escaped inspection (ADR 000098).
+#[derive(Default)]
+struct Attribution {
+    route: Option<Arc<str>>,
+    inspection_skipped: Option<InspectionSkip>,
+}
+
 /// The transport-agnostic transaction core (Stage A observability wrapper, ADR 000009). Every
 /// transport funnels through here, so it is the one place to tally per-request metrics and emit the
 /// access log: it times `proxy_core_inner`, records the RED signals, and — when enabled — logs the
@@ -136,10 +144,9 @@ pub(crate) async fn proxy_core(
         )
     });
 
-    // Why this transaction's response body escaped the route's `on-response-body` filters, if it
-    // did (ADR 000098). The metric is tallied where the decision is made; this carries the reason
-    // out to the access log, so a skip is attributable to a request and not only to a counter.
-    let mut inspection_skipped: Option<InspectionSkip> = None;
+    // What the transaction core reports back to `proxy_core` for the RED tally and the access
+    // log — the chosen route (ADR 000112) and why a response body escaped inspection (ADR 000098).
+    let mut attribution = Attribution::default();
     let result = if authority_valid {
         proxy_core_inner(
             state.clone(),
@@ -147,7 +154,7 @@ pub(crate) async fn proxy_core(
             client,
             trace,
             hyper::Request::from_parts(parts, body),
-            &mut inspection_skipped,
+            &mut attribution,
             admission.clone(),
         )
         .await
@@ -166,20 +173,19 @@ pub(crate) async fn proxy_core(
         Err(_) => StatusCode::BAD_GATEWAY.as_u16(),
     };
     let elapsed = start.elapsed();
-    state
-        .metrics
-        .record_request(plecto_control::UNMATCHED_ROUTE, status, elapsed);
+    let route_name = attribution
+        .route
+        .as_deref()
+        .unwrap_or(plecto_control::UNMATCHED_ROUTE);
+    state.metrics.record_request(route_name, status, elapsed);
     if let Some(access) = access {
-        access_log::record(
-            plecto_control::UNMATCHED_ROUTE,
-            scheme,
-            client,
-            &access,
+        let outcome = access_log::Outcome {
+            route: route_name,
             status,
             elapsed,
-            &trace,
-            inspection_skipped.map(InspectionSkip::as_str),
-        );
+            inspection_skipped: attribution.inspection_skipped.map(InspectionSkip::as_str),
+        };
+        access_log::record(scheme, client, &access, &outcome, &trace);
     }
     // One SERVER span per sampled transaction (ADR 000040): the root the filter spans (and the
     // upstream's own trace, via the propagated traceparent) nest under. Push is a bounded-queue
@@ -204,7 +210,7 @@ async fn proxy_core_inner(
     client: IpAddr,
     trace: RequestTrace,
     request: hyper::Request<ReqBody>,
-    inspection_skipped: &mut Option<InspectionSkip>,
+    attribution: &mut Attribution,
     admission: Arc<OwnedSemaphorePermit>,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let (mut parts, body) = request.into_parts();
@@ -244,6 +250,7 @@ async fn proxy_core_inner(
     let Some(route) = snapshot.find_route(&http_req) else {
         return Ok(synth(StatusCode::NOT_FOUND, &fault::NO_ROUTE, b"no route"));
     };
+    attribution.route = Some(route.name.clone());
     let idx = route.index;
 
     // From here on the route is chosen, so EVERY response this transaction can produce is that
@@ -259,9 +266,7 @@ async fn proxy_core_inner(
         // rate floor. The per-filter `host-ratelimit` capability (ADR 000026) is a separate,
         // policy-shaped limiter.
         if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(client) {
-            state
-                .metrics
-                .inc_rate_limited(plecto_control::UNMATCHED_ROUTE);
+            state.metrics.inc_rate_limited(&route.name);
             return Ok(Routed::Synthesised(with_error_code(
                 synth_retry_after(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -485,7 +490,7 @@ async fn proxy_core_inner(
             &route,
             forward,
             upstream_resp,
-            inspection_skipped,
+            &mut attribution.inspection_skipped,
         )
         .await
     }

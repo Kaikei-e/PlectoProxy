@@ -17,6 +17,19 @@ pub(crate) struct Access {
     pub(crate) path: String,
 }
 
+/// The transaction outcome fields emitted on the access log.
+pub(crate) struct Outcome<'a> {
+    /// The resolved route name, or `unmatched` when no route was chosen — no-route 404,
+    /// rejected authority/path, overload (ADR 000112).
+    pub(crate) route: &'a str,
+    pub(crate) status: u16,
+    pub(crate) elapsed: Duration,
+    /// Names why a route that declared an `on-response-body` filter served a response the filter
+    /// never saw (ADR 000098). Emitted ONLY on those transactions — a skip has to be attributable
+    /// to a request, not just to a counter — and is absent everywhere else.
+    pub(crate) inspection_skipped: Option<&'static str>,
+}
+
 /// Emit one access-log event. Deliberately carries no secrets (no Authorization / Cookie value, and
 /// the path without its query string — bp-rust): only method, authority, path, status, duration,
 /// client IP and the connection scheme.
@@ -28,21 +41,13 @@ pub(crate) struct Access {
 /// `trace_id` / `span_id` are emitted UNCONDITIONALLY, not only for sampled transactions (ADR
 /// 000099): the ids join this line to whatever downstream sampling did keep, and for an unsampled
 /// transaction the line is the only place the transaction is identifiable at all.
-/// `response_body_inspection_skipped` names why a route that declared an `on-response-body` filter
-/// served a response the filter never saw (ADR 000098). It is emitted ONLY on those transactions —
-/// a skip has to be attributable to a request, not just to a counter — and is absent everywhere
-/// else, which is also what keeps it off every ordinary line.
 pub(crate) fn record(
-    route: &str,
     scheme: &str,
     client: IpAddr,
     access: &Access,
-    status: u16,
-    elapsed: Duration,
+    outcome: &Outcome<'_>,
     trace: &RequestTrace,
-    inspection_skipped: Option<&'static str>,
 ) {
-    let _ = route;
     tracing::info!(
         target: "plecto::access",
         client = %client,
@@ -50,11 +55,12 @@ pub(crate) fn record(
         method = %access.method,
         authority = %access.authority,
         path = %access.path,
-        status = status,
-        duration_ms = elapsed.as_millis() as u64,
+        route = outcome.route,
+        status = outcome.status,
+        duration_ms = outcome.elapsed.as_millis() as u64,
         trace_id = %trace.trace_id(),
         span_id = %trace.request_span_id(),
-        response_body_inspection_skipped = inspection_skipped,
+        response_body_inspection_skipped = outcome.inspection_skipped,
         "access"
     );
 }

@@ -106,7 +106,7 @@ impl CompiledRoute {
         filters: &std::collections::HashMap<String, Arc<LoadedFilter>>,
     ) -> Self {
         Self {
-            name: Arc::from(""),
+            name: Arc::from(r.resolved_name()),
             // Pre-normalise the compiled match dimensions so per-request matching is
             // allocation-free (ADR 000034): host + header names lower-cased (case-insensitive),
             // method upper-cased (exact upper-case token), query names kept as-is
@@ -529,19 +529,51 @@ pub(crate) struct ValidatedRoute<'a> {
     pub(crate) targets: Vec<(&'a str, u32)>,
 }
 
-/// Validate every route's forwarding target (`upstream`/`backends`), weighted split, filter
-/// references, and native rate-limit config — PURELY, against the declared filter ids and
-/// upstream names, with no I/O and no registry mutation (ADR 000013 / 000017 / 000033 / 000034).
-/// Fails closed on the first invalid route, mirroring the checks `build_active` used to run
-/// inline. Takes filter IDS (not loaded filters), so the static `validate_manifest` path shares
-/// it without loading any artifact. Directly unit-testable with hand-built sets.
+/// Validate every route's name uniqueness (ADR 000112), forwarding target (`upstream`/`backends`),
+/// weighted split, filter references, and native rate-limit config — PURELY, against the declared
+/// filter ids and upstream names, with no I/O and no registry mutation (ADR 000013 / 000017 /
+/// 000033 / 000034 / 000112). Fails closed on the first invalid route, mirroring the checks
+/// `build_active` used to run inline. Takes filter IDS (not loaded filters), so the static
+/// `validate_manifest` path shares it without loading any artifact. Directly unit-testable with
+/// hand-built sets.
 pub(crate) fn validate_routes<'a>(
     routes: &'a [Route],
     filter_ids: &HashSet<&str>,
     upstream_names: &HashSet<&str>,
 ) -> Result<Vec<ValidatedRoute<'a>>, ControlError> {
     let mut validated = Vec::with_capacity(routes.len());
+    let mut seen_names = HashSet::with_capacity(routes.len());
     for r in routes {
+        // Validate route name (ADR 000112): fail closed if an explicit name is empty or
+        // whitespace-only, if the resolved name matches the reserved `UNMATCHED_ROUTE` sentinel,
+        // or if a resolved name collides with an earlier route. The collision error directs the
+        // operator to set an explicit `name` rather than silently auto-numbering, keeping
+        // dashboard/metric series stable across manifest reordering (ADR 000112 decision 2).
+        if let Some(name) = &r.name
+            && name.trim().is_empty()
+        {
+            return Err(ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason: "route name must not be empty or whitespace-only".to_string(),
+            });
+        }
+        let resolved_name = r.resolved_name();
+        if resolved_name == UNMATCHED_ROUTE {
+            return Err(ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason: format!(
+                    "route name `{UNMATCHED_ROUTE}` is reserved for requests that match no route (ADR 000112)"
+                ),
+            });
+        }
+        if !seen_names.insert(resolved_name) {
+            return Err(ControlError::InvalidRoute {
+                path_prefix: r.matcher.path_prefix.clone(),
+                reason: format!(
+                    "duplicate route name `{resolved_name}`; set an explicit `name` on one of the routes (ADR 000112)"
+                ),
+            });
+        }
         // The route's forwarding targets: the single `upstream` shorthand or weighted `backends`
         // (ADR 000034). Both-set / neither-set is fail-closed here.
         let targets = r.targets().map_err(|reason| ControlError::InvalidRoute {

@@ -131,6 +131,8 @@ capabilities = ["outbound-http", "outbound-tcp", "fat-guest"]
 
 [dependencies]
 plecto-control = { workspace = true }
+# arc-swap: lock-free atomic snapshot of the per-route metrics registry (ADR 000112).
+arc-swap = { workspace = true }
 # libc: glibc `mallopt(M_ARENA_MAX)` to cap per-thread malloc arenas at startup, bounding RSS on
 # many-core hosts (docs/servey body-tax). Used only on glibc targets; a no-op elsewhere.
 libc = "0.2"

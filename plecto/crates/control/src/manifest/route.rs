@@ -1,5 +1,6 @@
 //! A routing rule (`[[route]]`, ADR 000013 / 000034) and its matching / rate-limit sub-config.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -370,8 +371,24 @@ impl Route {
     /// The resolved operator-facing route name (ADR 000112, amended by ADR 000116): returns the
     /// explicit `name` if set, otherwise `<host lower-cased><path_prefix>` when `match.host` is
     /// declared, else `match.path_prefix` (ADR 000116).
-    pub fn resolved_name(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Borrowed(self.name.as_deref().unwrap_or(&self.matcher.path_prefix))
+    ///
+    /// The host is lower-cased because routing compares host case-insensitively (ADR 000034),
+    /// so the route name must not differentiate casing that routing treats as identical.
+    /// The host is always the DECLARED host (`matcher.host`), never the request's `Host` /
+    /// authority header, preserving the invariant that metric labels and log identifiers are
+    /// manifest-bounded and never derived from untrusted request inputs (ADR 000112 / 000116).
+    pub fn resolved_name(&self) -> Cow<'_, str> {
+        if let Some(name) = self.name.as_deref() {
+            Cow::Borrowed(name)
+        } else if let Some(h) = self.matcher.host.as_deref() {
+            Cow::Owned(format!(
+                "{}{}",
+                h.to_ascii_lowercase(),
+                self.matcher.path_prefix
+            ))
+        } else {
+            Cow::Borrowed(&self.matcher.path_prefix)
+        }
     }
 
     /// This route's forwarding targets as `(upstream_name, weight)` pairs (ADR 000034): the single

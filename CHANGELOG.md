@@ -34,9 +34,10 @@ All notable changes to Plecto are documented here. The format follows
 
 ### Added
 
-- **`[[route]] name`** ([ADR 000112](docs/ADR/000112.md)): routes can now declare an optional
-  `name` string field to identify the route in access logs and Prometheus metrics. If omitted,
-  the resolved name defaults to `match.path_prefix`.
+- **`[[route]] name`** ([ADR 000112](docs/ADR/000112.md), [ADR 000116](docs/ADR/000116.md)): routes
+  can now declare an optional `name` string field to identify the route in access logs and
+  Prometheus metrics. If omitted, the resolved name defaults to `<host><path_prefix>` (with host
+  lower-cased) when `match.host` is declared, else `match.path_prefix`.
 
 ### Changed
 
@@ -59,14 +60,14 @@ All notable changes to Plecto are documented here. The format follows
   **Migration**: Log ingestion mappings configured for top-level access log fields should add the
   typed `route` string slot.
 - **Manifest validation**: resolved route names must be unique across the manifest; collisions fail
-  `plecto validate`, startup, and `SIGHUP` reload fail-closed ([ADR 000112](docs/ADR/000112.md)).
-  Empty or whitespace-only names are rejected, and `name = "unmatched"` is now rejected as a
-  reserved sentinel.
-  **Migration**: If multiple routes share the same `match.path_prefix` — most commonly host-split
-  virtual hosts (two `[[route]]` on `path_prefix = "/"` with different `match.host`), or routes
-  differentiated only by method, headers, or query parameters — an explicit `name` must be
-  declared on at least one route to disambiguate. Any existing manifest declaring
-  `name = "unmatched"` must be renamed.
+  `plecto validate`, startup, and `SIGHUP` reload fail-closed ([ADR 000112](docs/ADR/000112.md),
+  [ADR 000116](docs/ADR/000116.md)). Empty or whitespace-only names are rejected, and
+  `name = "unmatched"` is rejected as a reserved sentinel. Because the default route name includes
+  the lower-cased host when `match.host` is set ([ADR 000116](docs/ADR/000116.md)), host-split
+  virtual hosts load without edits.
+  **Migration**: If multiple routes share the same host and `path_prefix` and differ only by
+  method, headers, or query parameters, an explicit `name` must be declared on at least one route
+  to disambiguate. Any existing manifest declaring `name = "unmatched"` must be renamed.
 
 ## [0.11.5] - 2026-09-15
 

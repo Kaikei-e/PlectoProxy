@@ -122,7 +122,7 @@ The admin `/metrics` endpoint exposes, alongside the RED signals:
 
 ## Per-route request metrics
 
-Two RED metric families carry a `route` label ([ADR 000112](ADR/000112.md)):
+Two RED metric families carry a `route` label ([ADR 000112](ADR/000112.md), [ADR 000116](ADR/000116.md)):
 
 - `plecto_requests_total{route="<name>",status_class="<1xx..5xx>"}` — counts completed requests by resolved
   route name and HTTP status class (previously labeled only with `status_class`).
@@ -191,7 +191,7 @@ slots without unwrapping a nested object first.
 | `method` | string | The request method as received. |
 | `authority` | string | The request's host authority. |
 | `path` | string | The request path **without its query string**. |
-| `route` | string | The resolved route name (the explicit `name` if declared, otherwise `match.path_prefix`), or `unmatched` if no route answered the request (no-route 404, rejected authority/path 400, overload 503) ([ADR 000112](ADR/000112.md)). Matches the `route` metric label. |
+| `route` | string | The resolved route name (the explicit `name` if declared, otherwise `<host><path_prefix>` with host lower-cased when `match.host` is set, else `match.path_prefix`), or `unmatched` if no route answered the request (no-route 404, rejected authority/path 400, overload 503) ([ADR 000112](ADR/000112.md), [ADR 000116](ADR/000116.md)). Matches the `route` metric label. |
 | `status` | number | The status Plecto returned to the client. A transport error the proxy could not answer is recorded as `502`. |
 | `duration_ms` | number | Whole milliseconds from the start of the transaction to the response head. |
 | `trace_id` | string | W3C trace id (32 lowercase hex chars) — the caller's, when it sent a `traceparent`, otherwise one Plecto minted. |
@@ -234,9 +234,23 @@ otlp_endpoint = "http://127.0.0.1:4318"  # the local collector originates TLS on
 ## Naming a route: the `name` key
 
 Every `[[route]]` entry can declare an optional `name` string to identify it in logs and metrics
-([ADR 000112](ADR/000112.md)):
+([ADR 000112](ADR/000112.md), [ADR 000116](ADR/000116.md)):
 
 ```toml
+# Virtual hosts with different match.host need no explicit name:
+[[route]]
+upstream = "public-svc"
+[route.match]
+host = "public.example"
+path_prefix = "/"
+
+[[route]]
+upstream = "protected-svc"
+[route.match]
+host = "protected.example"
+path_prefix = "/"
+
+# Routes sharing host and path_prefix (e.g. split by method) still need explicit names:
 [[route]]
 upstream = "app"
 [route.match]
@@ -251,13 +265,20 @@ path_prefix = "/api/items"
 method = "POST"
 ```
 
-- **Default value**: if `name` is omitted, the resolved name defaults to the route's `match.path_prefix`
-  (for example, `"/api/items"` on the `GET` route above). Because `path_prefix` is mandatory on every route,
-  a default is always available.
+- **Default value**: if `name` is omitted, the resolved name defaults to `<host><path_prefix>`
+  (with `match.host` lower-cased) when `match.host` is set, else `match.path_prefix`
+  ([ADR 000116](ADR/000116.md)). In the virtual host example above, the two unnamed routes on `"/"`
+  with different hosts resolve to `public.example/` and `protected.example/` respectively. In the
+  method-split example, the unnamed `GET` route resolves to `"/api/items"`. The host is lower-cased
+  because routing compares host case-insensitively ([ADR 000034](ADR/000034.md)), and the value is always
+  the declared `match.host`, never the request's authority header ([ADR 000112](ADR/000112.md),
+  [ADR 000116](ADR/000116.md)).
 - **Uniqueness is enforced fail-closed**: resolved route names must be unique across the entire manifest.
-  When two routes share a `path_prefix` (such as routes split by HTTP method, headers, or query parameters),
-  leaving both unnamed causes a collision. Manifests with colliding resolved names fail `plecto validate`,
-  startup, and `SIGHUP` reload fail-closed; the operator must assign an explicit `name` to disambiguate.
+  Virtual hosts differentiated by `match.host` resolve to distinct names by default and do not collide.
+  However, when two routes share both host and `path_prefix` (such as routes split by HTTP method,
+  headers, or query parameters), leaving both unnamed causes a collision. Manifests with colliding
+  resolved names fail `plecto validate`, startup, and `SIGHUP` reload fail-closed; the operator must
+  assign an explicit `name` to disambiguate.
 - **Empty and whitespace-only names are rejected**: a route name cannot be empty or consist only of whitespace
   (Prometheus treats empty label values as absent labels, which would violate metric family consistency).
 - **`unmatched` is reserved**: declaring `name = "unmatched"` is rejected fail-closed, preserving that name

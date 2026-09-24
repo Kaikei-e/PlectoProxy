@@ -118,7 +118,7 @@ admin `/metrics` は RED シグナルに加えて次を出す:
 
 ## route 別リクエストメトリクス
 
-2 つのリクエスト系メトリクス系列に `route` ラベルが付与される（[ADR 000112](ADR/000112.md)）:
+2 つのリクエスト系メトリクス系列に `route` ラベルが付与される（[ADR 000112](ADR/000112.md)、[ADR 000116](ADR/000116.md)）:
 
 - `plecto_requests_total{route="<name>",status_class="<1xx..5xx>"}` — 解決された route 名と HTTP ステータスクラス別のリクエスト完了カウンタ（以前は `status_class` のみ）。
 - `plecto_rate_limited_total{route="<name>"}` — native token-bucket レートリミッタにより拒否されたリクエストの route 別カウンタ（以前はラベルなし）。
@@ -173,7 +173,7 @@ access_log = true
 | `method` | string | 受信したままのリクエストメソッド。 |
 | `authority` | string | リクエストの host authority。 |
 | `path` | string | リクエストパス。**クエリ文字列は落とす**。 |
-| `route` | string | 解決された route 名（`name` が設定されていればその値、未設定なら `match.path_prefix`）、またはどの route にもマッチしなかったリクエスト（no-route 404、拒否された authority/path 400、過負荷 503）の場合は `unmatched`（[ADR 000112](ADR/000112.md)）。メトリクスの `route` ラベルと常に一致する。 |
+| `route` | string | 解決された route 名（`name` が設定されていればその値、未設定時は `match.host` 宣言があれば `<host><path_prefix>`（host は小文字化）、なければ `match.path_prefix`）、またはどの route にもマッチしなかったリクエスト（no-route 404、拒否された authority/path 400、過負荷 503）の場合は `unmatched`（[ADR 000112](ADR/000112.md)、[ADR 000116](ADR/000116.md)）。メトリクスの `route` ラベルと常に一致する。 |
 | `status` | number | クライアントへ返したステータス。プロキシが応答できなかった転送エラーは `502` として記録する。 |
 | `duration_ms` | number | トランザクション開始から応答ヘッダまでのミリ秒（整数）。 |
 | `trace_id` | string | W3C trace id（小文字 hex 32 桁）。呼び出し元が `traceparent` を送っていればその値、なければ Plecto が採番した値。 |
@@ -214,9 +214,23 @@ otlp_endpoint = "http://127.0.0.1:4318"  # ローカル collector が以降の T
 
 ## route の命名: `name` キー
 
-各 `[[route]]` は、ログやメトリクスで識別するための任意の `name` 文字列を宣言できる（[ADR 000112](ADR/000112.md)）:
+各 `[[route]]` は、ログやメトリクスで識別するための任意の `name` 文字列を宣言できる（[ADR 000112](ADR/000112.md)、[ADR 000116](ADR/000116.md)）:
 
 ```toml
+# host で分割したバーチャルホストは明示的な name 不要:
+[[route]]
+upstream = "public-svc"
+[route.match]
+host = "public.example"
+path_prefix = "/"
+
+[[route]]
+upstream = "protected-svc"
+[route.match]
+host = "protected.example"
+path_prefix = "/"
+
+# 同一の host・path_prefix を共有するルート（メソッド分岐など）は引き続き明示的な name が必要:
 [[route]]
 upstream = "app"
 [route.match]
@@ -231,8 +245,8 @@ path_prefix = "/api/items"
 method = "POST"
 ```
 
-- **既定値**: `name` を省略した場合、解決後の名前は `match.path_prefix` の値になる（上の `GET` route なら `"/api/items"`）。`path_prefix` は全 route で必須のため、既定値は常に定まる。
-- **一意性の強制（fail-closed）**: 解決後の route 名はマニフェスト全体で一意でなければならない。同一の `path_prefix` を共有する route（HTTP メソッド・ヘッダ・クエリパラメータで分岐したもの）で両方を無名のままにすると名前が衝突する。解決後の名前が衝突するマニフェストは `plecto validate`・起動・`SIGHUP` reload で fail-closed に拒否される。運用者は少なくとも一方に明示的な `name` を設定して曖昧さを解消しなければならない。
+- **既定値**: `name` を省略した場合、`match.host` が宣言されていれば `<host><path_prefix>`（host は小文字化）、未宣言なら `match.path_prefix` が解決後の名前になる（[ADR 000116](ADR/000116.md)）。上のバーチャルホストの例では、`"/"` 上の 2 つの無名ルートは衝突せずそれぞれ `public.example/` と `protected.example/` に解決される。メソッド分割の例の無名 `GET` ルートは `"/api/items"` になる。host を小文字化するのは、ルーティングが host を case-insensitive に照合するためであり（[ADR 000034](ADR/000034.md)）、値は常にマニフェスト宣言由来であってリクエストの authority ヘッダ値ではない（[ADR 000112](ADR/000112.md)、[ADR 000116](ADR/000116.md)）。
+- **一意性の強制（fail-closed）**: 解決後の route 名はマニフェスト全体で一意でなければならない。`match.host` で分岐したバーチャルホストは既定で異なる名前に解決されるため衝突しない。一方、同一の host と `path_prefix` を共有する route（HTTP メソッド・ヘッダ・クエリパラメータのみで分岐したもの）で両方を無名のままにすると名前が衝突する。解決後の名前が衝突するマニフェストは `plecto validate`・起動・`SIGHUP` reload で fail-closed に拒否される。運用者は少なくとも一方に明示的な `name` を設定して曖昧さを解消しなければならない。
 - **空文字および空白のみの名前は拒否**: `name` に空文字や空白のみの文字列を指定することはできない（Prometheus データモデルにおいて空ラベル値はラベル不在と同値であり、系列の一貫性を損なうため）。
 - **`unmatched` は予約語**: `name = "unmatched"` の宣言は fail-closed で拒否され、route 外で応答されたリクエスト用のセンチネルとして予約されている。
 

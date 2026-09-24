@@ -82,7 +82,7 @@ cargo test -p plecto-host --features polyglot-conformance,fat-guest --test polyg
 
 調査や設計のセカンドオピニオンには `antigravity_run` を使い、既定の `mode: plan` と
 `autonomy: safe` を維持する。継続依頼では最初の応答が返した `conversation_id` を明示的に渡し、
-省略時の直近会話への継続に依存しない。agy-mcp サーバーごとに実行中の呼び出しは一つに制限されるため、
+省略時の直近会話への継続に依存しない。agy-orch-mcp サーバーごとに実行中の呼び出しは一つに制限されるため、
 完了を待ってから次を呼び出す。agy や別の MCP/Claude エージェントへ再委譲する指示は出さず、
 ファイル変更を依頼するときは対象と意図を明示し、結果をこのリポジトリの規約でレビューする。
 

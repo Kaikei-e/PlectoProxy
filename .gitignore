@@ -32,3 +32,5 @@ flint-data/
 
 .serena/
 .mcp.json
+.codex/
+.claude/settings.local.json

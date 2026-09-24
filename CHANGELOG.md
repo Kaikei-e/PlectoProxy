@@ -32,6 +32,18 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-25
+
+Minor release: operator-facing observability — per-route `route` label on `plecto_requests_total` /
+`plecto_rate_limited_total`, access-log `route` field, and optional `[[route]] name` with a
+host-aware default ([ADR 000112](docs/ADR/000112.md) / [ADR 000116](docs/ADR/000116.md)).
+Operators must check the breaking points: exact-label PromQL selectors on `plecto_requests_total`
+and queries on the previously unlabelled `plecto_rate_limited_total` must account for the new
+`route` label, and colliding route names fail validation (host-split vhosts load unchanged, but
+method/header/query splits sharing host+prefix need a `name`, and `name = "unmatched"` is reserved).
+**Deployed filters do not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0`.
+Performance charts are now rendered with Flint (`performance/flint`).
+
 ### Added
 
 - **`[[route]] name`** ([ADR 000112](docs/ADR/000112.md), [ADR 000116](docs/ADR/000116.md)): routes

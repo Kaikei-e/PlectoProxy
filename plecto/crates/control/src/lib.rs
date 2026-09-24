@@ -83,7 +83,7 @@ pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
 pub use route::{
     CompressionConfig, ResponseBodyConfig, ResponseHeaders, RouteInfo, TimeoutConfig,
-    UpgradeConfig, normalize_path,
+    UNMATCHED_ROUTE, UpgradeConfig, normalize_path,
 };
 /// The rustls TLS client config the fast path re-encrypts upstream forward legs with
 /// (ADR 000042), re-exported for the same reason as [`TlsServerConfig`].
@@ -326,6 +326,12 @@ impl Control {
     /// The ids currently loaded (for diagnostics / tests). Order is unspecified.
     pub fn loaded_ids(&self) -> Vec<String> {
         self.active.load().filters.keys().cloned().collect()
+    }
+
+    /// The resolved names of the active configuration's routes in manifest order (ADR 000112).
+    /// Used to pre-register the `route` metric label series at startup and reload.
+    pub fn route_names(&self) -> Vec<Arc<str>> {
+        Vec::new()
     }
 }
 

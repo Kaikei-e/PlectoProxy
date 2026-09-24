@@ -110,7 +110,7 @@ async fn scrape_rate_limited(
     assert_eq!(status, StatusCode::OK);
     metrics
         .lines()
-        .find(|l| l.starts_with("plecto_rate_limited_total "))
+        .find(|l| l.starts_with("plecto_rate_limited_total{route=\"/\"}"))
         .and_then(|l| l.rsplit(' ').next())
         .and_then(|n| n.parse::<u64>().ok())
         .expect("the rate-limited counter is exposed")

@@ -183,6 +183,8 @@ async fn access_log_lines_are_flat_and_carry_the_trace_ids() {
     wait_until_serving(&client, proxy).await;
     let status = traced_get(&client, proxy, "/api/hello").await.unwrap();
     assert_eq!(status, 200);
+    let nope_status = traced_get(&client, proxy, "/nope").await.unwrap();
+    assert_eq!(nope_status, 404);
     // stdout is line-buffered, so the line is already on disk; give the write a moment anyway.
     tokio::time::sleep(Duration::from_millis(200)).await;
     kill(&mut child);
@@ -191,13 +193,14 @@ async fn access_log_lines_are_flat_and_carry_the_trace_ids() {
     let lines = json_lines(&raw);
     assert!(!lines.is_empty(), "the binary logs JSON lines:\n{raw}");
 
-    // The LAST access line is the request driven above; the readiness poll before it legitimately
-    // logged 503s while the upstream had not yet passed a probe.
     let access = lines
         .iter()
         .rev()
-        .find(|l| l.get("target").and_then(|t| t.as_str()) == Some("plecto::access"))
-        .unwrap_or_else(|| panic!("an access-log line is present:\n{raw}"));
+        .find(|l| {
+            l.get("target").and_then(|t| t.as_str()) == Some("plecto::access")
+                && l.get("path").and_then(|v| v.as_str()) == Some("/api/hello")
+        })
+        .unwrap_or_else(|| panic!("an access-log line for /api/hello is present:\n{raw}"));
 
     assert!(
         !access.contains_key("fields"),
@@ -209,6 +212,7 @@ async fn access_log_lines_are_flat_and_carry_the_trace_ids() {
         "method",
         "authority",
         "path",
+        "route",
         "status",
         "duration_ms",
         "trace_id",
@@ -219,6 +223,11 @@ async fn access_log_lines_are_flat_and_carry_the_trace_ids() {
             "the access log's `{field}` sits at the top level of the line: {access:?}"
         );
     }
+    assert_eq!(
+        access.get("route").and_then(|v| v.as_str()),
+        Some("/api"),
+        "{access:?}"
+    );
     assert_eq!(
         access.get("method").and_then(|v| v.as_str()),
         Some("GET"),
@@ -251,6 +260,20 @@ async fn access_log_lines_are_flat_and_carry_the_trace_ids() {
     assert!(
         span_id.chars().all(|c| c.is_ascii_hexdigit()) && span_id != "0000000000000000",
         "span_id is a valid, non-zero span id: {access:?}"
+    );
+
+    let nope_access = lines
+        .iter()
+        .rev()
+        .find(|l| {
+            l.get("target").and_then(|t| t.as_str()) == Some("plecto::access")
+                && l.get("path").and_then(|v| v.as_str()) == Some("/nope")
+        })
+        .unwrap_or_else(|| panic!("an access-log line for /nope is present:\n{raw}"));
+    assert_eq!(
+        nope_access.get("route").and_then(|v| v.as_str()),
+        Some("unmatched"),
+        "{nope_access:?}"
     );
 }
 

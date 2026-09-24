@@ -179,7 +179,7 @@ path_prefix = "/"
     );
     let twoxx = metrics
         .lines()
-        .find(|l| l.starts_with("plecto_requests_total{status_class=\"2xx\"}"))
+        .find(|l| l.starts_with("plecto_requests_total{route=\"/\",status_class=\"2xx\"}"))
         .expect("a 2xx counter line is present");
     let count: u64 = twoxx
         .rsplit(' ')

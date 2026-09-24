@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    /// Operator-facing name for the `route` metric label and access-log field (ADR 000112).
+    /// When absent, defaults to `match.path_prefix`. Resolved names across all routes in a
+    /// manifest must be unique; `"unmatched"` is reserved for requests matching no route.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The match dimensions (`[route.match]`): host / path_prefix / method / headers / query (ADR
     /// 000034). At least `path_prefix` is required; all other dimensions are optional and ANDed.
     #[serde(rename = "match")]
@@ -361,6 +366,12 @@ fn default_weight() -> u32 {
 pub(crate) const MAX_BACKEND_WEIGHT: u32 = 1_000_000;
 
 impl Route {
+    /// The resolved operator-facing route name (ADR 000112): returns the explicit `name` if set,
+    /// otherwise falls back to `match.path_prefix`.
+    pub fn resolved_name(&self) -> &str {
+        todo!()
+    }
+
     /// This route's forwarding targets as `(upstream_name, weight)` pairs (ADR 000034): the single
     /// `upstream` shorthand normalised to one weight-1 backend, or the explicit weighted `backends`.
     /// EXACTLY ONE of the two must be set — both or neither is a config error (returned as a reason
@@ -643,5 +654,33 @@ over_cap = "truncate"
             zero.content_hash().unwrap(),
             "declaring a timeout must flip the config version"
         );
+    }
+
+    #[test]
+    fn resolved_name_returns_explicit_name_when_set_else_path_prefix() {
+        // ADR 000112: `name` is optional; when set it is the resolved name, otherwise it defaults
+        // to `match.path_prefix`.
+        let explicit = Manifest::from_toml(
+            r#"
+[[route]]
+name = "custom-route"
+upstream = "a"
+[route.match]
+path_prefix = "/api/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.routes[0].resolved_name(), "custom-route");
+
+        let default = Manifest::from_toml(
+            r#"
+[[route]]
+upstream = "a"
+[route.match]
+path_prefix = "/api/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(default.routes[0].resolved_name(), "/api/v1");
     }
 }

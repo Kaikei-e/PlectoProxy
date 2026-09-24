@@ -100,18 +100,21 @@ async fn admin_handle(
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let (status, content_type, body) = match req.uri().path() {
-        "/metrics" => (
-            StatusCode::OK,
-            "text/plain; version=0.0.4; charset=utf-8",
-            state.metrics.render(
-                &state.control.filter_metrics(),
-                state.otlp.as_ref().map(|b| (b.dropped_spans(), b.len())),
-                state.control.pool_residency(),
-                // Walked at scrape time (ADR 000099), never tallied into a persistent counter —
-                // so the gauge cannot carry stale state across a reload.
-                &state.control.upstream_groups(),
-            ),
-        ),
+        "/metrics" => {
+            state.metrics.register_routes(&state.control.route_names());
+            (
+                StatusCode::OK,
+                "text/plain; version=0.0.4; charset=utf-8",
+                state.metrics.render(
+                    &state.control.filter_metrics(),
+                    state.otlp.as_ref().map(|b| (b.dropped_spans(), b.len())),
+                    state.control.pool_residency(),
+                    // Walked at scrape time (ADR 000099), never tallied into a persistent counter —
+                    // so the gauge cannot carry stale state across a reload.
+                    &state.control.upstream_groups(),
+                ),
+            )
+        }
         "/healthz" => (
             StatusCode::OK,
             "text/plain; charset=utf-8",

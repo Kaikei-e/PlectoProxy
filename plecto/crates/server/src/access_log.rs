@@ -33,6 +33,7 @@ pub(crate) struct Access {
 /// a skip has to be attributable to a request, not just to a counter — and is absent everywhere
 /// else, which is also what keeps it off every ordinary line.
 pub(crate) fn record(
+    route: &str,
     scheme: &str,
     client: IpAddr,
     access: &Access,
@@ -41,6 +42,7 @@ pub(crate) fn record(
     trace: &RequestTrace,
     inspection_skipped: Option<&'static str>,
 ) {
+    let _ = route;
     tracing::info!(
         target: "plecto::access",
         client = %client,

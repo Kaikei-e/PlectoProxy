@@ -233,9 +233,13 @@ impl ServerMetrics {
         self.circuit_open.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn inc_rate_limited(&self) {
+    pub(crate) fn inc_rate_limited(&self, _route: &str) {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Pre-register route names for the `route` metric label (ADR 000112).
+    /// Stubs out behavior for RED phase; routes are registered before render.
+    pub(crate) fn register_routes(&self, _names: &[Arc<str>]) {}
 
     pub(crate) fn inc_outlier_ejection(&self) {
         self.outlier_ejections.fetch_add(1, Ordering::Relaxed);
@@ -244,7 +248,7 @@ impl ServerMetrics {
     /// Record one completed request: tally its status class and observe its total duration. The
     /// class index is clamped into `[1,5]` then offset, and the read is bounds-checked, so an
     /// out-of-range status (a hostile filter could synthesise any `u16`) never panics.
-    pub(crate) fn record_request(&self, status: u16, elapsed: Duration) {
+    pub(crate) fn record_request(&self, _route: &str, status: u16, elapsed: Duration) {
         let idx = (status / 100).clamp(1, 5) as usize - 1;
         if let Some(slot) = self.status_class.get(idx) {
             slot.fetch_add(1, Ordering::Relaxed);
@@ -516,16 +520,32 @@ mod tests {
     #[test]
     fn records_status_classes_and_renders_prometheus_exposition() {
         let m = ServerMetrics::new();
-        m.record_request(200, Duration::from_millis(3));
-        m.record_request(204, Duration::from_millis(7));
-        m.record_request(404, Duration::from_millis(1));
-        m.record_request(503, Duration::from_millis(50));
+        m.record_request(
+            plecto_control::UNMATCHED_ROUTE,
+            200,
+            Duration::from_millis(3),
+        );
+        m.record_request(
+            plecto_control::UNMATCHED_ROUTE,
+            204,
+            Duration::from_millis(7),
+        );
+        m.record_request(
+            plecto_control::UNMATCHED_ROUTE,
+            404,
+            Duration::from_millis(1),
+        );
+        m.record_request(
+            plecto_control::UNMATCHED_ROUTE,
+            503,
+            Duration::from_millis(50),
+        );
 
         let text = m.render(&snap(0, 0, 0), None, None, &[]);
-        assert!(text.contains("plecto_requests_total{status_class=\"2xx\"} 2"));
-        assert!(text.contains("plecto_requests_total{status_class=\"4xx\"} 1"));
-        assert!(text.contains("plecto_requests_total{status_class=\"5xx\"} 1"));
-        assert!(text.contains("plecto_requests_total{status_class=\"3xx\"} 0"));
+        assert!(text.contains("plecto_requests_total{route=\"unmatched\",status_class=\"2xx\"} 2"));
+        assert!(text.contains("plecto_requests_total{route=\"unmatched\",status_class=\"4xx\"} 1"));
+        assert!(text.contains("plecto_requests_total{route=\"unmatched\",status_class=\"5xx\"} 1"));
+        assert!(text.contains("plecto_requests_total{route=\"unmatched\",status_class=\"3xx\"} 0"));
         assert!(text.contains("plecto_request_duration_seconds_count 4"));
         assert!(text.contains("# TYPE plecto_request_duration_seconds histogram"));
     }
@@ -568,7 +588,11 @@ mod tests {
         // A hostile filter can synthesise any u16 status; the metric must absorb it, never panic.
         let m = ServerMetrics::new();
         for status in [0u16, 99, 600, 999, u16::MAX] {
-            m.record_request(status, Duration::from_millis(1));
+            m.record_request(
+                plecto_control::UNMATCHED_ROUTE,
+                status,
+                Duration::from_millis(1),
+            );
         }
         // all five clamp into 1xx or 5xx — the point is simply that none panicked.
         assert!(
@@ -581,7 +605,11 @@ mod tests {
     fn histogram_buckets_are_cumulative_and_end_at_total_count() {
         let m = ServerMetrics::new();
         for ms in [2u64, 8, 30, 300] {
-            m.record_request(200, Duration::from_millis(ms));
+            m.record_request(
+                plecto_control::UNMATCHED_ROUTE,
+                200,
+                Duration::from_millis(ms),
+            );
         }
         let text = m.render(&snap(0, 0, 0), None, None, &[]);
         let counts: Vec<u64> = text
@@ -839,5 +867,146 @@ path = "/healthz"
             ),
             "the quote and backslash are escaped:\n{text}"
         );
+    }
+
+    #[test]
+    fn per_route_status_classes_counted_and_rendered() {
+        let m = ServerMetrics::new();
+        m.register_routes(&[Arc::from("api"), Arc::from("web")]);
+        m.record_request("api", 200, Duration::from_millis(5));
+        m.record_request("api", 200, Duration::from_millis(5));
+        m.record_request("api", 500, Duration::from_millis(10));
+        m.record_request("web", 404, Duration::from_millis(2));
+
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains("plecto_requests_total{route=\"api\",status_class=\"2xx\"} 2"),
+            "api 2xx counted and labelled in route, status_class order:\n{text}"
+        );
+        assert!(
+            text.contains("plecto_requests_total{route=\"api\",status_class=\"5xx\"} 1"),
+            "api 5xx counted and labelled in route, status_class order:\n{text}"
+        );
+        assert!(
+            text.contains("plecto_requests_total{route=\"web\",status_class=\"4xx\"} 1"),
+            "web 4xx counted and labelled in route, status_class order:\n{text}"
+        );
+    }
+
+    #[test]
+    fn registered_routes_appear_at_zero() {
+        let m = ServerMetrics::new();
+        m.register_routes(&[Arc::from("api")]);
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        for class in ["1xx", "2xx", "3xx", "4xx", "5xx"] {
+            assert!(
+                text.contains(&format!(
+                    "plecto_requests_total{{route=\"api\",status_class=\"{class}\"}} 0"
+                )),
+                "registered route api must have {class} present at 0:\n{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "plecto_requests_total{{route=\"unmatched\",status_class=\"{class}\"}} 0"
+                )),
+                "unmatched route must have {class} present at 0:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("plecto_rate_limited_total{route=\"api\"} 0"),
+            "rate limited total for registered route api must be present at 0:\n{text}"
+        );
+    }
+
+    #[test]
+    fn route_dropped_from_later_registration_keeps_frozen_series() {
+        let m = ServerMetrics::new();
+        m.register_routes(&[Arc::from("r1"), Arc::from("r2")]);
+        m.record_request("r1", 200, Duration::from_millis(5));
+
+        let text1 = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(text1.contains("plecto_requests_total{route=\"r1\",status_class=\"2xx\"} 1"));
+
+        // Second registration drops r1, keeps r2, adds r3
+        m.register_routes(&[Arc::from("r2"), Arc::from("r3")]);
+        let text2 = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text2.contains("plecto_requests_total{route=\"r1\",status_class=\"2xx\"} 1"),
+            "dropped route r1 series must stay frozen at its earlier value:\n{text2}"
+        );
+        assert!(
+            text2.contains("plecto_requests_total{route=\"r3\",status_class=\"2xx\"} 0"),
+            "newly added route r3 series must appear at 0:\n{text2}"
+        );
+    }
+
+    #[test]
+    fn recording_on_not_yet_registered_route_lazy_inserts_and_counts() {
+        let m = ServerMetrics::new();
+        m.record_request("unregistered", 200, Duration::from_millis(5));
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains("plecto_requests_total{route=\"unregistered\",status_class=\"2xx\"} 1"),
+            "lazy-inserted route must be counted and exposed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_labelled_per_route_and_absent_for_unmatched() {
+        let m = ServerMetrics::new();
+        m.register_routes(&[Arc::from("api")]);
+        m.inc_rate_limited("api");
+        m.inc_rate_limited(plecto_control::UNMATCHED_ROUTE);
+
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains("plecto_rate_limited_total{route=\"api\"} 1"),
+            "rate_limited_total must carry route label:\n{text}"
+        );
+        assert!(
+            !text.contains("plecto_rate_limited_total{route=\"unmatched\"}"),
+            "rate_limited_total must never be emitted for unmatched:\n{text}"
+        );
+    }
+
+    #[test]
+    fn route_label_values_with_quotes_are_escaped() {
+        let m = ServerMetrics::new();
+        m.register_routes(&[Arc::from("we\"ird\\route")]);
+        m.record_request("we\"ird\\route", 200, Duration::from_millis(5));
+
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains(
+                "plecto_requests_total{route=\"we\\\"ird\\\\route\",status_class=\"2xx\"} 1"
+            ),
+            "quotes and backslashes in route names must be escaped:\n{text}"
+        );
+    }
+
+    #[test]
+    fn request_duration_histogram_stays_unlabelled() {
+        let m = ServerMetrics::new();
+        m.register_routes(&[Arc::from("api")]);
+        m.record_request("api", 200, Duration::from_millis(5));
+
+        let text = m.render(&snap(0, 0, 0), None, None, &[]);
+        assert!(
+            text.contains("plecto_request_duration_seconds_count 1"),
+            "duration histogram count is exposed unlabelled:\n{text}"
+        );
+        assert!(
+            !text.contains("plecto_request_duration_seconds_count{"),
+            "duration histogram count must not have label brackets:\n{text}"
+        );
+        for line in text
+            .lines()
+            .filter(|l| l.starts_with("plecto_request_duration_seconds"))
+        {
+            assert!(
+                !line.contains("route="),
+                "duration histogram series must not carry route labels (ADR 000112 decision 3): {line}"
+            );
+        }
     }
 }

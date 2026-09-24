@@ -23,6 +23,10 @@ use crate::ratelimit::{NativeRateLimit, RateLimitDecision};
 use crate::upstream::UpstreamGroup;
 use crate::weighted::{self, WeightedBackends};
 
+/// Sentinel route name for requests that matched no configured route (ADR 000112).
+/// Used in the `route` metric label and access-log field; reserved so manifest routes cannot claim it.
+pub const UNMATCHED_ROUTE: &str = "unmatched";
+
 /// A route compiled from a manifest [`crate::Route`] into the live config: the match dimensions are
 /// pre-normalised (host + header names lower-cased, method upper-cased), and the forwarding target —
 /// a single upstream or a weighted split — is resolved to a [`WeightedBackends`] whose groups are
@@ -30,6 +34,9 @@ use crate::weighted::{self, WeightedBackends};
 /// the healthy set at forward time, not here (ADR 000017 / 000024).
 #[derive(Clone)]
 pub(crate) struct CompiledRoute {
+    /// The resolved operator-facing route name (ADR 000112), used as the `route` metric label
+    /// and access-log field. `Arc<str>` so `find_route` can clone it into `RouteInfo` cheaply.
+    pub(crate) name: Arc<str>,
     /// Lower-cased authority to match, or `None` for any host.
     pub(crate) host: Option<String>,
     pub(crate) path_prefix: String,
@@ -99,6 +106,7 @@ impl CompiledRoute {
         filters: &std::collections::HashMap<String, Arc<LoadedFilter>>,
     ) -> Self {
         Self {
+            name: Arc::from(""),
             // Pre-normalise the compiled match dimensions so per-request matching is
             // allocation-free (ADR 000034): host + header names lower-cased (case-insensitive),
             // method upper-cased (exact upper-case token), query names kept as-is
@@ -181,6 +189,7 @@ impl CompiledRoute {
 impl std::fmt::Debug for CompiledRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledRoute")
+            .field("name", &self.name)
             .field("host", &self.host)
             .field("path_prefix", &self.path_prefix)
             .field("method", &self.method)
@@ -683,6 +692,9 @@ pub(crate) struct RequestParts<'a> {
 #[derive(Debug, Clone)]
 pub struct RouteInfo {
     pub index: usize,
+    /// The resolved operator-facing route name (ADR 000112), used as the `route` metric label
+    /// and access-log field.
+    pub name: Arc<str>,
     pub(crate) backends: Arc<WeightedBackends>,
     /// `Arc<str>` so building this per-request `RouteInfo` from the compiled route (`find_route`,
     /// called on every request) is an atomic refcount bump, not a heap allocation.
@@ -1049,6 +1061,7 @@ mod tests {
 
     fn route(host: Option<&str>, prefix: &str, upstream: &str) -> CompiledRoute {
         CompiledRoute {
+            name: Arc::from(prefix),
             host: host.map(|h| h.to_ascii_lowercase()),
             path_prefix: prefix.to_string(),
             method: None,
@@ -1094,6 +1107,7 @@ mod tests {
         rate_limit: Option<crate::manifest::RouteRateLimit>,
     ) -> Route {
         Route {
+            name: None,
             matcher: crate::manifest::RouteMatch {
                 host: None,
                 path_prefix: "/".to_string(),
@@ -1469,6 +1483,7 @@ mod tests {
     fn route_info(group: Arc<UpstreamGroup>, timeouts: TimeoutConfig) -> RouteInfo {
         RouteInfo {
             index: 0,
+            name: Arc::from(""),
             backends: Arc::new(WeightedBackends::new(vec![(group, 1)]).unwrap()),
             strip_prefix: None,
             has_filters: false,
@@ -1556,6 +1571,91 @@ mod tests {
         let validated = validate_routes(&routes, &filters, &upstream_names).unwrap();
         assert_eq!(validated.len(), 1);
         assert_eq!(validated[0].targets, vec![("real", 1)]);
+    }
+
+    #[test]
+    fn validate_routes_rejects_colliding_resolved_names() {
+        // ADR 000112: routes whose resolved names collide (e.g. sharing path_prefix with no
+        // explicit name, differing only by method/header/query) must be rejected with
+        // `ControlError::InvalidRoute` so the metrics/access-log dimensions remain unambiguous.
+        // The error diagnostic must mention setting an explicit `name`.
+        let mut r1 = manifest_route(Some("real"), vec![], vec![], None);
+        r1.matcher.path_prefix = "/api".to_string();
+        r1.matcher.method = Some("GET".to_string());
+
+        let mut r2 = manifest_route(Some("real"), vec![], vec![], None);
+        r2.matcher.path_prefix = "/api".to_string();
+        r2.matcher.method = Some("POST".to_string());
+
+        let routes = vec![r1, r2];
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
+        match err {
+            ControlError::InvalidRoute { reason, .. } => {
+                assert!(
+                    reason.contains("name"),
+                    "rejection reason should mention setting an explicit name, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRoute error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_routes_accepts_distinct_resolved_names() {
+        // ADR 000112 regression guard: two routes on the same path prefix are accepted once one
+        // (or both) declares an explicit distinct `name`.
+        let mut r1 = manifest_route(Some("real"), vec![], vec![], None);
+        r1.matcher.path_prefix = "/api".to_string();
+        r1.matcher.method = Some("GET".to_string());
+        r1.name = Some("get-api".to_string());
+
+        let mut r2 = manifest_route(Some("real"), vec![], vec![], None);
+        r2.matcher.path_prefix = "/api".to_string();
+        r2.matcher.method = Some("POST".to_string());
+
+        let routes = vec![r1, r2];
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        assert!(validate_routes(&routes, &filters, &upstream_names).is_ok());
+    }
+
+    #[test]
+    fn validate_routes_rejects_reserved_unmatched_name() {
+        // ADR 000112: `name = "unmatched"` is reserved for requests that match no route and must
+        // be rejected with `ControlError::InvalidRoute`.
+        let mut r = manifest_route(Some("real"), vec![], vec![], None);
+        r.name = Some(UNMATCHED_ROUTE.to_string());
+
+        let routes = vec![r];
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
+        assert!(matches!(err, ControlError::InvalidRoute { .. }));
+    }
+
+    #[test]
+    fn validate_routes_rejects_empty_or_whitespace_name() {
+        // ADR 000112: an empty or whitespace-only explicit name is not a valid route identifier
+        // and must be rejected with `ControlError::InvalidRoute`.
+        let filters = HashSet::new();
+        let upstream_names: HashSet<&str> = ["real"].into_iter().collect();
+
+        for bad in ["", "   ", "\t", "\n"] {
+            let mut r = manifest_route(Some("real"), vec![], vec![], None);
+            r.name = Some(bad.to_string());
+            let routes = vec![r];
+
+            let err = validate_routes(&routes, &filters, &upstream_names).unwrap_err();
+            assert!(
+                matches!(err, ControlError::InvalidRoute { .. }),
+                "expected InvalidRoute for name={bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -54,9 +54,11 @@ pub(crate) async fn proxy_core(
         Err(_) => {
             // Rejected work does not enter the active-work gauge, but it remains a client-visible
             // 503 and belongs in the RED request/status counters.
-            state
-                .metrics
-                .record_request(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Duration::ZERO);
+            state.metrics.record_request(
+                plecto_control::UNMATCHED_ROUTE,
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                Duration::ZERO,
+            );
             return Ok(synth(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &fault::REQUEST_OVERLOADED,
@@ -164,9 +166,12 @@ pub(crate) async fn proxy_core(
         Err(_) => StatusCode::BAD_GATEWAY.as_u16(),
     };
     let elapsed = start.elapsed();
-    state.metrics.record_request(status, elapsed);
+    state
+        .metrics
+        .record_request(plecto_control::UNMATCHED_ROUTE, status, elapsed);
     if let Some(access) = access {
         access_log::record(
+            plecto_control::UNMATCHED_ROUTE,
             scheme,
             client,
             &access,
@@ -254,7 +259,9 @@ async fn proxy_core_inner(
         // rate floor. The per-filter `host-ratelimit` capability (ADR 000026) is a separate,
         // policy-shaped limiter.
         if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(client) {
-            state.metrics.inc_rate_limited();
+            state
+                .metrics
+                .inc_rate_limited(plecto_control::UNMATCHED_ROUTE);
             return Ok(Routed::Synthesised(with_error_code(
                 synth_retry_after(
                     StatusCode::TOO_MANY_REQUESTS,

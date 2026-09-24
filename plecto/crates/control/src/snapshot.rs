@@ -59,6 +59,7 @@ impl ConfigSnapshot {
         let r = &self.config.routes[index];
         Some(RouteInfo {
             index,
+            name: r.name.clone(),
             backends: r.backends.clone(),
             strip_prefix: r.strip_prefix.clone(),
             has_filters: !r.filters.is_empty(),

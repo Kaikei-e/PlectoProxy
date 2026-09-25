@@ -755,7 +755,7 @@ impl HostResolveAddressStream for TcpLookupView<'_> {
         )
     }
 
-    fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> wasmtime::Result<()> {
         self.table
             .delete::<PlectoResolveStream>(Resource::new_own(resource.rep()))?;
         Ok(())

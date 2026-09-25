@@ -535,14 +535,14 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.254.0/wasm-tools-1.254.0-x86_64-linux.tar.gz
-          echo "d0efb16c9c859137b7ab3e99151c299cd47caee106ed4594561002f7a04945bd  wasm-tools.tar.gz" | sha256sum -c -
+          curl -sSL -o wasm-tools.tar.gz https://github.com/bytecodealliance/wasm-tools/releases/download/v1.258.0/wasm-tools-1.258.0-x86_64-linux.tar.gz
+          echo "b52d14eb74a4852cc249369bd4480c2b2fdd876145f41db51ff52269ded240ce  wasm-tools.tar.gz" | sha256sum -c -
           tar xzf wasm-tools.tar.gz
           curl -sSL -o wkg https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.16.0/wkg-x86_64-unknown-linux-gnu
           echo "8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a  wkg" | sha256sum -c -
           chmod +x wkg
           mkdir -p wkg-bin && mv wkg wkg-bin/
-          echo "${{ runner.temp }}/wasm-tools-1.254.0-x86_64-linux" >> "$GITHUB_PATH"
+          echo "${{ runner.temp }}/wasm-tools-1.258.0-x86_64-linux" >> "$GITHUB_PATH"
           echo "${{ runner.temp }}/wkg-bin" >> "$GITHUB_PATH"
       - name: Install syft
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0

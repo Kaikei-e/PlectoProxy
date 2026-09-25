@@ -70,10 +70,12 @@ fn build_engine() -> Result<Engine> {
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
     // Same deny-by-default stance as the sync host (engine.rs): GC / exception-handling are
-    // default-on since wasmtime 47 but never lent to filters. wasmtime 48 audit: nothing newly
-    // default-on (fixed-length lists and the implements/external-id gate ship opt-in, left off).
+    // default-on since wasmtime 47 but never lent to filters. wasmtime 49 audit: 49 makes
+    // wide-arithmetic default-on; explicitly disabled to keep the engine's wasm feature surface
+    // deny-by-default.
     config.wasm_gc(false);
     config.wasm_exceptions(false);
+    config.wasm_wide_arithmetic(false);
     // Same metering as the sync host (ADR 000006): a background ticker advances the epoch so the
     // per-instance deadline can trap a runaway guest fail-closed.
     config.epoch_interruption(true);
@@ -219,5 +221,31 @@ mod tests {
             let got = map_decision(case.guest);
             assert_eq!(got, case.want, "case: {}", case.name);
         }
+    }
+
+    #[test]
+    fn streaming_engine_rejects_wide_arithmetic() {
+        let engine = build_engine().expect("streaming engine builds");
+        let wat_component = r#"
+            (component
+              (core module $m
+                (func (export "f") (param i64 i64 i64 i64) (result i64 i64)
+                  local.get 0
+                  local.get 1
+                  local.get 2
+                  local.get 3
+                  i64.add128
+                )
+              )
+            )
+        "#;
+        let wasm_component = wat::parse_str(wat_component).expect("wat parses component");
+        let component_err = wasmtime::component::Component::new(&engine, &wasm_component)
+            .expect_err("streaming component with wide arithmetic must be rejected");
+        let component_msg = format!("{component_err:#}");
+        assert!(
+            component_msg.contains("wide-arithmetic") || component_msg.contains("wide arithmetic"),
+            "expected error to mention wide arithmetic, got: {component_msg}"
+        );
     }
 }

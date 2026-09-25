@@ -28,11 +28,12 @@ pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
     // capability from either (guests are wasm32-unknown-unknown, header-only), so keep both off:
     // an untrusted component must not reach wasm features the host never decided to lend
     // (deny-by-default).
-    // wasmtime 48 audit (ADR 000096 bump procedure — read the release notes for newly default-on
-    // proposals): 48 turns nothing new on. Fixed-length lists and the implements / external-id
-    // reflection gate ship opt-in, and are left off.
+    // wasmtime 49 audit (ADR 000096 bump procedure — read the release notes for newly default-on
+    // proposals): 49 makes wide-arithmetic default-on. Explicitly disabled to keep the engine's
+    // wasm feature surface deny-by-default.
     config.wasm_gc(false);
     config.wasm_exceptions(false);
+    config.wasm_wide_arithmetic(false);
     // Outbound HTTP (ADR 000036) / outbound TCP (ADR 000060) / fat guest (ADR 000063) lend async
     // WASI interfaces; enable the Component Model async ABI so they link. Off by default; a
     // non-async guest is unaffected.
@@ -118,5 +119,59 @@ impl Drop for EpochTicker {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_rejects_wide_arithmetic() {
+        let engine = build_engine(Allocation::OnDemand).expect("engine builds");
+
+        // Module using i64.add128 from the wide-arithmetic proposal.
+        let wat_module = r#"
+            (module
+              (func (param i64 i64 i64 i64) (result i64 i64)
+                local.get 0
+                local.get 1
+                local.get 2
+                local.get 3
+                i64.add128
+              )
+            )
+        "#;
+        let wasm_module = wat::parse_str(wat_module).expect("wat parses module");
+        let module_err = wasmtime::Module::new(&engine, &wasm_module)
+            .expect_err("module with wide arithmetic must be rejected");
+        let module_msg = format!("{module_err:#}");
+        assert!(
+            module_msg.contains("wide-arithmetic") || module_msg.contains("wide arithmetic"),
+            "expected error to mention wide arithmetic, got: {module_msg}"
+        );
+
+        // Component wrapping a core module using i64.add128.
+        let wat_component = r#"
+            (component
+              (core module $m
+                (func (export "f") (param i64 i64 i64 i64) (result i64 i64)
+                  local.get 0
+                  local.get 1
+                  local.get 2
+                  local.get 3
+                  i64.add128
+                )
+              )
+            )
+        "#;
+        let wasm_component = wat::parse_str(wat_component).expect("wat parses component");
+        let component_err = wasmtime::component::Component::new(&engine, &wasm_component)
+            .expect_err("component with wide arithmetic must be rejected");
+        let component_msg = format!("{component_err:#}");
+        assert!(
+            component_msg.contains("wide-arithmetic") || component_msg.contains("wide arithmetic"),
+            "expected error to mention wide arithmetic, got: {component_msg}"
+        );
     }
 }

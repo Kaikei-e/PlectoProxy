@@ -40,21 +40,21 @@ unsafe_op_in_unsafe_fn = "deny"
 plecto-host = { path = "crates/host", version = "0.12.0" }
 plecto-control = { path = "crates/control", version = "0.12.0" }
 plecto-server = { path = "crates/server", version = "0.12.0" }
-# wasmtime 48.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
-# WASI 0.3). 48 turns no new proposal on by default; GC and exception handling stay default-on
-# from 47 and the engine keeps turning both back off explicitly (deny-by-default,
-# crates/host/src/engine.rs). The async / bindgen API is still moving on this line, so we track
-# the latest 48 patch (Cargo.lock pins the resolved build).
-wasmtime = "48.0.2"
+# wasmtime 49.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
+# WASI 0.3). 49 makes wide-arithmetic default-on; GC, exception handling, and wide-arithmetic
+# are explicitly turned off (deny-by-default, crates/host/src/engine.rs). The async / bindgen
+# API is still moving on this line, so we track the latest 49 patch (Cargo.lock pins the
+# resolved build).
+wasmtime = "49.0.1"
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "48.0.2"
-wasmtime-wasi-http = "48.0.2"
-# wit-component must stay on the wasm-tools series `wasmtime` above bundles (48.0.x ⇒ 0.254):
+wasmtime-wasi = "49.0.1"
+wasmtime-wasi-http = "49.0.1"
+# wit-component must stay on the wasm-tools series `wasmtime` above bundles (49.0.x ⇒ 0.258):
 # `bindgen!(include_component_type)` encodes each world with wasmtime's own copy, and the static
 # contract gate decodes it through wasmtime's `wit_parser` re-export — two series would not even
 # type-check (ADR 000114). Declared here so a partial bump cannot produce two wasm-tools stacks.
-wit-component = "0.254"
+wit-component = "0.258"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"

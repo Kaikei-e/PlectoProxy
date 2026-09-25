@@ -32,6 +32,63 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-25
+
+Minor-line release carrying the wasmtime 48 → 49 major bump, taken for four upstream advisories.
+Minor rather than patch because the runtime's types are re-surfaced through public signatures —
+`LoadError::Wasmtime(wasmtime::Error)` and `Host::pooling_allocator_metrics()` — so a downstream
+crate naming wasmtime 48 types cannot compile against this build. `cargo semver-checks` cannot see
+this (the type paths are unchanged), which is the gap the versioning policy above assigns to manual
+judgement (the same call as 0.10.1). **Deployed filters do not need a rebuild**: the contract stays
+at `plecto:filter@0.4.0` and all four shipped contract versions keep loading.
+
+Against the crates.io 0.12.0 baseline, `cargo semver-checks` reports no semver update required
+on each of `plecto-host` / `plecto-control` / `plecto-server` (default features), and the T1
+perf gate passes every invariant.
+
+### Security
+
+- **Runtime: wasmtime 48.0.2 → 49.0.1** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, per
+  the workspace's single-declaration rule; the streaming spike host in `spike/streaming-async`
+  follows in its own workspace). 49.0.1 carries the fixes for four advisories published
+  2026-09-24 whose affected ranges include 48.0.2:
+  - [GHSA-c9gc-w9vx-w86p](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-c9gc-w9vx-w86p)
+    — *`wasmtime-wasi-http` outgoing body writes let the guest exhaust host memory* (Moderate).
+    Reachable in a `capabilities` build where a filter is granted `outbound-http` (ADR 000036):
+    the allowlist bounds where a filter may connect, not how much body it writes.
+  - [GHSA-jqpg-j7w6-42pr](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-jqpg-j7w6-42pr)
+    — *dynamic record lifting can allocate beyond the hostcall fuel limit* (Low). The hostcall
+    fuel limit is wasmtime's own bound on host-side allocation while lifting guest values, active
+    at its default here, so this is treated as reachable.
+  - [GHSA-m63x-6p34-q65x](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-m63x-6p34-q65x)
+    — *`call_ref` and exception `catch` can drop fuel accounting* (Moderate). Not reachable: the
+    engine meters with epoch interruption and never enables fuel, and exception handling is
+    turned off.
+  - [GHSA-j2g9-4prp-pf6h](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-j2g9-4prp-pf6h)
+    — *a filesystem datetime overflow lets the guest panic the host* (Moderate). Not reachable:
+    the filesystem interface is lent inert, with zero preopens, so a filter holds no descriptor
+    to stat.
+- **49 turns the wide-arithmetic proposal on by default**, and the ADR 000096 audit closes it:
+  both engine configs now turn it explicitly off next to GC and exception handling, and tests pin
+  that a component using `i64.add128` is rejected at load ([ADR 000117](docs/ADR/000117.md),
+  amending [ADR 000096](docs/ADR/000096.md)). The exposure the engine gives an untrusted filter is
+  unchanged from the 48 line.
+
+### Changed
+
+- **`wit-component` 0.254 → 0.258 and the pinned `wasm-tools` CLI 1.254.0 → 1.258.0** (ADR 000114
+  series parity: wasmtime 49 bundles the 0.258 wasm-tools series). The test-only `wat` follows to
+  1.258. wasmtime 49's MSRV is 1.96.0; the repository toolchain stays at 1.97.1. The only host
+  source change beyond the engine config is `HostResolveAddressStream::drop` becoming `async` in
+  `wasmtime-wasi`, which the outbound-TCP lookup view follows.
+- **Reference-filter shelf republished**: `filters/cors` 0.2.1 → 0.2.2, `filters/apikey` 0.1.7 →
+  0.1.8 (ADR 000080 — filter tags are immutable). No filter source change: the zero-WASI entries
+  are componentized with the `wasm-tools` CLI, and moving it 1.254.0 → 1.258.0 changes the
+  encoded bytes — verified locally for `apikey` (1.254.0 reproduces the published digest, 1.258.0
+  does not). `filters/jwt` / `filters/extauthz` are built directly for `wasm32-wasip2`, their
+  sources and lockfiles are unchanged, and they stay at 0.1.9 / 0.2.1. The compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
+
 ## [0.12.0] - 2026-09-25
 
 Minor release: operator-facing observability — per-route `route` label on `plecto_requests_total` /

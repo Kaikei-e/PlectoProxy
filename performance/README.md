@@ -13,10 +13,19 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 ## Measurement setup
 
-- **Core isolation by pinning.** Plecto Proxy (and its in-process backends) is pinned to one dedicated
-  set of CPU cores; **every** load generator is pinned to a separate, disjoint set. The generator
-  therefore never steals a core from the proxy — the run measures Plecto Proxy, not the generator
-  fighting it. (Done with `taskset`; no privileged host tuning.)
+- **Core isolation by pinning.** The proxy is pinned at exec time so every thread inherits the mask
+  and the per-thread affinity is verified after start; the default proxy/generator split is by whole
+  physical cores (`bench/perf/cpu_split.py`). The generator therefore never steals a core from the proxy
+  — the run measures Plecto Proxy, not the generator fighting it. (The dev host is hybrid: P-cores 0-15 as
+  adjacent SMT pairs, E-cores 16-23, so the default GEN set 12-23 mixes P and E cores — informational.)
+- **Allocator configuration.** Every proxy launch runs with the shipped arena cap of 4 (`bench-server`
+  now calls `cap_malloc_arenas` like the `plecto` binary).
+- **Run data retention & host fingerprinting.** Raw per-round JSON, proxy logs, CSV copies and a host
+  fingerprint (`host.txt`) are kept under `performance/data/runs/<run-id>/` and `just perf-archive` tars
+  one for attaching to a GitHub Release.
+- **Historical comparability note.** Numbers measured before this change (the 2026-09-25 snapshot and
+  earlier) were taken with partial pinning and uncapped arenas outside the body phase, so footprint
+  KB/conn and gate spreads are not directly comparable.
 - **No host tuning.** CPU governor / turbo are left at their defaults — no fixed-frequency lock.
   Absolute throughput shifts run-to-run with clock; the **ratios, shapes and time-constants** are
   the durable signal, so those are what we read.
@@ -99,7 +108,11 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 > [`HISTORY.md`](HISTORY.md) — this TL;DR keeps only the newest two.
 > **µs/req deltas are what to track across snapshots**, not raw throughput — and the tracked
 > invariant set is machine-checked by the T1 gate (`bash bench/perf/run-perf.sh gate`, bands in
-> `bench/perf/gate_tolerances.toml`).
+> `bench/perf/gate_tolerances.toml`). The gate produces a three-valued verdict: `pass` (exit code 0,
+> all invariants in band), `fail` (exit code 1, interval outside band; dominates inconclusive), or
+> `inconclusive` (exit code 2, interval straddles band edge => re-run required).
+>
+> **Metric definition — µs/req**: µs/req = 1e6 / rps, i.e. inverse throughput. In a closed loop with C connections it equals mean latency / C (Little's law); it is neither latency nor CPU time. Note that criterion's per-call µs (single-thread, in-process) is a different quantity.
 
 **Load-balancing fast path** (plaintext HTTP/1.1, 3 upstreams, trivial 0 ms backend; k6 / loadgen / oha):
 
@@ -230,11 +243,13 @@ allocation contending for the same cache lines every tick; reported as measured,
 
 **Extension plane** (`crates/host/benches/wasm.rs`):
 
-| bench | cost | isolates |
+| bench | cost (per-call µs) | isolates |
 | --- | --- | --- |
-| `on_request` — pooled instance | ~2.88 µs/req | dispatch + call (init amortized) |
-| `on_request` — fresh instance / request | ~44.0 µs/req | + per-request instantiation (the pool's value) |
+| `on_request` — pooled instance | ~2.88 µs | dispatch + call (init amortized) |
+| `on_request` — fresh instance / request | ~44.0 µs | + per-request instantiation (the pool's value) |
 | cold `load` (verify + instantiate + init) | ~27.3 ms | cosign signature + SBOM verification dominates |
+
+*(Note: Criterion clocks wall-clock duration per call in a single-thread, in-process benchmark. This per-call µs is a different quantity from the macro inverse-throughput µs/req = 1e6 / rps; see [metric definition](#1-load-balancing-fast-path).)*
 
 The ~15× pooled→fresh gap here is the same one the [macro ladder](#the-wasm-cost-ladder--isolating-each-cost)
 shows end-to-end (~25× this snapshot, with the HTTP layer and its own run-to-run noise around it) —
@@ -268,6 +283,8 @@ reason. (Instruction counts measured 2026-08-15 at commit `b2a89be` (tag **v0.9.
 ---
 
 # 1. Load-balancing fast path
+
+> **Metric definition — µs/req**: `µs/req = 1e6 / rps`, i.e. inverse throughput. In a closed loop with *C* connections it equals mean latency / *C* (Little's law); it is neither latency nor CPU time. Criterion's per-call µs in [§0 Micro-benchmarks](#0-micro-benchmarks-in-process-criterion) is a single-thread, in-process quantity and dimensionally distinct.
 
 Subject: one Plecto Proxy route forwarding to an upstream pool of **3 instances**, round-robin pick
 over the healthy set, active health probe every **500 ms** with eject after **2** consecutive
@@ -532,9 +549,9 @@ below remain the honest queueing-free read.)*
 
 - **baseline → noop-pooled** = the **irreducible extension-plane dispatch cost**. Full-throttle,
   this run shows a **~47 % throughput** cost (180.0k → 95.6k, **≈ 4.91 µs/req** inverse-throughput
-  delta — matching the T1 gate's interleaved **4.48–4.69 µs** dispatch-floor invariant across the two
-  gate runs); the fixed-rate tails put the queueing-free floor at **+0.13 ms p50 / +0.16 ms p99**. Every
-  WASM filter pays this floor.
+  delta [see metric definition](#1-load-balancing-fast-path) — matching the T1 gate's interleaved **4.48–4.69 µs**
+  dispatch-floor invariant across the two gate runs); the fixed-rate tails put the queueing-free floor at
+  **+0.13 ms p50 / +0.16 ms p99**. Every WASM filter pays this floor.
 - **noop-pooled → noop-fresh** = the **per-request instantiation cost**, cleanly isolated from any
   host work: throughput collapses **~25×** (95.6k → 3.8k). This is what pooling buys.
 - **noop-pooled → trusted** = a **real filter's own work** on top of the no-op (header parse +
@@ -593,11 +610,11 @@ still not a tail you can operate behind near or above that knee.
 
 **The µs/req deltas are the invariants to track for regressions, not the percentages** (which widen or
 shrink whenever the *baseline* moves). These macro deltas **reconcile with the in-process
-[micro-benchmarks](#0-micro-benchmarks-in-process-criterion)** — with one disclosed asymmetry: this
-run's clean full-throttle ordering gives a real baseline→noop-pooled inverse-throughput delta of
-**~4.91 µs/req** (5.55 → 10.47 µs); criterion clocks the pooled per-request call at ~2.88 µs of that (carried from
-2026-08-15), leaving **~2.0 µs** as the `spawn_blocking` handoff (sync wasmtime, `!Send` store) that a route
-with no filters skips entirely. The fresh ~44 µs, by contrast, is the *uncontended* cost — criterion
+[micro-benchmarks](#0-micro-benchmarks-in-process-criterion)** in direction and general scale, but
+the 4.91 µs/req is an inverse-throughput delta under saturation (~+245 µs mean latency at 50 connections);
+subtracting a single-thread criterion call from it is dimensionally invalid; the per-request cost
+decomposition is open (filtered routes also do a second blocking handoff for on-response, which is a
+required export). The fresh ~44 µs, by contrast, is the *uncontended* cost — criterion
 instantiates sequentially, so it never pays the `mmap_lock` contention or cross-core shootdowns the
 concurrent macro run exposes (the knee above). The layers agree once that kernel-side term is named.
 
@@ -649,7 +666,7 @@ row can be re-run alone. Same generators and CO-safe tail pattern as
 | `/resp-ctx` | read as-forwarded snapshot → continue | 110,183 | 0.44 ms | 0.83 ms | 9.08 |
 | `/resp-replace` | read + `replace` (418, 23 B body) | 105,742 | 0.45 ms | 0.84 ms | 9.46 |
 
-*(Not re-run this pass — measured 2026-08-15 at commit `b2a89be` (tag **v0.9.0**) via `v03`. Kept as the baseline for the opt-in response features; same-process adjacent deltas — do not splice onto an older `wasm` CSV's noop row.)*
+*(Not re-run this pass — measured 2026-08-15 at commit `b2a89be` (tag **v0.9.0**) via `v03`. Kept as the baseline for the opt-in response features; same-process adjacent deltas — do not splice onto an older `wasm` CSV's noop row. µs/req = 1e6 / rps inverse throughput; see [definition](#1-load-balancing-fast-path).)*
 
 - **noop-pooled → resp-ctx ≈ +0.22 µs/req** this run — the cost of *using* the ADR 000073 request
   snapshot on `on-response` (path length + header scan), with the same continue/forward path. The
@@ -680,7 +697,7 @@ row can be re-run alone. Same generators and CO-safe tail pattern as
 | `/baseline` | identity (AE advertised, opt-in off) | 192,892 | 0.25 ms | 0.46 ms | 5.18 |
 | `/compress` | gzip (level 5, ADR 000075 defaults) | 133,135 | 0.36 ms | 0.63 ms | 7.51 |
 
-- **baseline → compress ≈ −31.0 % ceiling / +2.33 µs/req** for this highly compressible 4 KiB
+- **baseline → compress ≈ −31.0 % ceiling / +2.33 µs/req** (inverse throughput; see [definition](#1-load-balancing-fast-path)) for this highly compressible 4 KiB
   filler — the third pass in a row within ~0.25 µs of the same figure (+2.11 / +2.09 / +2.33). Real
   HTML/JSON ratios and CPU will differ; this row is a **regression floor** for the opt-in path, not
   a capacity guide for production payloads. RFC 9411 §7.3-style: one object size, sustainable
@@ -1004,9 +1021,14 @@ what that setup buys.)
   the frequency-invariant judge for "did the contract surface get more expensive?" — see
   [Reproducing](#reproducing) and `bench/methodology.md` § Measurement tiers.
 - **The local per-change gate.** `bash bench/perf/run-perf.sh gate` re-measures exactly the
-  invariants this report tracks (interleaved for a confidence half-width) and machine-checks them
+  invariants this report tracks (interleaved for a conservative uncertainty width) and machine-checks them
   against `bench/perf/gate_tolerances.toml` — the bands are tracked in-repo, so a deliberate
-  performance change is reviewed as a diff. `all` stays the human-read release snapshot.
+  performance change is reviewed as a diff. The gate returns a **three-valued verdict**:
+  - `pass` (exit code 0): every invariant's uncertainty interval `[value - ci_half, value + ci_half]` falls within its band `[band_lo, band_hi]`.
+  - `fail` (exit code 1): at least one invariant's uncertainty interval falls completely outside its band (`value + ci_half < band_lo` or `value - ci_half > band_hi`). Exit code 1 dominates inconclusive.
+  - `inconclusive` (exit code 2): an invariant straddles a band edge (neither fully inside nor fully outside). An inconclusive verdict indicates run-to-run noise or drift; re-run required.
+  (Invariants without `ci_half` keep binary pass/fail judgment.)
+  `all` stays the human-read release snapshot.
 - **CI regression gate.** Per-PR, two layers with different verdict policies (`bench.yml`): the
   criterion micro-benchmarks stay *informational* (hosted-runner wall-clock is noisy-neighbour
   bound, ~2–3 % CV, so a tight threshold would false-fail), while the gungraun instruction-count
@@ -1028,7 +1050,8 @@ cargo build --release -p plecto-server --features bench-harnesses \
   --example load-balancing --example bench-server --example tls-http --example swap-bench
 
 # T1 — the per-change regression gate (~6-7 min): interleaved invariant deltas judged against
-# bench/perf/gate_tolerances.toml, written to performance/data/gate.csv. Exit 0 = in band.
+# bench/perf/gate_tolerances.toml, written to performance/data/gate.csv.
+# Exit code: 0 = pass (in band), 1 = fail (out of band), 2 = inconclusive (straddles edge => re-run).
 bash bench/perf/run-perf.sh gate          # or: just gate
 
 # T2 — the full release-snapshot suite (~22 min at the report-tier windows). Phases:

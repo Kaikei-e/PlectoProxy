@@ -94,8 +94,8 @@ bench-build:
     cd {{plecto}} && cargo build --release -p plecto-server --features bench-harnesses \
         --example load-balancing --example bench-server --example tls-http --example swap-bench
 
-# Interleaved invariant deltas vs bench/perf/gate_tolerances.toml, machine verdict (exit 0 = in
-# band). Run on hot-path changes; see bench/methodology.md § tiers.
+# Interleaved invariant deltas vs bench/perf/gate_tolerances.toml, machine verdict (exit 0 = pass,
+# 1 = fail, 2 = inconclusive -> re-run). Run on hot-path changes; see bench/methodology.md § tiers.
 # T1 perf gate (~6-7 min)
 gate:
     bash bench/perf/run-perf.sh gate
@@ -107,3 +107,19 @@ report:
 # T3 deep phase by name (opt-in diagnostics): v03, tls, h3, or any single runbook phase
 deep PHASE:
     bash bench/perf/run-perf.sh {{PHASE}}
+
+# print CPU core split and hybrid topology check
+perf-cpus:
+    bash bench/perf/run-perf.sh cpus
+
+# tar one perf run dir (default: newest) for attaching to a GitHub Release
+perf-archive RUN='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd performance/data/runs
+    run="{{RUN}}"
+    run="${run:-$(ls -1td -- */ 2>/dev/null | head -1)}"
+    run="$(basename "${run%/}")"
+    [[ -n "$run" && -d "$run" ]] || { echo "no run directory under performance/data/runs" >&2; exit 1; }
+    tar -czf "$run.tar.gz" "$run"
+    echo "performance/data/runs/$run.tar.gz"

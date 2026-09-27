@@ -5,6 +5,16 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-09-26 (methodology update: pinning, arenas, data retention, three-valued gate)
+
+Methodology update establishing a new comparable series for upcoming runs:
+- **Core isolation by pinning**: The proxy is pinned at exec time so every thread inherits the mask and the per-thread affinity is verified after start. The default proxy/generator split partitions by whole physical cores (`bench/perf/cpu_split.py`). The dev host is hybrid (P-cores 0-15 as adjacent SMT pairs, E-cores 16-23), so the default GEN set 12-23 mixes P and E cores (informational).
+- **Allocator arena cap**: Every proxy launch runs with the shipped arena cap of 4 (`bench-server` now calls `cap_malloc_arenas` like the `plecto` binary).
+- **Raw data retention & host fingerprint**: Raw per-round JSON outputs, proxy logs, CSV copies, and a host fingerprint (`host.txt`) are preserved under `performance/data/runs/<run-id>/`, and `just perf-archive` packages them into a tarball for GitHub Release attachments.
+- **Three-valued gate verdict**: The T1 perf gate evaluates conservative uncertainty intervals (`[value - ci_half, value + ci_half]`) producing three-valued verdicts: `pass` (exit code 0), `fail` (exit code 1; dominates inconclusive), or `inconclusive` (exit code 2; interval straddles band edge, requiring a re-run).
+
+Numbers measured before this change (the 2026-09-25 snapshot and earlier) were taken with partial pinning and uncapped arenas outside the body phase, so footprint KB/conn and gate spreads are not directly comparable. The next T1 runs start a new comparable series.
+
 ## 2026-07-20 (v0.5.1/v0.5.2 patch confirmation)
 
 A full refresh: T1 `gate` (**PASS**, every invariant in band), a full `bash bench/perf/run-perf.sh

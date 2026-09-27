@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Plecto perf runbook — emits performance/data/*.csv consumed by performance/flint/plot.mjs. Fully local,
-# loopback. Plecto (+ its in-process backends) is pinned to one set of CPU cores and every load
-# generator to a disjoint set via taskset, so the generator never steals the proxy's cores. No host
+# loopback. Plecto (+ its in-process backends) is pinned at exec time to one set of whole physical
+# cores (cpu_split.py; every thread's affinity is verified after start) and every load generator to
+# a disjoint set via taskset, so the generator never steals the proxy's cores. Raw per-round output,
+# proxy logs and a host fingerprint are kept under performance/data/runs/<run-id>/. No host
 # tuning is applied (governor/turbo left as-is), so absolute throughput is bounded by this host and
 # the generator; read ratios, shapes and time-constants as the signal.
 #
@@ -17,7 +19,7 @@
 #
 #   bash bench/perf/run-perf.sh <phase>
 #   phase ∈ quick gate ceiling sweep openloop rr ejection swap wasm v03 tls h3 ws footprint ratelimit
-#           body mix industry all
+#           body mix industry cpus all
 #
 # Tiers (bench/methodology.md § Measurement tiers): `quick` = T0 smoke, `gate` = T1 per-change
 # regression gate (interleaved invariant deltas, banded verdict, exit code), `all` = T2 release
@@ -53,17 +55,116 @@ TIER="${TIER:-report}"; [[ "${1:-all}" == "gate" ]] && TIER=gate
 case "$TIER" in
   gate)   D_CEIL=10; D_SWEEP=10; D_WASM=10; D_TAIL=15; D_TLS=10; D_RL=10; D_ENF=10; D_BODY=10; D_MIX=30; ROUNDS=3;;
   report) D_CEIL=20; D_SWEEP=30; D_WASM=30; D_TAIL=20; D_TLS=20; D_RL=20; D_ENF=30; D_BODY=15; D_MIX=60; ROUNDS=1;;
-  *) echo "unknown TIER: $TIER (expected gate|report)"; exit 2;;
+  *) echo "unknown TIER: $TIER (expected gate|report)"; exit 64;;
 esac
 
 OHA="${OHA:-$HOME/.cargo/bin/oha}"
 K6="${K6:-$(command -v k6)}"
-# Pin Plecto and the generators to disjoint core sets. Default: split the logical CPUs in half —
-# proxy on the lower indices, generators on the upper. Override PROXY_CPUS / GEN_CPUS to match your
-# host's topology (e.g. put the proxy on its fastest cores and the generators on the rest).
-_NCPU="$(nproc)"; _HALF="$(( _NCPU / 2 ))"
-PROXY_CPUS="${PROXY_CPUS:-0-$(( _HALF - 1 ))}"
-GEN_CPUS="${GEN_CPUS:-$_HALF-$(( _NCPU - 1 ))}"
+# Pin Plecto and the generators to disjoint core sets via whole-physical-core assignment.
+# Override PROXY_CPUS / GEN_CPUS to match custom topologies.
+if [[ -z "${PROXY_CPUS:-}" || -z "${GEN_CPUS:-}" ]]; then
+  _DEF_PROXY=""
+  _DEF_GEN=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      PROXY_CPUS) _DEF_PROXY="$_v";;
+      GEN_CPUS) _DEF_GEN="$_v";;
+    esac
+  done < <(python3 "$HERE/cpu_split.py")
+  PROXY_CPUS="${PROXY_CPUS:-$_DEF_PROXY}"
+  GEN_CPUS="${GEN_CPUS:-$_DEF_GEN}"
+fi
+[[ -n "$PROXY_CPUS" && -n "$GEN_CPUS" ]] || {
+  echo "cannot split CPUs into proxy/generator sets (PROXY_CPUS='$PROXY_CPUS' GEN_CPUS='$GEN_CPUS'); set both explicitly" >&2
+  exit 64
+}
+
+if [[ "${1:-all}" == "cpus" ]]; then
+  echo "PROXY_CPUS=$PROXY_CPUS"
+  echo "GEN_CPUS=$GEN_CPUS"
+  python3 "$HERE/cpu_split.py" --check "$PROXY_CPUS" "$GEN_CPUS"
+  exit 0
+fi
+
+python3 "$HERE/cpu_split.py" --check "$PROXY_CPUS" "$GEN_CPUS"
+
+if [[ -z "${RUN_DIR:-}" ]]; then
+  _REV="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+  _DIRTY=""
+  if ! git -C "$ROOT" diff --quiet 2>/dev/null || ! git -C "$ROOT" diff --cached --quiet 2>/dev/null; then
+    _DIRTY="-dirty"
+  fi
+  _TS="$(date -u +%Y%m%dT%H%M%SZ)"
+  RUN_DIR="$ROOT/performance/data/runs/${_TS}-${_REV}${_DIRTY}"
+elif [[ "$RUN_DIR" != /* ]]; then
+  RUN_DIR="$ROOT/$RUN_DIR"
+fi
+mkdir -p "$RUN_DIR" "$RUN_DIR/logs" "$RUN_DIR/csv"
+
+write_host_info(){
+  local host_file="$RUN_DIR/host.txt"
+  [[ -f "$host_file" ]] && return 0
+  {
+    echo "=== Date ==="
+    date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || date -u
+    echo
+    echo "=== Git Revision ==="
+    local rev dirty=""
+    rev="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")"
+    if ! git -C "$ROOT" diff --quiet 2>/dev/null || ! git -C "$ROOT" diff --cached --quiet 2>/dev/null; then
+      dirty=" (dirty)"
+    fi
+    echo "${rev}${dirty}"
+    echo
+    echo "=== System ==="
+    uname -a
+    echo
+    echo "=== CPU Info (lscpu) ==="
+    lscpu 2>/dev/null || echo "lscpu unavailable"
+    echo
+    echo "=== CPU Core Topology (lscpu -e) ==="
+    lscpu -e=CPU,CORE,SOCKET,NODE,MAXMHZ 2>/dev/null || true
+    echo
+    echo "=== Scaling Governor ==="
+    python3 -c '
+import glob, collections, re, sys
+sys.path.insert(0, sys.argv[1])
+from cpu_split import format_cpuset
+govs = collections.defaultdict(list)
+for p in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor")):
+    m = re.search(r"/cpu(\d+)/", p)
+    if m:
+        govs[open(p).read().strip()].append(int(m.group(1)))
+for gov, cpus in govs.items():
+    print(f"{gov} -> {format_cpuset(cpus)}")
+' "$HERE" 2>/dev/null || echo "scaling_governor unavailable"
+    echo
+    echo "=== Turbo / Boost ==="
+    for p in /sys/devices/system/cpu/intel_pstate/no_turbo /sys/devices/system/cpu/cpufreq/boost; do
+      [[ -f "$p" ]] && echo "$p = $(cat "$p" 2>/dev/null)"
+    done
+    echo
+    echo "=== SMT Control ==="
+    if [[ -f /sys/devices/system/cpu/smt/control ]]; then
+      echo "smt/control = $(cat /sys/devices/system/cpu/smt/control 2>/dev/null)"
+    fi
+    echo
+    echo "=== Pinning Split & Topology Check ==="
+    echo "PROXY_CPUS=$PROXY_CPUS"
+    echo "GEN_CPUS=$GEN_CPUS"
+    python3 "$HERE/cpu_split.py" --check "$PROXY_CPUS" "$GEN_CPUS" 2>&1 || true
+    echo
+    echo "=== Allocator Arena ==="
+    echo "BENCH_MALLOC_ARENA_MAX=${BENCH_MALLOC_ARENA_MAX:-4}"
+    echo
+    echo "=== Tool Versions ==="
+    "$OHA" --version 2>/dev/null || echo "oha: absent"
+    "$K6" version 2>/dev/null || echo "k6: absent"
+    rustc --version 2>/dev/null || echo "rustc: absent"
+    python3 --version 2>/dev/null || echo "python3: absent"
+  } > "$host_file"
+}
+write_host_info
 export K6_NO_USAGE_REPORT=true
 # oha ≥1.14 maps NO_COLOR through clap and only accepts true/false — the conventional NO_COLOR=1
 # (common in CI/agent environments) makes every oha invocation fail with an empty JSON file.
@@ -164,9 +265,20 @@ PHASE_RESULTS=()
 RUN_RC=0
 run_phase(){
   local name="$1" rc=0; shift
+  local marker="$RUN_DIR/.marker_$name"
+  touch "$marker"
   "$@" || rc=$?
-  if (( rc )); then
-    PHASE_RESULTS+=("FAIL $name (exit $rc)"); RUN_RC=1; err "phase $name FAILED (exit $rc)"
+  find "$DATA" -maxdepth 1 \( -name '*.csv' -o -name '*.txt' -o -name '*.json' \) -newer "$marker" \
+    -exec cp -f {} "$RUN_DIR/csv/" \;
+  rm -f "$marker"
+  if (( rc == 2 )); then
+    PHASE_RESULTS+=("INCONCLUSIVE $name (exit $rc)")
+    (( RUN_RC == 0 )) && RUN_RC=2
+    err "phase $name INCONCLUSIVE (exit $rc)"
+  elif (( rc )); then
+    PHASE_RESULTS+=("FAIL $name (exit $rc)")
+    RUN_RC=1
+    err "phase $name FAILED (exit $rc)"
   else
     PHASE_RESULTS+=("ok   $name")
   fi
@@ -216,6 +328,7 @@ fi
 PROXY_PID=""
 PROXY_KEY=""
 BLOG=""
+BLOG_SEQ=0
 stop_proxy(){ [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; PROXY_PID=""; PROXY_KEY=""; }
 # End-of-phase stop. Under SHARE_PROXY=1 (the `all` runner) the proxy is left running so the next
 # phase's launch() can reuse it when the spec matches — the BACKEND_LATENCY_MS=0 bench-server
@@ -236,10 +349,15 @@ launch(){
   fi
   stop_proxy
   local ex="$1" addr="$2" health="$3"; shift 3
-  BLOG="$(mktemp)"
-  env PLECTO_PROXY_ADDR="$addr" RUST_LOG=warn "$@" "$WS/target/release/examples/$ex" >"$BLOG" 2>&1 &
+  BLOG_SEQ=$(( BLOG_SEQ + 1 ))
+  BLOG="$RUN_DIR/logs/${ex}-${BLOG_SEQ}.log"
+  # BENCH_MALLOC_ARENA_MAX=0 = glibc default arenas (MALLOC_ARENA_MAX must then be absent, not 0).
+  local arena="${BENCH_MALLOC_ARENA_MAX:-4}" arena_env=()
+  (( arena > 0 )) && arena_env=(MALLOC_ARENA_MAX="$arena")
+  taskset -c "$PROXY_CPUS" env -u MALLOC_ARENA_MAX PLECTO_PROXY_ADDR="$addr" \
+    "${arena_env[@]}" PLECTO_MALLOC_ARENA_MAX="$arena" \
+    RUST_LOG=warn "$@" "$WS/target/release/examples/$ex" >"$BLOG" 2>&1 &
   PROXY_PID=$!
-  taskset -cp "$PROXY_CPUS" "$PROXY_PID" >/dev/null 2>&1
   if [[ -n "$health" ]]; then
     local ok=""
     for _ in $(seq 80); do
@@ -256,6 +374,27 @@ launch(){
     sleep 2
     kill -0 "$PROXY_PID" 2>/dev/null || { err "proxy $ex exited during startup"; cat "$BLOG" >&2; return 1; }
   fi
+
+  local t_tasks=(/proc/"$PROXY_PID"/task/*)
+  local tcount="${#t_tasks[@]}"
+  local distinct_aff
+  distinct_aff="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/"$PROXY_PID"/task/*/status 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
+    printf '%s pid=%s threads=%s affinity=%s\n' "$ex" "$PROXY_PID" "$tcount" "$distinct_aff" >> "$RUN_DIR/affinity.txt"
+  fi
+  if [[ -z "$distinct_aff" ]]; then
+    err "proxy $ex has no active tasks/affinity (pid $PROXY_PID)"
+    cat "$BLOG" >&2
+    return 1
+  fi
+  for aff in $distinct_aff; do
+    if ! python3 "$HERE/cpu_split.py" --same "$aff" "$PROXY_CPUS"; then
+      err "proxy thread affinity mismatch: expected $PROXY_CPUS, got $aff (pid $PROXY_PID, distinct: $distinct_aff)"
+      cat "$BLOG" >&2
+      return 1
+    fi
+  done
+
   PROXY_KEY="$key"
   echo "launched $ex on $addr (pid $PROXY_PID, pinned $PROXY_CPUS)"
 }
@@ -282,7 +421,7 @@ print(r["rps"], r["p50"], r["p90"], r["p95"], r["p99"])
 phase_quick(){
   log "Quick — smoke ceiling + idle RSS (~1 min; oha only, no k6/Docker needed)"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/quick"; mkdir -p "$tmp"
   warm_oha -c 50 "http://$BENCH_ADDR/baseline/x"
   gen "$OHA" -z 10s -c 50 --no-tui --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/ka.json" 2>/dev/null
   echo "  keep-alive ceiling -> $(oha_row "$tmp/ka.json")"
@@ -296,7 +435,7 @@ phase_quick(){
 phase_ceiling(){
   log "Phase 1 — plain h1 ceiling: keep-alive RPS + cold-connection CPS (oha) -> ceiling.csv"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/ceiling"; mkdir -p "$tmp"
   warm_oha -c 50 "http://$BENCH_ADDR/baseline/x"
   gen "$OHA" -z "${D_CEIL}s" -c 50 --no-tui --output-format json "http://$BENCH_ADDR/baseline/x" > "$tmp/ka.json" 2>/dev/null
   echo "  keep-alive        -> $(oha_row "$tmp/ka.json")"
@@ -320,7 +459,7 @@ phase_ceiling(){
 phase_sweep(){
   log "Phase 2.1 — closed-loop sweep (k6 constant-vus) -> sweep.csv"
   launch load-balancing "$LB_ADDR" "http://$LB_ADDR/" || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/sweep"; mkdir -p "$tmp"
   for vus in 50 100 200 400 800; do
     log "  VU=$vus"
     gen "$K6" run -q "${INFLUX_OUT[@]}" \
@@ -434,7 +573,8 @@ phase_swap(){
   echo "  manifest: $manifest"
   # At t=15s (post-warmup): drop c, add the spare d — a genuinely different address set, the shape
   # a periodic-DNS re-resolution swap takes (ADR 000044), not a health-based ejection ([[000017]]).
-  local swapped; swapped="$(mktemp)"
+  local tmp="$RUN_DIR/swap"; mkdir -p "$tmp"
+  local swapped="$tmp/swapped.toml"
   cat > "$swapped" <<EOF
 [[upstream]]
 name = "pool"
@@ -455,7 +595,6 @@ EOF
     --exec-at "15=cp '$swapped' '$manifest' && kill -HUP $PROXY_PID" \
     --out "$DATA/swap.csv" --events-out "$DATA/swap_events.csv"
   stop_proxy
-  rm -f "$swapped"
   echo "--- events ---"; cat "$DATA/swap_events.csv"
   echo "--- timeline head/tail ---"; head -3 "$DATA/swap.csv"; tail -3 "$DATA/swap.csv"
 }
@@ -463,9 +602,10 @@ EOF
 # ---------------------------------------------------------------- Phase 3 WASM
 phase_wasm(){
   [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling || return 1
+  cp -f "$DATA/ceiling.csv" "$RUN_DIR/csv/"  # borrowed baseline: keep it with this run
   log "Phase 3.1 — WASM cost ladder (oha 50c, 0 ms backend) -> wasm_overhead.csv"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/wasm"; mkdir -p "$tmp"
   # The isolated cost ladder over one backend; adjacent deltas isolate one cost each:
   #   baseline(native) -> noop-pooled(dispatch+acquire) -> noop-fresh(instantiation) ->
   #   trusted(a real filter's work) -> ondemand(that filter fresh-per-request).
@@ -545,7 +685,7 @@ phase_v03(){
   # Response-side rungs share the default tiny backend (16 B): isolate guest/host work, not codec
   # CPU. Compression needs RESP_BYTES ≥ min_length (1024) + Accept-Encoding — separate launch.
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/v03"; mkdir -p "$tmp"
   # Adjacent deltas (same backend):
   #   noop-pooled → resp-ctx      = reading the as-forwarded request snapshot on on-response
   #   resp-ctx    → resp-replace  = synthesising a replace response (status+body)
@@ -638,8 +778,8 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
 phase_gate(){
   log "Gate — invariant deltas, interleaved x${ROUNDS}, banded verdict -> gate.csv"
   # Binary existence AND freshness are enforced centrally (require_fresh, run preflight + launch).
-  local tmp round r hdr
-  tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/gate"; mkdir -p "$tmp"
+  local round r hdr
   local ladder=(baseline noop-pooled trusted)
 
   # -- 1. WASM dispatch floor + filter cost: interleaved closed-loop ladder --
@@ -702,10 +842,15 @@ phase_gate(){
 
   # -- verdict --
   local rc=0
-  python3 "$HERE/gate_verdict.py" "$tmp" "$HERE/gate_tolerances.toml" > "$DATA/gate.csv" || rc=1
+  python3 "$HERE/gate_verdict.py" "$tmp" "$HERE/gate_tolerances.toml" > "$DATA/gate.csv" || rc=$?
   cat "$DATA/gate.csv"
-  if [[ "$rc" == 0 ]]; then log "gate: PASS (every invariant in band)"
-  else log "gate: FAIL — an invariant left its band (bands: bench/perf/gate_tolerances.toml)"; fi
+  if [[ "$rc" == 0 ]]; then
+    log "gate: PASS (every invariant in band)"
+  elif [[ "$rc" == 2 ]]; then
+    err "gate INCONCLUSIVE — re-run"
+  else
+    log "gate: FAIL — an invariant left its band (bands: bench/perf/gate_tolerances.toml)"
+  fi
 
   # -- 5. micro layer (informational): criterion vs a saved `main` baseline when one exists.
   #       The deterministic pass/fail judgement for contract-surface cost lives in the
@@ -724,8 +869,9 @@ phase_gate(){
 # ---------------------------------------------------------------- Phase 4 TLS
 phase_tls(){
   [[ -f "$DATA/ceiling.csv" ]] || phase_ceiling || return 1
+  cp -f "$DATA/ceiling.csv" "$RUN_DIR/csv/"  # borrowed baseline: keep it with this run
   log "Phase 4 — TLS decomposition (oha) -> tls.csv"
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/tls"; mkdir -p "$tmp"
   # plain h1 baseline: read from ceiling.csv (same route, same server, same oha flags — measuring
   # it again here would be the exact redundant run the harness merge eliminated).
   read -r plain_rps plain_p50 _ _ plain_p99 <<<"$(ceiling_row)"
@@ -765,14 +911,14 @@ phase_footprint(){
   # accept, and this phase measures the marginal cost of a held connection, not the cap. The divisor
   # is the count the generator reports as actually open — dividing by the REQUESTED count is how an
   # earlier snapshot published a bytes/conn figure four times too small.
-  local hold_out; hold_out="$(mktemp)"
+  local tmp="$RUN_DIR/footprint"; mkdir -p "$tmp"
+  local hold_out="$tmp/hold.txt"
   loadgen hold --target "http://$BENCH_ADDR/baseline/x" --conns 250 --seconds 6 >"$hold_out" 2>&1 &
   HOLD=$!
   sleep 3
   local busy; busy="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
   wait $HOLD 2>/dev/null
   local held; held="$(sed -n 's/^hold: \([0-9]\{1,\}\) connections.*/\1/p' "$hold_out")"
-  rm -f "$hold_out"
   echo "RSS with ${held:-0} held conns: ${busy} kB" | tee -a "$DATA/footprint.txt"
   python3 -c "print(f'bytes/conn ≈ {($busy-$idle)*1024/max(1,${held:-0}):.0f} (over ${held:-0} held connections)')" \
     | tee -a "$DATA/footprint.txt"
@@ -781,7 +927,7 @@ phase_footprint(){
 
 # ---------------------------------------------------------------- Phase 6 rate limit (ADR 000026)
 phase_ratelimit(){
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/ratelimit"; mkdir -p "$tmp"
   # -- 6.1 overhead: a generous (never-deny) bucket isolates the limiter's hot-path cost. Spread the
   # load across many keys (realistic multi-tenant), compare /ratelimit vs the no-filter /baseline. --
   log "Phase 6.1 — rate-limit overhead (generous bucket, multi-key) -> ratelimit_overhead.csv"
@@ -835,12 +981,11 @@ with open(sys.argv[2],"w",newline="") as o:
 # ---------------------------------------------------------------- Phase 7 request body (ADR 000025 / 000038)
 phase_body(){
   log "Phase 7 — request-body hook: payload sweep + zero-copy bypass + arena cap (ADR 000038) -> body.csv"
-  # As-shipped allocator default (Fix 1): cap glibc arenas the way the `plecto` bin does at startup
-  # (glibc reads MALLOC_ARENA_MAX at process start; equivalent to the in-process mallopt(M_ARENA_MAX,4)).
+  # The as-shipped arena cap (4) is applied by launch() for every phase, not just this one.
   # Routes: baseline (no filter) / body (filter-hello, reads the body → buffers) / body-headeronly
   # (filter-quickstart, header-only → the body streams through, ADR 000038 zero-copy bypass).
-  launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" MALLOC_ARENA_MAX=4 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" || return 1
+  local tmp="$RUN_DIR/body"; mkdir -p "$tmp"
   { echo "size,route,rps,req_mbps,p50,p99"
     for size in 1024 102400 1048576; do
       for rt in baseline body body-headeronly; do
@@ -863,7 +1008,7 @@ print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d
   # For the time-series peak/settled decomposition + allocator sweep see bench/perf/mem_matrix.py.
   { echo "route,rss_kb"
     for rt in baseline body body-headeronly; do
-      launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" MALLOC_ARENA_MAX=4 >/dev/null || return 1
+      launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" >/dev/null || return 1
       gen "$K6" run -q -e BASE="http://$BENCH_ADDR" -e ROUTE_PATH="/$rt" -e SIZE=1048576 -e VUS=50 \
         -e DUR=15s -e OUT="$tmp/rss_$rt.json" "$BENCH/k6-wasm/body-transform.js" >/dev/null 2>&1 &
       local kpid=$!
@@ -902,7 +1047,7 @@ phase_h3(){
 phase_mix(){
   log "Phase 9 — weighted request mix (60/25/10/5 read/auth/write/large) + paired same-rate read-only baseline -> mix.csv"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" RESP_BYTES=1024 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/mix"; mkdir -p "$tmp"
   # read-only first (the control), then the mix, both at the SAME arrival rate against the same
   # proxy: the per-class deltas are attributable to the traffic blend, not the offered load.
   for prof in read-only mix; do
@@ -931,7 +1076,7 @@ with open(sys.argv[3],"w",newline="") as o:
 phase_ws(){
   log "Phase 10 — WebSocket Upgrade tunnel (ADR 000048): handshake rate + tunnel footprint + echo throughput -> ws_*.csv"
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
-  local tmp; tmp="$(mktemp -d)"
+  local tmp="$RUN_DIR/ws"; mkdir -p "$tmp"
 
   log "  10.1 — handshake rate (open-loop, paced) -> ws_handshake.csv"
   loadgen ws --mode handshake --target "ws://$BENCH_ADDR/ws" --rate 500 --duration 20 --warmup 5 --workers 32 \
@@ -991,10 +1136,15 @@ case "$PHASE" in
     ;;
   # note: `v03` is opt-in (not in `all`) — run `bash bench/perf/run-perf.sh v03` after landing
   # ADR 000073/074/075 response features; see performance/README.md § v0.3.0 response ladder.
-  *) echo "unknown phase: $PHASE"; exit 2;;
+  *) echo "unknown phase: $PHASE"; exit 64;;  # not 2: that is the gate's inconclusive code
 esac
 
 log "done: $PHASE"
 if (( ${#PHASE_RESULTS[@]} )); then printf '  %s\n' "${PHASE_RESULTS[@]}"; fi
-(( RUN_RC == 0 )) || err "run FAILED — see the phase summary above; measured data for failed phases is absent or partial"
+if [[ -n "${RUN_DIR:-}" ]]; then echo "RUN_DIR: $RUN_DIR"; fi
+if (( RUN_RC == 2 )); then
+  err "run INCONCLUSIVE — re-run"
+elif (( RUN_RC != 0 )); then
+  err "run FAILED — see the phase summary above; measured data for failed phases is absent or partial"
+fi
 exit "$RUN_RC"

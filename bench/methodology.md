@@ -284,6 +284,38 @@ enforcement は offered の 48.8 % を失い、fairness の light key は 500/s 
 - **oha 1.14 / gungraun 0.19**: `-q` + `--latency-correction`、`--baseline=` / `--callgrind-limits`
   ともに現行仕様。ローカル runner と `Cargo.lock` の版一致を CI と同じ方式で確認。
 
+## 2026-09-26 — Measurement hygiene update (pinning, arenas, retention, three-valued gate)
+
+### 調査目的・改訂の背景
+ローカル性能計測ハーネス（`bench/perf/run-perf.sh`）において、測定の衛生性（hygiene）と再現性を向上させるための改訂を実施した。
+
+### 改訂内容
+1. **Exec-time pinning とスレッド別アフィニティ検証**:
+   - 従来は起動後の `taskset -cp` で親 PID のみリピンしていたため、tokio worker が全コアアフィニティを引き継ぐ競合（race）が生じていた。
+   - `taskset -c "$PROXY_CPUS" env ... binary &` による exec-time pinning へ変更し、全ワーカースレッドが確実にマスクを継承するようにした。
+   - 起動健全化後、`/proc/$PROXY_PID/task/*/status` の `Cpus_allowed_list` を読み取り、期待される `$PROXY_CPUS`（正規化集合で比較）と不一致のスレッドがあれば即座に exit 1 で失敗させる。
+   - 各起動ごとにスレッド数・アフィニティ一覧を `$RUN_DIR/affinity.txt` にスナップショット記録する。
+2. **物理コア境界での CPU 分割 (`cpu_split.py`)**:
+   - 従来の論理 CPU 半分分割（SMT ペアの分断リスク）を廃止し、`/sys/devices/system/cpu/cpu*/topology/{physical_package_id,core_id}` から物理コアをグループ化して丸ごと割り当てる `cpu_split.py` を導入。
+   - コア共有を `--check` で検知し警告を出力。ハイブリッド CPU（`/sys/devices/cpu_core` と `/sys/devices/cpu_atom`）の場合は各セットの内訳を note 出力する。
+   - 開発ホスト（i7-13700K: 0-15 P-core 隣接 SMT ペア、16-23 E-cores）では、既定値 `PROXY_CPUS=0-11`, `GEN_CPUS=12-23`（GEN 側が P コアと E コアの混在）となり過去履歴と連続性を保つ。
+3. **アロケータ arena 数の統一 (MALLOC_ARENA_MAX=4)**:
+   - `launch()` において `MALLOC_ARENA_MAX="${BENCH_MALLOC_ARENA_MAX:-4}"` および `PLECTO_MALLOC_ARENA_MAX="${BENCH_MALLOC_ARENA_MAX:-4}"` を全起動に一貫して適用（`bench-server` も `plecto` バイナリ同様に `cap_malloc_arenas` を呼ぶ）。`phase_body` 限定指定を撤廃。
+4. **生データ保持とホスト指紋 (`RUN_DIR` / `host.txt` / `just perf-archive`)**:
+   - 揮発性 `mktemp -d` を廃止し、起動時に `RUN_DIR=performance/data/runs/<UTC yyyymmddTHHMMSSZ>-<git short sha>[-dirty]` を作成。
+   - 各 phase の生 JSON、プロキシログ（`$RUN_DIR/logs/<example>-<seq>.log`）、出力 CSV コピー（`$RUN_DIR/csv/`）を保存。
+   - ホスト指紋 `$RUN_DIR/host.txt`（UTC 時刻、git revision + dirty、uname、lscpu、scaling_governor、boost/turbo、smt、アフィニティ分割、ツールバージョン）を記録。
+   - `just perf-archive` により run ディレクトリを `.tar.gz` に固めて GitHub Release 添付用にパッケージ可能にした。
+5. **3 値判定ゲート (T1 gate)**:
+   - `gate_verdict.py` は保守的不確実性幅 `[value - ci_half, value + ci_half]` を評価し、3 値を返す:
+     - `pass` (exit code 0): 不確実性区間が許容帯 `[band_lo, band_hi]` に収まる。
+     - `fail` (exit code 1): 区間が帯の外側に外れる（fail は inconclusive に優先）。
+     - `inconclusive` (exit code 2): 帯の境界を跨ぐ。`gate INCONCLUSIVE — re-run` を出力し再計測を要求（自動再実行は行わない）。
+   - `Report.dump` のサマリ行は stderr へ出力し、`gate.csv` の純粋な CSV フォーマットを維持する。
+
+### 比較可能性についての注意
+2026-09-26 以前の測定値は、部分的なアフィニティ割り当ておよび body 以外の非キャップ arena 下で取得されたため、**footprint KB/conn** および **gate の分散幅（spreads）** は本改訂以降の数値と直接比較できない。新世代の基準点として扱う。
+
 ## Offline policy
 
 - **During a load run**: loopback only. `K6_NO_USAGE_REPORT=true`. No registry / CDN / phone-home.
@@ -301,6 +333,7 @@ cd plecto && cargo build --release -p plecto-server --features bench-harnesses \
 ```
 
 ```bash
+bash bench/perf/run-perf.sh cpus  # CPU split & hybrid topology check only
 bash bench/perf/run-perf.sh gate  # T1: per-change invariant gate (~6-7 min, machine verdict)
 bash bench/perf/run-perf.sh all   # T2: release-snapshot report (~22 min, report-tier windows)
 bash bench/perf/run-perf.sh industry
@@ -309,4 +342,5 @@ OPENLOOP_RATE=60000 bash bench/perf/run-perf.sh openloop
 OPENLOOP_GEN=k6 OPENLOOP_RATE=60000 bash bench/perf/run-perf.sh openloop
 sudo unshare -n -- bash -c 'ip link set lo up; REQUIRE_OFFLINE=1 bash bench/perf/run-perf.sh industry'
 PLECTO_BENCH_ALLOW_STALE=1 bash bench/perf/run-perf.sh gate  # 意図的に古い build を測るときだけ
+just perf-archive                 # performance/data/runs/ 最新 run を tar.gz アーカイブ
 ```

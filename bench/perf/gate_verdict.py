@@ -7,13 +7,14 @@ the honest run-to-run spread on an unpinned host), and prints one CSV row per in
 
     invariant,value,ci_half,band_lo,band_hi,verdict
 
-verdict ∈ pass / fail / skipped (input missing, e.g. no k6) / info (reported, never judged).
-Exit code 0 iff no row is `fail` — the machine gate for `just gate` / pre-push hooks.
+verdict ∈ pass / fail / inconclusive / skipped (input missing, e.g. no k6) / info (reported, never judged).
+Exit code: 1 if any fail, else 2 if any inconclusive, else 0 — the machine gate for `just gate` / pre-push hooks.
 """
 
 import csv
 import glob
 import json
+import math
 import os
 import sys
 import tomllib
@@ -42,17 +43,59 @@ def spread(xs):
     return (sum(xs) / len(xs), (max(xs) - min(xs)) / 2)
 
 
+def judge(value, band_lo, band_hi, ci_half=None):
+    if math.isnan(value) or (ci_half is not None and math.isnan(ci_half)):
+        return "fail"
+    # Note: the half-range of a few rounds is not a confidence interval
+    # but is used as a conservative uncertainty width.
+    if ci_half is not None and ci_half > 0:
+        lo_v = value - ci_half
+        hi_v = value + ci_half
+        if band_lo <= lo_v and hi_v <= band_hi:
+            return "pass"
+        elif hi_v < band_lo or lo_v > band_hi:
+            return "fail"
+        else:
+            return "inconclusive"
+    return "pass" if band_lo <= value <= band_hi else "fail"
+
+
+def exit_code(rows_or_verdicts):
+    verdicts = set()
+    for item in rows_or_verdicts:
+        if isinstance(item, (tuple, list)):
+            verdicts.add(item[-1])
+        elif isinstance(item, str):
+            verdicts.add(item)
+    if "fail" in verdicts:
+        return 1
+    if "inconclusive" in verdicts:
+        return 2
+    return 0
+
+
+def count_verdicts(rows_or_verdicts):
+    c = {"pass": 0, "fail": 0, "inconclusive": 0}
+    for item in rows_or_verdicts:
+        v = item[-1] if isinstance(item, (tuple, list)) else item
+        if v in c:
+            c[v] += 1
+    return c
+
+
+def format_summary(counts):
+    return f"{counts['pass']} pass, {counts['fail']} fail, {counts['inconclusive']} inconclusive"
+
+
 class Report:
     def __init__(self, bands):
         self.bands = bands
         self.rows = []
-        self.failed = False
 
     def judge(self, name, value, ci_half=None):
         band = self.bands[name]  # a missing band is a bug in the tolerances file: fail loudly
-        ok = band["lo"] <= value <= band["hi"]
-        self.failed |= not ok
-        self.rows.append((name, value, ci_half, band["lo"], band["hi"], "pass" if ok else "fail"))
+        verdict = judge(value, band["lo"], band["hi"], ci_half)
+        self.rows.append((name, value, ci_half, band["lo"], band["hi"], verdict))
 
     def info(self, name, value, ci_half=None):
         self.rows.append((name, value, ci_half, "", "", "info"))
@@ -61,12 +104,26 @@ class Report:
         band = self.bands.get(name, {})
         self.rows.append((name, "", "", band.get("lo", ""), band.get("hi", ""), "skipped"))
 
-    def dump(self):
-        w = csv.writer(sys.stdout)
+    @property
+    def failed(self):
+        return any(v == "fail" for _, _, _, _, _, v in self.rows)
+
+    def counts(self):
+        return count_verdicts(self.rows)
+
+    def summary(self):
+        return format_summary(self.counts())
+
+    def exit_code(self):
+        return exit_code(self.rows)
+
+    def dump(self, out=sys.stdout, err=sys.stderr):
+        w = csv.writer(out)
         w.writerow(["invariant", "value", "ci_half", "band_lo", "band_hi", "verdict"])
         for name, value, ci, lo, hi, verdict in self.rows:
             fmt = lambda x: f"{x:.4f}" if isinstance(x, float) else x
             w.writerow([name, fmt(value), fmt(ci) if ci is not None else "", lo, hi, verdict])
+        print(self.summary(), file=err)
 
 
 def ladder_deltas(tmp, rep):
@@ -168,7 +225,7 @@ def main():
     rr(tmp, rep)
     ejection(tmp, rep)
     rep.dump()
-    sys.exit(1 if rep.failed else 0)
+    sys.exit(rep.exit_code())
 
 
 if __name__ == "__main__":

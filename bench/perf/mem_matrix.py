@@ -92,6 +92,7 @@ class Sampler(threading.Thread):
 
 def taskset(cpus, argv, env_extra):
     env = {**os.environ, **env_extra}
+    env.pop("MALLOC_ARENA_MAX", None)  # an inherited value would silently cap the "glibc" cells
     return subprocess.Popen(
         ["taskset", "-c", cpus, *argv],
         env=env,
@@ -184,7 +185,7 @@ def main():
         # ---- Full matrix (glibc default allocator) --------------------------------------------
         for route in ROUTES:
             for size in SIZES:
-                proxy = launch_proxy("bench-server-glibc", {})
+                proxy = launch_proxy("bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "0"})
                 try:
                     for vus in VUS:
                         tag = f"{route}_{size}_{vus}_glibc"
@@ -204,10 +205,10 @@ def main():
                     proxy.wait(timeout=5)
         # ---- Allocator sweep on the worst cell (body, 1 MB, 50 VUs) ----------------------------
         sweep = [
-            ("glibc", "bench-server-glibc", {}),
-            ("arena4", "bench-server-glibc", {"MALLOC_ARENA_MAX": "4"}),
-            ("arena1", "bench-server-glibc", {"MALLOC_ARENA_MAX": "1"}),
-            ("jemalloc", "bench-server-jemalloc", {}),
+            ("glibc", "bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "0"}),
+            ("arena4", "bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "4"}),
+            ("arena1", "bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "1"}),
+            ("jemalloc", "bench-server-jemalloc", {"PLECTO_MALLOC_ARENA_MAX": "0"}),
         ]
         for alloc, binary, env_extra in sweep:
             proxy = launch_proxy(binary, env_extra)

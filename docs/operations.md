@@ -413,7 +413,7 @@ The two places that answer the two different questions:
 
 ```console
 $ plecto --version
-plecto 0.13.0 (profile: minimal)
+plecto 0.13.1 (profile: minimal)
 filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0, plecto:filter@0.4.0
 ```
 
@@ -495,3 +495,25 @@ reload: `[trust]` and `[state]`, both rejected fail-closed by `SIGHUP`. A third 
 `[listen.client_auth]`, which a reload does consume) and all of `[observability]` are captured
 when the process starts. Editing only those sections leaves the config version unchanged, so
 `SIGHUP` logs "unchanged" and swaps nothing — plan a restart for them.
+
+## Memory allocator tuning (Linux glibc)
+
+On Linux GNU targets, Plecto caps glibc's dynamic memory arenas at process startup (via `mallopt(M_ARENA_MAX, ...)`) before the Tokio runtime spawns its worker threads. This bounds virtual memory fragmentation and resident set size (RSS) under bursty concurrent allocations.
+
+The shipped default cap is **32** (revised from the earlier default of 4; see [`bench/methodology.md`](../bench/methodology.md#2026-09-27--アリーナ既定値を判断するための分離計測t3), [`performance/HISTORY.md`](../performance/HISTORY.md#2026-09-28-allocator-arena-default-transition-4--32), and [ADR 000118](ADR/000118.md)). In 2-round isolated measurements on the reference host (i7-13700K, glibc 2.39), N=32 limited the throughput gap relative to glibc's own default to 2.3% on auth and 1.9% on rate limiting, while cutting proxy peak RSS by 22.4% and post-load 15s settled RSS by 23.0% compared to glibc's default.
+
+However, moving from cap 4 to 32 increases memory usage: on the reference host, 1 MiB body peak RSS grew from ~167 to ~260 MiB (+55%) and 15s post-load settled RSS increased from ~140 to ~198 MiB (+42%). Deployments requiring the earlier, lower-memory footprint can preserve the initial cap of 4 directly by setting:
+
+```bash
+PLECTO_MALLOC_ARENA_MAX=4
+```
+
+The arena limit is configured at launch via `PLECTO_MALLOC_ARENA_MAX`:
+
+- **Unset or non-numeric string**: Uses the shipped default (`32`).
+- **`4`**: Preserves previous default behavior (ADR 000038 / [ADR 000118](ADR/000118.md)), reducing body RSS retention compared to 32 at the expense of high-concurrency throughput (on the reference host, auth throughput was ~24.2% lower and rate-limit throughput was ~15.1% lower under 4 than under 32; or ~26.0% lower on auth and ~16.7% lower on rate limiting relative to glibc default).
+- **`4`–`16` (or `24`)**: Serves as a tuning range and starting point for memory-constrained environments, rather than a universal recommendation. Intermediate caps (e.g. 16 or 24) trade throughput for smaller heap retention without dropping all the way to 4's throughput penalty.
+- **`0`**: Skips calling `mallopt`, leaving glibc's external configuration untouched (e.g. host environment variables, tunables, or glibc's built-in default). This delegates arena management entirely to glibc and is not an assertion of "unlimited".
+- **Negative integer (e.g. `-1`)**: Kept for backwards compatibility; behaves as a no-op (does not call `mallopt`).
+
+This tuning applies only to Linux GNU environments; on musl, macOS, and other platforms it is a compile-time no-op. Because `mallopt(M_ARENA_MAX)` only limits the creation of *new* arenas and cannot reclaim existing ones, any change requires a process restart rather than a configuration reload (`SIGHUP`).

@@ -35,3 +35,4 @@ flint-data/
 .mcp.json
 .codex/
 .claude/settings.local.json
+bench/perf/__pycache__/

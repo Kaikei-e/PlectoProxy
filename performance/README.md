@@ -18,10 +18,10 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   physical cores (`bench/perf/cpu_split.py`). The generator therefore never steals a core from the proxy
   — the run measures Plecto Proxy, not the generator fighting it. (The dev host is hybrid: P-cores 0-15 as
   adjacent SMT pairs, E-cores 16-23, so the default GEN set 12-23 mixes P and E cores — informational.)
-- **Allocator configuration.** Every proxy launch runs with the shipped arena cap of 4 (`bench-server`
-  now calls `cap_malloc_arenas` like the `plecto` binary).
+- **Allocator configuration.** Every proxy launch runs with the shipped arena cap (default **32**, revised from the historical cap of 4; all 4 standard harnesses call `cap_malloc_arenas` before runtime initialization). Legacy behavior is reproducible in production with `PLECTO_MALLOC_ARENA_MAX=4` (or in benchmarks via `BENCH_MALLOC_ARENA_MAX=4`, as `run-perf.sh` scrubs inherited `PLECTO_*` variables). Note that historical tables throughout this document (e.g. body RSS snapshots of ~114 / ~196 / ~122 MB) reflect earlier co-resident runs under `MALLOC_ARENA_MAX=4` and are distinct from current isolated measurements under default 32; see [`bench/methodology.md`](../bench/methodology.md#2026-09-27--アリーナ既定値を判断するための分離計測t3), [`performance/HISTORY.md`](HISTORY.md#2026-09-28-allocator-arena-default-transition-4--32), and [ADR 000118](../docs/ADR/000118.md).
 - **Run data retention & host fingerprinting.** Raw per-round JSON, proxy logs, CSV copies and a host
-  fingerprint (`host.txt`) are kept under `performance/data/runs/<run-id>/` and `just perf-archive` tars
+  fingerprint (`host.txt`, allowlisted for publication: no hostname, kernel build string or per-CVE
+  mitigation lines) are kept under `performance/data/runs/<run-id>/` and `just perf-archive` tars
   one for attaching to a GitHub Release.
 - **Historical comparability note.** Numbers measured before this change (the 2026-09-25 snapshot and
   earlier) were taken with partial pinning and uncapped arenas outside the body phase, so footprint
@@ -188,7 +188,7 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
   A **header-only filter** (`/body-headeronly`) **streams the body through**: at 1 MB it lands
   **within ~0.3 % of `/baseline`** (ADR 000038, within noise); at 100 KB the gap is **~12 %**
   and at 1 KB the gap is the ordinary **WASM dispatch floor** on a tiny request, not a body cost.
-- RSS at 1 MB × 50 VUs (`MALLOC_ARENA_MAX=4`): **~114 MB `/baseline` · ~196 MB `/body` · ~122 MB
+- Combined proxy + upstream RSS at 1 MB × 50 VUs (one mid-load sample, `MALLOC_ARENA_MAX=4`): **~114 MB `/baseline` · ~196 MB `/body` · ~122 MB
   `/body-headeronly`**. The header-only bypass stays near baseline; the buffer stays bounded (16 MiB
   cap, fail-closed 413).
 
@@ -861,12 +861,16 @@ body never enters guest memory: at 1 MB it lands **within ~0.3 % of `/baseline`*
 000038 — the two paths are indistinguishable at this size, and which one wins is noise); at 100 KB
 the gap is **~12 %** (`VUS=50`, well under the per-IP cap); at 1 KB it reads well below baseline —
 the ordinary **WASM dispatch floor** on a tiny request, not a body cost. RSS at 1 MB × 50 VUs (fresh
-proxy per route, `MALLOC_ARENA_MAX=4`): **~114 MB `/baseline` · ~196 MB `/body` · ~122 MB
+proxy per route, `MALLOC_ARENA_MAX=4`; proxy + in-process upstream, one mid-load sample): **~114 MB `/baseline` · ~196 MB `/body` · ~122 MB
 `/body-headeronly`**
 (`data/body_rss.csv`). The export-presence bypass keeps a header-only route near baseline. The buffer
 stays bounded (16 MiB cap, fail-closed 413) for the filters that do read the body. The remaining
 buffered-path copy is the target of a future `stream<u8>` increment (ADR 000020); a per-request
-time-series / allocator-sweep decomposition lives in `bench/perf/mem_matrix.py`.
+time-series / allocator-sweep decomposition lives in `bench/perf/mem_matrix.py`. For choosing an
+arena default, use `bench/perf/arena_sweep.py`: it isolates the upstream in a separate process and
+records proxy-only loaded peaks and post-load retention for every candidate. The snapshot above
+is neither a proxy-only peak nor a post-load retention measurement; see the
+[measurement procedure](../bench/methodology.md#2026-09-27--アリーナ既定値を判断するための分離計測t3).
 
 ## Footprint
 

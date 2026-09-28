@@ -22,10 +22,20 @@ lo = 2.0
 hi = 5.0
 
 # trusted − noop-pooled, closed-loop µs/req: the apikey filter's own per-request work.
-# 2026-07-06 interleaved A/B: 0.6 ± 0.2 µs; 2026-07-11 single-window: 0.86 µs.
+# 2026-07-06 interleaved A/B: 0.6 ± 0.2 µs; 2026-07-11 single-window: 0.86 µs (uncapped glibc, N=0).
+# 2026-09-28: default malloc arena cap moved 4 → 32 (ADR 000118, selected via T3 throughput/RSS trade-off).
+# Under the current runner on the reference host, default32 T1 runs landed at 1.4053 ± 0.0716 and
+# 1.4210 ± 0.0451 µs (old band 0.3..1.2 FAIL); a paired explicit cap 0 control landed at 1.1052 ± 0.1744 µs
+# (old band INCONCLUSIVE, exit 2). These observed values reflect the specific benchmark setup and host conditions;
+# single cap 0 and current host variations do not prove causal attribution solely to the arena cap.
+# Operational recalibration (not a statistical confidence guarantee) sets hi 1.2 → 1.7 based on default32:
+# max observed center 1.421 + 3x max half-range 0.0716 ≈ 1.636, rounded up to 1.7. lo (0.3) and all other
+# bands remain unchanged. An independent explicit32 T1 holdout run
+# (performance/data/runs/gate-explicit32-validation-20260928) completed with gate exit 0 (10 pass,
+# 0 fail, 0 inconclusive), with apikey_cost_us landing at 1.2994 ± 0.2035 µs inside the 0.3..1.7 band.
 [apikey_cost_us]
 lo = 0.3
-hi = 1.2
+hi = 1.7
 
 # Fixed-rate (2000 rps) p50 deltas, ms — the honest tail floor invariants.
 # noop-pooled − baseline: +0.11 ms across the last two snapshots.

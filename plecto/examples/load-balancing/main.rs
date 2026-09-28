@@ -36,8 +36,18 @@ use plecto_server::serve;
 /// Plain HTTP/1.1 — the focus is upstream balancing, not TLS.
 const PROXY_ADDR: &str = "127.0.0.1:8080";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Cap glibc malloc arenas BEFORE the runtime spawns worker threads (M_ARENA_MAX only gates new
+    // arenas, so it must precede them) — a manual runtime build instead of `#[tokio::main]` is what
+    // gives us that ordering. Bounds RSS on many-core hosts (docs/servey body-tax).
+    plecto_server::cap_malloc_arenas();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let base = dir.path();
 

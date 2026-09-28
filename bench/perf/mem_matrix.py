@@ -23,6 +23,8 @@ Output: prints a summary table and writes summary.csv + worst-cell timeseries.cs
 (default: a scratch dir; override with OUTDIR=...).
 """
 import csv
+import json
+import math
 import os
 import pathlib
 import subprocess
@@ -36,7 +38,6 @@ K6 = os.environ.get("K6", "k6")
 K6_SCRIPT = ROOT / "bench" / "k6-wasm" / "body-transform.js"
 
 OUTDIR = pathlib.Path(os.environ.get("OUTDIR", "/tmp/mem-matrix"))
-OUTDIR.mkdir(parents=True, exist_ok=True)
 
 NCPU = os.cpu_count() or 24
 PROXY_CPUS = os.environ.get("PROXY_CPUS", "0-7")
@@ -75,19 +76,56 @@ class Sampler(threading.Thread):
         super().__init__(daemon=True)
         self.pid = pid
         self.rows = []
-        self._stop = threading.Event()
+        self.status_rows = []
+        self.started = time.monotonic()
+        self.error = None
+        self._stopping = threading.Event()
 
     def run(self):
-        t0 = time.monotonic()
-        while not self._stop.is_set():
-            m = smaps_rollup(self.pid)
-            if m:
-                self.rows.append((time.monotonic() - t0, m.get("Rss", 0), m.get("Private_Dirty", 0)))
-            time.sleep(SAMPLE_S)
+        try:
+            while not self._stopping.is_set():
+                m = smaps_rollup(self.pid)
+                if not m:
+                    raise RuntimeError(f"proxy {self.pid}: missing smaps_rollup sample")
+                t = time.monotonic() - self.started
+                self.rows.append((t, m["Rss"], m["Private_Dirty"]))
+                status = pathlib.Path(f"/proc/{self.pid}/status").read_text()
+                threads = next(int(line.split()[1]) for line in status.splitlines()
+                               if line.startswith("Threads:"))
+                self.status_rows.append((t, threads))
+                self._stopping.wait(SAMPLE_S)
+        except Exception as exc:
+            self.error = exc
 
     def stop(self):
-        self._stop.set()
+        # Thread.join() calls Thread._stop(); never shadow it with an Event.
+        self._stopping.set()
         self.join(timeout=2)
+        if self.is_alive():
+            raise RuntimeError("RSS sampler did not stop")
+        if self.error:
+            raise self.error
+
+
+def memory_summary(rows, load_start, load_end, tail_end):
+    """Separate loaded peak from the final two seconds of the post-load tail."""
+    loaded = [r for r in rows if load_start <= r[0] <= load_end]
+    settled = [r for r in rows if max(load_end, tail_end - 2) <= r[0] <= tail_end]
+    if not loaded or len(settled) < 2 or tail_end - load_end < 2:
+        raise ValueError("missing loaded samples or post-load tail shorter than two seconds")
+    return {
+        "peak_kb": max(r[1] for r in loaded),
+        "peak_pd_kb": max(r[2] for r in loaded),
+        "settled_kb": round(sum(r[1] for r in settled) / len(settled)),
+    }
+
+
+def read_k6(path):
+    """Do not let a failed generator or failed HTTP traffic look like a cheap allocator."""
+    d = json.loads(pathlib.Path(path).read_text())
+    if not math.isfinite(d["rps"]) or d["rps"] <= 0 or d["failed_rate"] != 0:
+        raise ValueError(f"invalid/failed k6 measurement: {path}")
+    return d
 
 
 def taskset(cpus, argv, env_extra):
@@ -137,15 +175,10 @@ def run_k6(route, size, vus, out_json):
         env={**os.environ, **env},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        check=True,
     )
-    try:
-        import json
-
-        with open(out_json) as f:
-            d = json.load(f)
-        return d.get("rps", 0.0), d.get("req_mbps", 0.0), d.get("failed_rate", 0.0)
-    except Exception:
-        return 0.0, 0.0, 0.0
+    d = read_k6(out_json)
+    return d["rps"], d["req_mbps"], d["failed_rate"]
 
 
 def measure(pid, route, size, vus, tag):
@@ -155,20 +188,25 @@ def measure(pid, route, size, vus, tag):
     time.sleep(0.5)
     idle = smaps_rollup(pid).get("Rss", 0)
     out_json = OUTDIR / f"k6_{tag}.json"
-    rps, mbps, failed = run_k6(route, size, vus, out_json)
-    # post-load tail: keep sampling to see what does NOT come back (the (C) retention signal).
-    time.sleep(TAIL_S)
-    s.stop()
-    rss_series = [r[1] for r in s.rows] or [idle]
-    pd_series = [r[2] for r in s.rows] or [0]
-    peak = max(rss_series)
-    peak_pd = max(pd_series)
-    settled = int(sum(rss_series[-10:]) / max(1, len(rss_series[-10:])))  # ~last 2 s mean
+    load_start = time.monotonic() - s.started
+    try:
+        rps, mbps, failed = run_k6(route, size, vus, out_json)
+        load_end = time.monotonic() - s.started
+        # post-load tail: keep sampling to see what does NOT come back (the (C) retention signal).
+        time.sleep(TAIL_S)
+        tail_end = time.monotonic() - s.started
+    finally:
+        s.stop()
+    summary = memory_summary(s.rows, load_start, load_end, tail_end)
+    with (OUTDIR / f"timeseries_{tag}.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_s", "rss_kb", "private_dirty_kb", "phase", "threads"])
+        for (t, rss, pd), (_, threads) in zip(s.rows, s.status_rows, strict=True):
+            phase = "idle" if t < load_start else "load" if t <= load_end else "tail"
+            w.writerow([round(t, 3), rss, pd, phase, threads])
     return {
         "idle_kb": idle,
-        "peak_kb": peak,
-        "settled_kb": settled,
-        "peak_pd_kb": peak_pd,
+        **summary,
         "rps": round(rps, 1),
         "req_mbps": round(mbps, 2),
         "failed": round(failed, 4),
@@ -177,6 +215,7 @@ def measure(pid, route, size, vus, tag):
 
 
 def main():
+    OUTDIR.mkdir(parents=True, exist_ok=True)
     up = taskset(UP_CPUS, [str(EX / "upstream")], {"UPSTREAM_ADDR": UPSTREAM_ADDR, "RESP_BYTES": "16"})
     time.sleep(1.0)
     rows = []
@@ -185,9 +224,9 @@ def main():
         # ---- Full matrix (glibc default allocator) --------------------------------------------
         for route in ROUTES:
             for size in SIZES:
-                proxy = launch_proxy("bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "0"})
-                try:
-                    for vus in VUS:
+                for vus in VUS:
+                    proxy = launch_proxy("bench-server", {"PLECTO_MALLOC_ARENA_MAX": "0"})
+                    try:
                         tag = f"{route}_{size}_{vus}_glibc"
                         m = measure(proxy.pid, route, size, vus, tag)
                         rows.append(("glibc", route, size, vus, m))
@@ -200,14 +239,14 @@ def main():
                         )
                         if route == "body" and size == 1048576 and vus == 50:
                             worst_series = m["series"]
-                finally:
-                    proxy.terminate()
-                    proxy.wait(timeout=5)
+                    finally:
+                        proxy.terminate()
+                        proxy.wait(timeout=5)
         # ---- Allocator sweep on the worst cell (body, 1 MB, 50 VUs) ----------------------------
         sweep = [
-            ("glibc", "bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "0"}),
-            ("arena4", "bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "4"}),
-            ("arena1", "bench-server-glibc", {"PLECTO_MALLOC_ARENA_MAX": "1"}),
+            ("glibc", "bench-server", {"PLECTO_MALLOC_ARENA_MAX": "0"}),
+            ("arena4", "bench-server", {"PLECTO_MALLOC_ARENA_MAX": "4"}),
+            ("arena1", "bench-server", {"PLECTO_MALLOC_ARENA_MAX": "1"}),
             ("jemalloc", "bench-server-jemalloc", {"PLECTO_MALLOC_ARENA_MAX": "0"}),
         ]
         for alloc, binary, env_extra in sweep:
@@ -226,6 +265,7 @@ def main():
                 proxy.wait(timeout=5)
     finally:
         up.terminate()
+        up.wait(timeout=5)
 
     # ---- Write CSVs ---------------------------------------------------------------------------
     with open(OUTDIR / "summary.csv", "w", newline="") as f:

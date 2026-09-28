@@ -5,6 +5,35 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-09-28 (allocator arena default transition: 4 → 32)
+
+Transition of the glibc malloc arena default cap from 4 to 32 based on the 2026-09-27 isolated measurements (T3; `performance/data/runs/arena-isolated-{memory,throughput}-20260927`, see [`bench/methodology.md`](../bench/methodology.md#2026-09-27--アリーナ既定値を判断するための分離計測t3) and [ADR 000118](../docs/ADR/000118.md)):
+- **Rationale & trade-offs**: 2-round isolated sweeps on the reference host demonstrated that N=32 limited the throughput gap relative to glibc's own default to 2.3% on auth and 1.9% on rate limiting, while preserving meaningful body-buffering RSS containment compared to glibc default (proxy peak RSS -22.4%, post-load 15s RSS -23.0%; conversely, glibc default peak RSS is ~29% higher than N=32). Compared to N=32, N=4 throughput was ~24.2% lower on auth and ~15.1% lower on rate limiting (and ~26.0% lower on auth, ~16.7% lower on rate limiting relative to glibc default). In exchange, moving from cap 4 to 32 increases body peak RSS from ~167 to ~260 MiB (+55%) and post-load settled RSS from ~140 to ~198 MiB (+42%).
+- **Heuristic scope**: 32 is a host-calibrated heuristic balancing throughput against RSS retention, not an assertion of universal optimality or zero contention on all hosts and topologies. Intermediate caps (16, 24) remain viable tuning starting points for memory-constrained environments and are not dismissed.
+- **Configuration & compatibility**:
+  - In production, `PLECTO_MALLOC_ARENA_MAX=4` preserves previous default cap 4 (ADR 000038 / ADR 000118) for footprint comparison (the runner removes startup `MALLOC_ARENA_MAX` injection, so exact reproduction of historical runs is not asserted). In benchmarks, `BENCH_MALLOC_ARENA_MAX=4` reproduces this configuration as `run-perf.sh` scrubs inherited `PLECTO_*` variables.
+  - Values `4`–`16` (or `24`) serve as an operational tuning range and starting point when memory footprint is prioritized, not a universal recommendation across all workloads.
+  - `0` leaves glibc's external configuration untouched (system environment variables, tunables, or built-in defaults; delegates to glibc and is not an assertion of "unlimited").
+  - Negative values remain backwards-compatible no-ops; unset or invalid strings default to 32.
+  - Active on Linux GNU targets only; compile-time no-op on other platforms.
+- **Harness & runner alignment**:
+  - All four standard proxy harnesses (`bench-server`, `load-balancing`, `tls-http`, `swap-bench`) invoke `cap_malloc_arenas()` before spawning the Tokio runtime.
+  - `run-perf.sh` leaves `PLECTO_MALLOC_ARENA_MAX` unset when `BENCH_MALLOC_ARENA_MAX` is omitted (testing Rust default 32 directly). Explicit values (4/16/24/32/0) inject `PLECTO_MALLOC_ARENA_MAX` without setting startup `MALLOC_ARENA_MAX`. Inherited allocator env (`MALLOC_*`, `glibc.malloc.*`) is scrubbed and `LD_PRELOAD` is refused.
+  - `arena_sweep.py` supports `--arenas default,32` for measured comparison between shipped default and explicit 32.
+- **T3 validation (default vs explicit32, 2-round averages)**:
+  - Both conditions completed with `complete` files and zero HTTP failures.
+  - `/trusted` auth: default 96,281.3 / explicit32 94,982.7 rps.
+  - `/ratelimit`: default 82,305.3 / explicit32 81,917.9 rps.
+  - `/body`: default 2,090.1 / explicit32 2,098.5 rps.
+  - Proxy peak RSS (1MiB x 50 VUs): default 256.51 / explicit32 256.00 MiB.
+  - Post-load 15s settled RSS: default 185.93 / explicit32 199.21 MiB.
+  - (Baseline is not averaged across mixed oha/k6 models). These 2-round figures provide a measured comparison; statistical equivalence was not established.
+- **T1 gate measurements & recalibration**:
+  - Measured two default32 T1 runs on the same release binary (`performance/data/runs/gate-default-run1-20260928`, `gate-default-run2-20260928`): run1 `dispatch_floor_us` 4.5397 ± 0.0540 µs (pass) / `apikey_cost_us` 1.4053 ± 0.0716 µs (fail under old band 0.3..1.2); run2 `dispatch_floor_us` 4.5860 ± 0.0600 µs (pass) / `apikey_cost_us` 1.4210 ± 0.0451 µs (fail). All other 9 invariants passed on both runs (micro layer skipped without saved criterion baseline main).
+  - Explicit cap 0 control on the same binary/runner (`performance/data/runs/gate-glibc-control-20260928`): `apikey_cost_us` landed at 1.1052 ± 0.1744 µs, straddling old hi 1.2 to produce **INCONCLUSIVE (exit code 2)**, not PASS (other 9 invariants passed).
+  - These observed deltas reflect the specific benchmark setup and host conditions; a single cap 0 control and host variations do not prove causal attribution solely to the arena cap. Recalibration is an operational adjustment on the reference host (not a statistical confidence guarantee): max center 1.421 + 3x max half-range 0.0716 ≈ 1.636 rounded up to 1.7 (lo 0.3 and all other bands unchanged).
+- **Holdout validation completed**: An independent `explicit32` T1 gate holdout run (`performance/data/runs/gate-explicit32-validation-20260928`) completed with gate exit code 0 (10 pass, 0 fail, 0 inconclusive). Measured invariants: `dispatch_floor_us` 4.5796 ± 0.1892 µs (pass); `apikey_cost_us` 1.2994 ± 0.2035 µs (pass under recalibrated band 0.3..1.7); `ratelimit_tax_us` 4.3764 ± 0.0745 µs (pass); `pooled_tail_p50_ms` 0.1262 ms (pass); `apikey_tail_p50_ms` 0.0146 ms (pass); `respctx_tail_p50_ms` -0.0288 ms (pass); `enforce_allowed_ratio` 0.9166 (pass); `rr_spread_req` 0 (pass); `ejection_transition_s` 1 s (pass); `ejection_stray_failed` 0 (pass). Informational: `pooled_tail_p99_ms` 0.1517 ms, `respctx_tail_p99_ms` -0.0009 ms, `enforce_limited_frac` 0.7800; criterion micro informational layer skipped (saved `main` baseline absent).
+
 ## 2026-09-26 (methodology update: pinning, arenas, data retention, three-valued gate)
 
 Methodology update establishing a new comparable series for upcoming runs:

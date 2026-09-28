@@ -72,31 +72,39 @@ use crate::upstream_client::UpstreamClients;
 
 pub use listener::{DEFAULT_DRAIN_DEADLINE, serve, serve_with_shutdown};
 
+const DEFAULT_MALLOC_ARENA_MAX: i32 = 32;
+
+/// Parse the environment string for `PLECTO_MALLOC_ARENA_MAX` into an arena limit.
+fn parse_malloc_arena_max(raw: Option<&str>) -> i32 {
+    raw.and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(DEFAULT_MALLOC_ARENA_MAX)
+}
+
 /// Cap glibc's per-thread malloc arenas at process start to bound RSS on many-core hosts.
 ///
-/// glibc defaults to `8 × ncpu` arenas on 64-bit. Under a many-threaded proxy doing bursty
-/// per-request allocations, freed memory lingers in each thread's arena instead of returning to the
-/// OS, inflating RSS (measured ~2.5× at 1 MB bodies × 50 conns — docs/servey body-tax). This is a
-/// defensive complement to the real fix (not buffering a body no filter reads); routes that
-/// legitimately buffer still allocate, and this bounds their arena fragmentation.
+/// Arena defaults depend on glibc and CPU count; under a many-threaded proxy doing bursty
+/// per-request allocations, concurrent allocation across arenas can retain freed memory
+/// instead of returning it to the OS, inflating RSS (measured ~2.5× at 1 MB bodies × 50 conns —
+/// docs/servey body-tax). This is a defensive complement to the real fix (not buffering a body
+/// no filter reads); routes that legitimately buffer still allocate, and this bounds their arena
+/// fragmentation.
 ///
 /// `M_ARENA_MAX` only gates creation of NEW arenas and never reclaims existing ones, so this MUST
-/// run before the runtime spawns its worker threads (call it first in `main`). Default cap **4** — a
-/// portable, contention-safe value used across multithreaded services, chosen over the value that
-/// minimised RSS on one host (1) precisely because Plecto is self-hosted on varied machines.
-/// Override with `PLECTO_MALLOC_ARENA_MAX` (`0` leaves glibc's default in place). No-op off glibc.
+/// run before the runtime spawns its worker threads (call it first in `main`). Default cap **32** — a
+/// pragmatic balance between high-RPS throughput (auth, rate-limit) and body-route RSS containment,
+/// revised from the initial cap of 4 (docs/ADR/000118.md, amends ADR 000038). 32 is a host-calibrated
+/// heuristic, not a guarantee of zero contention or universal optimality on all hardware.
+/// Override with `PLECTO_MALLOC_ARENA_MAX` (`0` leaves glibc's external configuration untouched,
+/// which is not an assertion of "unlimited"). Values <= 0 are no-ops. No-op off glibc.
 pub fn cap_malloc_arenas() {
-    let max = std::env::var("PLECTO_MALLOC_ARENA_MAX")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(4);
+    let max = parse_malloc_arena_max(std::env::var("PLECTO_MALLOC_ARENA_MAX").ok().as_deref());
     apply_arena_cap(max);
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn apply_arena_cap(max: i32) {
     if max <= 0 {
-        return; // 0 / negative: leave glibc's default (8 × ncpu) untouched.
+        return; // 0 / negative: leave glibc's default allocator configuration untouched.
     }
     // SAFETY: a plain libc call made single-threaded at startup, before any worker thread exists.
     // Returns 1 on success / 0 on failure; a best-effort tuning knob, so a rejection is ignored
@@ -287,10 +295,10 @@ mod alloc_tuning_tests {
     #[test]
     fn mallopt_arena_max_is_accepted_by_glibc() {
         // Guards the FFI constant + linkage: glibc returns 1 when it accepts the option.
-        let rc = unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) };
+        let rc = unsafe { libc::mallopt(libc::M_ARENA_MAX, super::DEFAULT_MALLOC_ARENA_MAX) };
         assert_eq!(
             rc, 1,
-            "glibc mallopt(M_ARENA_MAX, 4) should return 1 on success"
+            "glibc mallopt(M_ARENA_MAX, 32) should return 1 on success"
         );
     }
 
@@ -298,6 +306,31 @@ mod alloc_tuning_tests {
     fn cap_is_a_noop_when_disabled() {
         // 0 leaves glibc's default in place; must not panic (and compiles/no-ops off glibc).
         super::apply_arena_cap(0);
+    }
+
+    #[test]
+    fn parse_malloc_arena_max_defaults_to_32() {
+        assert_eq!(super::DEFAULT_MALLOC_ARENA_MAX, 32);
+        assert_eq!(super::parse_malloc_arena_max(None), 32);
+        assert_eq!(super::parse_malloc_arena_max(Some("")), 32);
+        assert_eq!(super::parse_malloc_arena_max(Some("garbage")), 32);
+        assert_eq!(super::parse_malloc_arena_max(Some("32x")), 32);
+        assert_eq!(
+            super::parse_malloc_arena_max(Some("9999999999999999999999")),
+            32
+        );
+    }
+
+    #[test]
+    fn parse_malloc_arena_max_preserves_numbers_and_noop() {
+        assert_eq!(super::parse_malloc_arena_max(Some("1")), 1);
+        assert_eq!(super::parse_malloc_arena_max(Some("4")), 4);
+        assert_eq!(super::parse_malloc_arena_max(Some("16")), 16);
+        assert_eq!(super::parse_malloc_arena_max(Some("24")), 24);
+        assert_eq!(super::parse_malloc_arena_max(Some("32")), 32);
+        assert_eq!(super::parse_malloc_arena_max(Some("64")), 64);
+        assert_eq!(super::parse_malloc_arena_max(Some("0")), 0);
+        assert_eq!(super::parse_malloc_arena_max(Some("-1")), -1);
     }
 }
 

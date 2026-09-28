@@ -34,6 +34,11 @@
 # (industry-style lab isolation; see bench/methodology.md). INFLUX=1 is opt-in local dashboard only.
 set -uo pipefail
 
+if [[ -n "${LD_PRELOAD:-}" ]]; then
+  echo "unset LD_PRELOAD before running perf benchmarks" >&2
+  exit 64
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH="$(cd "$HERE/.." && pwd)"
 ROOT="$(cd "$BENCH/.." && pwd)"
@@ -116,11 +121,19 @@ write_host_info(){
     fi
     echo "${rev}${dirty}"
     echo
+    # host.txt ships in Release tarballs: allowlist only what reading the numbers needs. Hostname,
+    # the full kernel build string and per-CVE mitigation lines would publish the patch level of the
+    # machine that signs releases, so the kernel is cut to major.minor and mitigations to the one
+    # perf-relevant bit (default vs overridden on the command line).
     echo "=== System ==="
-    uname -a
+    ( . /etc/os-release 2>/dev/null && echo "os: ${NAME:-unknown} ${VERSION_ID:-}" )
+    echo "kernel: $(uname -s) $(uname -r | cut -d. -f1,2) $(uname -m)"
+    echo "mitigations: $(grep -o 'mitigations=[^ ]*' /proc/cmdline 2>/dev/null || echo "kernel default")"
+    awk '/^MemTotal:/ {printf "memory: %.0f GiB\n", $2 / 1048576}' /proc/meminfo
     echo
-    echo "=== CPU Info (lscpu) ==="
-    lscpu 2>/dev/null || echo "lscpu unavailable"
+    echo "=== CPU Info (lscpu, allowlisted) ==="
+    lscpu 2>/dev/null | grep -E '^(Architecture|Model name|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)|NUMA node\(s\)|CPU (max|min) MHz|L[123][di]? cache):' \
+      || echo "lscpu unavailable"
     echo
     echo "=== CPU Core Topology (lscpu -e) ==="
     lscpu -e=CPU,CORE,SOCKET,NODE,MAXMHZ 2>/dev/null || true
@@ -155,7 +168,11 @@ for gov, cpus in govs.items():
     python3 "$HERE/cpu_split.py" --check "$PROXY_CPUS" "$GEN_CPUS" 2>&1 || true
     echo
     echo "=== Allocator Arena ==="
-    echo "BENCH_MALLOC_ARENA_MAX=${BENCH_MALLOC_ARENA_MAX:-4}"
+    if [[ -n "${BENCH_MALLOC_ARENA_MAX+x}" ]]; then
+      echo "BENCH_MALLOC_ARENA_MAX=$BENCH_MALLOC_ARENA_MAX"
+    else
+      echo "BENCH_MALLOC_ARENA_MAX=default (binary)"
+    fi
     echo
     echo "=== Tool Versions ==="
     "$OHA" --version 2>/dev/null || echo "oha: absent"
@@ -351,11 +368,11 @@ launch(){
   local ex="$1" addr="$2" health="$3"; shift 3
   BLOG_SEQ=$(( BLOG_SEQ + 1 ))
   BLOG="$RUN_DIR/logs/${ex}-${BLOG_SEQ}.log"
-  # BENCH_MALLOC_ARENA_MAX=0 = glibc default arenas (MALLOC_ARENA_MAX must then be absent, not 0).
-  local arena="${BENCH_MALLOC_ARENA_MAX:-4}" arena_env=()
-  (( arena > 0 )) && arena_env=(MALLOC_ARENA_MAX="$arena")
-  taskset -c "$PROXY_CPUS" env -u MALLOC_ARENA_MAX PLECTO_PROXY_ADDR="$addr" \
-    "${arena_env[@]}" PLECTO_MALLOC_ARENA_MAX="$arena" \
+  local alloc_output
+  alloc_output="$(python3 "$HERE/allocator_env.py" --env-args)" || return 1
+  local alloc_args=()
+  mapfile -t alloc_args <<< "$alloc_output"
+  taskset -c "$PROXY_CPUS" env "${alloc_args[@]}" PLECTO_PROXY_ADDR="$addr" \
     RUST_LOG=warn "$@" "$WS/target/release/examples/$ex" >"$BLOG" 2>&1 &
   PROXY_PID=$!
   if [[ -n "$health" ]]; then
@@ -1004,7 +1021,7 @@ print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d
 
   # RSS at 1 MB × 50 VUs, sampled mid-load — a FRESH proxy per route so a prior route's grown linear
   # memory / arena state can't contaminate the next (the single-long-lived-proxy flaw that the
-  # mem_matrix investigation fixed). Combined proxy+in-process-upstream, MALLOC_ARENA_MAX=4 (shipped).
+  # mem_matrix investigation fixed). Combined proxy+in-process-upstream, default arena (shipped 32).
   # For the time-series peak/settled decomposition + allocator sweep see bench/perf/mem_matrix.py.
   { echo "route,rss_kb"
     for rt in baseline body body-headeronly; do
@@ -1017,7 +1034,7 @@ print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d
       wait $kpid 2>/dev/null
       stop_proxy
     done; } > "$DATA/body_rss.csv"
-  echo "--- RSS at 1MB x 50 VUs (fresh proxy per route, MALLOC_ARENA_MAX=4) ---"
+  echo "--- RSS at 1MB x 50 VUs (fresh proxy per route, default arena) ---"
   cat "$DATA/body_rss.csv"
 }
 

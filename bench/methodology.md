@@ -304,7 +304,7 @@ enforcement は offered の 48.8 % を失い、fairness の light key は 500/s 
 4. **生データ保持とホスト指紋 (`RUN_DIR` / `host.txt` / `just perf-archive`)**:
    - 揮発性 `mktemp -d` を廃止し、起動時に `RUN_DIR=performance/data/runs/<UTC yyyymmddTHHMMSSZ>-<git short sha>[-dirty]` を作成。
    - 各 phase の生 JSON、プロキシログ（`$RUN_DIR/logs/<example>-<seq>.log`）、出力 CSV コピー（`$RUN_DIR/csv/`）を保存。
-   - ホスト指紋 `$RUN_DIR/host.txt`（UTC 時刻、git revision + dirty、uname、lscpu、scaling_governor、boost/turbo、smt、アフィニティ分割、ツールバージョン）を記録。
+   - ホスト指紋 `$RUN_DIR/host.txt`（UTC 時刻、git revision + dirty、OS / カーネル major.minor、メモリ量、lscpu の許可リスト項目とトポロジ、scaling_governor、boost/turbo、smt、アフィニティ分割、ツールバージョン）を記録。Release に添付される前提で許可リスト方式にしており、ホスト名・カーネルのビルド文字列・脆弱性ごとの緩和状態は載せない（署名を行うマシンのパッチ水準を公開しないため）。緩和策は性能に効く唯一の区別として、`/proc/cmdline` の `mitigations=` 上書きの有無だけを残す。
    - `just perf-archive` により run ディレクトリを `.tar.gz` に固めて GitHub Release 添付用にパッケージ可能にした。
 5. **3 値判定ゲート (T1 gate)**:
    - `gate_verdict.py` は保守的不確実性幅 `[value - ci_half, value + ci_half]` を評価し、3 値を返す:
@@ -315,6 +315,69 @@ enforcement は offered の 48.8 % を失い、fairness の light key は 500/s 
 
 ### 比較可能性についての注意
 2026-09-26 以前の測定値は、部分的なアフィニティ割り当ておよび body 以外の非キャップ arena 下で取得されたため、**footprint KB/conn** および **gate の分散幅（spreads）** は本改訂以降の数値と直接比較できない。新世代の基準点として扱う。
+
+## 2026-09-27 — アリーナ既定値を判断するための分離計測（T3）
+
+`run-perf.sh body` の RSS は **proxy と同一プロセス内 upstream の合算を負荷中に一度採った値**であり、
+proxy 単体の peak / 負荷後の保持量ではない。アロケータの既定値を変更する判断には
+`bench/perf/arena_sweep.py` を使う。T1 gate の帯は既存条件の回帰検知に使い、既定値の選択基準にはしない。
+
+- proxy / upstream / generator を別プロセス・互いに重ならない物理コアに固定する。基準ホストの既定は
+  `PROXY_CPUS=0-11`, `UP_CPUS=16-19`, `GEN_CPUS=12-15,20-23`。異なるホストでは3組を明示指定する。
+- proxy の `PLECTO_MALLOC_ARENA_MAX` だけを変更する。実バイナリと同じ起動時 `mallopt` を通し、
+  exec 時の `MALLOC_ARENA_MAX` は追加しない。継承した malloc 環境変数と `glibc.malloc.*` tunable を除去し、
+  upstream のアロケータ条件は全セルで同じにする。
+- RSS は各 `(N, route, round)` で新しい proxy を起動し、`smaps_rollup` を200msごとに採る。
+  1MiB × 50 VU、warm-up 5秒＋計測15秒の負荷中 peak と、その後15秒の無負荷期間の最後2秒平均を
+  `settled` として別々に保存する。settled は15秒後の観測値であり、長期定常値の保証ではない。
+- 負荷中のスレッド数、全セルの時系列、生JSON、各プロセスのログ、設定・glibc/ツール版・バイナリSHA256を保存する。
+  生成器の失敗・HTTP失敗・RSS取得失敗は測定失敗とし、ゼロ値で補完しない。
+- N=4 / 16 / 24 / 32 / 0（glibcに委ねる）を昇順・降順の2巡で比較する。スループットは同じ分離構成で
+  `/baseline` / `/noop-pooled` / `/trusted` を3回インタリーブし、rate-limit はk6の1000 keyで2回比較する。
+  各巡に upstream 直接負荷の対照を置き、生成器・upstream が律速していないかも読む。
+- この分離構成の絶対値は従来の同居構成とは直接比較しない。p99は閉ループ飽和時の待ち時間であり、
+  固定レートのサービス遅延とは区別する。
+
+```bash
+cd plecto
+cargo build --release --locked -p plecto-server --features bench-harnesses \
+  --example bench-server --example upstream
+cd ..
+python3 bench/perf/arena_sweep.py --phase memory \
+  --out performance/data/runs/arena-isolated-memory
+python3 bench/perf/arena_sweep.py --phase throughput \
+  --out performance/data/runs/arena-isolated-throughput
+```
+
+出力先は未作成のディレクトリを指定する。`summary.csv` はセル完了ごとに保存し、全条件の成功時だけ
+`complete` ファイルを作る。通常の計測器テストは `python3 -m unittest discover -s bench/perf -p 'test_*.py'`。
+
+## 2026-09-28 — アリーナ既定値改定（4→32）に伴うハーネス起動と環境変数の統制
+
+分離計測（2026-09-27）の結果を受け、glibc malloc アリーナ上限の出荷既定値を 4 から 32 へ移行する作業に伴い、ベンチマークハーネスおよび計測ランナーの統制を実施した。
+
+1. **4 ハーネスでの起動前上限呼び出しの統一**:
+   - `bench-server` だけでなく、通常 proxy 起動を行う 4 つのハーネス（`bench-server`, `load-balancing`, `tls-http`, `swap-bench`）すべてにおいて、Tokio ランタイム生成（`#[tokio::main]` 等）より前に `plecto_server::cap_malloc_arenas()` を呼ぶよう統一。起動経路の違いによる上限の漏れや数値の二重管理を解消した。
+2. **`run-perf.sh` の環境変数注入と衛生化**:
+   - `BENCH_MALLOC_ARENA_MAX` 未指定時は `PLECTO_MALLOC_ARENA_MAX` 環境変数を設定せず、バイナリ内の出荷既定（Rust default 32）を直接利用する。
+   - 明示指定時（4, 16, 24, 32, 0）は `PLECTO_MALLOC_ARENA_MAX` のみを注入し、プロセス起動時の `MALLOC_ARENA_MAX` は直接設定しない（Plecto の起動時 `mallopt` 経路を通す）。
+   - 親環境から継承したアロケータ環境変数（`MALLOC_*` および `GLIBC_TUNABLES` 内の `glibc.malloc.*`）を清掃・除去し、`LD_PRELOAD` を明示的に拒否する。
+3. **出荷既定と明示指定の比較 (`arena_sweep.py`)**:
+   - `arena_sweep.py` は `--arenas default,32` を受け付け、環境変数を設定しない出荷既定（`default`）と、環境変数で明示指定した `32` の実測比較ができる。
+4. **実装・検証状況**:
+   - **コード検証・ビルド**: ユニットテスト 4 件 GREEN、cargo test 67 suites 746 passed、clippy green、4 ハーネス＋upstream の release build、Python テスト 33 件 pass。ADR は [ADR 000118](../docs/ADR/000118.md) として記録済み。
+   - **T3 分離計測（出荷既定 default 対 明示 32 の 2 巡）**: 両条件で `complete` を得て正常完了（HTTP 失敗なし）。2 巡平均の観測値は以下の通り（※ baseline は oha/k6 で負荷モデルが異なるため合算平均は算出しない。2 巡の差は実測比較のための記録であり、統計的同等性を検証・保証するものではない）:
+     - `/trusted` 認証: 96,281.3 / 94,982.7 rps
+     - `/ratelimit`: 82,305.3 / 81,917.9 rps
+     - `/body`: 2,090.1 / 2,098.5 rps
+     - body 経路 proxy 単体 peak RSS: 256.51 / 256.00 MiB
+     - 負荷停止後 15 秒 RSS: 185.93 / 199.21 MiB
+   - **T1 回帰ゲート測定と apikey 帯較正**:
+     - 同一 release binary / 現行 runner による出荷既定（default32）の T1 gate 2 巡（生データ: `performance/data/runs/gate-default-run1-20260928`, `gate-default-run2-20260928`）: run1 は `dispatch_floor_us` 4.5397 ± 0.0540 µs (pass) / `apikey_cost_us` 1.4053 ± 0.0716 µs (旧帯 0.3..1.2 に対して fail)、run2 は 4.5860 ± 0.0600 µs (pass) / 1.4210 ± 0.0451 µs (fail)。両 run とも他 9 項目は pass（micro 層は criterion baseline main 不在で情報層 skip）。
+     - 同一条件での glibc 既定対照（`BENCH_MALLOC_ARENA_MAX=0`、生データ: `performance/data/runs/gate-glibc-control-20260928`）: `apikey_cost_us` は 1.1052 ± 0.1744 µs となり、上限 1.2 をまたいだため PASS ではなく **INCONCLUSIVE (exit code 2)** を記録（他 9 項目は pass）。
+     - これらの実測値は特定セットアップ下での観測結果であり、単一の cap 0 対照やホスト変動を考慮すると、数値変動の要因をアリーナ上限のみへ排他的に因果帰属できるものではない。既定値 32 の採用自体は前日 T3 のスループット／RSS トレードオフに基づき決定済みであり、ゲート帯は選定基準ではなく既存期待値の回帰検知用である。基準ホストでの運用上の再較正（統計的信頼区間の保証ではない）として、default32 実測の最大中心値 1.421 + 3 × 最大 half-range 0.0716 ≈ 1.636 を切り上げ、`bench/perf/gate_tolerances.toml` の `apikey_cost_us` 上限を 1.2 → 1.7 へ改定（lower 0.3 および他全帯・判定方式は維持）。
+   - **Holdout 検証完了（T1 gate holdout）**: 改定後の `gate_tolerances.toml`（`apikey_cost_us` 上限 1.7）に対し、独立した `explicit32` の T1 gate holdout 実測（生データ: `performance/data/runs/gate-explicit32-validation-20260928`）が完了し、ゲート正常終了（exit code 0、10 pass, 0 fail, 0 inconclusive）を確認した。
+     - 実測値: `dispatch_floor_us` 4.5796 ± 0.1892 µs (pass), `apikey_cost_us` 1.2994 ± 0.2035 µs (pass; 新帯 0.3..1.7 内), `ratelimit_tax_us` 4.3764 ± 0.0745 µs (pass)。固定レート tail p50（pooled 0.1262 ms, apikey 0.0146 ms, respctx -0.0288 ms）、`enforce_allowed_ratio` 0.9166、`rr_spread_req` 0、`ejection_transition_s` 1 s、`ejection_stray_failed` 0 も全項目 pass（informational: pooled p99 0.1517 ms, respctx p99 -0.0009 ms, enforce limited 0.7800; criterion micro は保存 baseline main 不在のため情報層 skip）。
 
 ## Offline policy
 

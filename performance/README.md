@@ -618,6 +618,17 @@ required export). The fresh ~44 µs, by contrast, is the *uncontended* cost — 
 instantiates sequentially, so it never pays the `mmap_lock` contention or cross-core shootdowns the
 concurrent macro run exposes (the knee above). The layers agree once that kernel-side term is named.
 
+> **Decomposed 2026-09-29 (inline header hooks, [ADR 000119](../docs/ADR/000119.md)):**
+> The dispatch floor was mostly the blocking-pool round trips (two per filtered request: on-request
+> and on-response) rather than guest execution. Trusted, non-blocking filters now run inline on the
+> Tokio worker. On the reference host (i7-13700K, 6 P-cores, 50 conns), dispatch floor dropped from
+> 4.06–4.21 to 1.41–1.44 µs/req; noop-pooled ceiling rose 100.2k → 146.6k rps, and trusted (apikey,
+> memory backend) ceiling rose 87.9k → 123.1k rps (apikey's own cost unchanged at ~1.30 µs).
+> Per-request scheduling collapsed: voluntary context switches 5.09 → 0.79/req (baseline 0.87–0.92),
+> CPU 103 → 76 µs/req, runqueue wait 76 → 0.7 µs/req, and proxy thread count 80 → 35. At 2,000 rps,
+> noop-pooled p50 dropped 0.406 → 0.361 ms (baseline 0.291 ms). The snapshot tables above predate
+> this change and reflect the earlier blocking-pool path.
+
 ## Short-circuit: rejecting bad traffic at the edge
 
 ![Accept vs reject latency](img/wasm_shortcircuit.png)

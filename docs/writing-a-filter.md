@@ -304,6 +304,7 @@ id = "my-filter"               # required: host identity; namespaces this filter
 source = "artifacts/my-filter" # required: manifest-relative path to the local OCI image-layout
 digest = "sha256:..."          # required: pinned OCI image-manifest digest
 isolation = "untrusted"        # "untrusted" (default, fresh per request) | "trusted" (pooled, fast)
+dispatch = "auto"              # optional: "auto" (default) | "blocking" (keep off async worker)
 init_deadline_ms = 200         # optional: metering overrides; unset = host default
 request_deadline_ms = 25       # optional
 max_memory_bytes = 16777216    # optional

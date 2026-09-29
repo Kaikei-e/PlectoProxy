@@ -119,6 +119,8 @@ The admin `/metrics` endpoint exposes, alongside the RED signals:
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — bytes relayed
   downstream (upstream → client) and upstream (client → upstream) by tunnels, recorded as
   each tunnel closes.
+- `plecto_filter_inline_fallbacks_total{reason="pool_exhausted|pool_filling|breaker_open"}` — header-hook calls of inline-eligible filters that fell back to the blocking pool ([ADR 000119](ADR/000119.md)). `pool_exhausted` = every pooled instance was busy (the pool cap is below the worker count under load); `pool_filling` = instances not built yet or being recycled; `breaker_open` = the filter's trap breaker is open.
+- `plecto_filter_inline_duration_seconds` (histogram) — wall time of each inline filter hook call on the async worker. Its upper buckets show how long a trusted filter can hold a worker.
 
 ## Per-route request metrics
 
@@ -429,6 +431,25 @@ Before an upgrade, check that every `contract` you see there is still on the new
 version retired — the upgrade needs no filter work at all. A major contract version stays loadable
 for at least two release series and its retirement is declared in its own ADR, per the
 compatibility policy in [ADR 000085](ADR/000085.md); it is never dropped silently.
+
+### Filter execution: inline vs blocking pool
+
+Header hooks (`on-request` / `on-response`) of inline-eligible filters run directly on the async
+Tokio worker instead of offloading to the blocking pool. A filter is eligible when declared
+`isolation = "trusted"` and `dispatch = "auto"` (default), imports only non-blocking host APIs
+(`host-log`, `host-clock`, `host-config`), imports state interfaces (`host-kv`, `host-counter`,
+`host-ratelimit`) only with the in-memory backend, and attaches no blocking capabilities (no outbound
+HTTP/TCP, no WASI). Because redb calls (including counter and rate-limit updates) wait for a
+batched commit that periodically syncs to disk, they may block; state-using filters under redb
+therefore keep the blocking-pool path. The chain stops at the first ineligible filter (or when no
+idle pooled instance is available) and the rest of the chain continues on the blocking pool.
+
+Because an inline filter consumes CPU directly on the proxy worker thread (bounded by the
+per-request deadline), CPU-heavy trusted filters should keep per-request work small, declare
+`dispatch = "blocking"`, or declare `isolation = "untrusted"`. Body hooks always run on the blocking pool.
+Watch `plecto_filter_inline_duration_seconds` to decide when a filter should be switched to
+`dispatch = "blocking"`, and `plecto_filter_inline_fallbacks_total{reason="pool_exhausted"}` to see
+whether the trusted pool is too small (`pool_size`).
 
 ## CI pre-flight: `plecto validate --resolve`
 

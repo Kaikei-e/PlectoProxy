@@ -154,10 +154,20 @@ body hook（`filter-body` world）を持つフィルタが居る route では bu
 _Avoid_: body proxy（変換を含意。ここでは非接触）
 
 **Blocking bridge（sync↔async）**:
-async な fast path が **sync な filter chain**（wasmtime の `!Send` Store）を blocking プール上で駆動する
-継ぎ目。route 照合は async スレッド、chain 駆動は blocking プール（M1 の trusted instance pool が再利用・
-飽和を担う）。
+async な fast path が sync な filter chain を blocking プール上で駆動する継ぎ目。wasmtime 49 の Store は
+`Send` だが、guest は epoch deadline まで同期的に実行されるため、ブロッキング操作を持ちうるフィルタや
+ボディチェーンは blocking プールで実行する。ヘッダチェーンはインライン適格なフィルタを async ワーカー上で
+直接実行し、ブロックしうるフィルタまたは待機インスタンスが無いフィルタに達した時点で残りのチェーンを blocking
+プールへ引き渡す（resumable dispatch）。ボディチェーンは常に blocking プール上で駆動する。
 _Avoid_: worker pool（曖昧）, executor（async ランタイム側と紛らわしい）
+
+**Inline dispatch（インラインディスパッチ）**:
+ヘッダフック（`on-request` / `on-response`）のうち、trusted（プール利用）かつスレッドをブロックしうる
+capability を持たないフィルタを、`spawn_blocking` を介さず Tokio の async ワーカー上で直接実行する方式
+（ADR 000119）。ワーカー上では待機やインスタンス生成を行わず、アイドルなプールインスタンスのみを取得する。
+待機インスタンスが無い場合や対象外フィルタに遭遇した場合はそこで中断し、残りのチェーンを blocking bridge 経由で
+継続する。ボディフックは常に blocking プールで実行される。
+_Avoid_: worker execution（曖昧）, direct call（ホスト側境界を軽視）
 
 **Forwarding header family**:
 クライアントが送信元 IP / scheme を表すために送りうる一群のヘッダ（`Forwarded` ＋ de-facto の `X-Forwarded-*`、

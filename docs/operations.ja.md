@@ -115,6 +115,8 @@ admin `/metrics` は RED シグナルに加えて次を出す:
   トンネルを切ることになるかもここでわかる。
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — トンネルが中継した
   バイト数（down = upstream → client、up = client → upstream）。各トンネルの close 時に加算。
+- `plecto_filter_inline_fallbacks_total{reason="pool_exhausted|pool_filling|breaker_open"}` — blocking プールへフォールバックしたインライン適格フィルタのヘッダフック呼び出し数（[ADR 000119](ADR/000119.md)）。`pool_exhausted` = プール内の全インスタンスが使用中（高負荷時にプール上限がワーカー数を下回っている）；`pool_filling` = インスタンスが未生成またはリサイクル中；`breaker_open` = フィルタの trap breaker がオープン。
+- `plecto_filter_inline_duration_seconds`（histogram） — async ワーカー上での各インラインフィルタフック呼び出しの所要時間（wall time）。上位バケットは trusted フィルタがワーカーを占有しうる時間を示す。
 
 ## route 別リクエストメトリクス
 
@@ -388,6 +390,25 @@ filter contracts: plecto:filter@0.1.0, plecto:filter@0.2.0, plecto:filter@0.3.0,
 ——そのアップグレードにフィルタ側の作業は一切要らない。major 契約版は最低 2 リリース系列は
 ロード可能なまま維持され、その廃止は単独の ADR で宣言される（互換ポリシーは
 [ADR 000085](ADR/000085.md)）。黙って消えることはない。
+
+### フィルタの実行場所: inline と blocking プール
+
+インライン適格なフィルタのヘッダフック（`on-request` / `on-response`）は、blocking プールへ退避
+せず Tokio の async ワーカー上で直接実行される。適格条件は、マニフェストで `isolation = "trusted"`
+かつ `dispatch = "auto"`（既定）と指定され、非ブロッキングなホスト API（`host-log`, `host-clock`,
+`host-config`）のみを import し、state インターフェース（`host-kv`, `host-counter`, `host-ratelimit`）は
+インメモリ backend 利用時のみインライン対象とし、ブロッキング機能（outbound HTTP/TCP、WASI）が
+付与されていないことである。redb の呼び出し（カウンターやレートリミットの更新を含む）は定期的に
+ディスクへ sync するバッチコミットを待つためブロックする可能性があり、redb 下で state を利用する
+フィルタは blocking プールの実行経路を維持する。チェーンは最初の不適格フィルタ（またはプール内の
+空きインスタンスが存在しない場合）で中断し、チェーンの残りは blocking プール上で継続して実行される。
+
+インラインフィルタの CPU 時間はプロキシのワーカースレッド上で直接消費されるため（リクエスト
+デッドラインで有界）、計算負荷の高い trusted フィルタは 1 リクエストあたりの処理量を小さく抑えるか、
+`dispatch = "blocking"` または `isolation = "untrusted"` で実行すること。ボディフックは常に
+blocking プールで実行される。フィルタを `dispatch = "blocking"` へ切り替えるべきかの判断には
+`plecto_filter_inline_duration_seconds` を、trusted プールが小さすぎないか（`pool_size`）の
+確認には `plecto_filter_inline_fallbacks_total{reason="pool_exhausted"}` を注視する。
 
 ## CI プリフライト: `plecto validate --resolve`
 

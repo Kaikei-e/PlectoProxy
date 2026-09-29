@@ -32,6 +32,20 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Runtime / Data Plane: inline header hook execution for trusted non-blocking filters ([ADR 000119](docs/ADR/000119.md))**:
+  Amends ADR 000013 and ADR 000021. Header hooks (`on-request` / `on-response`) of filters that are trusted (pooled) and have no capability that can block the thread now run inline directly on the Tokio worker instead of `tokio::task::spawn_blocking`.
+  - **Eligibility & Resumable Dispatch**: Evaluated at load time (`LoadedFilter::runs_inline`). Eligible filters require `isolation = "trusted"`, imports only non-blocking host APIs (`host-log`, `host-clock`, `host-config`, types), state interfaces (`host-kv`, `host-counter`, `host-ratelimit`) only when using the in-memory backend (`!KvBackend::may_block()`), and no outbound HTTP/TCP or WASI. The inline path takes only an idle pooled instance without waiting or building on the worker; if none is idle (pool at cap, not yet built, recycle pending, breaker open) or a filter is ineligible, dispatch stops and the remaining chain continues on the blocking pool (`dispatch_request_from` / `dispatch_response_from`). Body hooks remain on the blocking pool.
+  - **Operational Consequence**: State-using filters under `[state] backend = "redb"` keep the blocking-pool path. A trusted inline filter occupies its worker thread for its own CPU time, bounded by the per-request epoch deadline (default 100 ms); expensive trusted filters should keep per-request work small or declare `dispatch = "blocking"` (below).
+  - **Performance** (reference host i7-13700K, proxy on 12 logical CPUs, 50 connections, memory state backend): dispatch floor (`noop-pooled − baseline`) 4.06–4.21 → 1.41–1.44 µs/req; `noop-pooled` ceiling 100.2k → 146.6k rps and trusted (`apikey`) 87.9k → 123.1k rps; p50 at 500 rps 0.352 → 0.256 ms (`noop-pooled`); voluntary context switches 5.09 → 0.79 per request. T1 gate bands `dispatch_floor_us` / `ratelimit_tax_us` recalibrated to 0.9–2.1 / 1.2–2.4 µs.
+
+### Added
+
+- **Manifest `[[filter]] dispatch = "auto" | "blocking"` (default `auto`)**: `blocking` keeps a trusted filter's header hooks on the blocking pool while keeping the pooled lifecycle; narrowing-only (no value forces inline); trusted-only like `pool_size` (rejected at validate for untrusted). Omitting `dispatch` is equivalent to `dispatch = "auto"`.
+- **Metrics on admin `/metrics`**: `plecto_filter_inline_fallbacks_total{reason="pool_exhausted|pool_filling|breaker_open"}` and the histogram `plecto_filter_inline_duration_seconds`.
+- **Inline panic parity**: A panic inside an inline chain dispatch now maps to the same 502 as the blocking-pool path (the connection stays up), instead of unwinding the connection task.
+
 ## [0.13.1] - 2026-09-29
 
 Patch release: raises the glibc malloc arena limit default from 4 to 32 ([ADR 000118](docs/ADR/000118.md), amending ADR 000038) to recover high-RPS authentication and rate-limiting throughput, incorporates performance testing and benchmark infrastructure enhancements, provides benchmark harness and runner alignment, and updates DocDag 0.5 and Go 1.27 in CI. Strict patch with no WIT contract, manifest schema, CLI, or public API change: verified against the 0.13.0 baseline via `just release-check` (`cargo semver-checks` reports "no semver update required" with 196 checks passed and 57 skipped on each of `plecto-host` / `plecto-control` / `plecto-server`; all 4 packages verified). **Deployed filters do not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0` and the reference-filter shelf is unchanged.

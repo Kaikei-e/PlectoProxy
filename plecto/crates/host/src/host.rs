@@ -15,7 +15,7 @@ use crate::contract::{
 use crate::engine::{Allocation, EpochTicker, TRUSTED_POOL_MAX, build_engine};
 use crate::errors::LoadError;
 use crate::filter::LoadedFilter;
-use crate::observe;
+use crate::observe::{self, InlineMetrics};
 #[cfg(feature = "outbound-http")]
 use crate::outbound_http;
 #[cfg(feature = "outbound-tcp")]
@@ -32,7 +32,7 @@ use crate::runtime::{FilterPreBinding, FilterRuntime, WasmtimeRuntime};
 ))]
 use crate::state::add_cli_runtime;
 use crate::state::{HostState, KV_NS_DELIM};
-use crate::{Isolation, KvBackend, LoadOptions, MemoryBackend, NoopSink, SignedArtifact};
+use crate::{Dispatch, Isolation, KvBackend, LoadOptions, MemoryBackend, NoopSink, SignedArtifact};
 use crate::{TelemetrySink, TrustPolicy};
 
 /// The wasmtime host: two engines (one per isolation mode) plus the shared state backend.
@@ -61,6 +61,8 @@ pub struct Host {
     /// outbound policy.
     #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
     outbound_rt: Arc<OutboundRuntime>,
+    /// Host-aggregated inline execution metrics.
+    inline_metrics: Arc<InlineMetrics>,
     /// Drives epoch deadlines for both engines; stops on drop. Held only for its lifetime.
     _epoch_ticker: EpochTicker,
 }
@@ -148,8 +150,14 @@ impl Host {
             sink: Arc::new(NoopSink),
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
             outbound_rt,
+            inline_metrics: Arc::new(InlineMetrics::new()),
             _epoch_ticker,
         })
+    }
+
+    /// Read-only snapshot of host-aggregated inline execution metrics.
+    pub fn inline_metrics_snapshot(&self) -> observe::InlineMetricsSnapshot {
+        self.inline_metrics.snapshot()
     }
 
     /// Set the telemetry sink (ADR 000009 observability stage). Filters loaded **after** this
@@ -400,6 +408,51 @@ impl Host {
             return Err(LoadError::MissingCapability { imports: unlent });
         }
 
+        let mut has_blocking_or_unknown_import = false;
+        let backend_may_block = self.kv.may_block();
+        for (import_name, _) in component.component_type().imports(engine) {
+            if let Some(rest) = import_name.strip_prefix("plecto:filter/") {
+                let interface = rest.split('@').next().unwrap_or(rest);
+                match interface {
+                    "host-log" | "host-clock" | "host-config" | "types" => {}
+                    "host-kv" | "host-counter" | "host-ratelimit" => {
+                        if backend_may_block {
+                            has_blocking_or_unknown_import = true;
+                        }
+                    }
+                    _ => {
+                        has_blocking_or_unknown_import = true;
+                    }
+                }
+            } else {
+                has_blocking_or_unknown_import = true;
+            }
+        }
+
+        #[allow(unused_mut)]
+        let mut needs_rt = false;
+        #[cfg(feature = "outbound-http")]
+        {
+            needs_rt |= outbound.is_some();
+        }
+        #[cfg(feature = "outbound-tcp")]
+        {
+            needs_rt |= outbound_tcp.is_some();
+        }
+
+        #[allow(unused_mut)]
+        let mut has_attached_blocking_capability = false;
+        #[cfg(feature = "fat-guest")]
+        {
+            has_attached_blocking_capability |= opts.wasi_minimal;
+        }
+
+        let runs_inline = matches!(opts.isolation, Isolation::Trusted)
+            && opts.dispatch == Dispatch::Auto
+            && !has_blocking_or_unknown_import
+            && !has_attached_blocking_capability
+            && !needs_rt;
+
         let pre = match version {
             ContractVersion::V04 => {
                 FilterPreBinding::V04(FilterPreV04::new(linker.instantiate_pre(&component)?)?)
@@ -442,18 +495,7 @@ impl Host {
             kv_quota: self.kv_quota.clone(),
             config: Arc::new(opts.config.clone()),
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
-            rt: {
-                let mut needs_rt = false;
-                #[cfg(feature = "outbound-http")]
-                {
-                    needs_rt |= outbound.is_some();
-                }
-                #[cfg(feature = "outbound-tcp")]
-                {
-                    needs_rt |= outbound_tcp.is_some();
-                }
-                needs_rt.then(|| self.outbound_rt.clone())
-            },
+            rt: needs_rt.then(|| self.outbound_rt.clone()),
             #[cfg(feature = "outbound-http")]
             outbound,
             #[cfg(feature = "outbound-tcp")]
@@ -486,9 +528,14 @@ impl Host {
             filter_id.to_string(),
             self.sink.clone(),
             opts.isolation,
+            self.inline_metrics.clone(),
         );
 
-        Ok(LoadedFilter { inner, trusted })
+        Ok(LoadedFilter {
+            inner,
+            trusted,
+            runs_inline,
+        })
     }
 }
 
@@ -634,5 +681,191 @@ mod tests {
             matches!(decision, RequestDecision::Continue),
             "deleting durable legacy rows must make quota capacity available again"
         );
+    }
+
+    #[test]
+    fn runs_inline_reflects_isolation_and_capabilities() {
+        use crate::test_support::{filter_apikey_component, filter_noop_component};
+
+        let signer = TestSigner::new().unwrap();
+        let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+
+        let sign_artifact = |bytes: &[u8]| -> (Vec<u8>, Vec<u8>) {
+            let comp_sig = signer.sign(bytes).unwrap();
+            let sbom = bound_sbom(bytes);
+            let sbom_sig = signer.sign(&sbom).unwrap();
+            (comp_sig, sbom_sig)
+        };
+
+        // 1. filter-hello with Isolation::Trusted -> runs_inline is true
+        let hello_bytes = filter_hello_component();
+        let (hello_sig, hello_sbom_sig) = sign_artifact(&hello_bytes);
+        let hello_sbom = bound_sbom(&hello_bytes);
+        let hello_artifact = SignedArtifact {
+            component_bytes: &hello_bytes,
+            component_signature: &hello_sig,
+            sbom: &hello_sbom,
+            sbom_signature: &hello_sbom_sig,
+        };
+        let hello_trusted = host
+            .load("hello-trusted", &hello_artifact, LoadOptions::trusted())
+            .unwrap();
+        assert!(hello_trusted.runs_inline());
+
+        // Trusted filter loaded with Dispatch::Blocking has runs_inline == false
+        let hello_blocking = host
+            .load(
+                "hello-blocking",
+                &hello_artifact,
+                LoadOptions::trusted().with_dispatch(Dispatch::Blocking),
+            )
+            .unwrap();
+        assert!(!hello_blocking.runs_inline());
+
+        // 2. filter-hello with Isolation::Untrusted -> runs_inline is false
+        let hello_untrusted = host
+            .load("hello-untrusted", &hello_artifact, LoadOptions::untrusted())
+            .unwrap();
+        assert!(!hello_untrusted.runs_inline());
+
+        // 3. filter-noop with Isolation::Trusted -> runs_inline is true
+        let noop_bytes = filter_noop_component();
+        let (noop_sig, noop_sbom_sig) = sign_artifact(&noop_bytes);
+        let noop_sbom = bound_sbom(&noop_bytes);
+        let noop_artifact = SignedArtifact {
+            component_bytes: &noop_bytes,
+            component_signature: &noop_sig,
+            sbom: &noop_sbom,
+            sbom_signature: &noop_sbom_sig,
+        };
+        let noop_trusted = host
+            .load("noop-trusted", &noop_artifact, LoadOptions::trusted())
+            .unwrap();
+        assert!(noop_trusted.runs_inline());
+
+        // 4. filter-apikey imports host-kv and host-counter -> runs_inline is true on memory backend
+        let apikey_bytes = filter_apikey_component();
+        let (apikey_sig, apikey_sbom_sig) = sign_artifact(&apikey_bytes);
+        let apikey_sbom = bound_sbom(&apikey_bytes);
+        let apikey_artifact = SignedArtifact {
+            component_bytes: &apikey_bytes,
+            component_signature: &apikey_sig,
+            sbom: &apikey_sbom,
+            sbom_signature: &apikey_sbom_sig,
+        };
+        let apikey_trusted = host
+            .load("apikey-trusted", &apikey_artifact, LoadOptions::trusted())
+            .unwrap();
+        assert!(apikey_trusted.runs_inline());
+
+        let apikey_untrusted = host
+            .load(
+                "apikey-untrusted",
+                &apikey_artifact,
+                LoadOptions::untrusted(),
+            )
+            .unwrap();
+        assert!(!apikey_untrusted.runs_inline());
+
+        // 5. redb-backed host -> state-importing filters (filter-hello, filter-apikey) are never inline-safe
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let redb_backend = Arc::new(crate::RedbBackend::open(&path).unwrap());
+        let redb_host = Host::with_backend(signer.trust_policy().unwrap(), redb_backend).unwrap();
+
+        // Assert on what the fixtures actually import
+        let hello_imports: Vec<_> =
+            wasmtime::component::Component::new(&redb_host.trusted_engine, &hello_bytes)
+                .unwrap()
+                .component_type()
+                .imports(&redb_host.trusted_engine)
+                .map(|(name, _)| name.to_string())
+                .collect();
+        assert!(
+            hello_imports.iter().any(|i| i.contains("host-ratelimit")),
+            "filter-hello fixture must import host-ratelimit"
+        );
+
+        let apikey_imports: Vec<_> =
+            wasmtime::component::Component::new(&redb_host.trusted_engine, &apikey_bytes)
+                .unwrap()
+                .component_type()
+                .imports(&redb_host.trusted_engine)
+                .map(|(name, _)| name.to_string())
+                .collect();
+        assert!(
+            apikey_imports.iter().any(|i| i.contains("host-kv")),
+            "filter-apikey fixture must import host-kv"
+        );
+        assert!(
+            apikey_imports.iter().any(|i| i.contains("host-counter")),
+            "filter-apikey fixture must import host-counter"
+        );
+
+        let redb_hello_trusted = redb_host
+            .load(
+                "hello-redb-trusted",
+                &hello_artifact,
+                LoadOptions::trusted(),
+            )
+            .unwrap();
+        assert!(!redb_hello_trusted.runs_inline());
+
+        let redb_hello_untrusted = redb_host
+            .load(
+                "hello-redb-untrusted",
+                &hello_artifact,
+                LoadOptions::untrusted(),
+            )
+            .unwrap();
+        assert!(!redb_hello_untrusted.runs_inline());
+
+        let redb_apikey_trusted = redb_host
+            .load(
+                "apikey-redb-trusted",
+                &apikey_artifact,
+                LoadOptions::trusted(),
+            )
+            .unwrap();
+        assert!(!redb_apikey_trusted.runs_inline());
+
+        let redb_apikey_untrusted = redb_host
+            .load(
+                "apikey-redb-untrusted",
+                &apikey_artifact,
+                LoadOptions::untrusted(),
+            )
+            .unwrap();
+        assert!(!redb_apikey_untrusted.runs_inline());
+
+        // trusted noop has no state imports, so it runs inline even under redb
+        let redb_noop_trusted = redb_host
+            .load("noop-redb-trusted", &noop_artifact, LoadOptions::trusted())
+            .unwrap();
+        assert!(redb_noop_trusted.runs_inline());
+    }
+
+    #[test]
+    #[cfg(feature = "outbound-http")]
+    fn trusted_filter_with_outbound_policy_does_not_run_inline() {
+        use crate::test_support::filter_extauthz_component;
+        let signer = TestSigner::new().unwrap();
+        let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+        let bytes = filter_extauthz_component();
+        let comp_sig = signer.sign(&bytes).unwrap();
+        let sbom = bound_sbom(&bytes);
+        let sbom_sig = signer.sign(&sbom).unwrap();
+        let artifact = SignedArtifact {
+            component_bytes: &bytes,
+            component_signature: &comp_sig,
+            sbom: &sbom,
+            sbom_signature: &sbom_sig,
+        };
+        let opts =
+            LoadOptions::trusted().with_outbound_http(vec![], vec![], None, None, None, None);
+        let filter = host
+            .load("extauthz-trusted", &artifact, opts)
+            .expect("load filter with outbound policy");
+        assert!(!filter.runs_inline());
     }
 }

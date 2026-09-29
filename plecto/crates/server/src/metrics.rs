@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use plecto_control::{MetricsSnapshot, UpstreamGroup};
+use plecto_control::{INLINE_DURATION_BUCKETS, MetricsSnapshot, UpstreamGroup};
 
 /// Upper bounds (seconds) of the request-latency histogram buckets. Prometheus convention: each
 /// `_bucket{le=...}` is cumulative and a final `+Inf` bucket equals `_count`. The spread (1 ms…10 s)
@@ -547,6 +547,52 @@ impl ServerMetrics {
             filter.total_duration.as_secs_f64()
         ));
 
+        out.push(
+            "# HELP plecto_filter_inline_fallbacks_total Inline-eligible filter hook calls that fell back to the blocking pool, by reason."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_filter_inline_fallbacks_total counter".to_string());
+        out.push(format!(
+            "plecto_filter_inline_fallbacks_total{{reason=\"pool_exhausted\"}} {}",
+            filter.inline.fallbacks_pool_exhausted
+        ));
+        out.push(format!(
+            "plecto_filter_inline_fallbacks_total{{reason=\"pool_filling\"}} {}",
+            filter.inline.fallbacks_pool_filling
+        ));
+        out.push(format!(
+            "plecto_filter_inline_fallbacks_total{{reason=\"breaker_open\"}} {}",
+            filter.inline.fallbacks_breaker_open
+        ));
+
+        out.push(
+            "# HELP plecto_filter_inline_duration_seconds Inline filter execution duration in seconds."
+                .to_string(),
+        );
+        out.push("# TYPE plecto_filter_inline_duration_seconds histogram".to_string());
+        let mut cumulative = 0u64;
+        for (bound, count) in INLINE_DURATION_BUCKETS
+            .iter()
+            .zip(filter.inline.duration_buckets.iter())
+        {
+            cumulative += count;
+            out.push(format!(
+                "plecto_filter_inline_duration_seconds_bucket{{le=\"{bound}\"}} {cumulative}"
+            ));
+        }
+        out.push(format!(
+            "plecto_filter_inline_duration_seconds_bucket{{le=\"+Inf\"}} {}",
+            filter.inline.duration_count
+        ));
+        out.push(format!(
+            "plecto_filter_inline_duration_seconds_sum {}",
+            filter.inline.duration_sum.as_secs_f64()
+        ));
+        out.push(format!(
+            "plecto_filter_inline_duration_seconds_count {}",
+            filter.inline.duration_count
+        ));
+
         // --- OTLP export queue (ADR 000040), only when an exporter is configured ---
         if let Some((dropped, queued)) = otlp {
             out.push(
@@ -601,6 +647,7 @@ impl ServerMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plecto_control::InlineMetricsSnapshot;
 
     fn snap(total: u64, errors: u64, short_circuits: u64) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -608,6 +655,7 @@ mod tests {
             errors,
             short_circuits,
             total_duration: Duration::from_millis(0),
+            inline: InlineMetricsSnapshot::default(),
         }
     }
 
@@ -1102,5 +1150,38 @@ path = "/healthz"
                 "duration histogram series must not carry route labels (ADR 000112 decision 3): {line}"
             );
         }
+    }
+
+    #[test]
+    fn renders_inline_filter_metrics() {
+        let m = ServerMetrics::new();
+        let mut snapshot = snap(3, 1, 0);
+        snapshot.inline.fallbacks_pool_exhausted = 2;
+        snapshot.inline.fallbacks_pool_filling = 5;
+        snapshot.inline.fallbacks_breaker_open = 1;
+        snapshot.inline.duration_buckets[0] = 1;
+        snapshot.inline.duration_count = 2;
+        snapshot.inline.duration_sum = Duration::from_micros(15);
+
+        let text = m.render(&snapshot, None, None, &[]);
+        assert!(text.contains("# HELP plecto_filter_inline_fallbacks_total Inline-eligible filter hook calls that fell back to the blocking pool, by reason."));
+        assert!(text.contains("# TYPE plecto_filter_inline_fallbacks_total counter"));
+        assert!(text.contains("plecto_filter_inline_fallbacks_total{reason=\"pool_exhausted\"} 2"));
+        assert!(text.contains("plecto_filter_inline_fallbacks_total{reason=\"pool_filling\"} 5"));
+        assert!(text.contains("plecto_filter_inline_fallbacks_total{reason=\"breaker_open\"} 1"));
+
+        assert!(text.contains("# TYPE plecto_filter_inline_duration_seconds histogram"));
+        assert!(text.contains("# HELP plecto_filter_inline_duration_seconds Inline filter execution duration in seconds."));
+        for bound in INLINE_DURATION_BUCKETS {
+            assert!(
+                text.contains(&format!(
+                    "plecto_filter_inline_duration_seconds_bucket{{le=\"{bound}\"}}"
+                )),
+                "bucket for bound {bound} must be present in:\n{text}"
+            );
+        }
+        assert!(text.contains("plecto_filter_inline_duration_seconds_bucket{le=\"+Inf\"} 2"));
+        assert!(text.contains("plecto_filter_inline_duration_seconds_sum 0.000015"));
+        assert!(text.contains("plecto_filter_inline_duration_seconds_count 2"));
     }
 }

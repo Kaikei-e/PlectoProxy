@@ -14,9 +14,10 @@ use hyper::header::{CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
 use plecto_control::otlp::SpanRecord;
 use plecto_control::{
-    ChainOutcome, ConfigSnapshot, HashInput, HashKeySource, HttpRequest, HttpResponse, OverCapMode,
-    RateLimitDecision, RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseBodyOutcome,
-    ResponseOutcome, RouteInfo, UninspectableMode,
+    ChainOutcome, ConfigSnapshot, HashInput, HashKeySource, HttpRequest, HttpResponse,
+    InlineRequestOutcome, InlineResponseOutcome, OverCapMode, RateLimitDecision,
+    RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseBodyOutcome, ResponseOutcome,
+    RouteInfo, UninspectableMode,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -44,6 +45,12 @@ use crate::{ReqBody, ResponseBody, ServerState, access_log};
 struct Attribution {
     route: Option<Arc<str>>,
     inspection_skipped: Option<InspectionSkip>,
+}
+
+// Parity with the spawn_blocking JoinError path: a panic unwinding out of inline dispatch
+// must be caught and converted to ServerError::ChainPanic rather than unwinding the worker task.
+fn catch_chain_panic<T>(f: impl FnOnce() -> T) -> Result<T, ServerError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ServerError::ChainPanic)
 }
 
 /// The transport-agnostic transaction core (Stage A observability wrapper, ADR 000009). Every
@@ -289,18 +296,29 @@ async fn proxy_core_inner(
             admission,
         };
 
-        // --- request side: the route's chain on the blocking pool (sync wasmtime, !Send Store).
+        // --- request side: the route's chain inline on worker or on blocking pool.
         // A route with no filters skips the hop entirely — an empty chain is the identity, and the
         // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax.
         let mut forward = if route.has_filters {
-            let snap_req = snapshot.clone();
-            let admission = chain.admission.clone();
-            match tokio::task::spawn_blocking(move || {
-                let _admission = admission;
-                snap_req.dispatch_request(idx, http_req)
-            })
-            .await?
-            {
+            // Inline runs only filters that never block or build on the worker; the rest
+            // continues on the blocking pool.
+            let inline_res = catch_chain_panic(|| snapshot.dispatch_request_inline(idx, http_req))?;
+            let outcome = match inline_res {
+                InlineRequestOutcome::Complete(outcome) => outcome,
+                InlineRequestOutcome::Pending {
+                    filter_index,
+                    request,
+                } => {
+                    let snap_req = snapshot.clone();
+                    let admission = chain.admission.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _admission = admission;
+                        snap_req.dispatch_request_from(idx, filter_index, request)
+                    })
+                    .await?
+                }
+            };
+            match outcome {
                 ChainOutcome::Respond(resp) => {
                     return Ok(Routed::Synthesised(http_response(resp)));
                 }
@@ -628,7 +646,7 @@ enum BodyHookOutcome {
 /// route actually reads it — i.e. exports `on-request-body` (`reads_body`, ADR 000038). A route
 /// with no body-reading filter (or a bodyless request) skips this entirely and keeps the body on
 /// the zero-copy streaming path — the real fix for the body-tax (docs/servey). The chain runs on
-/// the blocking pool (sync wasmtime, !Send Store), like the header chain.
+/// the blocking pool because body processing runs synchronously until its epoch deadline.
 async fn request_body_hook(
     state: &ServerState,
     chain: &ChainRef<'_>,
@@ -802,14 +820,29 @@ async fn upgrade_switch(
             headers: headers_to_vec(upstream_resp.headers()),
             body: Vec::new(),
         };
-        let snap_resp = chain.snapshot.clone();
-        let idx = chain.idx;
-        let admission = chain.admission.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let _admission = admission;
-            snap_resp.dispatch_response(idx, &forward, http_resp)
-        })
-        .await?;
+        // Inline runs only filters that never block or build on the worker; the rest
+        // continues on the blocking pool.
+        let inline_res = catch_chain_panic(|| {
+            chain
+                .snapshot
+                .dispatch_response_inline(chain.idx, &forward, http_resp)
+        })?;
+        let outcome = match inline_res {
+            InlineResponseOutcome::Complete(outcome) => outcome,
+            InlineResponseOutcome::Pending {
+                filter_index,
+                response,
+            } => {
+                let snap_resp = chain.snapshot.clone();
+                let idx = chain.idx;
+                let admission = chain.admission.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _admission = admission;
+                    snap_resp.dispatch_response_from(idx, filter_index, &forward, response)
+                })
+                .await?
+            }
+        };
         let edited = match outcome {
             // A response filter replaced the handshake (or trapped fail-closed): honour
             // its response and never splice — the upstream connection drops with
@@ -905,15 +938,31 @@ async fn respond_through_chain(
     // egress hop-by-hop strip / path rewrite / traceparent injection), moved here for free —
     // no per-request copy is added to hold it. It comes back out because the body hook, which
     // runs after this one, is handed the same snapshot.
-    let snap_resp = chain.snapshot.clone();
-    let idx = chain.idx;
-    let admission = chain.admission.clone();
-    let (outcome, forward) = tokio::task::spawn_blocking(move || {
-        let _admission = admission;
-        let outcome = snap_resp.dispatch_response(idx, &forward, http_resp);
-        (outcome, forward)
-    })
-    .await?;
+    // Inline runs only filters that never block or build on the worker; the rest
+    // continues on the blocking pool.
+    let inline_res = catch_chain_panic(|| {
+        chain
+            .snapshot
+            .dispatch_response_inline(chain.idx, &forward, http_resp)
+    })?;
+    let (outcome, forward) = match inline_res {
+        InlineResponseOutcome::Complete(outcome) => (outcome, forward),
+        InlineResponseOutcome::Pending {
+            filter_index,
+            response,
+        } => {
+            let snap_resp = chain.snapshot.clone();
+            let idx = chain.idx;
+            let admission = chain.admission.clone();
+            tokio::task::spawn_blocking(move || {
+                let _admission = admission;
+                let outcome =
+                    snap_resp.dispatch_response_from(idx, filter_index, &forward, response);
+                (outcome, forward)
+            })
+            .await?
+        }
+    };
 
     // The typed successor of the old in-band signal (ADR 000073): `Forward` sends the edited
     // status + headers; `Respond` is a synthesised response — a filter's `replace` or the chain's
@@ -1413,5 +1462,17 @@ mod tests {
         strip_inspection_hostile_headers(&mut headers);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].name, "x-keep");
+    }
+
+    #[test]
+    fn catch_chain_panic_catches_panic_and_passes_value() {
+        // Parity with the spawn_blocking JoinError path: a panic unwinds into ServerError::ChainPanic.
+        let panic_res = catch_chain_panic(|| -> () {
+            panic!("inline chain panicked");
+        });
+        assert!(matches!(panic_res, Err(ServerError::ChainPanic)));
+
+        let pass_res = catch_chain_panic(|| 42);
+        assert!(matches!(pass_res, Ok(42)));
     }
 }

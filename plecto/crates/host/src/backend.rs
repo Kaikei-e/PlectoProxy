@@ -57,6 +57,11 @@ pub enum KvBackendInventoryError {
 /// resolved **fail-closed** (reads vanish, rate limits deny), never a panic on the data
 /// plane (bp-rust).
 pub trait KvBackend: Send + Sync {
+    /// Whether a call can wait on I/O or another thread; inline callers must avoid backends that do.
+    fn may_block(&self) -> bool {
+        true
+    }
+
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn set(&self, key: &[u8], value: Vec<u8>);
     fn delete(&self, key: &[u8]);
@@ -199,6 +204,10 @@ pub struct MemoryBackend {
 }
 
 impl KvBackend for MemoryBackend {
+    fn may_block(&self) -> bool {
+        false
+    }
+
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.map.lock().get(key).cloned()
     }

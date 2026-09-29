@@ -6,7 +6,7 @@ use plecto_host::LoadOptions;
 use super::SchemeKind;
 #[cfg(feature = "fat-guest")]
 use super::WasiKind;
-use super::{FilterEntry, IsolationKind};
+use super::{DispatchKind, FilterEntry, IsolationKind};
 
 impl FilterEntry {
     /// The host `LoadOptions` for this entry: isolation plus any metering overrides
@@ -15,6 +15,10 @@ impl FilterEntry {
         let mut opts = match self.isolation {
             IsolationKind::Trusted => LoadOptions::trusted(),
             IsolationKind::Untrusted => LoadOptions::untrusted(),
+        };
+        opts = match self.dispatch {
+            DispatchKind::Auto => opts.with_dispatch(plecto_host::Dispatch::Auto),
+            DispatchKind::Blocking => opts.with_dispatch(plecto_host::Dispatch::Blocking),
         };
         if let Some(ms) = self.init_deadline_ms {
             opts = opts.with_init_deadline_ms(ms);
@@ -104,6 +108,7 @@ mod tests {
             source: "s".to_string(),
             digest: "sha256:abc".to_string(),
             isolation: IsolationKind::Trusted,
+            dispatch: DispatchKind::Auto,
             init_deadline_ms: None,
             request_deadline_ms: Some(40),
             max_memory_bytes: Some(1024),
@@ -124,6 +129,7 @@ mod tests {
         let opts = entry.load_options();
 
         assert_eq!(opts.isolation, plecto_host::Isolation::Trusted);
+        assert_eq!(opts.dispatch, plecto_host::Dispatch::Auto);
         assert_eq!(opts.request_deadline_ms, 40);
         assert_eq!(opts.max_memory_bytes, 1024);
         // the pool lifecycle knobs (ADR 000012) reach the host from the manifest
@@ -143,6 +149,16 @@ mod tests {
         assert_eq!(bucket.capacity, 100);
         assert_eq!(bucket.refill_tokens, 10);
         assert_eq!(bucket.refill_interval_ms, 1000);
+
+        // dispatch = blocking maps to plecto_host::Dispatch::Blocking
+        let blocking_entry = FilterEntry {
+            dispatch: DispatchKind::Blocking,
+            ..entry
+        };
+        assert_eq!(
+            blocking_entry.load_options().dispatch,
+            plecto_host::Dispatch::Blocking
+        );
     }
 
     #[test]

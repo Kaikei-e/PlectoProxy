@@ -30,7 +30,7 @@ use crate::error::ControlError;
 
 pub use chain::Chain;
 pub use filter_entry::{
-    FilterEntry, IsolationKind, OutboundHttpConfig, OutboundTcpConfig, WasiKind,
+    DispatchKind, FilterEntry, IsolationKind, OutboundHttpConfig, OutboundTcpConfig, WasiKind,
 };
 // `AllowDest` / `TcpAllowDest` / `RateLimitConfig` are schema fields reached through
 // `OutboundHttpConfig` / `OutboundTcpConfig` / `FilterEntry` rather than by name elsewhere in this

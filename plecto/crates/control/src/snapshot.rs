@@ -14,7 +14,10 @@ use std::sync::Arc;
 use plecto_host::{Header, HttpRequest, HttpResponse, RequestTrace};
 
 use crate::ActiveConfig;
-use crate::chain::{self, ChainOutcome, RequestBodyOutcome, ResponseBodyOutcome, ResponseOutcome};
+use crate::chain::{
+    self, ChainOutcome, InlineRequestOutcome, InlineResponseOutcome, RequestBodyOutcome,
+    ResponseBodyOutcome, ResponseOutcome,
+};
 use crate::route::{self, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
@@ -73,6 +76,33 @@ impl ConfigSnapshot {
         })
     }
 
+    /// Drive a request through a matched route's chain inline on the worker thread.
+    pub fn dispatch_request_inline(
+        &self,
+        route: usize,
+        request: HttpRequest,
+    ) -> InlineRequestOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_request_inline(&r.resolved_chain, request, &self.trace),
+            None => InlineRequestOutcome::Complete(ChainOutcome::Respond(no_route_response())),
+        }
+    }
+
+    /// Resume driving a request through a matched route's chain starting from filter index `filter_index`.
+    pub fn dispatch_request_from(
+        &self,
+        route: usize,
+        filter_index: usize,
+        request: HttpRequest,
+    ) -> ChainOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => {
+                chain::dispatch_request_from(&r.resolved_chain, filter_index, request, &self.trace)
+            }
+            None => ChainOutcome::Respond(no_route_response()),
+        }
+    }
+
     /// Drive a request through a matched route's chain (request side). `route` is the index from
     /// [`ConfigSnapshot::find_route`] on this same snapshot. Returns forward-or-respond.
     /// Out-of-range (a stale index from another snapshot) responds with a fail-closed 404 rather
@@ -128,6 +158,41 @@ impl ConfigSnapshot {
                 body,
                 transformed: false,
             },
+        }
+    }
+
+    /// Drive a response back through a matched route's chain inline on the worker thread.
+    pub fn dispatch_response_inline(
+        &self,
+        route: usize,
+        request: &HttpRequest,
+        response: HttpResponse,
+    ) -> InlineResponseOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => {
+                chain::dispatch_response_inline(&r.resolved_chain, request, response, &self.trace)
+            }
+            None => InlineResponseOutcome::Complete(ResponseOutcome::Forward(response)),
+        }
+    }
+
+    /// Resume driving a response back through a matched route's chain starting from filter index `filter_index`.
+    pub fn dispatch_response_from(
+        &self,
+        route: usize,
+        filter_index: usize,
+        request: &HttpRequest,
+        response: HttpResponse,
+    ) -> ResponseOutcome {
+        match self.config.routes.get(route) {
+            Some(r) => chain::dispatch_response_from(
+                &r.resolved_chain,
+                filter_index,
+                request,
+                response,
+                &self.trace,
+            ),
+            None => ResponseOutcome::Forward(response),
         }
     }
 

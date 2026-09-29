@@ -19,7 +19,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use plecto_control::{Control, Host, Manifest, MemoryStore, ResolvedArtifact};
-use plecto_host::test_support::{TestSigner, bound_sbom, filter_hello_component};
+use plecto_host::test_support::{
+    TestSigner, bound_sbom, filter_hello_component, filter_noop_component,
+};
 use plecto_server::serve;
 
 /// A fake upstream: returns 200 with the path it received (`x-upstream-path`), an `x-from:
@@ -332,5 +334,72 @@ async fn overwrites_spoofed_forwarded_headers_with_the_real_peer() {
             .and_then(|v| v.to_str().ok()),
         Some("http"),
         "X-Forwarded-Proto reflects the plaintext connection"
+    );
+}
+
+fn control_for_noop(upstream_addr: SocketAddr) -> Arc<Control> {
+    let component = filter_noop_component();
+    let signer = TestSigner::new().unwrap();
+    let component_signature = signer.sign(&component).unwrap();
+    let sbom = bound_sbom(&component);
+    let sbom_signature = signer.sign(&sbom).unwrap();
+    let mut store = MemoryStore::new();
+    let digest = store.insert(
+        "noop",
+        ResolvedArtifact {
+            component,
+            component_signature,
+            sbom,
+            sbom_signature,
+        },
+    );
+    let toml = format!(
+        r#"
+[[filter]]
+id = "noop"
+source = "noop"
+digest = "{digest}"
+isolation = "trusted"
+
+[[upstream]]
+name = "echo"
+addresses = ["{upstream_addr}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+
+[[route]]
+filters = ["noop"]
+upstream = "echo"
+strip_prefix = "/api"
+[route.match]
+path_prefix = "/api"
+"#
+    );
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    Arc::new(Control::load(host, &manifest, Box::new(store)).unwrap())
+}
+
+#[tokio::test]
+async fn trusted_noop_filter_route_runs_inline_and_forwards() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(control_for_noop(upstream)).await;
+    let client = client();
+    wait_ready(&client, proxy).await;
+
+    let (status, headers, body) = get(&client, proxy, "/api/hello", &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "an unblocked request forwards 200");
+    assert_eq!(body, "upstream-ok", "the upstream body streams through");
+    assert_eq!(
+        headers.get("x-from").and_then(|v| v.to_str().ok()),
+        Some("upstream"),
+        "the response came from the upstream"
+    );
+    assert_eq!(
+        headers.get("x-upstream-path").and_then(|v| v.to_str().ok()),
+        Some("/hello"),
+        "strip_prefix was applied"
     );
 }

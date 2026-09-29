@@ -10,6 +10,13 @@ use crate::{
     RequestDecision, RequestTrace, ResponseBodyDecision, ResponseDecision, RunError, SpanOutcome,
 };
 
+/// The outcome of attempting a non-blocking hook call on a loaded filter.
+#[derive(Debug)]
+pub enum TryHookOutcome<T> {
+    Executed(std::result::Result<(T, Vec<LogLine>), RunError>),
+    WouldBlock,
+}
+
 /// Which optional body hooks a loaded component exports, per direction (ADR 000098 decision 2).
 /// Read off the component's exports at load, so it is sound (fail-closed): a filter cannot read a
 /// body without declaring it in the contract. The two flags are independent — the acceptance
@@ -52,9 +59,19 @@ impl BodyHooks {
 pub struct LoadedFilter {
     pub(crate) inner: LoadedInner<WasmtimeRuntime>,
     pub(crate) trusted: Option<TrustedPool<WasmtimeInstance>>,
+    pub(crate) runs_inline: bool,
 }
 
 impl LoadedFilter {
+    /// Returns whether this filter may execute inline on an async worker.
+    ///
+    /// Eligible iff isolation is [`Isolation::Trusted`], no blocking capabilities (outbound,
+    /// WASI) are attached, and all imported interfaces are non-blocking: state interfaces
+    /// (`host-kv`, `host-counter`, `host-ratelimit`) require `!KvBackend::may_block()`.
+    pub fn runs_inline(&self) -> bool {
+        self.runs_inline
+    }
+
     pub fn isolation(&self) -> Isolation {
         self.inner.isolation
     }
@@ -76,6 +93,29 @@ impl LoadedFilter {
         }
     }
 
+    fn execute_with_span<T>(
+        &self,
+        trace: &RequestTrace,
+        hook: Hook,
+        run: impl FnOnce() -> HookResult<T>,
+    ) -> std::result::Result<(T, Vec<LogLine>), RunError>
+    where
+        for<'a> SpanOutcome: From<&'a T>,
+    {
+        if !self.inner.sink.enabled() {
+            return run().map_err(|(err, _)| err);
+        }
+        let start = SystemTime::now();
+        let elapsed = Instant::now();
+        let result = run();
+        let outcome = match &result {
+            Ok((decision, _)) => SpanOutcome::from(decision),
+            Err((err, _)) => <SpanOutcome as From<&RunError>>::from(err),
+        };
+        self.emit_span(trace, hook, outcome, start, elapsed.elapsed(), &result);
+        result.map_err(|(err, _)| err)
+    }
+
     /// Run the request-side hook under the request's trace context (`trace`, ADR 000009). The
     /// host times the call and emits one span — parented by `trace`, carrying the outcome and
     /// the filter's host-log lines as events — to its `TelemetrySink`. Returns the typed
@@ -86,31 +126,44 @@ impl LoadedFilter {
         req: &HttpRequest,
         trace: &RequestTrace,
     ) -> std::result::Result<(RequestDecision, Vec<LogLine>), RunError> {
-        if !self.inner.sink.enabled() {
-            return self.run_on_request(req).map_err(|(err, _)| err);
-        }
-        let start = SystemTime::now();
-        let elapsed = Instant::now();
-        let result = self.run_on_request(req);
-        let outcome = match &result {
-            Ok((decision, _)) => SpanOutcome::from(decision),
-            Err((err, _)) => SpanOutcome::from(err),
-        };
-        self.emit_span(
-            trace,
-            Hook::OnRequest,
-            outcome,
-            start,
-            elapsed.elapsed(),
-            &result,
-        );
-        result.map_err(|(err, _)| err)
+        self.execute_with_span(trace, Hook::OnRequest, || self.run_on_request(req))
     }
 
     fn run_on_request(&self, req: &HttpRequest) -> HookResult<RequestDecision> {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner.runtime.call_on_request(inst, req)
         })
+    }
+
+    /// Run the request-side hook without blocking. Takes ONLY an idle pooled instance.
+    /// If none is idle — or the filter is not eligible to run inline — returns `WouldBlock`
+    /// without calling the guest.
+    pub fn try_on_request(
+        &self,
+        req: &HttpRequest,
+        trace: &RequestTrace,
+    ) -> TryHookOutcome<RequestDecision> {
+        if !self.runs_inline {
+            return TryHookOutcome::WouldBlock;
+        }
+        let Some(pool) = self.trusted.as_ref() else {
+            return TryHookOutcome::WouldBlock;
+        };
+        let pooled = match self.inner.checkout_idle(pool) {
+            Ok(inst) => inst,
+            Err(miss) => {
+                self.inner.inline_metrics.inc_fallback(miss);
+                return TryHookOutcome::WouldBlock;
+            }
+        };
+        let start = Instant::now();
+        let outcome = self.execute_with_span(trace, Hook::OnRequest, || {
+            self.inner.execute_pooled(pool, pooled, |inst| {
+                self.inner.runtime.call_on_request(inst, req)
+            })
+        });
+        self.inner.inline_metrics.record_duration(start.elapsed());
+        TryHookOutcome::Executed(outcome)
     }
 
     /// Run the request-side BODY hook (buffer-then-decide, ADR 000025). The host hands the filter
@@ -199,25 +252,7 @@ impl LoadedFilter {
         resp: &HttpResponse,
         trace: &RequestTrace,
     ) -> std::result::Result<(ResponseDecision, Vec<LogLine>), RunError> {
-        if !self.inner.sink.enabled() {
-            return self.run_on_response(req, resp).map_err(|(err, _)| err);
-        }
-        let start = SystemTime::now();
-        let elapsed = Instant::now();
-        let result = self.run_on_response(req, resp);
-        let outcome = match &result {
-            Ok((decision, _)) => SpanOutcome::from(decision),
-            Err((err, _)) => SpanOutcome::from(err),
-        };
-        self.emit_span(
-            trace,
-            Hook::OnResponse,
-            outcome,
-            start,
-            elapsed.elapsed(),
-            &result,
-        );
-        result.map_err(|(err, _)| err)
+        self.execute_with_span(trace, Hook::OnResponse, || self.run_on_response(req, resp))
     }
 
     fn run_on_response(
@@ -228,6 +263,38 @@ impl LoadedFilter {
         self.inner.run_hook(self.trusted.as_ref(), |inst| {
             self.inner.runtime.call_on_response(inst, req, resp)
         })
+    }
+
+    /// Run the response-side hook without blocking. Takes ONLY an idle pooled instance.
+    /// If none is idle — or the filter is not eligible to run inline — returns `WouldBlock`
+    /// without calling the guest.
+    pub fn try_on_response(
+        &self,
+        req: &HttpRequest,
+        resp: &HttpResponse,
+        trace: &RequestTrace,
+    ) -> TryHookOutcome<ResponseDecision> {
+        if !self.runs_inline {
+            return TryHookOutcome::WouldBlock;
+        }
+        let Some(pool) = self.trusted.as_ref() else {
+            return TryHookOutcome::WouldBlock;
+        };
+        let pooled = match self.inner.checkout_idle(pool) {
+            Ok(inst) => inst,
+            Err(miss) => {
+                self.inner.inline_metrics.inc_fallback(miss);
+                return TryHookOutcome::WouldBlock;
+            }
+        };
+        let start = Instant::now();
+        let outcome = self.execute_with_span(trace, Hook::OnResponse, || {
+            self.inner.execute_pooled(pool, pooled, |inst| {
+                self.inner.runtime.call_on_response(inst, req, resp)
+            })
+        });
+        self.inner.inline_metrics.record_duration(start.elapsed());
+        TryHookOutcome::Executed(outcome)
     }
 
     /// Run the response-side BODY hook (buffer-then-decide, ADR 000098). The host has held the

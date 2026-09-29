@@ -22,6 +22,28 @@ pub(crate) type HookResult<T> = std::result::Result<(T, Vec<LogLine>), (RunError
 /// Shared, isolation-independent load result. Generic over the `FilterRuntime` seam so the pool /
 /// lifecycle-dispatch logic here is unit-testable against a fake runtime — production always
 /// resolves `R = WasmtimeRuntime` (`LoadedFilter` is a concrete, non-generic struct built that way).
+/// Why an idle checkout failed for an inline-eligible filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleMiss {
+    /// Pool is at or above capacity and has no idle instances.
+    PoolExhausted,
+    /// Pool is below capacity but has no idle instances yet (building or recycling).
+    PoolFilling,
+    /// Circuit breaker is open due to consecutive traps.
+    BreakerOpen,
+}
+
+impl IdleMiss {
+    #[allow(dead_code)]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            IdleMiss::PoolExhausted => "pool_exhausted",
+            IdleMiss::PoolFilling => "pool_filling",
+            IdleMiss::BreakerOpen => "breaker_open",
+        }
+    }
+}
+
 pub(crate) struct LoadedInner<R: FilterRuntime> {
     pub(crate) runtime: R,
     /// The filter id (span name + telemetry attribute, ADR 000009).
@@ -37,6 +59,7 @@ pub(crate) struct LoadedInner<R: FilterRuntime> {
     /// incoming request forever — bounded per-call by the epoch deadline, but with zero backoff
     /// across calls, exactly the repeated-cost DoS shape the trusted pool's breaker exists to stop.
     untrusted_breaker: Mutex<TrapBreaker>,
+    pub(crate) inline_metrics: Arc<crate::observe::InlineMetrics>,
 }
 
 /// Consecutive traps before a circuit breaker opens a cooldown; the ONE breaker implementation
@@ -119,6 +142,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
         filter_id: String,
         sink: Arc<dyn TelemetrySink>,
         isolation: Isolation,
+        inline_metrics: Arc<crate::observe::InlineMetrics>,
     ) -> Self {
         Self {
             runtime,
@@ -129,6 +153,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 UNTRUSTED_TRAP_BREAKER_THRESHOLD,
                 UNTRUSTED_TRAP_COOLDOWN,
             )),
+            inline_metrics,
         }
     }
 
@@ -264,7 +289,19 @@ impl<R: FilterRuntime> LoadedInner<R> {
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
     ) -> HookResult<T> {
         // Nothing instantiated yet on a checkout failure → no Store, no logs to recover.
-        let mut pooled = self.checkout(pool).map_err(|e| (e, Vec::new()))?;
+        let pooled = self.checkout(pool).map_err(|e| (e, Vec::new()))?;
+        self.execute_pooled(pool, pooled, call)
+    }
+
+    /// Shared post-checkout execution: runs `call` under the per-request deadline, handles
+    /// return-to-idle, recycling after `max_requests_per_instance`, or trap recording and discard.
+    /// Shared identically between blocking checkout and non-blocking idle checkout.
+    pub(crate) fn execute_pooled<T>(
+        &self,
+        pool: &TrustedPool<R::Instance>,
+        mut pooled: PooledInstance<R::Instance>,
+        call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+    ) -> HookResult<T> {
         // Armed across the guest call: a panic unwinding out of `call` must still release the
         // `live` slot and wake a waiter. Both normal arms below disarm and do their own
         // bookkeeping (return-to-idle / recycle / discard).
@@ -318,6 +355,26 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 pool.available.notify_one();
                 Err((RunError::from_call(e), logs))
             }
+        }
+    }
+
+    /// Check out an idle instance from the pool under the mutex.
+    /// If no instance is idle, or the breaker is open, returns an [`IdleMiss`] without building
+    /// or waiting.
+    pub(crate) fn checkout_idle(
+        &self,
+        pool: &TrustedPool<R::Instance>,
+    ) -> Result<PooledInstance<R::Instance>, IdleMiss> {
+        let mut g = pool.inner.lock();
+        if g.breaker.is_open() {
+            return Err(IdleMiss::BreakerOpen);
+        }
+        if let Some(inst) = g.idle.pop() {
+            Ok(inst)
+        } else if g.live >= pool.cap {
+            Err(IdleMiss::PoolExhausted)
+        } else {
+            Err(IdleMiss::PoolFilling)
         }
     }
 
@@ -406,6 +463,25 @@ impl<I> TrustedPool<I> {
             max_requests_per_instance,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn empty(
+        cap: usize,
+        checkout_timeout: Duration,
+        max_requests_per_instance: u64,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(PoolInner {
+                idle: Vec::new(),
+                live: 0,
+                breaker: TrapBreaker::new(TRUSTED_TRAP_BREAKER_THRESHOLD, TRUSTED_TRAP_COOLDOWN),
+            }),
+            available: Condvar::new(),
+            cap,
+            checkout_timeout,
+            max_requests_per_instance,
+        }
+    }
 }
 
 /// Unit tests for the pool / lifecycle-dispatch DECISION logic in `LoadedInner`/`TrustedPool`
@@ -484,6 +560,7 @@ mod pool_tests {
             "test".to_string(),
             Arc::new(NoopSink),
             Isolation::Trusted,
+            Arc::new(crate::observe::InlineMetrics::new()),
         )
     }
 
@@ -752,6 +829,165 @@ mod pool_tests {
             marker_log("take_logs_final"),
             "run_fresh's Ok arm must use the final drain (partial-line flush), \
              not the plain mid-lifetime drain — the instance is discarded either way"
+        );
+    }
+
+    fn idle_miss<I>(res: Result<PooledInstance<I>, IdleMiss>) -> IdleMiss {
+        match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected checkout_idle to return Err(IdleMiss)"),
+        }
+    }
+
+    #[test]
+    fn idle_miss_as_str_labels() {
+        assert_eq!(IdleMiss::PoolExhausted.as_str(), "pool_exhausted");
+        assert_eq!(IdleMiss::PoolFilling.as_str(), "pool_filling");
+        assert_eq!(IdleMiss::BreakerOpen.as_str(), "breaker_open");
+    }
+
+    #[test]
+    fn non_blocking_call_returns_would_block_when_no_idle_instance_and_never_builds() {
+        let runtime = FakeRuntime::new();
+        let inner = fake_inner(runtime);
+
+        // 1. Fresh pool with nothing built
+        let pool = TrustedPool::empty(2, Duration::from_millis(50), 1000);
+        assert_eq!(
+            idle_miss(inner.checkout_idle(&pool)),
+            IdleMiss::PoolFilling,
+            "fresh pool with nothing built must return PoolFilling"
+        );
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            0,
+            "non-blocking call on empty pool must never build an instance"
+        );
+
+        // 2. After one blocking call has built an instance, non-blocking call succeeds and returns
+        // to idle
+        let (val, _) = inner
+            .run_hook(Some(&pool), |inst: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+            .expect("blocking call builds instance and succeeds");
+        assert_eq!(inner.runtime.instantiate_calls(), 1);
+
+        let pooled = inner
+            .checkout_idle(&pool)
+            .expect("expected idle instance to be available");
+        let res = inner.execute_pooled(&pool, pooled, |inst: &mut FakeInstance| {
+            Ok::<_, wasmtime::Error>(inst.id)
+        });
+        match res {
+            Ok((id, _)) => assert_eq!(id, val),
+            other => panic!("expected non-blocking call to succeed, got {other:?}"),
+        }
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            1,
+            "non-blocking call must reuse the idle instance without building"
+        );
+
+        // Second non-blocking call succeeds too (proving previous call returned instance to idle)
+        let pooled2 = inner
+            .checkout_idle(&pool)
+            .expect("instance must return to idle so subsequent non-blocking call succeeds");
+        let res2 = inner.execute_pooled(&pool, pooled2, |inst: &mut FakeInstance| {
+            Ok::<_, wasmtime::Error>(inst.id)
+        });
+        assert!(
+            res2.is_ok(),
+            "instance must return to idle so subsequent non-blocking call succeeds"
+        );
+        assert_eq!(inner.runtime.instantiate_calls(), 1);
+
+        // 3. Pool at cap with all instances checked out
+        let held1 = inner.checkout(&pool).expect("checkout idle instance");
+        let held2 = inner
+            .checkout(&pool)
+            .expect("checkout built second instance up to cap");
+        assert_eq!(inner.runtime.instantiate_calls(), 2);
+
+        // Now pool is at cap (live=2, cap=2) and 0 idle instances.
+        assert_eq!(
+            idle_miss(inner.checkout_idle(&pool)),
+            IdleMiss::PoolExhausted,
+            "pool at cap with all instances checked out must return PoolExhausted"
+        );
+        assert_eq!(
+            inner.runtime.instantiate_calls(),
+            2,
+            "must never build when pool is at cap"
+        );
+
+        // Return instances
+        pool.inner.lock().idle.push(held1);
+        pool.inner.lock().idle.push(held2);
+
+        // Now non-blocking succeeds again
+        let pooled4 = inner
+            .checkout_idle(&pool)
+            .expect("idle instance should be available after return");
+        let res4 = inner.execute_pooled(&pool, pooled4, |inst: &mut FakeInstance| {
+            Ok::<_, wasmtime::Error>(inst.id)
+        });
+        assert!(res4.is_ok());
+    }
+
+    #[test]
+    fn trap_on_non_blocking_path_is_handled_like_blocking_path() {
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = TrustedPool::new(4, Duration::from_millis(50), 1000, first);
+        let inner = fake_inner(runtime);
+
+        // Non-blocking call that traps
+        let pooled = inner
+            .checkout_idle(&pool)
+            .expect("idle instance should be available");
+        let res = inner.execute_pooled(&pool, pooled, |_inst: &mut FakeInstance| {
+            wasmtime::Result::<()>::Err(wasmtime::Error::msg("simulated trap on inline"))
+        });
+        match res {
+            Err((RunError::Trap(_), _logs)) => {}
+            other => panic!("expected Trap on non-blocking path, got {other:?}"),
+        }
+
+        // Instance was discarded; live decremented from 1 to 0; idle is empty.
+        {
+            let g = pool.inner.lock();
+            assert_eq!(
+                g.idle.len(),
+                0,
+                "trapped instance must be discarded from idle"
+            );
+            assert_eq!(g.live, 0, "trapped instance must decrement live");
+            assert_eq!(
+                g.breaker.consecutive_traps, 1,
+                "breaker must count the trap"
+            );
+        }
+
+        // Subsequent non-blocking call returns PoolFilling (idle is empty)
+        assert_eq!(idle_miss(inner.checkout_idle(&pool)), IdleMiss::PoolFilling);
+
+        // Produce 2 more traps via blocking path to reach threshold (3)
+        for _ in 1..TRUSTED_TRAP_BREAKER_THRESHOLD {
+            let res = inner.run_hook(Some(&pool), |_inst: &mut FakeInstance| {
+                wasmtime::Result::<()>::Err(wasmtime::Error::msg("more traps"))
+            });
+            assert!(matches!(res, Err((RunError::Trap(_), _))));
+        }
+
+        // Breaker is now open
+        assert!(pool.inner.lock().breaker.is_open());
+
+        // Non-blocking call while breaker is open must return BreakerOpen without checking out
+        assert_eq!(
+            idle_miss(inner.checkout_idle(&pool)),
+            IdleMiss::BreakerOpen,
+            "open breaker must return BreakerOpen"
         );
     }
 }

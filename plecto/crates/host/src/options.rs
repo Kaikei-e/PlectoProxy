@@ -38,6 +38,16 @@ impl Isolation {
     }
 }
 
+/// Execution dispatch mode for a loaded filter (ADR 000119).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dispatch {
+    /// Run header hooks inline on the async worker when eligible (ADR 000119).
+    #[default]
+    Auto,
+    /// Always run hooks on the blocking pool while keeping the pooled instance lifecycle.
+    Blocking,
+}
+
 /// Generous default budget for the heavy once-per-instance `init` of a **trusted** filter
 /// (Tenet 4): regex compile, schema build, config parse. Trusted init runs once per instance
 /// and is then reused, so a large budget is paid once — separate from, and much larger than,
@@ -139,6 +149,8 @@ const MAX_OUTBOUND_TCP_IO_DEADLINE_MS: u64 = 30_000;
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub isolation: Isolation,
+    /// Execution dispatch mode (`auto` | `blocking`, ADR 000119).
+    pub dispatch: Dispatch,
     /// Epoch deadline (ms) for the once-per-instance `init` export.
     pub init_deadline_ms: u64,
     /// Epoch deadline (ms) for each per-request hook (`on-request` / `on-response`).
@@ -195,6 +207,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             isolation: Isolation::Untrusted,
+            dispatch: Dispatch::Auto,
             // default is untrusted → init re-runs per request, so bound it tight.
             init_deadline_ms: DEFAULT_UNTRUSTED_INIT_DEADLINE_MS,
             request_deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
@@ -227,6 +240,11 @@ impl LoadOptions {
     }
     pub fn untrusted() -> Self {
         Self::default()
+    }
+    /// Override the execution dispatch mode (`auto` | `blocking`, ADR 000119).
+    pub fn with_dispatch(mut self, dispatch: Dispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
     /// Override the per-request hook deadline (ms).
     pub fn with_request_deadline_ms(mut self, ms: u64) -> Self {

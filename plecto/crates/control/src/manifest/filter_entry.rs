@@ -142,6 +142,12 @@ pub struct FilterEntry {
     pub init_deadline_ms: Option<u64>,
     pub request_deadline_ms: Option<u64>,
     pub max_memory_bytes: Option<u64>,
+    /// Execution dispatch mode for this filter (`auto` | `blocking`).
+    /// `auto` (default) runs the header hooks inline on the async worker when the filter is
+    /// eligible (ADR 000119); `blocking` always runs them on the blocking pool while keeping the
+    /// pooled instance lifecycle; there is deliberately no value that forces inline.
+    #[serde(default)]
+    pub dispatch: DispatchKind,
     /// Trusted pool capacity (max concurrent reusable instances, ADR 000012), `pool_size`.
     /// Only valid with `isolation = "trusted"` (the untrusted lifecycle is fresh-per-request);
     /// the host clamps to its ceiling. Absent = the host default.
@@ -211,6 +217,20 @@ pub enum IsolationKind {
     #[default]
     Untrusted,
     Trusted,
+}
+
+/// Manifest spelling of the filter execution dispatch mode.
+/// `auto` (default) runs the header hooks inline on the async worker when the filter is
+/// eligible (ADR 000119); `blocking` always runs them on the blocking pool while keeping the
+/// pooled instance lifecycle; there is deliberately no value that forces inline.
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchKind {
+    #[default]
+    Auto,
+    Blocking,
 }
 
 /// A filter's WASI grant (ADR 000063). `minimal` lends the fixed, non-configurable slice —
@@ -334,12 +354,35 @@ path_prefix = "/"
 
         assert_eq!(m.filters.len(), 2);
         assert_eq!(m.filters[0].isolation, IsolationKind::Untrusted); // default
+        assert_eq!(m.filters[0].dispatch, DispatchKind::Auto); // default
         assert_eq!(m.filters[1].isolation, IsolationKind::Trusted);
         assert_eq!(m.filters[1].request_deadline_ms, Some(25));
         assert_eq!(
             m.routes[0].filters,
             vec!["auth".to_string(), "rl".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_dispatch_kind() {
+        let m = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "f1"
+source = "s"
+digest = "sha256:abc"
+dispatch = "blocking"
+
+[[filter]]
+id = "f2"
+source = "s"
+digest = "sha256:def"
+dispatch = "auto"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.filters[0].dispatch, DispatchKind::Blocking);
+        assert_eq!(m.filters[1].dispatch, DispatchKind::Auto);
     }
 
     const OUTBOUND_TOML: &str = r#"

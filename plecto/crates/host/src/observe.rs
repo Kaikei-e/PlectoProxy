@@ -426,6 +426,7 @@ impl MetricsSink {
             errors: self.errors.load(Ordering::Relaxed),
             short_circuits: self.short_circuits.load(Ordering::Relaxed),
             total_duration: Duration::from_nanos(self.duration_nanos.load(Ordering::Relaxed)),
+            inline: InlineMetricsSnapshot::default(),
         }
     }
 }
@@ -454,13 +455,107 @@ impl TelemetrySink for MetricsSink {
     }
 }
 
-/// A point-in-time read of [`MetricsSink`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Upper bounds (seconds) of the inline filter latency histogram buckets.
+pub const INLINE_DURATION_BUCKETS: &[f64] = &[
+    5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1,
+];
+
+pub const INLINE_DURATION_BUCKET_COUNT: usize = INLINE_DURATION_BUCKETS.len();
+
+/// Lock-free counters and histogram for inline filter executions and fallbacks.
+pub(crate) struct InlineMetrics {
+    fallbacks_pool_exhausted: AtomicU64,
+    fallbacks_pool_filling: AtomicU64,
+    fallbacks_breaker_open: AtomicU64,
+    duration_buckets: [AtomicU64; INLINE_DURATION_BUCKET_COUNT],
+    duration_count: AtomicU64,
+    duration_nanos: AtomicU64,
+}
+
+impl InlineMetrics {
+    pub(crate) fn new() -> Self {
+        Self {
+            fallbacks_pool_exhausted: AtomicU64::new(0),
+            fallbacks_pool_filling: AtomicU64::new(0),
+            fallbacks_breaker_open: AtomicU64::new(0),
+            duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            duration_count: AtomicU64::new(0),
+            duration_nanos: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn inc_fallback(&self, miss: crate::pool::IdleMiss) {
+        match miss {
+            crate::pool::IdleMiss::PoolExhausted => {
+                self.fallbacks_pool_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            crate::pool::IdleMiss::PoolFilling => {
+                self.fallbacks_pool_filling.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::pool::IdleMiss::BreakerOpen => {
+                self.fallbacks_breaker_open.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn record_duration(&self, duration: Duration) {
+        self.duration_count.fetch_add(1, Ordering::Relaxed);
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.duration_nanos.fetch_add(nanos, Ordering::Relaxed);
+        let seconds = duration.as_secs_f64();
+        for (bound, slot) in INLINE_DURATION_BUCKETS
+            .iter()
+            .zip(self.duration_buckets.iter())
+        {
+            if seconds <= *bound {
+                slot.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> InlineMetricsSnapshot {
+        let mut buckets = [0u64; INLINE_DURATION_BUCKET_COUNT];
+        for (slot, dst) in self.duration_buckets.iter().zip(buckets.iter_mut()) {
+            *dst = slot.load(Ordering::Relaxed);
+        }
+        InlineMetricsSnapshot {
+            fallbacks_pool_exhausted: self.fallbacks_pool_exhausted.load(Ordering::Relaxed),
+            fallbacks_pool_filling: self.fallbacks_pool_filling.load(Ordering::Relaxed),
+            fallbacks_breaker_open: self.fallbacks_breaker_open.load(Ordering::Relaxed),
+            duration_buckets: buckets,
+            duration_count: self.duration_count.load(Ordering::Relaxed),
+            duration_sum: Duration::from_nanos(self.duration_nanos.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Default for InlineMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time snapshot of inline filter execution metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InlineMetricsSnapshot {
+    pub fallbacks_pool_exhausted: u64,
+    pub fallbacks_pool_filling: u64,
+    pub fallbacks_breaker_open: u64,
+    pub duration_buckets: [u64; INLINE_DURATION_BUCKET_COUNT],
+    pub duration_count: u64,
+    pub duration_sum: Duration,
+}
+
+/// A point-in-time read of [`MetricsSink`] and host inline metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MetricsSnapshot {
     pub total: u64,
     pub errors: u64,
     pub short_circuits: u64,
     pub total_duration: Duration,
+    pub inline: InlineMetricsSnapshot,
 }
 
 /// Send every span to several sinks (e.g. export + aggregate at once). The host holds one
@@ -663,5 +758,41 @@ mod tests {
             (MAX_RETAINED_SPANS + 9).to_string(),
             "the newest span is retained"
         );
+    }
+
+    #[test]
+    fn inline_duration_histogram_records_into_correct_buckets() {
+        let metrics = InlineMetrics::new();
+        metrics.record_duration(Duration::from_nanos(1_000));
+        metrics.record_duration(Duration::from_nanos(5_000));
+        metrics.record_duration(Duration::from_nanos(8_000));
+        metrics.record_duration(Duration::from_nanos(20_000));
+        metrics.record_duration(Duration::from_millis(50));
+        metrics.record_duration(Duration::from_millis(200));
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.duration_count, 6);
+        assert_eq!(snap.duration_buckets[0], 2);
+        assert_eq!(snap.duration_buckets[1], 1);
+        assert_eq!(snap.duration_buckets[2], 1);
+        assert_eq!(snap.duration_buckets[10], 1);
+        assert_eq!(snap.duration_buckets[11], 0);
+        assert_eq!(
+            snap.duration_sum,
+            Duration::from_nanos(1_000 + 5_000 + 8_000 + 20_000) + Duration::from_millis(50 + 200)
+        );
+    }
+
+    #[test]
+    fn inline_metrics_counts_fallbacks_by_reason() {
+        let metrics = InlineMetrics::new();
+        metrics.inc_fallback(crate::pool::IdleMiss::PoolExhausted);
+        metrics.inc_fallback(crate::pool::IdleMiss::PoolExhausted);
+        metrics.inc_fallback(crate::pool::IdleMiss::PoolFilling);
+        metrics.inc_fallback(crate::pool::IdleMiss::BreakerOpen);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.fallbacks_pool_exhausted, 2);
+        assert_eq!(snap.fallbacks_pool_filling, 1);
+        assert_eq!(snap.fallbacks_breaker_open, 1);
     }
 }

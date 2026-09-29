@@ -3,8 +3,8 @@
 //! persistent state (upstream registry / host load) is ever touched.
 
 use super::{
-    FilterEntry, HashKeyKind, IsolationKind, LbAlgorithm, MAX_HASH_TABLE_SIZE, MAX_INSTANCE_WEIGHT,
-    OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
+    DispatchKind, FilterEntry, HashKeyKind, IsolationKind, LbAlgorithm, MAX_HASH_TABLE_SIZE,
+    MAX_INSTANCE_WEIGHT, OutboundHttpConfig, OutboundTcpConfig, State, StateBackendKind, Upstream,
 };
 use crate::error::ControlError;
 
@@ -210,6 +210,11 @@ impl FilterEntry {
                 "pool_size / checkout_timeout_ms / max_requests_per_instance apply only to isolation = \"trusted\"",
             ));
         }
+        if self.isolation == IsolationKind::Untrusted && self.dispatch == DispatchKind::Blocking {
+            return Err(bad(
+                "dispatch = \"blocking\" applies only to isolation = \"trusted\"",
+            ));
+        }
         if let Some(rl) = self.ratelimit {
             if rl.capacity == 0 {
                 return Err(bad("ratelimit.capacity must be non-zero"));
@@ -384,6 +389,7 @@ mod tests {
             source: "s".to_string(),
             digest: "sha256:abc".to_string(),
             isolation: IsolationKind::Untrusted,
+            dispatch: DispatchKind::Auto,
             init_deadline_ms: None,
             request_deadline_ms: None,
             max_memory_bytes: None,
@@ -452,6 +458,7 @@ mod tests {
             source: "s".to_string(),
             digest: "sha256:abc".to_string(),
             isolation: IsolationKind::Trusted,
+            dispatch: DispatchKind::Auto,
             init_deadline_ms: None,
             request_deadline_ms: None,
             max_memory_bytes: None,
@@ -518,6 +525,64 @@ mod tests {
                 "a pool knob under isolation = untrusted is rejected"
             );
         }
+    }
+
+    #[test]
+    fn dispatch_blocking_is_trusted_only() {
+        let trusted = FilterEntry {
+            id: "x".to_string(),
+            source: "s".to_string(),
+            digest: "sha256:abc".to_string(),
+            isolation: IsolationKind::Trusted,
+            dispatch: DispatchKind::Blocking,
+            init_deadline_ms: None,
+            request_deadline_ms: None,
+            max_memory_bytes: None,
+            pool_size: None,
+            checkout_timeout_ms: None,
+            max_requests_per_instance: None,
+            ratelimit: None,
+            outbound_http: None,
+            outbound_tcp: None,
+            wasi: WasiKind::None,
+            config: None,
+            config_files: None,
+        };
+        assert!(
+            trusted.validate().is_ok(),
+            "dispatch = blocking is valid under isolation = trusted"
+        );
+        assert!(
+            FilterEntry {
+                dispatch: DispatchKind::Auto,
+                ..trusted.clone()
+            }
+            .validate()
+            .is_ok(),
+            "dispatch = auto is valid under isolation = trusted"
+        );
+
+        let untrusted_auto = FilterEntry {
+            isolation: IsolationKind::Untrusted,
+            dispatch: DispatchKind::Auto,
+            ..trusted.clone()
+        };
+        assert!(
+            untrusted_auto.validate().is_ok(),
+            "dispatch = auto is valid under isolation = untrusted"
+        );
+
+        let untrusted_blocking = FilterEntry {
+            isolation: IsolationKind::Untrusted,
+            dispatch: DispatchKind::Blocking,
+            ..trusted
+        };
+        let err = untrusted_blocking.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dispatch = \"blocking\" applies only to isolation = \"trusted\""),
+            "dispatch = blocking under untrusted must report trusted-only diagnostic, got {err}"
+        );
     }
 
     #[test]

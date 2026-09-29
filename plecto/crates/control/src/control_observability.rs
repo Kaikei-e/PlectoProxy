@@ -27,7 +27,9 @@ impl Control {
     /// `MetricsSink` wired at construction has accumulated. The fast path's admin `/metrics`
     /// endpoint renders this alongside its native RED metrics.
     pub fn filter_metrics(&self) -> MetricsSnapshot {
-        self.filter_metrics.snapshot()
+        let mut snap = self.filter_metrics.snapshot();
+        snap.inline = self.host.inline_metrics_snapshot();
+        snap
     }
 
     /// Residency of the trusted (pooling) engine, for the admin `/metrics` endpoint. `None` when

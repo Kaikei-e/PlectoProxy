@@ -9,10 +9,10 @@
 //! filter short-circuited / failed closed) or forwards the request to the route's upstream and
 //! runs the response side of the chain on the way back.
 //!
-//! **sync↔async bridge (the §6.3 prerequisite).** Filter execution is synchronous and runs on a
-//! wasmtime `Store` that is `!Send`, so it cannot cross an `.await`. Each chain dispatch is moved
-//! to tokio's blocking pool via `spawn_blocking`; the M1 trusted instance pool handles instance
-//! reuse and saturation there. Route matching is pure config lookup and stays on the async thread.
+//! **sync↔async bridge (the §6.3 prerequisite).** Filter execution is synchronous and occupies
+//! the thread until its epoch deadline, so non-inline chain dispatches run on tokio's blocking pool
+//! via `spawn_blocking`; the M1 trusted instance pool handles instance reuse and saturation there.
+//! Route matching is pure config lookup and stays on the async thread.
 //!
 //! **Request body: buffered ONLY when a filter reads it (ADR 000025 / 000038).** A route whose
 //! filters all target the header-only `filter` world streams the request body straight to the

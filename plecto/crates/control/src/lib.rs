@@ -64,7 +64,8 @@ use plecto_host::{LoadedFilter, SignedArtifact};
 
 pub use artifact::{ArtifactStore, MemoryStore, ResolvedArtifact};
 pub use chain::{
-    ChainOutcome, MAX_REQUEST_BODY_BUFFER, RequestBodyOutcome, ResponseBodyOutcome, ResponseOutcome,
+    ChainOutcome, InlineRequestOutcome, InlineResponseOutcome, MAX_REQUEST_BODY_BUFFER,
+    RequestBodyOutcome, ResponseBodyOutcome, ResponseOutcome,
 };
 pub use diagnostic::{
     DEV_KEY_IN_TRUST, Diagnostic, PATH_NORMALIZATION_REJECTED, QUOTA_EXCEEDED,
@@ -72,10 +73,11 @@ pub use diagnostic::{
 };
 pub use error::ControlError;
 pub use manifest::{
-    Chain, CircuitBreaker, CompressionAlgorithm, FilterEntry, HealthConfig, IsolationKind,
-    Manifest, Observability, OutlierDetection, OverCapMode, ProxyProtocolTrust, RateLimitKeyKind,
-    Route, RouteCompression, RouteHeaders, RouteRateLimit, RouteResponseBody, RouteTimeouts, State,
-    StateBackendKind, TlsCert, Trust, TrustedProxyTrust, UninspectableMode, Upstream,
+    Chain, CircuitBreaker, CompressionAlgorithm, DispatchKind, FilterEntry, HealthConfig,
+    IsolationKind, Manifest, Observability, OutlierDetection, OverCapMode, ProxyProtocolTrust,
+    RateLimitKeyKind, Route, RouteCompression, RouteHeaders, RouteRateLimit, RouteResponseBody,
+    RouteTimeouts, State, StateBackendKind, TlsCert, Trust, TrustedProxyTrust, UninspectableMode,
+    Upstream,
 };
 pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
@@ -100,7 +102,8 @@ pub use upstream::{
 // on `plecto-host` directly for the common path — including the ADR 000009 observability
 // types (build a `Host` with a sink, then drive snapshots that carry the trace context).
 pub use plecto_host::{
-    BodyHooks, FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse, InMemorySink,
+    BodyHooks, Dispatch, FanOutSink, FilterSpan, Header, Host, HttpRequest, HttpResponse,
+    INLINE_DURATION_BUCKET_COUNT, INLINE_DURATION_BUCKETS, InMemorySink, InlineMetricsSnapshot,
     MetricsSink, MetricsSnapshot, NoopSink, RequestTrace, SpanOutcome, TelemetrySink, TrustPolicy,
 };
 // Filter Dev Kit (ADR 000065): `plecto conformance` / `plecto dev` / `plecto new-filter` need

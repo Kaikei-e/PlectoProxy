@@ -114,8 +114,9 @@ pub use dev_signer::{
     DEV_KEY_MARKER, DevKeyError, DevSigner, PemSigner, bound_sbom, public_key_path_for,
 };
 pub use observe::{
-    FanOutSink, FilterSpan, Hook, InMemorySink, MetricsSink, MetricsSnapshot, NoopSink,
-    RequestTrace, SpanOutcome, TelemetrySink,
+    FanOutSink, FilterSpan, Hook, INLINE_DURATION_BUCKET_COUNT, INLINE_DURATION_BUCKETS,
+    InMemorySink, InlineMetricsSnapshot, MetricsSink, MetricsSnapshot, NoopSink, RequestTrace,
+    SpanOutcome, TelemetrySink,
 };
 
 mod bindings {
@@ -145,9 +146,9 @@ pub use bindings::plecto::filter::types::{
 };
 
 pub use errors::{LoadError, RunError};
-pub use filter::{BodyHooks, LoadedFilter};
+pub use filter::{BodyHooks, LoadedFilter, TryHookOutcome};
 pub use host::Host;
-pub use options::{Isolation, LoadOptions};
+pub use options::{Dispatch, Isolation, LoadOptions};
 pub use quota::KvQuotaRestoreError;
 // `HostState` stays crate-internal (DECREE §2: minimal pub surface) — it has no public
 // constructor or methods and no external users; only `LogLine` crosses the crate boundary

@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use plecto_control::{
-    ChainOutcome, Control, ControlError, Host, HttpRequest, HttpResponse, InMemorySink, Manifest,
-    MemoryStore, ResolvedArtifact, ResponseOutcome,
+    ChainOutcome, Control, ControlError, Host, HttpRequest, HttpResponse, InMemorySink,
+    InlineRequestOutcome, InlineResponseOutcome, Manifest, MemoryStore, ResolvedArtifact,
+    ResponseOutcome,
 };
 use plecto_host::Header;
 use plecto_host::test_support::{
@@ -38,6 +39,14 @@ fn header_value<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case(name))
         .and_then(|header| std::str::from_utf8(&header.value).ok())
+}
+
+fn assert_headers_eq(a: &[Header], b: &[Header]) {
+    assert_eq!(a.len(), b.len(), "header count mismatch");
+    for (ha, hb) in a.iter().zip(b.iter()) {
+        assert_eq!(ha.name, hb.name, "header name mismatch");
+        assert_eq!(ha.value, hb.value, "header value mismatch");
+    }
 }
 
 /// filter-hello, signed with a fresh ephemeral key (the returned signer trusts it).
@@ -801,4 +810,255 @@ hmac_key = "no-such-file"
     let ok = toml.replace("no-such-file", "hmac_key");
     let manifest = Manifest::from_toml(&ok).unwrap();
     plecto_control::validate_manifest(&manifest, dir.path()).unwrap();
+}
+
+#[test]
+fn resumable_chain_dispatch_on_would_block_request_and_response() {
+    let (signer, hello_art) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let d1 = store.insert("fh1", hello_art.clone());
+    let d2 = store.insert("fh2", hello_art.clone());
+    let du1 = store.insert("u1", hello_art.clone());
+    let du2 = store.insert("u2", hello_art);
+
+    let toml = format!(
+        r#"
+[[filter]]
+id = "fh-trusted"
+source = "fh1"
+digest = "{d1}"
+isolation = "trusted"
+
+[[filter]]
+id = "fh-untrusted"
+source = "fh2"
+digest = "{d2}"
+isolation = "untrusted"
+
+[[filter]]
+id = "u1"
+source = "u1"
+digest = "{du1}"
+isolation = "untrusted"
+
+[[filter]]
+id = "u2"
+source = "u2"
+digest = "{du2}"
+isolation = "untrusted"
+
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
+filters = ["fh-trusted", "fh-untrusted"]
+upstream = "be"
+[route.match]
+path_prefix = "/two"
+
+[[route]]
+filters = ["u1", "u2"]
+upstream = "be"
+[route.match]
+path_prefix = "/pure-untrusted"
+
+[[route]]
+filters = ["fh-untrusted", "fh-trusted"]
+upstream = "be"
+[route.match]
+path_prefix = "/rev-mixed"
+"#
+    );
+
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+    let snap = control.snapshot();
+
+    // 1. REQUEST SIDE: [trusted, untrusted]
+    // Filter 0 (trusted) runs inline and edits the request; filter 1 (untrusted) returns WouldBlock.
+    let mut r = req(&[]);
+    r.path_with_query = "/two".to_string();
+    let info = snap.find_route(&r).unwrap();
+
+    let mut request = req(&[("x-plecto-addheader", "1")]);
+    request.path_with_query = "/two".to_string();
+
+    let inline_res = snap.dispatch_request_inline(info.index, request.clone());
+    let (filter_idx, pending_req) = match inline_res {
+        InlineRequestOutcome::Pending {
+            filter_index,
+            request,
+        } => (filter_index, request),
+        other => panic!("expected Pending at filter 1, got {other:?}"),
+    };
+    assert_eq!(filter_idx, 1, "pending must point to filter 1 (untrusted)");
+    assert!(
+        pending_req
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("x-plecto-added")),
+        "filter 0's edit must be applied to pending request"
+    );
+
+    let resumed = snap.dispatch_request_from(info.index, filter_idx, pending_req);
+    let expected = snap.dispatch_request(info.index, request);
+    match (resumed, expected) {
+        (ChainOutcome::Forward(res_req), ChainOutcome::Forward(exp_req)) => {
+            assert_headers_eq(&res_req.headers, &exp_req.headers);
+        }
+        (o1, o2) => panic!("mismatch: resumed={o1:?}, expected={o2:?}"),
+    }
+
+    // 2. RESPONSE SIDE: [trusted, untrusted]
+    // Response runs in reverse: index 1 (untrusted) is visited first and returns WouldBlock.
+    let resp = HttpResponse {
+        status: 200,
+        headers: vec![Header {
+            name: "x-plecto-respedit".to_string(),
+            value: b"1".to_vec(),
+        }],
+        body: vec![],
+    };
+
+    let inline_resp = snap.dispatch_response_inline(info.index, &r, resp.clone());
+    let (resp_filter_idx, pending_resp) = match inline_resp {
+        InlineResponseOutcome::Pending {
+            filter_index,
+            response,
+        } => (filter_index, response),
+        other => panic!("expected Pending at filter 1, got {other:?}"),
+    };
+    assert_eq!(
+        resp_filter_idx, 1,
+        "pending in reverse must point to filter 1 (untrusted position)"
+    );
+
+    let resumed_resp = snap.dispatch_response_from(info.index, resp_filter_idx, &r, pending_resp);
+    let expected_resp = snap.dispatch_response(info.index, &r, resp.clone());
+    match (resumed_resp, expected_resp) {
+        (ResponseOutcome::Forward(r1), ResponseOutcome::Forward(r2)) => {
+            assert_headers_eq(&r1.headers, &r2.headers);
+        }
+        (o1, o2) => panic!("mismatch: resumed={o1:?}, expected={o2:?}"),
+    }
+
+    // Also check [untrusted, trusted] in reverse:
+    // Filter 1 (trusted) runs inline and edits the response; filter 0 (untrusted) yields Pending.
+    let mut rev_r = req(&[]);
+    rev_r.path_with_query = "/rev-mixed".to_string();
+    let rev_info = snap.find_route(&rev_r).unwrap();
+    let inline_rev = snap.dispatch_response_inline(rev_info.index, &rev_r, resp.clone());
+    let (rev_idx, rev_pending) = match inline_rev {
+        InlineResponseOutcome::Pending {
+            filter_index,
+            response,
+        } => (filter_index, response),
+        other => panic!("expected Pending at filter 0, got {other:?}"),
+    };
+    assert_eq!(rev_idx, 0, "pending in reverse must point to filter 0");
+    assert!(
+        rev_pending
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("x-plecto-respadded")),
+        "filter 1's response edit must be applied inline before filter 0 yielded pending"
+    );
+    let resumed_rev = snap.dispatch_response_from(rev_info.index, rev_idx, &rev_r, rev_pending);
+    let expected_rev = snap.dispatch_response(rev_info.index, &rev_r, resp.clone());
+    match (resumed_rev, expected_rev) {
+        (ResponseOutcome::Forward(r1), ResponseOutcome::Forward(r2)) => {
+            assert_headers_eq(&r1.headers, &r2.headers);
+        }
+        (o1, o2) => panic!("mismatch: resumed={o1:?}, expected={o2:?}"),
+    }
+
+    // 3. PURE-UNTRUSTED ROUTE
+    // Pure-untrusted route returns Pending at index 0 (request) / last index (response) without running anything inline.
+    let mut pure_r = req(&[]);
+    pure_r.path_with_query = "/pure-untrusted".to_string();
+    let pure_info = snap.find_route(&pure_r).unwrap();
+
+    let pure_req_outcome = snap.dispatch_request_inline(pure_info.index, req(&[]));
+    match pure_req_outcome {
+        InlineRequestOutcome::Pending { filter_index, .. } => {
+            assert_eq!(
+                filter_index, 0,
+                "pure-untrusted route must return Pending at index 0 on request side"
+            );
+        }
+        other => panic!("expected Pending at index 0, got {other:?}"),
+    }
+
+    let pure_resp_outcome = snap.dispatch_response_inline(pure_info.index, &pure_r, resp);
+    match pure_resp_outcome {
+        InlineResponseOutcome::Pending { filter_index, .. } => {
+            assert_eq!(
+                filter_index, 1,
+                "pure-untrusted route must return Pending at last index on response side"
+            );
+        }
+        other => panic!("expected Pending at index 1, got {other:?}"),
+    }
+}
+
+#[test]
+fn short_circuit_at_filter_1_inline_never_reaches_filter_2() {
+    let (signer, hello_art) = signed_filter_hello();
+    let mut store = MemoryStore::new();
+    let d1 = store.insert("fh1", hello_art.clone());
+    let d2 = store.insert("fh2", hello_art);
+
+    let toml = format!(
+        r#"
+[[filter]]
+id = "fh1"
+source = "fh1"
+digest = "{d1}"
+isolation = "trusted"
+
+[[filter]]
+id = "fh2"
+source = "fh2"
+digest = "{d2}"
+isolation = "untrusted"
+
+[[upstream]]
+name = "be"
+addresses = ["127.0.0.1:9"]
+[upstream.health]
+path = "/"
+
+[[route]]
+filters = ["fh1", "fh2"]
+upstream = "be"
+[route.match]
+path_prefix = "/two"
+"#
+    );
+
+    let manifest = Manifest::from_toml(&toml).unwrap();
+    let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+    let control = Control::load(host, &manifest, Box::new(store)).unwrap();
+    let snap = control.snapshot();
+    let mut r = req(&[]);
+    r.path_with_query = "/two".to_string();
+    let info = snap.find_route(&r).unwrap();
+
+    // Request with block header triggers short-circuit at filter 0 inline (fh1).
+    // Because filter 0 short-circuits inline, it returns Complete(403) and NEVER reaches filter 1
+    // (which is untrusted and would otherwise return Pending).
+    let mut blocked_req = req(&[("x-plecto-block", "1")]);
+    blocked_req.path_with_query = "/two".to_string();
+
+    let outcome = snap.dispatch_request_inline(info.index, blocked_req);
+    match outcome {
+        InlineRequestOutcome::Complete(ChainOutcome::Respond(resp)) => {
+            assert_eq!(resp.status, 403, "short-circuit at filter 0 must yield 403");
+        }
+        other => panic!("expected Complete with 403 Respond, got {other:?}"),
+    }
 }

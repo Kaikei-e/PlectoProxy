@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use plecto_host::{
-    Header, HttpRequest, HttpResponse, LoadedFilter, RequestBodyDecision, RequestBodyEdit,
+    Header, HttpRequest, HttpResponse, LoadedFilter, LogLine, RequestBodyDecision, RequestBodyEdit,
     RequestDecision, RequestEdit, RequestTrace, ResponseBodyDecision, ResponseBodyEdit,
-    ResponseDecision, ResponseEdit,
+    ResponseDecision, ResponseEdit, RunError, TryHookOutcome,
 };
 
 /// The fixed host-wide cap for a request body buffered for `on-request-body`. The server reserves
@@ -16,6 +16,7 @@ use plecto_host::{
 pub const MAX_REQUEST_BODY_BUFFER: usize = 16 << 20; // 16 MiB
 
 /// The result of driving a request through the chain.
+#[derive(Debug)]
 pub enum ChainOutcome {
     /// Respond now without reaching upstream: a filter short-circuited, or the chain failed
     /// closed on a trap / deadline (the synthetic 5xx from `RunError::fail_closed_response`).
@@ -56,6 +57,7 @@ pub enum ResponseBodyOutcome {
 
 /// The result of driving a response back through the chain (ADR 000073): the typed successor
 /// of the old in-band "non-empty body means synthetic" signal.
+#[derive(Debug)]
 pub enum ResponseOutcome {
     /// The chain passed: send the (possibly edited) status + headers and stream the upstream
     /// body through (its `body` is empty — header-only, ADR 000038).
@@ -65,25 +67,103 @@ pub enum ResponseOutcome {
     Respond(HttpResponse),
 }
 
-pub(crate) fn dispatch_request(
+/// The outcome of driving a request through the chain inline on a worker thread.
+#[derive(Debug)]
+pub enum InlineRequestOutcome {
+    /// The chain completed inline: forward or synthesised response.
+    Complete(ChainOutcome),
+    /// The chain would block at the given filter index; continuation carries current request state.
+    Pending {
+        filter_index: usize,
+        request: HttpRequest,
+    },
+}
+
+/// The outcome of driving a response back through the chain inline on a worker thread.
+#[derive(Debug)]
+pub enum InlineResponseOutcome {
+    /// The response chain completed inline: forward or synthesised response.
+    Complete(ResponseOutcome),
+    /// The response chain would block at the given filter index; continuation carries current response state.
+    Pending {
+        filter_index: usize,
+        response: HttpResponse,
+    },
+}
+
+enum StepOutcome<T> {
+    Continue,
+    Terminal(T),
+}
+
+fn handle_request_step(
+    request: &mut HttpRequest,
+    result: Result<(RequestDecision, Vec<LogLine>), RunError>,
+) -> StepOutcome<ChainOutcome> {
+    match result {
+        Ok((RequestDecision::Continue, _logs)) => StepOutcome::Continue,
+        Ok((RequestDecision::Modified(edit), _logs)) => {
+            apply_request_edit(request, edit);
+            StepOutcome::Continue
+        }
+        Ok((RequestDecision::ShortCircuit(response), _logs)) => {
+            StepOutcome::Terminal(ChainOutcome::Respond(response))
+        }
+        // fail-closed: a trapped / timed-out filter must not reach upstream.
+        Err(err) => StepOutcome::Terminal(ChainOutcome::Respond(err.fail_closed_response())),
+    }
+}
+
+pub(crate) fn dispatch_request_inline(
     chain: &[Arc<LoadedFilter>],
     mut request: HttpRequest,
     trace: &RequestTrace,
-) -> ChainOutcome {
-    for filter in chain {
+) -> InlineRequestOutcome {
+    for (k, filter) in chain.iter().enumerate() {
         // `trace` parents each filter span (ADR 000009): the host times the call and emits the
         // span to its sink; we drive only the decision here.
-        match filter.on_request(&request, trace) {
-            Ok((RequestDecision::Continue, _logs)) => {}
-            Ok((RequestDecision::Modified(edit), _logs)) => apply_request_edit(&mut request, edit),
-            Ok((RequestDecision::ShortCircuit(response), _logs)) => {
-                return ChainOutcome::Respond(response);
+        match filter.try_on_request(&request, trace) {
+            TryHookOutcome::WouldBlock => {
+                return InlineRequestOutcome::Pending {
+                    filter_index: k,
+                    request,
+                };
             }
-            // fail-closed: a trapped / timed-out filter must not reach upstream.
-            Err(err) => return ChainOutcome::Respond(err.fail_closed_response()),
+            TryHookOutcome::Executed(res) => match handle_request_step(&mut request, res) {
+                StepOutcome::Continue => {}
+                StepOutcome::Terminal(outcome) => {
+                    return InlineRequestOutcome::Complete(outcome);
+                }
+            },
+        }
+    }
+    InlineRequestOutcome::Complete(ChainOutcome::Forward(request))
+}
+
+pub(crate) fn dispatch_request_from(
+    chain: &[Arc<LoadedFilter>],
+    start: usize,
+    mut request: HttpRequest,
+    trace: &RequestTrace,
+) -> ChainOutcome {
+    for filter in chain.iter().skip(start) {
+        // `trace` parents each filter span (ADR 000009): the host times the call and emits the
+        // span to its sink; we drive only the decision here.
+        let result = filter.on_request(&request, trace);
+        match handle_request_step(&mut request, result) {
+            StepOutcome::Continue => {}
+            StepOutcome::Terminal(outcome) => return outcome,
         }
     }
     ChainOutcome::Forward(request)
+}
+
+pub(crate) fn dispatch_request(
+    chain: &[Arc<LoadedFilter>],
+    request: HttpRequest,
+    trace: &RequestTrace,
+) -> ChainOutcome {
+    dispatch_request_from(chain, 0, request, trace)
 }
 
 /// Drive a buffered request body through the chain's `on-request-body` hooks in order (ADR 000025),
@@ -133,31 +213,95 @@ fn oversize_guest_request_body_response() -> HttpResponse {
     }
 }
 
-pub(crate) fn dispatch_response(
+fn handle_response_step(
+    response: &mut HttpResponse,
+    result: Result<(ResponseDecision, Vec<LogLine>), RunError>,
+) -> StepOutcome<ResponseOutcome> {
+    match result {
+        Ok((ResponseDecision::Continue, _logs)) => StepOutcome::Continue,
+        Ok((ResponseDecision::Modified(edit), _logs)) => {
+            apply_response_edit(response, edit);
+            StepOutcome::Continue
+        }
+        // A `replace` stops the chain and answers with the synthesised response — same terminal shape
+        // as the request side's short-circuit and the fail-closed arm (and the general proxy-filter
+        // form: a local response skips the remaining filters).
+        Ok((ResponseDecision::Replace(replacement), _logs)) => {
+            StepOutcome::Terminal(ResponseOutcome::Respond(replacement))
+        }
+        // fail-closed: a trapped / timed-out filter must not reach upstream.
+        Err(err) => StepOutcome::Terminal(ResponseOutcome::Respond(err.fail_closed_response())),
+    }
+}
+
+/// The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
+/// `request` is the as-forwarded snapshot every hook sees (ADR 000073).
+/// The same `trace` as the request side, so request + response spans share one trace (ADR 000009).
+pub(crate) fn dispatch_response_inline(
     chain: &[Arc<LoadedFilter>],
     request: &HttpRequest,
     mut response: HttpResponse,
     trace: &RequestTrace,
+) -> InlineResponseOutcome {
+    for (k, filter) in chain.iter().enumerate().rev() {
+        match filter.try_on_response(request, &response, trace) {
+            TryHookOutcome::WouldBlock => {
+                return InlineResponseOutcome::Pending {
+                    filter_index: k,
+                    response,
+                };
+            }
+            TryHookOutcome::Executed(res) => match handle_response_step(&mut response, res) {
+                StepOutcome::Continue => {}
+                StepOutcome::Terminal(outcome) => {
+                    return InlineResponseOutcome::Complete(outcome);
+                }
+            },
+        }
+    }
+    InlineResponseOutcome::Complete(ResponseOutcome::Forward(response))
+}
+
+/// The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
+/// `request` is the as-forwarded snapshot every hook sees (ADR 000073).
+/// The same `trace` as the request side, so request + response spans share one trace (ADR 000009).
+pub(crate) fn dispatch_response_from(
+    chain: &[Arc<LoadedFilter>],
+    start: usize,
+    request: &HttpRequest,
+    mut response: HttpResponse,
+    trace: &RequestTrace,
 ) -> ResponseOutcome {
-    // The response side runs the chain in reverse (CONTEXT: request/response are symmetric).
-    // `request` is the as-forwarded snapshot every hook sees (ADR 000073). A `replace` stops
-    // the chain and answers with the synthesised response — same terminal shape as the request
-    // side's short-circuit and the fail-closed arm (and the general proxy-filter form: a local
-    // response skips the remaining filters). The same `trace` as the request side, so request +
-    // response spans share one trace (ADR 000009).
-    for filter in chain.iter().rev() {
-        match filter.on_response(request, &response, trace) {
-            Ok((ResponseDecision::Continue, _logs)) => {}
-            Ok((ResponseDecision::Modified(edit), _logs)) => {
-                apply_response_edit(&mut response, edit)
-            }
-            Ok((ResponseDecision::Replace(replacement), _logs)) => {
-                return ResponseOutcome::Respond(replacement);
-            }
-            Err(err) => return ResponseOutcome::Respond(err.fail_closed_response()),
+    let Some(last) = chain.len().checked_sub(1) else {
+        return ResponseOutcome::Forward(response);
+    };
+    let bound = start.min(last);
+    let Some(slice) = chain.get(..=bound) else {
+        return ResponseOutcome::Forward(response);
+    };
+    for filter in slice.iter().rev() {
+        let result = filter.on_response(request, &response, trace);
+        match handle_response_step(&mut response, result) {
+            StepOutcome::Continue => {}
+            StepOutcome::Terminal(outcome) => return outcome,
         }
     }
     ResponseOutcome::Forward(response)
+}
+
+pub(crate) fn dispatch_response(
+    chain: &[Arc<LoadedFilter>],
+    request: &HttpRequest,
+    response: HttpResponse,
+    trace: &RequestTrace,
+) -> ResponseOutcome {
+    dispatch_response_from(
+        chain,
+        chain.len().saturating_sub(1),
+        request,
+        response,
+        trace,
+    )
 }
 
 /// Drive a buffered response body through the chain's `on-response-body` hooks in reverse (ADR

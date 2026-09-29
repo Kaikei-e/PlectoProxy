@@ -544,4 +544,51 @@ path_prefix = "/"
             "a chain change must flip the content hash"
         );
     }
+
+    #[test]
+    fn content_hash_changes_on_dispatch_mode_edit() {
+        let auto = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+isolation = "trusted"
+dispatch = "auto"
+"#,
+        )
+        .unwrap();
+        let blocking = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+isolation = "trusted"
+dispatch = "blocking"
+"#,
+        )
+        .unwrap();
+        let default_dispatch = Manifest::from_toml(
+            r#"
+[[filter]]
+id = "auth"
+source = "artifacts/auth"
+digest = "sha256:abc"
+isolation = "trusted"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            auto.content_hash().unwrap(),
+            default_dispatch.content_hash().unwrap(),
+            "omitted dispatch defaults to auto and must produce the same content hash"
+        );
+        assert_ne!(
+            auto.content_hash().unwrap(),
+            blocking.content_hash().unwrap(),
+            "changing dispatch to blocking must flip the content hash"
+        );
+    }
 }

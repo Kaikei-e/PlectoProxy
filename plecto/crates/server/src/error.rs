@@ -11,6 +11,8 @@ pub(crate) enum ServerError {
     RequestBuild(#[from] hyper::http::Error),
     #[error("chain dispatch task failed: {0}")]
     ChainJoin(#[from] tokio::task::JoinError),
+    #[error("chain dispatch panicked")]
+    ChainPanic,
     #[error(transparent)]
     Upstream(#[from] UpstreamSendError),
     /// HTTP/3 (QUIC) transport setup/accept failure. `h3`/`quinn`'s error types don't uniformly

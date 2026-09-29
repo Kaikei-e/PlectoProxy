@@ -145,7 +145,8 @@ webpki-roots = { workspace = true, optional = true }
 # M3 Stage 1 (ADR 000021): a minimal `block_on` to drive wasmtime's now-async `call_async` /
 # `instantiate_async` from the host's still-sync public API. The guest runs to completion on a
 # fiber without suspending (epoch is trap-mode, host-API imports never block), so a no-reactor
-# executor suffices. The server-side spawn_blocking removal (true async) is Stage 2.
+# executor suffices. Header hooks of inline-eligible filters now run on the async worker through
+# this `block_on` (ADR 000119); removing the remaining spawn_blocking (true async) is Stage 2.
 pollster = "1"
 anyhow = { workspace = true }
 thiserror = { workspace = true }

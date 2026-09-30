@@ -32,6 +32,10 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Packaging / metadata**: The `plecto` binary crate no longer advertises docs.rs documentation (it has no library target) and the redundant `homepage` field was dropped across manifests.
+
 ## [0.14.0] - 2026-09-29
 
 Minor release: trusted filters whose header hooks cannot block the thread now run on the async worker instead of paying a blocking-pool round trip per hook ([ADR 000119](docs/ADR/000119.md)), cutting the per-request WASM dispatch floor from ~4.1 to ~1.4 µs on the reference host. Minor rather than patch because three public structs gain a field — `plecto_host::LoadOptions.dispatch`, `plecto_host::MetricsSnapshot.inline` and `plecto_control::FilterEntry.dispatch` — which breaks downstream code that builds them with a struct literal: `cargo semver-checks --release-type patch` flags exactly these as `constructible_struct_adds_field` on `plecto-host` / `plecto-control`, and reports no change for `plecto-server`. The manifest change is additive: existing manifests load unchanged, and omitting `dispatch` means `auto`. **Deployed filters do not need a rebuild**: the contract stays at `plecto:filter@0.4.0` and the reference-filter shelf is unchanged.

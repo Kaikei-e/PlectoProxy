@@ -1,7 +1,6 @@
 # Plecto Proxy
 
 [![crates.io](https://img.shields.io/crates/v/plecto.svg)](https://crates.io/crates/plecto)
-[![docs.rs](https://img.shields.io/docsrs/plecto)](https://docs.rs/plecto)
 [![CI](https://github.com/Kaikei-e/PlectoProxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kaikei-e/PlectoProxy/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/plecto.svg)](https://github.com/Kaikei-e/PlectoProxy/blob/main/LICENSE)
 
@@ -68,7 +67,7 @@ path, filter included.
 
 This crate is one member of the Plecto Proxy Cargo workspace (all members version in lockstep):
 
-- [`plecto`](https://docs.rs/plecto) — the `plecto` binary and operator CLI. `cargo install plecto` is the primary entry point.
+- [`plecto`](https://crates.io/crates/plecto) — the `plecto` binary and operator CLI. `cargo install plecto` is the primary entry point.
 - [`plecto-host`](https://docs.rs/plecto-host) — the wasmtime embedding host that loads, sandboxes, and runs `plecto:filter` WASM components; also home of the versioned conformance battery (`run_conformance` / `run_conformance_with`, five-way per-case verdicts).
 - [`plecto-control`](https://docs.rs/plecto-control) — the control plane: declarative manifest, OCI artifact loading, filter-chain dispatch, atomic hot reload.
 - [`plecto-server`](https://docs.rs/plecto-server) — the fast path data plane library (HTTP/1.1, HTTP/2, HTTP/3, TLS, routing, load balancing).

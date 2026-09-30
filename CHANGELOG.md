@@ -32,6 +32,21 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **JavaScript example guests drop `decompress`**: `filter-hello-js` and `filter-tokenlimit-js`
+  move `@bytecodealliance/componentize-js` 0.22.0 → 0.23.0. 0.22.0 pulled
+  `@bytecodealliance/weval` 0.4.1, which depended on `decompress` 4.2.1; `decompress` has four open
+  advisories (GHSA-mp2f-45pm-3cg9, GHSA-h39j-r5qq-r9mm, GHSA-jwp9-9v96-94mx, GHSA-hrh2-vp3x-79xf:
+  archive extraction can write files / create links outside the target directory) and no patched
+  release. 0.23.0 takes weval 0.5.0, which extracts with `tar` / `fflate` instead. jco 1.35.0 (a
+  dependency of componentize-js) still asks for componentize-js `^0.22.0`, so each guest's
+  `package.json` adds an npm `overrides` entry resolving jco's copy to the same pinned version; jco
+  only loads it for its own `componentize` CLI subcommand, which the builds do not use. `decompress`
+  only ran when ComponentizeJS fetches the weval binary for AOT compilation, which the example
+  guests never enable, so their builds never reached it, and nothing ships to the proxy or the
+  reference-filter shelf. No filter source, WIT contract, or build option changes.
+
 ## [0.14.1] - 2026-09-30
 
 Patch release: package metadata only. docs.rs documents library targets only, so the bin-only `plecto` crate showed "not a library" there and its README badge read "docs: failing"; the crate no longer links to that page. No source change from 0.14.0 — the WIT contract, manifest schema, CLI, and public API are unchanged. **Deployed filters do not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0` and the reference-filter shelf is unchanged.

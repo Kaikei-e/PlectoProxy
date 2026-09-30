@@ -32,6 +32,10 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-30
+
+Patch release: package metadata only. docs.rs documents library targets only, so the bin-only `plecto` crate showed "not a library" there and its README badge read "docs: failing"; the crate no longer links to that page. No source change from 0.14.0 — the WIT contract, manifest schema, CLI, and public API are unchanged. **Deployed filters do not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0` and the reference-filter shelf is unchanged.
+
 ### Changed
 
 - **Packaging / metadata**: The `plecto` binary crate no longer advertises docs.rs documentation (it has no library target) and the redundant `homepage` field was dropped across manifests.

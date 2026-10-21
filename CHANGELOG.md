@@ -32,6 +32,25 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-21
+
+Minor-line release carrying the wasmtime 49 → 50 major bump ([ADR 000120](docs/ADR/000120.md),
+amending [ADR 000096](docs/ADR/000096.md)) and dropping the transitive `decompress` dependency
+from the JavaScript example guests. Minor rather than patch because the runtime's types are
+re-surfaced through public signatures — `LoadError::Wasmtime(wasmtime::Error)` and
+`Host::pooling_allocator_metrics()` — so a downstream crate naming wasmtime 49 types cannot
+compile against this build. `cargo semver-checks` cannot see this (the type paths are unchanged),
+which is the gap the versioning policy above assigns to manual judgement (the same call as
+0.10.1 and 0.13.0). **Deployed filters do not need a rebuild**: the contract stays at
+`plecto:filter@0.4.0` and all four shipped contract versions keep loading.
+
+Against the crates.io 0.14.1 baseline, `cargo semver-checks` reports no semver update required
+on each of `plecto-host` / `plecto-control` / `plecto-server` (default features), Criterion
+microbenchmarks vs the wasmtime 49.0.1 baseline show `on_request/trusted_pooled` at 2.09 µs
+(−9.4% vs 2.27 µs), `on_request/untrusted_fresh` at 25.8 µs (−5.2% vs 26.5 µs), and
+`filter_load/trusted_cold` unchanged at 7.76 ms (+0.7%, p = 0.54), and the T1 perf gate passes
+every invariant (10 pass, 0 fail, 0 inconclusive).
+
 ### Security
 
 - **JavaScript example guests drop `decompress`**: `filter-hello-js` and `filter-tokenlimit-js`
@@ -46,6 +65,34 @@ All notable changes to Plecto are documented here. The format follows
   only ran when ComponentizeJS fetches the weval binary for AOT compilation, which the example
   guests never enable, so their builds never reached it, and nothing ships to the proxy or the
   reference-filter shelf. No filter source, WIT contract, or build option changes.
+
+### Changed
+
+- **Runtime: wasmtime 49.0.1 → 50.0.0** (`wasmtime-wasi` / `wasmtime-wasi-http` in lockstep, per
+  the workspace's single-declaration rule; the streaming spike host in `spike/streaming-async`
+  follows in its own workspace; [ADR 000120](docs/ADR/000120.md), amending
+  [ADR 000096](docs/ADR/000096.md)). The ADR 000096 proposal audit confirms 50.0.0 introduces no
+  newly default-on Cranelift proposals (`wasm_compact_imports`,
+  `wasm_component_model_canonical_names`, and `wasm_component_model_accessors` all default to
+  `false`); `wasm_gc(false)`, `wasm_exceptions(false)`, and `wasm_wide_arithmetic(false)` stay
+  explicitly pinned in both engine configs.
+- **`wit-component` 0.258 → 0.261 and the pinned `wasm-tools` CLI 1.258.0 → 1.261.0** (ADR 000114
+  series parity: wasmtime 50 bundles the 0.261 wasm-tools series). The test-only `wat` follows to
+  1.261. wasmtime 50's MSRV is 1.97.0, matching the repository's declared `rust-version = "1.97"`.
+  The only host source change beyond the engine audit comments is passing `canonical_names = false`
+  to `wit_component::targets` in `crates/host/src/contract_target.rs`.
+- **Reference-filter shelf republished**: `filters/cors` 0.2.2 → 0.2.3, `filters/apikey` 0.1.8 →
+  0.1.9 (ADR 000080 — filter tags are immutable). No filter source change: the zero-WASI entries
+  are componentized with the `wasm-tools` CLI, and moving it 1.258.0 → 1.261.0 changes the
+  encoded bytes. `filters/jwt` / `filters/extauthz` are built directly for `wasm32-wasip2`, their
+  sources and lockfiles are unchanged, and they stay at 0.1.9 / 0.2.1. The compatibility matrix
+  (`docs/reference-filters.md`) is updated to match.
+- **T1 performance gate lower bounds (`bench/perf/gate_tolerances.toml`)**: `pooled_tail_p50_ms`
+  `lo` moves 0.04 → 0.00 ms to span warm-turbo P-core runs under inline header hooks
+  ([ADR 000119](docs/ADR/000119.md), measured +0.0131 ms at 2,000 rps) alongside powersave-downclocked
+  runs (~0.060–0.082 ms), and `ratelimit_tax_us` `lo` moves 1.2 → 0.9 µs (matching
+  `dispatch_floor_us` `lo = 0.9`) after the wasmtime 50 inline call speedup landed at
+  1.1752 ± 0.0282 µs. Upper bounds (`hi = 0.20` ms and `hi = 2.4` µs) are unchanged.
 
 ## [0.14.1] - 2026-09-30
 

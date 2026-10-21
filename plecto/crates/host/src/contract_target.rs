@@ -81,7 +81,9 @@ pub fn check_contract_target(component: &[u8]) -> Result<ContractTargetVerdict, 
     for (&version, (world_resolve, world_id)) in
         SUPPORTED_CONTRACT_VERSIONS.iter().zip(&shipped.worlds)
     {
-        match wit_component::targets(world_resolve, *world_id, component) {
+        // `canonical_names = false`: matches `ComponentEncoder::default()` and the engine's
+        // default-off `wasm_component_model_canonical_names` setting.
+        match wit_component::targets(world_resolve, *world_id, component, false) {
             Ok(()) => satisfied.push(version),
             Err(e) => newest_failure = Some(e),
         }

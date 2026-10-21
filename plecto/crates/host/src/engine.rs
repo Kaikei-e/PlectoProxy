@@ -31,6 +31,8 @@ pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
     // wasmtime 49 audit (ADR 000096 bump procedure — read the release notes for newly default-on
     // proposals): 49 makes wide-arithmetic default-on. Explicitly disabled to keep the engine's
     // wasm feature surface deny-by-default.
+    // wasmtime 50 audit: nothing newly default-on on Cranelift (compact-imports, component-model
+    // canonical-names, and component-model accessors ship opt-in and stay off).
     config.wasm_gc(false);
     config.wasm_exceptions(false);
     config.wasm_wide_arithmetic(false);

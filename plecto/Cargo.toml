@@ -39,21 +39,21 @@ unsafe_op_in_unsafe_fn = "deny"
 plecto-host = { path = "crates/host", version = "0.14.1" }
 plecto-control = { path = "crates/control", version = "0.14.1" }
 plecto-server = { path = "crates/server", version = "0.14.1" }
-# wasmtime 49.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
-# WASI 0.3). 49 makes wide-arithmetic default-on; GC, exception handling, and wide-arithmetic
-# are explicitly turned off (deny-by-default, crates/host/src/engine.rs). The async / bindgen
-# API is still moving on this line, so we track the latest 49 patch (Cargo.lock pins the
-# resolved build).
-wasmtime = "49.0.1"
+# wasmtime 50.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
+# WASI 0.3). 50 adds no newly default-on Cranelift proposals; GC (47), exception handling (47),
+# and wide-arithmetic (49) stay explicitly turned off (deny-by-default, crates/host/src/engine.rs).
+# The async / bindgen API is still moving on this line, so we track the latest 50 patch (Cargo.lock
+# pins the resolved build).
+wasmtime = "50.0.0"
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "49.0.1"
-wasmtime-wasi-http = "49.0.1"
-# wit-component must stay on the wasm-tools series `wasmtime` above bundles (49.0.x ⇒ 0.258):
+wasmtime-wasi = "50.0.0"
+wasmtime-wasi-http = "50.0.0"
+# wit-component must stay on the wasm-tools series `wasmtime` above bundles (50.0.x ⇒ 0.261):
 # `bindgen!(include_component_type)` encodes each world with wasmtime's own copy, and the static
 # contract gate decodes it through wasmtime's `wit_parser` re-export — two series would not even
 # type-check (ADR 000114). Declared here so a partial bump cannot produce two wasm-tools stacks.
-wit-component = "0.258"
+wit-component = "0.261"
 anyhow = "1"
 # redb: embedded transactional KV — durable host-state backend (ADR 000004).
 redb = "4.1"

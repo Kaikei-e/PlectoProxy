@@ -72,7 +72,8 @@ fn build_engine() -> Result<Engine> {
     // Same deny-by-default stance as the sync host (engine.rs): GC / exception-handling are
     // default-on since wasmtime 47 but never lent to filters. wasmtime 49 audit: 49 makes
     // wide-arithmetic default-on; explicitly disabled to keep the engine's wasm feature surface
-    // deny-by-default.
+    // deny-by-default. wasmtime 50 audit: nothing newly default-on on Cranelift (compact-imports,
+    // component-model canonical-names, and component-model accessors ship opt-in and stay off).
     config.wasm_gc(false);
     config.wasm_exceptions(false);
     config.wasm_wide_arithmetic(false);

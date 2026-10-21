@@ -150,7 +150,7 @@ the four expected exports, and no `on-response-body`.
 
 The wit-bindgen bindings under `interface/`, `world/`, and `gen/` are **committed**, not
 regenerated on every build — `gen/world/filter-request-body/` holds the hand-written
-`tokenlimit.mbt` next to the generated stubs, and its `moon.pkg.json` carries host-API imports
+`tokenlimit.mbt` next to the generated stubs, and its `moon.pkg` carries host-API imports
 that a regeneration would reset. `wit/deps/` is materialised from the canonical
 `plecto/wit/world.wit` at build time so this guest's world uses the contract's own types
 without a vendored copy that could drift; the canonical file is never edited (ADR 000063).

@@ -3,10 +3,10 @@
 #
 # Requires: moon (MoonBit toolchain), wasm-tools >= 1.252 on PATH.
 #
-# The wit-bindgen bindings (interface/ world/ gen/ + moon.mod.json) are COMMITTED, not
+# The wit-bindgen bindings (interface/ world/ gen/ + moon.mod) are COMMITTED, not
 # regenerated here: gen/world/filter-body/ carries the hand-written filter.mbt and a
-# moon.pkg.json whose host-API imports wit-bindgen would reset. Regenerate only when
-# the WIT changes, then re-add those imports:
+# moon.pkg whose host-API imports wit-bindgen would reset. Regenerate only when
+# the WIT changes, then re-add those imports and run `moon fmt`:
 #   wit-bindgen moonbit ../../../wit/v0.3.0 --world filter-body --out-dir .
 #
 # MoonBit strings are UTF-16, so `component embed` must declare --encoding utf16 —

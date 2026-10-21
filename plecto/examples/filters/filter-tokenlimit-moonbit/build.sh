@@ -9,10 +9,10 @@
 # MATERIALISED here from plecto/wit/world.wit, so the 0.4.0 types this world `use`s come from
 # the contract itself and a vendored copy cannot drift away from it.
 #
-# The wit-bindgen bindings (interface/ world/ gen/ + moon.mod.json) are COMMITTED, not
+# The wit-bindgen bindings (interface/ world/ gen/ + moon.mod) are COMMITTED, not
 # regenerated here: gen/world/filter-request-body/ carries the hand-written tokenlimit.mbt and
-# a moon.pkg.json whose host-API imports wit-bindgen would reset to just `types`. Regenerate
-# only when the WIT changes, then re-add the hostLog / hostRatelimit / hostConfig imports:
+# a moon.pkg whose host-API imports wit-bindgen would reset to just `types`. Regenerate
+# only when the WIT changes, then re-add the hostLog / hostRatelimit / hostConfig imports and run `moon fmt`:
 #   mkdir -p wit/deps/plecto-filter && cp ../../../wit/world.wit wit/deps/plecto-filter/
 #   wit-bindgen moonbit ./wit --world filter-request-body --out-dir .
 #

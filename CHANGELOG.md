@@ -53,6 +53,13 @@ every invariant (10 pass, 0 fail, 0 inconclusive).
 
 ### Security
 
+- **TLS and QUIC lockfile updates (`plecto/Cargo.lock`, `bench/loadgen/Cargo.lock`)**:
+  - `rustls` 0.23.45 → 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348,
+    RUSTSEC-2026-0349) and `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382).
+  - `webpki-roots` 1.0.9 → 1.0.10 (RUSTSEC-2026-0381; transitive via `sigstore` / `reqwest` in the
+    control plane).
+  - `quinn-proto` 0.11.17 → 0.11.19 (RUSTSEC-2026-0338, RUSTSEC-2026-0340, RUSTSEC-2026-0343;
+    dev/example-only via `h3-quinn` in `plecto-server`).
 - **JavaScript example guests drop `decompress`**: `filter-hello-js` and `filter-tokenlimit-js`
   move `@bytecodealliance/componentize-js` 0.22.0 → 0.23.0. 0.22.0 pulled
   `@bytecodealliance/weval` 0.4.1, which depended on `decompress` 4.2.1; `decompress` has four open
@@ -87,6 +94,9 @@ every invariant (10 pass, 0 fail, 0 inconclusive).
   encoded bytes. `filters/jwt` / `filters/extauthz` are built directly for `wasm32-wasip2`, their
   sources and lockfiles are unchanged, and they stay at 0.1.9 / 0.2.1. The compatibility matrix
   (`docs/reference-filters.md`) is updated to match.
+- **MoonBit example guests (`filter-hello-moonbit`, `filter-tokenlimit-moonbit`)**: migrate module
+  and package manifests from `moon.mod.json` / `moon.pkg.json` to `moon.mod` / `moon.pkg` (`moon fmt`)
+  for compatibility with current MoonBit toolchains.
 - **T1 performance gate lower bounds (`bench/perf/gate_tolerances.toml`)**: `pooled_tail_p50_ms`
   `lo` moves 0.04 → 0.00 ms to span warm-turbo P-core runs under inline header hooks
   ([ADR 000119](docs/ADR/000119.md), measured +0.0131 ms at 2,000 rps) alongside powersave-downclocked

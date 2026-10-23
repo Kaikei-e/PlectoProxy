@@ -114,13 +114,13 @@ disableFeatures）や Python（componentize-py --stub-wasi）もこの形にで�
 _Avoid_: pure component（ComponentizeJS 固有の呼称）, header-only filter（body disposition の別軸）
 
 **Fat guest（Tier B）**:
-言語ランタイムが wasi 0.2 interface（`wasi:cli` / `wasi:io` / `wasi:clocks` …）の提供を前提とする
+言語ランタイムが WASI 0.2 / 0.3 interface（`wasi:cli` / `wasi:io` / `wasi:clocks` …）の提供を前提とする
 ゲストコンポーネント。TinyGo（Go）が代表——ファイルを一切使わないプログラムでも `wasi:filesystem/types`
 / `preopens` を無条件 import する（wasip2 ランタイムの起動処理由来、TinyGo 0.41.1 で実機確認）。host の
 `fat-guest` feature（off-by-default）＋フィルタの manifest `wasi = "minimal"` 宣言の両方が揃ったときのみ、
-固定・最小の WASI スライス（`wasi:io` / `clocks` / `random` / `cli` ＋ preopens 空の `filesystem`。
-fs アクセスも sockets も一切なし）を host が貸す（ADR 000063）。どちらか片方でも欠けば instantiate に
-失敗する（deny-by-default）。参照実装: `examples/filters/filter-hello-go/`。
+固定・最小の WASI スライス（`wasi:io`（0.2） / `clocks` / `random` / `cli` ＋ preopens 空の `filesystem` を
+`@0.2.x` と `@0.3.0` の両方で貸与。fs アクセスも sockets も一切なし）を host が貸す（ADR 000063 / 000121）。
+どちらか片方でも欠けば instantiate に失敗する（deny-by-default）。参照実装: `examples/filters/filter-hello-go/`。
 _Avoid_: WASI guest（どの WASI をどこまで要るのかが出ない）
 
 **Trusted filter / Untrusted filter**:
@@ -170,16 +170,18 @@ _Avoid_: host-kv（可変状態との混同）, secrets（秘密管理の含意�
 
 **Outbound capability（outbound HTTP）**:
 フィルタが外部へ HTTP を 1 本発行する能力（ext_authz / JWKS 取得 / token introspection / OPA 問い合わせ）。
-標準形 `wasi:http/outgoing-handler` で貸し、他の host-API と同じ deny-by-default ゲート（`Linker`）を通す。
-既定では**貸さない**。貸す瞬間に Outbound allowlist ＋ SSRF guard ＋ 資源境界で囲う（ADR 000036）。
+標準形 `wasi:http/outgoing-handler`（0.2）および `wasi:http/client@0.3.0`（0.3）で貸し、他の host-API と同じ
+deny-by-default ゲート（`Linker`）を通す。既定では**貸さない**。貸す瞬間に Outbound allowlist ＋ SSRF guard ＋
+資源境界で囲う（ADR 000036 / 000121）。
 _Avoid_: fetch, http-client（能力の貸与という含意が出ない）, egress（L4 の含意）
 
 **Outbound capability（outbound TCP）**:
-フィルタが外部へ能動 TCP 接続を張る能力（Redis / memcached 等の外部ストアへの consult、ADR 000060）。
-標準語彙 `wasi:sockets`（network / instance-network / tcp-create-socket / tcp ＋ ホスト検問付き
-ip-name-lookup）で貸し、**UDP と listen（受動 open）は貸さない**（interface 自体をリンクしない）。
-既定では**貸さない**。貸す瞬間に outbound HTTP と同一の allowlist ＋ SSRF guard（同じ `classify`・
-同じ floor）＋ IP pin ＋ 資源境界（per-request の connect 予算、hook 呼び出しの wall-clock deadline）で囲う。
+フィルタが外部へ能動 TCP 接続を張る能力（Redis / memcached 等の外部ストアへの consult、ADR 000060 / 000121）。
+標準語彙 `wasi:sockets`（0.2 の network / instance-network / tcp-create-socket / tcp ＋ ホスト検問付き
+ip-name-lookup、および 0.3 の `types@0.3.0` / `ip-name-lookup@0.3.0`）で貸し、**UDP と listen（受動 open）は貸さない**
+（0.2 では interface 自体をリンクせず、0.3 の統合 `types@0.3.0` では `udp-socket.create` と `tcp-socket.listen` を
+構造的に拒否する）。既定では**貸さない**。貸す瞬間に outbound HTTP と同一の allowlist ＋ SSRF guard（同じ `classify`・
+同じ floor）＋ IP pin ＋ 資源境界（per-request の connect 予算、live socket 枠、hook 呼び出しの wall-clock deadline）で囲う。
 _Avoid_: socket capability（貸与単位が出ない）, raw sockets（UDP / listen を含む含意）
 
 **Persistent connection（跨リクエスト接続）**:

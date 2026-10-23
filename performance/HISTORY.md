@@ -5,6 +5,39 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-10-24 (wasmtime 50.0.0 + WASI 0.3 dual capability host confirmation)
+
+T1 regression gate (`bash bench/perf/run-perf.sh gate`) and Criterion WASM micro-benchmarks (`crates/host/benches/wasm.rs`) measured at `3b8ca45` (`v0.15.1+`) after landing the lockstep Wasmtime 50.0.0 bump ([ADR 000120](../docs/ADR/000120.md)) and full WASI 0.3 (`@0.3.0`) capability host support alongside WASI 0.2 (`@0.2.x`) across `fat-guest`, `outbound-http`, `outbound-tcp`, and `streaming-body` ([ADR 000121](../docs/ADR/000121.md), amending ADR 000036, ADR 000060, and ADR 000063):
+- **Hot-path execution model unchanged**: Tier A zero-WASI filters (`wasi_minimal = false`, no outbound) continue to execute on `pollster::block_on` (and inline on the Tokio worker when eligible under [ADR 000119](../docs/ADR/000119.md)). Wasmtime's ambient Tokio runtime (`block_on_wasi`) is entered only for `wasi = "minimal"` (`fat-guest`) and `streaming-body` invocations so WASI 0.3 clock waits (`wasi:clocks/monotonic-clock@0.3.0#wait-for`) have a timer driver even when called outside Tokio.
+- **Criterion WASM micro-benchmarks (`cargo bench -p plecto-host --bench wasm --features outbound-http,outbound-tcp,fat-guest,streaming-body`)**:
+  - `on_request/trusted_pooled`: **2.20 µs** `[2.191 µs .. 2.216 µs]` (v0.9.0 baseline: ~2.88 µs)
+  - `on_request/untrusted_fresh`: **27.92 µs** `[27.61 µs .. 28.29 µs]` (v0.9.0 baseline: ~44.0 µs)
+  - `filter_load/trusted_cold`: **7.75 ms** `[7.66 ms .. 7.84 ms]` (v0.9.0 baseline: ~27.3 ms)
+- **T1 gate (`bash bench/perf/run-perf.sh gate`, `PROXY_CPUS=0-11`, `GEN_CPUS=12-23`, 3 interleaved rounds)**: **PASS (`10 pass, 0 fail, 0 inconclusive`)**:
+  - **Closed-loop ceilings (oha, `-c 50`, 3 interleaved rounds)**:
+    - `/baseline`: 216,270.1 / 222,076.6 / 219,515.8 rps (mean **219.3k rps**, p50 0.22 ms, p99 0.36–0.47 ms)
+    - `/noop-pooled`: 173,512.1 / 175,182.0 / 174,680.0 rps (mean **174.5k rps**, p50 0.28 ms, p99 0.42–0.48 ms)
+    - `/trusted` (`filter-apikey`): 146,023.8 / 144,189.3 / 144,485.6 rps (mean **144.9k rps**, p50 0.34 ms, p99 0.50 ms)
+  - **Fixed-rate tails at 2,000 rps (`oha -q --latency-correction`)**:
+    - `/baseline`: p50 0.0636 ms, p90 0.0928 ms, p95 0.1067 ms, p99 0.1390 ms, p99.9 0.2059 ms
+    - `/noop-pooled`: p50 0.0771 ms, p90 0.1122 ms, p95 0.1290 ms, p99 0.1628 ms, p99.9 0.2144 ms
+    - `/trusted`: p50 0.0866 ms, p90 0.1284 ms, p95 0.1503 ms, p99 0.1944 ms, p99.9 0.2736 ms
+    - `/resp-ctx`: p50 0.0782 ms, p90 0.1170 ms, p95 0.1364 ms, p99 0.1719 ms, p99.9 0.2329 ms
+  - **Rate-limit tax & enforcement (k6)**:
+    - Closed-loop (`VUS=50`, 2 rounds): `/baseline` 151,829 / 149,994 rps (p50 0.23 ms, p99 1.25–1.27 ms) vs `/ratelimit` 129,839 / 127,522 rps (p50 0.30 ms, p99 1.16–1.21 ms), 0 % failed.
+    - Enforcement (5,000/s offered): allowed 1,100/s (11,000 ok / 39,000 429 / 0 no-status, 78.0 % shed; accept p99 0.20 ms, 429 p99 0.15 ms).
+  - **Gate invariants (`gate.csv`)**:
+    - `dispatch_floor_us`: **1.1714 ± 0.0330 µs** (band `0.9..2.1`, pass)
+    - `apikey_cost_us`: **1.1694 ± 0.0710 µs** (band `0.3..1.7`, pass)
+    - `pooled_tail_p50_ms`: **0.0135 ms** (band `0.00..0.20`, pass; informational `pooled_tail_p99_ms` 0.0238 ms)
+    - `apikey_tail_p50_ms`: **0.0095 ms** (band `-0.02..0.15`, pass)
+    - `respctx_tail_p50_ms`: **0.0011 ms** (band `-0.05..0.25`, pass; informational `respctx_tail_p99_ms` 0.0091 ms)
+    - `ratelimit_tax_us`: **1.1452 ± 0.0297 µs** (band `0.9..2.4`, pass)
+    - `enforce_allowed_ratio`: **0.9166** (band `0.90..1.10`, pass; informational `enforce_limited_frac` 0.7800)
+    - `rr_spread_req`: **0** (40,000 / 40,000 / 40,000 across 120,000 responses, pass)
+    - `ejection_transition_s`: **1.0000 s** (band `0..2`, pass)
+    - `ejection_stray_failed`: **0** (band `0..0`, pass)
+
 ## 2026-09-29 (inline header hooks: dispatch floor reduction)
 
 Execution of header hooks (`on-request` / `on-response`) for trusted, non-blocking filters was moved inline onto the async Tokio worker instead of `tokio::task::spawn_blocking` ([ADR 000119](../docs/ADR/000119.md), amending ADR 000013 and ADR 000021):

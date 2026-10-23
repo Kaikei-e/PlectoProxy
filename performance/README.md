@@ -62,7 +62,7 @@ signals — ratios, curve shapes and time-constants, not headline throughput.
 
 ## TL;DR
 
-> **Measurement history** (newest first). **2026-09-25 (v0.11.5+ snapshot)** — a full refresh of the
+> **Measurement history** (newest first). **2026-10-24 (v0.15.1+ ADR 000120/000121 T1 gate & Criterion pass)** — measured at commit `3b8ca45` (`v0.15.1+`, wasmtime 50.0.0 lockstep bump per [ADR 000120](../docs/ADR/000120.md) + dual WASI 0.2/0.3 `@0.3.0` capability host across `fat-guest`, `outbound-http`, `outbound-tcp`, and `streaming-body` per [ADR 000121](../docs/ADR/000121.md)): T1 `bash bench/perf/run-perf.sh gate` passed every invariant in band (`10 pass, 0 fail, 0 inconclusive` — `dispatch_floor_us` **1.1714 ± 0.0330 µs**, `apikey_cost_us` **1.1694 ± 0.0710 µs**, `pooled_tail_p50_ms` **0.0135 ms**, `apikey_tail_p50_ms` **0.0095 ms**, `respctx_tail_p50_ms` **0.0011 ms**, `ratelimit_tax_us` **1.1452 ± 0.0297 µs**, `enforce_allowed_ratio` **0.9166**, `rr_spread_req` **0**, `ejection_transition_s` **1.0 s**, `ejection_stray_failed` **0**; 3-round interleaved ceilings: `/baseline` **219.3k rps**, `/noop-pooled` **174.5k rps**, `/trusted` **144.9k rps**), and Criterion WASM micro-benchmarks (`crates/host/benches/wasm.rs`, all WASI capability features enabled) measured `on_request/trusted_pooled` **2.20 µs**, `on_request/untrusted_fresh` **27.92 µs**, and `filter_load/trusted_cold` **7.75 ms** (full breakdown in [`HISTORY.md`](HISTORY.md#2026-10-24-wasmtime-5000--wasi-03-dual-capability-host-confirmation)). **2026-09-25 (v0.11.5+ snapshot)** — a full refresh of the
 > fast path at commit `a2725da` (**v0.11.5** plus the unreleased ADR 000112 per-route `route` label on
 > request counters; wasmtime 48.0.2; later ADR 000116 alters route name computation at manifest build time
 > only — no hot-path change): T2 `bash bench/perf/run-perf.sh all` (all its phases) and the T1 `gate` twice
@@ -245,18 +245,19 @@ allocation contending for the same cache lines every tick; reported as measured,
 
 | bench | cost (per-call µs) | isolates |
 | --- | --- | --- |
-| `on_request` — pooled instance | ~2.88 µs | dispatch + call (init amortized) |
-| `on_request` — fresh instance / request | ~44.0 µs | + per-request instantiation (the pool's value) |
-| cold `load` (verify + instantiate + init) | ~27.3 ms | cosign signature + SBOM verification dominates |
+| `on_request` — pooled instance | ~2.20 µs | dispatch + call (init amortized) |
+| `on_request` — fresh instance / request | ~27.9 µs | + per-request instantiation (the pool's value) |
+| cold `load` (verify + instantiate + init) | ~7.75 ms | cosign signature + SBOM verification + compile |
 
 *(Note: Criterion clocks wall-clock duration per call in a single-thread, in-process benchmark. This per-call µs is a different quantity from the macro inverse-throughput µs/req = 1e6 / rps; see [metric definition](#1-load-balancing-fast-path).)*
 
-The ~15× pooled→fresh gap here is the same one the [macro ladder](#the-wasm-cost-ladder--isolating-each-cost)
-shows end-to-end (~25× this snapshot, with the HTTP layer and its own run-to-run noise around it) —
+The ~13× pooled→fresh gap here is the same one the [macro ladder](#the-wasm-cost-ladder--isolating-each-cost)
+shows end-to-end (~25× in the T2 snapshot, with the HTTP layer and its own run-to-run noise around it) —
 the two layers agree in direction and order of magnitude, so a divergence between them would be a
-real bug. (Criterion tables measured 2026-08-15 at commit `b2a89be` (tag **v0.9.0**); not re-run on
-2026-09-25 (commit `a2725da` / v0.11.5+) because no saved `main` baseline was present. Kept as the local
-in-process baseline — day-to-day drift of ±10–20 % is expected per
+real bug. (Extension-plane Criterion table re-measured 2026-10-24 at `3b8ca45` (`v0.15.1+`, ADR 000120/000121),
+wasmtime 50.0.0 with `outbound-http,outbound-tcp,fat-guest,streaming-body` enabled — down from
+~2.88 µs / ~44.0 µs / ~27.3 ms on 2026-08-15 `v0.9.0`; fast-path Criterion table above measured
+2026-08-15 at commit `b2a89be` (`v0.9.0`). Day-to-day drift of ±10–20 % is expected per
 [`bench/methodology.md`](../bench/methodology.md) § Measurement tiers.)
 
 **The frequency-invariant twin — instruction counts** (gungraun/callgrind, feature
@@ -618,7 +619,7 @@ required export). The fresh ~44 µs, by contrast, is the *uncontended* cost — 
 instantiates sequentially, so it never pays the `mmap_lock` contention or cross-core shootdowns the
 concurrent macro run exposes (the knee above). The layers agree once that kernel-side term is named.
 
-> **Decomposed 2026-09-29 (inline header hooks, [ADR 000119](../docs/ADR/000119.md)):**
+> **Decomposed 2026-09-29 (inline header hooks, [ADR 000119](../docs/ADR/000119.md)) & reconfirmed 2026-10-24 (wasmtime 50.0.0 + WASI 0.3, [ADR 000120](../docs/ADR/000120.md) / [ADR 000121](../docs/ADR/000121.md)):**
 > The dispatch floor was mostly the blocking-pool round trips (two per filtered request: on-request
 > and on-response) rather than guest execution. Trusted, non-blocking filters now run inline on the
 > Tokio worker. On the reference host (i7-13700K, 6 P-cores, 50 conns), dispatch floor dropped from
@@ -626,8 +627,13 @@ concurrent macro run exposes (the knee above). The layers agree once that kernel
 > memory backend) ceiling rose 87.9k → 123.1k rps (apikey's own cost unchanged at ~1.30 µs).
 > Per-request scheduling collapsed: voluntary context switches 5.09 → 0.79/req (baseline 0.87–0.92),
 > CPU 103 → 76 µs/req, runqueue wait 76 → 0.7 µs/req, and proxy thread count 80 → 35. At 2,000 rps,
-> noop-pooled p50 dropped 0.406 → 0.361 ms (baseline 0.291 ms). The snapshot tables above predate
-> this change and reflect the earlier blocking-pool path.
+> noop-pooled p50 dropped 0.406 → 0.361 ms (baseline 0.291 ms). On 2026-10-24 (wasmtime 50.0.0 +
+> dual WASI 0.2/0.3 capability host), the 3-round interleaved T1 gate measured `dispatch_floor_us`
+> **1.1714 ± 0.0330 µs**, `apikey_cost_us` **1.1694 ± 0.0710 µs**, `ratelimit_tax_us`
+> **1.1452 ± 0.0297 µs**, ceilings of **219.3k rps** (`/baseline`), **174.5k rps** (`/noop-pooled`),
+> and **144.9k rps** (`/trusted`), and fixed-rate 2,000 rps `pooled_tail_p50_ms` **+0.0135 ms**
+> (`0.0636 → 0.0771 ms`, all 10 invariants PASS). The T2 snapshot tables above predate inline hooks
+> and reflect the earlier blocking-pool path.
 
 ## Short-circuit: rejecting bad traffic at the edge
 

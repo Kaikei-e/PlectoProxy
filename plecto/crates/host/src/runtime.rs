@@ -169,13 +169,17 @@ impl WasmtimeRuntime {
         }
     }
 
-    /// Drive a guest call to completion. A filter without outbound uses the no-reactor `pollster`
-    /// (its host-API imports never block); an outbound-using filter uses the tokio runtime so its
-    /// `wasi:http` / `wasi:sockets` I/O is serviced (ADR 000036 / 000060).
+    /// Drive a guest call to completion. Outbound filters use their shared Tokio runtime;
+    /// minimal-WASI filters enter Wasmtime's ambient runtime so P3 clock waits have a timer
+    /// driver even when the public synchronous API is called outside Tokio.
     pub(crate) fn drive<F: std::future::Future>(&self, fut: F) -> F::Output {
         #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
         if let Some(rt) = &self.rt {
             return rt.block_on(fut);
+        }
+        #[cfg(feature = "fat-guest")]
+        if self.wasi_minimal {
+            return crate::util::block_on_wasi(fut);
         }
         pollster::block_on(fut)
     }

@@ -344,6 +344,9 @@ impl Host {
             // terminal-*), each inert under the empty `WasiCtx`. Still NO filesystem — the
             // capability boundary that matters (mirrors the streaming path, audit F-002).
             add_cli_runtime(&mut linker)?;
+            // WASI 0.3 (`@0.3.0`) base slice (`wasi:clocks@0.3.0`, `wasi:random@0.3.0`,
+            // `wasi:cli@0.3.0`), linked alongside `p2` under the same `lent.wasi_base` gate.
+            crate::state::add_wasi_base_p3(&mut linker)?;
         }
         // Fat guest (ADR 000063): TinyGo's wasip2 runtime unconditionally imports
         // `wasi:filesystem/types` + `wasi:filesystem/preopens` even for a program that never
@@ -357,14 +360,19 @@ impl Host {
         #[cfg(feature = "outbound-http")]
         if lent.http {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+            wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         }
         // Outbound TCP (ADR 000060): the `wasi:sockets` TCP-connect slice ONLY — network /
         // instance-network / tcp-create-socket / tcp behind the Store's socket_addr_check, plus
-        // the host's OWN vetted ip-name-lookup (the upstream one has no hostname filter). The UDP
-        // interfaces are never linked: the capability's absence, not a runtime deny.
+        // the host's OWN vetted ip-name-lookup (the upstream one has no hostname filter). In WASI
+        // 0.2 the UDP interfaces are never linked; in WASI 0.3 (`wasi:sockets/types@0.3.0` +
+        // `wasi:sockets/ip-name-lookup@0.3.0`) the same `PlectoTcpSockets` / `PlectoTcpLookup`
+        // projections enforce the allowlist, SSRF floor, IP pin, live-socket quota, and deny UDP
+        // socket creation with `AccessDenied`.
         #[cfg(feature = "outbound-tcp")]
         if lent.sockets {
             use wasmtime_wasi::p2::bindings::sockets;
+            use wasmtime_wasi::p3::bindings::sockets as p3_sockets;
             use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
             let getter = <HostState as WasiSocketsView>::sockets;
             let net_opts = sockets::network::LinkOptions::default();
@@ -386,6 +394,14 @@ impl Host {
                 HostState::tcp_sockets,
             )?;
             sockets::ip_name_lookup::add_to_linker::<HostState, outbound_tcp::PlectoTcpLookup>(
+                &mut linker,
+                HostState::tcp_lookup,
+            )?;
+            p3_sockets::types::add_to_linker::<HostState, outbound_tcp::PlectoTcpSockets>(
+                &mut linker,
+                HostState::tcp_sockets,
+            )?;
+            p3_sockets::ip_name_lookup::add_to_linker::<HostState, outbound_tcp::PlectoTcpLookup>(
                 &mut linker,
                 HostState::tcp_lookup,
             )?;
@@ -650,6 +666,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fat-guest")]
+    fn minimal_wasi_drives_p3_clock_waits_without_outbound_or_a_caller_runtime() {
+        use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
+        use wasmtime_wasi::p3::bindings::clocks::monotonic_clock::HostWithStore;
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let signer = TestSigner::new().unwrap();
+        let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+        let bytes = filter_hello_component();
+        let signature = signer.sign(&bytes).unwrap();
+        let sbom = bound_sbom(&bytes);
+        let sbom_signature = signer.sign(&sbom).unwrap();
+        let artifact = SignedArtifact {
+            component_bytes: &bytes,
+            component_signature: &signature,
+            sbom: &sbom,
+            sbom_signature: &sbom_signature,
+        };
+        let filter = host
+            .load(
+                "p3-clock",
+                &artifact,
+                LoadOptions::untrusted().with_wasi_minimal(),
+            )
+            .unwrap();
+        let runtime = &filter.inner.runtime;
+        let mut inst = runtime.instantiate_initialized().unwrap();
+        #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
+        assert!(runtime.rt.is_none(), "the filter has no outbound executor");
+        runtime
+            .drive(inst.store.run_concurrent(async |accessor| {
+                let accessor = accessor.with_getter::<WasiClocks>(HostState::clocks);
+                <WasiClocks as HostWithStore<HostState>>::wait_for(&accessor, 1_000_000).await
+            }))
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
     fn redb_restart_restores_quota_before_guest_growth_and_recovers_after_delete() {
         // A real durable DB already at the per-filter entry cap must consume that capacity
         // when Host::with_backend reopens it. The guest's untrusted init wants one counter and
@@ -867,5 +922,181 @@ mod tests {
             .load("extauthz-trusted", &artifact, opts)
             .expect("load filter with outbound policy");
         assert!(!filter.runs_inline());
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "outbound-http",
+        feature = "outbound-tcp",
+        feature = "fat-guest"
+    ))]
+    fn wasip3_capability_gates_enforce_structural_deny_and_link_only_lent_slices() {
+        let signer = TestSigner::new().unwrap();
+        let host = Host::new(signer.trust_policy().unwrap()).unwrap();
+
+        let load_wat = |wat_src: &str, opts: LoadOptions| {
+            let bytes = wat::parse_str(wat_src).expect("parse WAT component");
+            let comp_sig = signer.sign(&bytes).unwrap();
+            let sbom = bound_sbom(&bytes);
+            let sbom_sig = signer.sign(&sbom).unwrap();
+            let artifact = SignedArtifact {
+                component_bytes: &bytes,
+                component_signature: &comp_sig,
+                sbom: &sbom,
+                sbom_signature: &sbom_sig,
+            };
+            host.load("wasip3-gate-probe", &artifact, opts)
+        };
+
+        let wat_with_import = |wasi_import: &str| -> String {
+            format!(
+                r#"(component
+                     (import "plecto:filter/host-clock@0.4.0" (instance
+                       (export "now-ms" (func (result u64)))
+                     ))
+                     {wasi_import}
+                   )"#
+            )
+        };
+
+        let http_p3 = wat_with_import(r#"(import "wasi:http/client@0.3.0" (instance))"#);
+        let sockets_p3 = wat_with_import(r#"(import "wasi:sockets/types@0.3.0" (instance))"#);
+        let fs_p3 = wat_with_import(r#"(import "wasi:filesystem/preopens@0.3.0" (instance))"#);
+
+        // 1. `wasi:http/client@0.3.0` is denied under no-capability, `wasi_minimal`, and `outbound_tcp`.
+        for opts in [
+            LoadOptions::untrusted(),
+            LoadOptions::untrusted().with_wasi_minimal(),
+            LoadOptions::untrusted().with_outbound_tcp(vec![], vec![], None, None),
+        ] {
+            let err = load_wat(&http_p3, opts)
+                .err()
+                .expect("http@0.3.0 must fail closed");
+            match err.downcast_ref::<LoadError>() {
+                Some(LoadError::MissingCapability { imports }) => {
+                    assert_eq!(imports, &vec!["wasi:http/client@0.3.0".to_string()]);
+                }
+                other => panic!("expected MissingCapability for http@0.3.0, got {other:?}"),
+            }
+        }
+
+        // 2. `wasi:sockets/types@0.3.0` is denied under no-capability, `wasi_minimal`, and `outbound_http`.
+        for opts in [
+            LoadOptions::untrusted(),
+            LoadOptions::untrusted().with_wasi_minimal(),
+            LoadOptions::untrusted().with_outbound_http(vec![], vec![], None, None, None, None),
+        ] {
+            let err = load_wat(&sockets_p3, opts)
+                .err()
+                .expect("sockets@0.3.0 must fail closed");
+            match err.downcast_ref::<LoadError>() {
+                Some(LoadError::MissingCapability { imports }) => {
+                    assert_eq!(imports, &vec!["wasi:sockets/types@0.3.0".to_string()]);
+                }
+                other => panic!("expected MissingCapability for sockets@0.3.0, got {other:?}"),
+            }
+        }
+
+        // 3. `wasi:filesystem/preopens@0.3.0` is denied under no-capability, `outbound_http`, and `outbound_tcp`.
+        for opts in [
+            LoadOptions::untrusted(),
+            LoadOptions::untrusted().with_outbound_http(vec![], vec![], None, None, None, None),
+            LoadOptions::untrusted().with_outbound_tcp(vec![], vec![], None, None),
+        ] {
+            let err = load_wat(&fs_p3, opts)
+                .err()
+                .expect("filesystem@0.3.0 must fail closed");
+            match err.downcast_ref::<LoadError>() {
+                Some(LoadError::MissingCapability { imports }) => {
+                    assert_eq!(imports, &vec!["wasi:filesystem/preopens@0.3.0".to_string()]);
+                }
+                other => panic!("expected MissingCapability for filesystem@0.3.0, got {other:?}"),
+            }
+        }
+
+        // 4. Verify the Linker itself resolves `@0.3.0` functions only on the corresponding slice.
+        let engine = &host.untrusted_engine;
+        let base_and_fs_wat = wat::parse_str(
+            r#"(component
+                 (import "wasi:cli/environment@0.3.0" (instance
+                   (export "get-environment" (func (result (list (tuple string string)))))
+                 ))
+                 (import "wasi:clocks/monotonic-clock@0.3.0" (instance
+                   (export "now" (func (result u64)))
+                 ))
+                 (import "wasi:random/random@0.3.0" (instance
+                   (export "get-random-u64" (func (result u64)))
+                 ))
+                 (import "wasi:filesystem/types@0.3.0" (instance
+                   (export "descriptor" (type (sub resource)))
+                 ))
+               )"#,
+        )
+        .unwrap();
+        let base_and_fs_comp = Component::from_binary(engine, &base_and_fs_wat).unwrap();
+
+        let mut base_only_linker = Linker::<HostState>::new(engine);
+        crate::state::add_wasi_base_p3(&mut base_only_linker).unwrap();
+        assert!(
+            base_only_linker.instantiate_pre(&base_and_fs_comp).is_err(),
+            "wasi_base_p3 alone must not satisfy wasi:filesystem/types@0.3.0"
+        );
+
+        crate::state::add_inert_filesystem(&mut base_only_linker).unwrap();
+        assert!(
+            base_only_linker.instantiate_pre(&base_and_fs_comp).is_ok(),
+            "wasi_base_p3 + inert_filesystem must satisfy fat-guest @0.3.0 imports"
+        );
+
+        let http_wat = wat::parse_str(
+            r#"(component
+                 (import "wasi:http/types@0.3.0" (instance
+                   (export "fields" (type (sub resource)))
+                 ))
+               )"#,
+        )
+        .unwrap();
+        let http_comp = Component::from_binary(engine, &http_wat).unwrap();
+        assert!(
+            base_only_linker.instantiate_pre(&http_comp).is_err(),
+            "fat-guest linker must not satisfy wasi:http@0.3.0"
+        );
+        let mut http_linker = Linker::<HostState>::new(engine);
+        crate::state::add_wasi_base_p3(&mut http_linker).unwrap();
+        wasmtime_wasi_http::p3::add_to_linker(&mut http_linker).unwrap();
+        assert!(
+            http_linker.instantiate_pre(&http_comp).is_ok(),
+            "outbound-http linker must satisfy wasi:http/{{types,client}}@0.3.0"
+        );
+
+        let sockets_wat = wat::parse_str(
+            r#"(component
+                 (import "wasi:sockets/types@0.3.0" (instance
+                   (export "tcp-socket" (type (sub resource)))
+                 ))
+               )"#,
+        )
+        .unwrap();
+        let sockets_comp = Component::from_binary(engine, &sockets_wat).unwrap();
+        assert!(
+            http_linker.instantiate_pre(&sockets_comp).is_err(),
+            "outbound-http linker must not satisfy wasi:sockets@0.3.0"
+        );
+        let mut sockets_linker = Linker::<HostState>::new(engine);
+        crate::state::add_wasi_base_p3(&mut sockets_linker).unwrap();
+        wasmtime_wasi::p3::bindings::sockets::types::add_to_linker::<
+            HostState,
+            outbound_tcp::PlectoTcpSockets,
+        >(&mut sockets_linker, HostState::tcp_sockets)
+        .unwrap();
+        wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::add_to_linker::<
+            HostState,
+            outbound_tcp::PlectoTcpLookup,
+        >(&mut sockets_linker, HostState::tcp_lookup)
+        .unwrap();
+        assert!(
+            sockets_linker.instantiate_pre(&sockets_comp).is_ok(),
+            "outbound-tcp linker must satisfy wasi:sockets/{{types,ip-name-lookup}}@0.3.0"
+        );
     }
 }

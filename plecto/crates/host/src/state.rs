@@ -195,6 +195,10 @@ pub struct HostState {
     /// `socket_addr_check` closure inside `wasi` above and the host's ip-name-lookup impl.
     #[cfg(feature = "outbound-tcp")]
     tcp: outbound_tcp::TcpGuard,
+    /// P3 streams can outlive their socket resource. Each entry shares its reservation with
+    /// the host-owned completion consumers for all derived streams.
+    #[cfg(feature = "outbound-tcp")]
+    p3_tcp_leases: std::collections::HashMap<u32, Arc<outbound_tcp::P3SocketLease>>,
     /// Fat guest (ADR 000063): `Some` only for a filter this build lent the minimal WASI grant
     /// AND that declared `wasi = "minimal"` — its stdout/stderr is bridged here, drained into
     /// `logs` (above) by [`HostState::take_logs`]. `None` for every other filter, including a
@@ -292,6 +296,8 @@ impl HostState {
             hooks,
             #[cfg(feature = "outbound-tcp")]
             tcp,
+            #[cfg(feature = "outbound-tcp")]
+            p3_tcp_leases: std::collections::HashMap::new(),
             #[cfg(feature = "fat-guest")]
             stdio_bridge,
         }
@@ -353,11 +359,16 @@ impl HostState {
     /// Store guard before taking the WASI projection, which borrows the same state and table.
     #[cfg(feature = "outbound-tcp")]
     pub(crate) fn tcp_sockets(&mut self) -> outbound_tcp::TcpSocketsView<'_> {
-        use wasmtime_wasi::sockets::WasiSocketsView;
-
         let guard = self.tcp.clone();
-        let sockets = <Self as WasiSocketsView>::sockets(self);
-        outbound_tcp::TcpSocketsView { sockets, guard }
+        let sockets = wasmtime_wasi::sockets::WasiSocketsCtxView {
+            ctx: self.wasi.sockets(),
+            table: &mut self.table,
+        };
+        outbound_tcp::TcpSocketsView {
+            sockets,
+            guard,
+            p3_leases: &mut self.p3_tcp_leases,
+        }
     }
 
     /// Namespace a filter-supplied key into `{filter_id}\u{1f}{tag}\u{1f}{key}` bytes.
@@ -430,10 +441,30 @@ pub(crate) fn add_cli_runtime<T: wasmtime_wasi::cli::WasiCliView>(
     Ok(())
 }
 
-/// Link an EMPTY `wasi:filesystem` (`types` + `preopens`) for a fat guest declaring `wasi =
-/// "minimal"` (ADR 000063). Confirmed empirically (TinyGo 0.41.1): a wasip2 TinyGo guest
-/// unconditionally imports `wasi:filesystem/types` + `wasi:filesystem/preopens` as part of its
-/// runtime bootstrap, even for a program that never touches a file — so Tier B must LINK the
+/// Add the WASI 0.3 (`@0.3.0`) base runtime slice (`wasi:clocks@0.3.0`, `wasi:random@0.3.0`,
+/// `wasi:cli@0.3.0`) alongside the `p2` base (`add_to_linker_proxy_interfaces_async` +
+/// `add_cli_runtime`). In WASI 0.3 `wasi:io` was replaced by Component Model `stream<T>` /
+/// `future<T>`, so these three packages form the complete WASI 0.3 base — still with NO
+/// `wasi:filesystem` and NO `wasi:sockets`.
+#[cfg(any(
+    feature = "outbound-http",
+    feature = "outbound-tcp",
+    feature = "fat-guest",
+    feature = "streaming-body"
+))]
+pub(crate) fn add_wasi_base_p3<T: wasmtime_wasi::WasiView>(
+    linker: &mut Linker<T>,
+) -> wasmtime::Result<()> {
+    wasmtime_wasi::p3::clocks::add_to_linker(linker)?;
+    wasmtime_wasi::p3::random::add_to_linker(linker)?;
+    wasmtime_wasi::p3::cli::add_to_linker(linker)?;
+    Ok(())
+}
+
+/// Link an EMPTY `wasi:filesystem` (`types` + `preopens`, at both `@0.2.x` and `@0.3.0`) for a fat
+/// guest declaring `wasi = "minimal"` (ADR 000063). Confirmed empirically (TinyGo 0.41.1): a wasip2
+/// TinyGo guest unconditionally imports `wasi:filesystem/types` + `wasi:filesystem/preopens` as part
+/// of its runtime bootstrap, even for a program that never touches a file — so Tier B must LINK the
 /// interface for such a guest to instantiate at all. This lends ZERO real capability: the
 /// `WasiCtx`'s preopens list is never populated (no `WasiCtxBuilder::preopened_dir` call
 /// anywhere in the fat-guest path), so `preopens.get-directories()` returns `[]` and the guest
@@ -450,6 +481,7 @@ pub(crate) fn add_inert_filesystem<T: wasmtime_wasi::filesystem::WasiFilesystemV
     let getter = <T as WasiFilesystemView>::filesystem;
     filesystem::types::add_to_linker::<T, WasiFilesystem>(linker, getter)?;
     filesystem::preopens::add_to_linker::<T, WasiFilesystem>(linker, getter)?;
+    wasmtime_wasi::p3::filesystem::add_to_linker(linker)?;
     Ok(())
 }
 

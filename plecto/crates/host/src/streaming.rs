@@ -114,6 +114,7 @@ impl StreamingFilterRuntime {
         let mut linker: Linker<Ctx> = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
         crate::state::add_cli_runtime::<Ctx>(&mut linker)?;
+        crate::state::add_wasi_base_p3::<Ctx>(&mut linker)?;
 
         Ok(Self {
             engine,
@@ -144,16 +145,15 @@ impl StreamingFilterRuntime {
         store.limiter(|c| &mut c.limits);
         store.set_epoch_deadline(limits.deadline_ms);
 
-        // Drive with pollster (the host stays no-tokio; ADR 000021). The guest never blocks on
-        // real I/O — it only pulls the host-fed stream — so a no-reactor executor suffices.
-        let instance = pollster::block_on(bindings::StreamingFilter::instantiate_async(
+        // The ambient WASI runtime drives P3 clock timers even from synchronous callers.
+        let instance = crate::util::block_on_wasi(bindings::StreamingFilter::instantiate_async(
             &mut store,
             &self.component,
             &self.linker,
         ))?;
 
         let reader = StreamReader::new(&mut store, body)?;
-        let decision = pollster::block_on(store.run_concurrent(async move |accessor| {
+        let decision = crate::util::block_on_wasi(store.run_concurrent(async move |accessor| {
             instance
                 .plecto_filter_streaming_body_filter()
                 .call_process_body(accessor, reader)
@@ -191,6 +191,27 @@ fn map_decision(decision: RequestBodyDecision) -> StreamingDecision {
 mod tests {
     use super::*;
     use bindings::plecto::filter_streaming::types::HttpResponse as GuestResponse;
+
+    #[test]
+    fn streaming_p3_clock_waits_have_a_timer_driver_without_a_caller_runtime() {
+        use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
+        use wasmtime_wasi::p3::bindings::clocks::monotonic_clock::HostWithStore;
+
+        let mut store = Store::new(
+            &build_engine().unwrap(),
+            Ctx {
+                limits: StoreLimitsBuilder::new().build(),
+                table: ResourceTable::new(),
+                wasi: WasiCtxBuilder::new().build(),
+            },
+        );
+        crate::util::block_on_wasi(store.run_concurrent(async |accessor| {
+            let accessor = accessor.with_getter::<WasiClocks>(Ctx::clocks);
+            <WasiClocks as HostWithStore<Ctx>>::wait_for(&accessor, 1_000_000).await
+        }))
+        .unwrap()
+        .unwrap();
+    }
 
     #[test]
     fn map_decision_lowers_guest_variants() {
@@ -248,5 +269,41 @@ mod tests {
             component_msg.contains("wide-arithmetic") || component_msg.contains("wide arithmetic"),
             "expected error to mention wide arithmetic, got: {component_msg}"
         );
+    }
+
+    #[test]
+    fn streaming_linker_lends_wasip3_base_and_denies_filesystem_sockets_and_http() {
+        let base_wat = wat::parse_str(
+            r#"(component
+                 (import "wasi:cli/environment@0.3.0" (instance
+                   (export "get-environment" (func (result (list (tuple string string)))))
+                 ))
+                 (import "wasi:clocks/monotonic-clock@0.3.0" (instance
+                   (export "now" (func (result u64)))
+                 ))
+                 (import "wasi:random/random@0.3.0" (instance
+                   (export "get-random-u64" (func (result u64)))
+                 ))
+               )"#,
+        )
+        .expect("parse base p3 WAT");
+        let rt = StreamingFilterRuntime::load(&base_wat).expect("load streaming runtime");
+        assert!(
+            rt.linker.instantiate_pre(&rt.component).is_ok(),
+            "streaming linker must satisfy wasi:cli/clocks/random@0.3.0"
+        );
+
+        for unlent in [
+            r#"(component (import "wasi:filesystem/types@0.3.0" (instance (export "descriptor" (type (sub resource))))))"#,
+            r#"(component (import "wasi:sockets/types@0.3.0" (instance (export "tcp-socket" (type (sub resource))))))"#,
+            r#"(component (import "wasi:http/types@0.3.0" (instance (export "fields" (type (sub resource))))))"#,
+        ] {
+            let bytes = wat::parse_str(unlent).expect("parse unlent p3 WAT");
+            let comp = Component::from_binary(&rt.engine, &bytes).expect("compile component");
+            assert!(
+                rt.linker.instantiate_pre(&comp).is_err(),
+                "streaming linker must deny unlent @0.3.0 capability: {unlent}"
+            );
+        }
     }
 }

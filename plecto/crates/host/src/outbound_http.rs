@@ -1029,4 +1029,215 @@ mod tests {
             WasiHttpError::ConnectionLimitReached
         ));
     }
+
+    #[tokio::test]
+    async fn p3_client_send_enforces_allowlist_ssrf_and_streams_capped_response() {
+        use crate::MemoryBackend;
+        use crate::engine::{Allocation, build_engine};
+        use crate::options::DEFAULT_MAX_MEMORY_BYTES;
+        use crate::quota::KvQuota;
+        use crate::state::{HostState, HostStateInit};
+        use std::collections::BTreeMap;
+        use wasmtime::Store;
+        use wasmtime_wasi_http::p3::bindings::http::client::HostWithStore as P3ClientHost;
+        use wasmtime_wasi_http::p3::bindings::http::types::{
+            ErrorCode as P3HttpErrorCode, Host as P3TypesHost, HostResponse as P3HostResponse,
+        };
+        use wasmtime_wasi_http::{WasiHttp, WasiHttpView};
+
+        let (listener, ip) = private_test_listener().await;
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let req_line = String::from_utf8_lossy(&buf);
+                    let body: &[u8] = if req_line.contains("/oversize") {
+                        b"0123456789abcdef" // 16 bytes > 10-byte cap
+                    } else {
+                        b"p3-ok"
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        let loopback_live = spawn_server(b"loopback-secret".to_vec()).await;
+        let mut policy = test_policy(vec![
+            allow("allowed.internal", addr.port(), Scheme::Http),
+            allow("rebind.internal", loopback_live.port(), Scheme::Http),
+        ]);
+        policy.allow_private = vec![format!("{ip}/32").parse().unwrap()];
+        policy.max_response_bytes = 10;
+        let resolver = Resolver::Static(HashMap::from([
+            ("allowed.internal".to_string(), vec![ip]),
+            (
+                "rebind.internal".to_string(),
+                vec![IpAddr::from([127, 0, 0, 1])],
+            ),
+        ]));
+        let outbound_state = OutboundState::new_with_resolver(policy, resolver);
+
+        let engine = build_engine(Allocation::OnDemand).unwrap();
+        let make_store = || {
+            let state = HostState::new(
+                HostStateInit {
+                    kv: Arc::new(MemoryBackend::default()),
+                    kv_prefix: "test\x1f".to_string(),
+                    max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+                    ratelimit_bucket: None,
+                    quota: Arc::new(KvQuota::new()),
+                    config: Arc::new(BTreeMap::new()),
+                    #[cfg(feature = "fat-guest")]
+                    wasi_minimal: false,
+                },
+                outbound_state.hooks(),
+                #[cfg(feature = "outbound-tcp")]
+                crate::outbound_tcp::TcpGuard::deny_all(),
+            );
+            Store::new(&engine, state)
+        };
+
+        // 1. Unlisted destination over `wasi:http/client@0.3.0#send` is denied before DNS.
+        {
+            let mut store = make_store();
+            let req_res = {
+                let view = store.data_mut().http();
+                let (p3_req, _io) = wasmtime_wasi_http::p3::Request::from_http(
+                    view.hooks,
+                    req("http://evil.example.com/"),
+                );
+                view.table.push(p3_req).unwrap()
+            };
+            let res = store
+                .run_concurrent(async move |accessor| {
+                    let accessor =
+                        accessor.with_getter::<WasiHttp>(<HostState as WasiHttpView>::http);
+                    <WasiHttp as P3ClientHost<HostState>>::send(&accessor, req_res).await
+                })
+                .await
+                .unwrap();
+            let err = res.expect_err("unlisted p3 request must be denied");
+            let code =
+                <wasmtime_wasi_http::WasiHttpCtxView<'_> as P3TypesHost>::convert_error_code(
+                    &mut store.data_mut().http(),
+                    err,
+                )
+                .unwrap();
+            assert!(matches!(code, P3HttpErrorCode::HttpRequestDenied));
+        }
+
+        // 2. Allowlisted hostname resolving to loopback is SSRF-blocked on `wasi:http/client@0.3.0#send`.
+        {
+            let mut store = make_store();
+            let req_res = {
+                let view = store.data_mut().http();
+                let (p3_req, _io) = wasmtime_wasi_http::p3::Request::from_http(
+                    view.hooks,
+                    req(&format!("http://rebind.internal:{}/", loopback_live.port())),
+                );
+                view.table.push(p3_req).unwrap()
+            };
+            let res = store
+                .run_concurrent(async move |accessor| {
+                    let accessor =
+                        accessor.with_getter::<WasiHttp>(<HostState as WasiHttpView>::http);
+                    <WasiHttp as P3ClientHost<HostState>>::send(&accessor, req_res).await
+                })
+                .await
+                .unwrap();
+            let err = res.expect_err("loopback-resolving p3 request must be SSRF-blocked");
+            let code =
+                <wasmtime_wasi_http::WasiHttpCtxView<'_> as P3TypesHost>::convert_error_code(
+                    &mut store.data_mut().http(),
+                    err,
+                )
+                .unwrap();
+            assert!(matches!(code, P3HttpErrorCode::DestinationIpProhibited));
+        }
+
+        // 3. Vetted destination over `wasi:http/client@0.3.0#send` succeeds and streams its body.
+        {
+            let mut store = make_store();
+            let req_res = {
+                let view = store.data_mut().http();
+                let (p3_req, _io) = wasmtime_wasi_http::p3::Request::from_http(
+                    view.hooks,
+                    req(&format!("http://allowed.internal:{}/ok", addr.port())),
+                );
+                view.table.push(p3_req).unwrap()
+            };
+            let resp_res = store
+                .run_concurrent(async move |accessor| {
+                    let accessor =
+                        accessor.with_getter::<WasiHttp>(<HostState as WasiHttpView>::http);
+                    <WasiHttp as P3ClientHost<HostState>>::send(&accessor, req_res).await
+                })
+                .await
+                .unwrap()
+                .expect("allowed p3 request succeeds");
+            let status =
+                <wasmtime_wasi_http::WasiHttpCtxView<'_> as P3HostResponse>::get_status_code(
+                    &mut store.data_mut().http(),
+                    wasmtime::component::Resource::new_borrow(resp_res.rep()),
+                )
+                .unwrap();
+            assert_eq!(status, 200);
+            let p3_resp = store.data_mut().http().table.delete(resp_res).unwrap();
+            let http_resp = p3_resp
+                .into_http(&mut store, std::future::ready(Ok(())))
+                .unwrap();
+            let bytes = http_resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&bytes[..], b"p3-ok");
+            assert_eq!(
+                outbound_state.permits.available_permits(),
+                8,
+                "permit released after p3 response body EOF"
+            );
+        }
+
+        // 4. Oversize p3 response body is capped at `max_response_bytes` and releases its permit.
+        {
+            let mut store = make_store();
+            let req_res = {
+                let view = store.data_mut().http();
+                let (p3_req, _io) = wasmtime_wasi_http::p3::Request::from_http(
+                    view.hooks,
+                    req(&format!("http://allowed.internal:{}/oversize", addr.port())),
+                );
+                view.table.push(p3_req).unwrap()
+            };
+            let resp_res = store
+                .run_concurrent(async move |accessor| {
+                    let accessor =
+                        accessor.with_getter::<WasiHttp>(<HostState as WasiHttpView>::http);
+                    <WasiHttp as P3ClientHost<HostState>>::send(&accessor, req_res).await
+                })
+                .await
+                .unwrap()
+                .expect("headers arrive before body cap triggers");
+            let p3_resp = store.data_mut().http().table.delete(resp_res).unwrap();
+            let http_resp = p3_resp
+                .into_http(&mut store, std::future::ready(Ok(())))
+                .unwrap();
+            let body_err = http_resp
+                .into_body()
+                .collect()
+                .await
+                .expect_err("oversize p3 response body must fail");
+            assert!(matches!(
+                body_err,
+                WasiHttpError::HttpResponseBodySize(Some(10))
+            ));
+            assert_eq!(
+                outbound_state.permits.available_permits(),
+                8,
+                "permit released after p3 response body cap error"
+            );
+        }
+    }
 }

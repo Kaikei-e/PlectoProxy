@@ -256,13 +256,44 @@ impl IsTerminal for StdioStream {
 
 impl StdoutStream for StdioStream {
     fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
-        // Never reached: `p2_stream` below is overridden and is the only path the p2 WASI host
-        // uses. A real no-op sink (not a panic) keeps this safe even if that assumption changes.
-        Box::new(tokio::io::sink())
+        // WASI 0.3 (`wasi:cli/{stdout,stderr}@0.3.0#write-via-stream`) obtains its consumer sink
+        // through `async_stream()` and polls `AsyncWrite` directly inside `OutputStreamConsumer`.
+        // Returning `self.clone()` routes p3 stdio through the exact same `StdioBridge` and byte
+        // budget as `p2_stream` with no background task.
+        Box::new(self.clone())
     }
 
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(self.clone())
+    }
+}
+
+impl tokio::io::AsyncWrite for StdioStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.bridge
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write(self.kind, buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -398,5 +429,29 @@ mod tests {
         let lines = b.drain();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].message, "fresh");
+    }
+
+    #[test]
+    fn async_stream_feeds_the_same_bridge_and_budget_for_wasip3() {
+        use tokio::io::AsyncWriteExt;
+
+        let b = bridge();
+        let mut stdout = Box::into_pin(b.stream(StdioKind::Stdout).async_stream());
+        let mut stderr = Box::into_pin(b.stream(StdioKind::Stderr).async_stream());
+        pollster::block_on(async {
+            stdout.write_all(b"p3 stdout line\n").await.unwrap();
+            stderr.write_all(b"p3 stderr partial").await.unwrap();
+            stdout.flush().await.unwrap();
+            stderr.shutdown().await.unwrap();
+        });
+        let lines = b.drain();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].level, LogLevel::Debug);
+        assert_eq!(lines[0].message, "p3 stdout line");
+
+        let final_lines = b.drain_final();
+        assert_eq!(final_lines.len(), 1);
+        assert_eq!(final_lines[0].level, LogLevel::Warn);
+        assert_eq!(final_lines[0].message, "p3 stderr partial");
     }
 }

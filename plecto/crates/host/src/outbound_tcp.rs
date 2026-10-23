@@ -179,8 +179,8 @@ struct GuardInner {
     pinned: Mutex<HashMap<IpAddr, HashSet<String>>>,
     /// Connects consumed by the current request (reset by `begin_request`).
     connects: AtomicU32,
-    /// Native TCP socket descriptors this Store has created and not yet released through the
-    /// guest resource's `drop`. Unlike `connects`, this spans requests on a trusted instance.
+    /// Native TCP descriptors still owned by socket resources or P3 stream halves. Unlike
+    /// `connects`, this spans requests on a trusted instance.
     live_sockets: AtomicU32,
     socket_quota: Arc<TcpSocketQuota>,
 }
@@ -327,11 +327,68 @@ impl HasData for PlectoTcpSockets {
 }
 
 /// A narrow forwarding view over Wasmtime's socket host implementation. Socket creation reserves
-/// a host-owned descriptor lease; all operations are delegated unchanged except resource drop,
-/// which returns that lease only after Wasmtime deleted the native socket successfully.
+/// a host-owned descriptor lease. P2 streams are resource children; P3 streams share an RAII
+/// lease with the socket, so deleting a socket cannot make its still-live streams free.
 pub(crate) struct TcpSocketsView<'a> {
     pub(crate) sockets: wasmtime_wasi::sockets::WasiSocketsCtxView<'a>,
     pub(crate) guard: TcpGuard,
+    pub(crate) p3_leases: &'a mut HashMap<u32, Arc<P3SocketLease>>,
+}
+
+/// Shared by the P3 socket resource and its send/receive completion consumers. Wasmtime's
+/// completion resolves only once its native stream half is closed, including cancellation.
+/// Keeping the consumer host-owned prevents a guest from releasing the lease by dropping the
+/// guest-visible completion future early.
+pub(crate) struct P3SocketLease(TcpGuard);
+
+impl Drop for P3SocketLease {
+    fn drop(&mut self) {
+        self.0.release_live_socket();
+    }
+}
+
+type P3StreamResult = Result<(), wasmtime_wasi::p3::bindings::sockets::types::ErrorCode>;
+
+struct P3StreamCompletion {
+    result: Option<tokio::sync::oneshot::Sender<P3StreamResult>>,
+    _lease: Arc<P3SocketLease>,
+}
+
+impl<T: 'static> wasmtime::component::FutureConsumer<T> for P3StreamCompletion {
+    type Item = P3StreamResult;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        mut store: wasmtime::StoreContextMut<'_, T>,
+        mut source: wasmtime::component::Source<'_, Self::Item>,
+        _finish: bool,
+    ) -> std::task::Poll<wasmtime::Result<()>> {
+        let mut value = None;
+        source.read(&mut store, &mut value)?;
+        if let (Some(tx), Some(value)) = (self.result.take(), value) {
+            let _ = tx.send(value);
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+fn retain_p3_stream_lease<T: 'static>(
+    mut store: wasmtime::StoreContextMut<'_, T>,
+    completion: wasmtime::component::FutureReader<P3StreamResult>,
+    lease: Arc<P3SocketLease>,
+) -> wasmtime::Result<wasmtime::component::FutureReader<P3StreamResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    completion.pipe(
+        &mut store,
+        P3StreamCompletion {
+            result: Some(tx),
+            _lease: lease,
+        },
+    )?;
+    wasmtime::component::FutureReader::new(&mut store, async move {
+        rx.await.map_err(wasmtime::Error::from)
+    })
 }
 
 impl wasmtime_wasi::p2::bindings::sockets::tcp_create_socket::Host for TcpSocketsView<'_> {
@@ -615,6 +672,60 @@ pub(crate) struct TcpLookupView<'a> {
     pub(crate) guard: &'a TcpGuard,
 }
 
+/// Error classification returned by [`resolve_vetted`], mapped into `p2` and `p3` `ErrorCode`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VettedResolveError {
+    PermanentResolverFailure,
+    NameUnresolvable,
+}
+
+/// Core vetted DNS resolution shared by `wasi:sockets/ip-name-lookup` `@0.2.x` (`p2`) and
+/// `@0.3.0` (`p3`):
+/// 1. Deny-by-default allowlist check before any DNS query.
+/// 2. Host-side resolution (`inner.resolver`).
+/// 3. SSRF classification of EVERY resolved IP (a single blocked address rejects the entire lookup).
+/// 4. Per-Store IP pinning under `MAX_PINNED_IPS`.
+async fn resolve_vetted(
+    inner: Option<Arc<GuardInner>>,
+    name: String,
+) -> Result<Vec<IpAddr>, VettedResolveError> {
+    let Some(inner) = inner else {
+        return Err(VettedResolveError::PermanentResolverFailure);
+    };
+    let lower = name.to_ascii_lowercase();
+    if !inner.policy.allows_name(&lower) {
+        return Err(VettedResolveError::PermanentResolverFailure);
+    }
+    let addrs = inner.resolver.resolve(&lower, 0).await.map_err(|e| {
+        tracing::debug!(host = %lower, error = %e, "outbound-tcp DNS resolution failed");
+        VettedResolveError::NameUnresolvable
+    })?;
+    if addrs.is_empty() {
+        return Err(VettedResolveError::NameUnresolvable);
+    }
+    let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip().to_canonical()).collect();
+    // Classify EVERY resolved address; a single blocked one rejects the whole lookup
+    // (the DNS-rebinding / mixed-record guard, same strictness as outbound HTTP).
+    if ips
+        .iter()
+        .any(|ip| inner.policy.classify(*ip) != AddrVerdict::Allowed)
+    {
+        return Err(VettedResolveError::PermanentResolverFailure);
+    }
+    // Pin: record every vetted address under the name that produced it, so the connect
+    // gate can require "an IP this host resolved for that allowlisted name".
+    {
+        let mut pinned = inner.pinned.lock();
+        for ip in &ips {
+            if !pinned.contains_key(ip) && pinned.len() >= MAX_PINNED_IPS {
+                return Err(VettedResolveError::PermanentResolverFailure);
+            }
+            pinned.entry(*ip).or_default().insert(lower.clone());
+        }
+    }
+    Ok(ips)
+}
+
 impl Host for TcpLookupView<'_> {
     fn resolve_addresses(
         &mut self,
@@ -629,36 +740,17 @@ impl Host for TcpLookupView<'_> {
         if !inner.policy.allows_name(&lower) {
             return Err(ErrorCode::PermanentResolverFailure.into());
         }
-        let inner = inner.clone();
+        let inner = Some(inner.clone());
         let task = wasmtime_wasi::runtime::spawn(async move {
-            let addrs = inner.resolver.resolve(&lower, 0).await.map_err(|e| {
-                tracing::debug!(host = %lower, error = %e, "outbound-tcp DNS resolution failed");
-                SocketError::from(ErrorCode::NameUnresolvable)
-            })?;
-            if addrs.is_empty() {
-                return Err(ErrorCode::NameUnresolvable.into());
-            }
-            let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip().to_canonical()).collect();
-            // Classify EVERY resolved address; a single blocked one rejects the whole lookup
-            // (the DNS-rebinding / mixed-record guard, same strictness as outbound HTTP).
-            if ips
-                .iter()
-                .any(|ip| inner.policy.classify(*ip) != AddrVerdict::Allowed)
-            {
-                return Err(ErrorCode::PermanentResolverFailure.into());
-            }
-            // Pin: record every vetted address under the name that produced it, so the connect
-            // gate can require "an IP this host resolved for that allowlisted name".
-            {
-                let mut pinned = inner.pinned.lock();
-                for ip in &ips {
-                    if !pinned.contains_key(ip) && pinned.len() >= MAX_PINNED_IPS {
-                        return Err(ErrorCode::PermanentResolverFailure.into());
-                    }
-                    pinned.entry(*ip).or_default().insert(lower.clone());
+            match resolve_vetted(inner, lower).await {
+                Ok(ips) => Ok(ips.into_iter().map(IpAddress::from).collect::<Vec<_>>()),
+                Err(VettedResolveError::PermanentResolverFailure) => {
+                    Err(ErrorCode::PermanentResolverFailure.into())
+                }
+                Err(VettedResolveError::NameUnresolvable) => {
+                    Err(ErrorCode::NameUnresolvable.into())
                 }
             }
-            Ok(ips.into_iter().map(IpAddress::from).collect::<Vec<_>>())
         });
         let resource = self.table.push(PlectoResolveStream::Waiting(task))?;
         Ok(Resource::new_own(resource.rep()))
@@ -759,6 +851,620 @@ impl HostResolveAddressStream for TcpLookupView<'_> {
         self.table
             .delete::<PlectoResolveStream>(Resource::new_own(resource.rep()))?;
         Ok(())
+    }
+}
+
+// --- WASI 0.3 (`wasi:sockets@0.3.0`) host implementations ---
+//
+// In WASI 0.3, `wasi:sockets` consolidated into two interfaces:
+// 1. `wasi:sockets/ip-name-lookup@0.3.0` (`resolve-addresses: async func(name: string)`)
+// 2. `wasi:sockets/types@0.3.0` (`resource tcp-socket` + `resource udp-socket`)
+//
+// Both route through the exact same `TcpGuard` / `resolve_vetted` / `TcpSocketQuota` enforcement as
+// the `p2` bindings above: vetted DNS resolution with IP pinning, SSRF classification, per-Store and
+// per-Host live socket limits, and unconditional denial of UDP (`AccessDenied`), `listen`, and
+// non-wildcard `bind`.
+
+impl wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::Host for TcpLookupView<'_> {}
+
+impl<U> wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::HostWithStore<U> for PlectoTcpLookup {
+    async fn resolve_addresses(
+        store: &wasmtime::component::Accessor<U, Self>,
+        name: String,
+    ) -> wasmtime::Result<
+        Result<
+            Vec<wasmtime_wasi::p3::bindings::sockets::types::IpAddress>,
+            wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::ErrorCode,
+        >,
+    > {
+        use wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::ErrorCode as P3LookupErrorCode;
+        use wasmtime_wasi::p3::bindings::sockets::types::IpAddress as P3IpAddress;
+
+        let inner = store.with(|mut view| view.get().guard.inner.clone());
+        Ok(match resolve_vetted(inner, name).await {
+            Ok(ips) => Ok(ips.into_iter().map(P3IpAddress::from).collect()),
+            Err(VettedResolveError::PermanentResolverFailure) => {
+                Err(P3LookupErrorCode::PermanentResolverFailure)
+            }
+            Err(VettedResolveError::NameUnresolvable) => Err(P3LookupErrorCode::NameUnresolvable),
+        })
+    }
+}
+
+impl wasmtime_wasi::p3::bindings::sockets::types::Host for TcpSocketsView<'_> {
+    fn convert_error_code(
+        &mut self,
+        error: wasmtime_wasi::p3::sockets::SocketError,
+    ) -> wasmtime::Result<wasmtime_wasi::p3::bindings::sockets::types::ErrorCode> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::Host>::convert_error_code(
+            &mut self.sockets,
+            error,
+        )
+    }
+}
+
+impl wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket for TcpSocketsView<'_> {
+    fn create(
+        &mut self,
+        address_family: wasmtime_wasi::p3::bindings::sockets::types::IpAddressFamily,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    > {
+        if !self.guard.try_acquire_live_socket() {
+            // WASI 0.3 `wasi:sockets/types@0.3.0` removed the `new-socket-limit` variant from
+            // `error-code`; resource-exhaustion on socket creation surfaces as `out-of-memory`.
+            return Err(wasmtime_wasi::p3::bindings::sockets::types::ErrorCode::OutOfMemory.into());
+        }
+        let result = <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::create(
+            &mut self.sockets,
+            address_family,
+        );
+        match result {
+            Ok(socket) => {
+                self.p3_leases
+                    .insert(socket.rep(), Arc::new(P3SocketLease(self.guard.clone())));
+                Ok(socket)
+            }
+            Err(err) => {
+                self.guard.release_live_socket();
+                Err(err)
+            }
+        }
+    }
+
+    async fn bind(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        local_address: wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::bind(
+            &mut self.sockets,
+            socket,
+            local_address,
+        )
+        .await
+    }
+
+    fn get_local_address(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    > {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_local_address(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_remote_address(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    > {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_remote_address(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_is_listening(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime::Result<bool> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_is_listening(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_address_family(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime::Result<wasmtime_wasi::p3::bindings::sockets::types::IpAddressFamily> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_address_family(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_listen_backlog_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: u64,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_listen_backlog_size(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_keep_alive_enabled(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<bool> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_keep_alive_enabled(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_keep_alive_enabled(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: bool,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_keep_alive_enabled(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_keep_alive_idle_time(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime_wasi::p3::bindings::sockets::types::Duration,
+    > {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_keep_alive_idle_time(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_keep_alive_idle_time(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: wasmtime_wasi::p3::bindings::sockets::types::Duration,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_keep_alive_idle_time(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_keep_alive_interval(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime_wasi::p3::bindings::sockets::types::Duration,
+    > {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_keep_alive_interval(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_keep_alive_interval(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: wasmtime_wasi::p3::bindings::sockets::types::Duration,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_keep_alive_interval(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_keep_alive_count(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u32> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_keep_alive_count(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_keep_alive_count(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: u32,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_keep_alive_count(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_hop_limit(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u8> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_hop_limit(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_hop_limit(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: u8,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_hop_limit(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_receive_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u64> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_receive_buffer_size(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_receive_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: u64,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_receive_buffer_size(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_send_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u64> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::get_send_buffer_size(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_send_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        value: u64,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::set_send_buffer_size(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn drop(
+        &mut self,
+        sock: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime::Result<()> {
+        let rep = sock.rep();
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocket>::drop(
+            &mut self.sockets,
+            sock,
+        )?;
+        self.p3_leases.remove(&rep);
+        Ok(())
+    }
+}
+
+impl<T: wasmtime_wasi::sockets::WasiSocketsView + Send>
+    wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocketWithStore<T> for PlectoTcpSockets
+{
+    async fn connect(
+        store: &wasmtime::component::Accessor<T, Self>,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        remote_address: wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        let accessor = store.with_getter::<wasmtime_wasi::sockets::WasiSockets>(T::sockets);
+        <wasmtime_wasi::sockets::WasiSockets as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocketWithStore<T>>::connect(
+            &accessor,
+            socket,
+            remote_address,
+        )
+        .await
+    }
+
+    async fn listen(
+        mut store: wasmtime::component::Access<'_, T, Self>,
+        socket_resource: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime::component::StreamReader<
+            Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        >,
+    > {
+        use wasmtime::AsContextMut as _;
+        let access = wasmtime::component::Access::<T, wasmtime_wasi::sockets::WasiSockets>::new(
+            store.as_context_mut(),
+            T::sockets,
+        );
+        <wasmtime_wasi::sockets::WasiSockets as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocketWithStore<T>>::listen(
+            access,
+            socket_resource,
+        )
+        .await
+    }
+
+    fn send(
+        mut store: wasmtime::component::Access<'_, T, Self>,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+        data: wasmtime::component::StreamReader<u8>,
+    ) -> wasmtime::Result<
+        wasmtime::component::FutureReader<
+            Result<(), wasmtime_wasi::p3::bindings::sockets::types::ErrorCode>,
+        >,
+    > {
+        use wasmtime::AsContextMut as _;
+        let lease = store
+            .get()
+            .p3_leases
+            .get(&socket.rep())
+            .cloned()
+            .ok_or_else(|| wasmtime::Error::msg("missing P3 TCP socket lease"))?;
+        let access = wasmtime::component::Access::<T, wasmtime_wasi::sockets::WasiSockets>::new(
+            store.as_context_mut(),
+            T::sockets,
+        );
+        let completion = <wasmtime_wasi::sockets::WasiSockets as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocketWithStore<T>>::send(
+            access,
+            socket,
+            data,
+        )?;
+        retain_p3_stream_lease(store.as_context_mut(), completion, lease)
+    }
+
+    fn receive(
+        mut store: wasmtime::component::Access<'_, T, Self>,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::TcpSocket>,
+    ) -> wasmtime::Result<(
+        wasmtime::component::StreamReader<u8>,
+        wasmtime::component::FutureReader<
+            Result<(), wasmtime_wasi::p3::bindings::sockets::types::ErrorCode>,
+        >,
+    )> {
+        use wasmtime::AsContextMut as _;
+        let lease = store
+            .get()
+            .p3_leases
+            .get(&socket.rep())
+            .cloned()
+            .ok_or_else(|| wasmtime::Error::msg("missing P3 TCP socket lease"))?;
+        let access = wasmtime::component::Access::<T, wasmtime_wasi::sockets::WasiSockets>::new(
+            store.as_context_mut(),
+            T::sockets,
+        );
+        let (mut stream, completion) = <wasmtime_wasi::sockets::WasiSockets as wasmtime_wasi::p3::bindings::sockets::types::HostTcpSocketWithStore<T>>::receive(
+            access,
+            socket,
+        )?;
+        match retain_p3_stream_lease(store.as_context_mut(), completion, lease) {
+            Ok(completion) => Ok((stream, completion)),
+            Err(err) => {
+                stream.close(&mut store)?;
+                Err(err)
+            }
+        }
+    }
+}
+
+// In WASI 0.3, `udp-socket` is part of the same `wasi:sockets/types@0.3.0` interface as
+// `tcp-socket`. Plecto's outbound-TCP capability never permits UDP (ADR 000060): `create` fails
+// closed with `AccessDenied` before touching the OS, and `WasiCtxBuilder::allow_udp(false)` +
+// `TcpGuard::permits` deny every UDP operation as defence in depth.
+impl wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket for TcpSocketsView<'_> {
+    async fn create(
+        &mut self,
+        _address_family: wasmtime_wasi::p3::bindings::sockets::types::IpAddressFamily,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    > {
+        Err(wasmtime_wasi::p3::bindings::sockets::types::ErrorCode::AccessDenied.into())
+    }
+
+    async fn bind(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+        local_address: wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::bind(
+            &mut self.sockets,
+            socket,
+            local_address,
+        )
+        .await
+    }
+
+    async fn connect(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+        remote_address: wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::connect(
+            &mut self.sockets,
+            socket,
+            remote_address,
+        )
+        .await
+    }
+
+    fn disconnect(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::disconnect(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_local_address(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    > {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::get_local_address(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_remote_address(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<
+        wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    > {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::get_remote_address(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_address_family(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime::Result<wasmtime_wasi::p3::bindings::sockets::types::IpAddressFamily> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::get_address_family(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn get_unicast_hop_limit(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u8> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::get_unicast_hop_limit(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_unicast_hop_limit(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+        value: u8,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::set_unicast_hop_limit(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_receive_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u64> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::get_receive_buffer_size(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_receive_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+        value: u64,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::set_receive_buffer_size(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn get_send_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<u64> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::get_send_buffer_size(
+            &mut self.sockets,
+            socket,
+        )
+    }
+
+    fn set_send_buffer_size(
+        &mut self,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+        value: u64,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::set_send_buffer_size(
+            &mut self.sockets,
+            socket,
+            value,
+        )
+    }
+
+    fn drop(
+        &mut self,
+        sock: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime::Result<()> {
+        <wasmtime_wasi::sockets::WasiSocketsCtxView<'_> as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocket>::drop(
+            &mut self.sockets,
+            sock,
+        )
+    }
+}
+
+impl<T: wasmtime_wasi::sockets::WasiSocketsView + Send>
+    wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocketWithStore<T> for PlectoTcpSockets
+{
+    async fn send(
+        store: &wasmtime::component::Accessor<T, Self>,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+        data: Vec<u8>,
+        remote_address: Option<wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<()> {
+        let accessor = store.with_getter::<wasmtime_wasi::sockets::WasiSockets>(T::sockets);
+        <wasmtime_wasi::sockets::WasiSockets as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocketWithStore<T>>::send(
+            &accessor,
+            socket,
+            data,
+            remote_address,
+        )
+        .await
+    }
+
+    async fn receive(
+        store: &wasmtime::component::Accessor<T, Self>,
+        socket: Resource<wasmtime_wasi::p3::bindings::sockets::types::UdpSocket>,
+    ) -> wasmtime_wasi::p3::sockets::SocketResult<(
+        Vec<u8>,
+        wasmtime_wasi::p3::bindings::sockets::types::IpSocketAddress,
+    )> {
+        let accessor = store.with_getter::<wasmtime_wasi::sockets::WasiSockets>(T::sockets);
+        <wasmtime_wasi::sockets::WasiSockets as wasmtime_wasi::p3::bindings::sockets::types::HostUdpSocketWithStore<T>>::receive(
+            &accessor,
+            socket,
+        )
+        .await
     }
 }
 
@@ -1060,7 +1766,12 @@ mod tests {
         // deterministically returns access-denied before any OS socket call, exercising rollback.
         let mut state = state_with_tcp(TcpGuard::deny_all());
         let sockets = <HostState as WasiSocketsView>::sockets(&mut state);
-        let mut sockets = TcpSocketsView { sockets, guard };
+        let mut p3_leases = HashMap::new();
+        let mut sockets = TcpSocketsView {
+            sockets,
+            guard,
+            p3_leases: &mut p3_leases,
+        };
         assert!(sockets.create_tcp_socket(IpAddressFamily::Ipv4).is_err());
         assert_eq!(
             quota.used(),
@@ -1121,5 +1832,428 @@ mod tests {
         // must return the lease that the guest intentionally retained.
         drop(state);
         assert_eq!(quota.used(), 0);
+    }
+
+    #[test]
+    fn p3_tcp_socket_create_and_drop_enforce_quota_and_udp_is_denied() {
+        use wasmtime_wasi::p3::bindings::sockets::types::{
+            ErrorCode as P3ErrorCode, Host as P3TypesHost, HostTcpSocket as P3HostTcpSocket,
+            HostUdpSocket as P3HostUdpSocket, IpAddressFamily as P3IpAddressFamily,
+        };
+
+        let quota = Arc::new(TcpSocketQuota::with_limit(1));
+        let guard = guard_with_quota(
+            policy(vec![entry("8.8.8.8", 853)], vec![], 1),
+            quota.clone(),
+        );
+        let mut state = state_with_tcp(guard);
+        let mut sockets = state.tcp_sockets();
+
+        // UDP creation is unconditionally denied with AccessDenied in WASI 0.3.
+        let udp_err = pollster::block_on(<TcpSocketsView<'_> as P3HostUdpSocket>::create(
+            &mut sockets,
+            P3IpAddressFamily::Ipv4,
+        ))
+        .expect_err("UDP socket creation must be denied");
+        let code = <TcpSocketsView<'_> as P3TypesHost>::convert_error_code(&mut sockets, udp_err)
+            .expect("convert error code");
+        assert!(matches!(code, P3ErrorCode::AccessDenied));
+        assert_eq!(quota.used(), 0, "denied UDP must not touch TCP quota");
+
+        // First p3 TCP socket succeeds and reserves the 1-slot host quota.
+        let sock1 =
+            <TcpSocketsView<'_> as P3HostTcpSocket>::create(&mut sockets, P3IpAddressFamily::Ipv4)
+                .expect("create first p3 TCP socket");
+        assert_eq!(quota.used(), 1);
+
+        // Second p3 TCP socket exceeds the quota and fails with OutOfMemory.
+        let limit_err =
+            <TcpSocketsView<'_> as P3HostTcpSocket>::create(&mut sockets, P3IpAddressFamily::Ipv4)
+                .expect_err("second p3 TCP socket must hit quota");
+        let code = <TcpSocketsView<'_> as P3TypesHost>::convert_error_code(&mut sockets, limit_err)
+            .expect("convert error code");
+        assert!(matches!(code, P3ErrorCode::OutOfMemory));
+
+        // Dropping the p3 TCP socket releases the slot.
+        <TcpSocketsView<'_> as P3HostTcpSocket>::drop(&mut sockets, sock1)
+            .expect("drop first p3 TCP socket");
+        assert_eq!(quota.used(), 0);
+    }
+
+    #[test]
+    fn resolve_vetted_enforces_allowlist_ssrf_and_pins_resolved_ips() {
+        let mut static_map = StdHashMap::new();
+        static_map.insert(
+            "allowed.internal".to_string(),
+            vec!["93.184.216.34".parse().unwrap()],
+        );
+        static_map.insert(
+            "mixed.internal".to_string(),
+            vec![
+                "93.184.216.34".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            ],
+        );
+        let state = OutboundTcpState::new(
+            policy(
+                vec![
+                    entry("allowed.internal", 6379),
+                    entry("mixed.internal", 6379),
+                ],
+                vec![],
+                4,
+            ),
+            Resolver::Static(static_map),
+            Arc::new(TcpSocketQuota::new()),
+        );
+        let g = state.guard();
+
+        // Unlisted hostname fails before resolution.
+        let unlisted = pollster::block_on(resolve_vetted(
+            g.inner.clone(),
+            "unlisted.internal".to_string(),
+        ));
+        assert_eq!(unlisted, Err(VettedResolveError::PermanentResolverFailure));
+
+        // Mixed public + loopback record set is rejected wholesale and pins nothing.
+        let mixed = pollster::block_on(resolve_vetted(
+            g.inner.clone(),
+            "mixed.internal".to_string(),
+        ));
+        assert_eq!(mixed, Err(VettedResolveError::PermanentResolverFailure));
+        assert!(
+            !g.permits(addr("93.184.216.34", 6379), SocketAddrUse::TcpConnect),
+            "rejected mixed lookup must not pin the public half"
+        );
+
+        // Allowed public hostname resolves and pins its IP for subsequent connect.
+        let resolved = pollster::block_on(resolve_vetted(
+            g.inner.clone(),
+            "ALLOWED.Internal".to_string(),
+        ))
+        .expect("allowed name resolves");
+        assert_eq!(resolved, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
+        assert!(
+            g.permits(addr("93.184.216.34", 6379), SocketAddrUse::TcpConnect),
+            "vetted lookup pins the resolved IP for connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn p3_streams_keep_the_socket_quota_after_resource_and_completion_drop() {
+        use crate::engine::{Allocation, build_engine};
+        use wasmtime::component::{Access, StreamReader};
+        use wasmtime::{AsContextMut as _, Store};
+        use wasmtime_wasi::p3::bindings::sockets::types::{
+            HostTcpSocket as P3Socket, HostTcpSocketWithStore as P3SocketWithStore,
+            IpAddressFamily as P3Family, IpSocketAddress as P3Address,
+            Ipv4SocketAddress as P3V4Address,
+        };
+
+        // Hold the send stream open until explicitly released; no unbounded buffering or I/O.
+        struct PendingBytes(tokio::sync::oneshot::Receiver<()>);
+        impl<T> wasmtime::component::StreamProducer<T> for PendingBytes {
+            type Item = u8;
+            type Buffer = Option<u8>;
+            fn poll_produce<'a>(
+                mut self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                _store: wasmtime::StoreContextMut<'a, T>,
+                _dst: wasmtime::component::Destination<'a, u8, Option<u8>>,
+                finish: bool,
+            ) -> std::task::Poll<wasmtime::Result<wasmtime::component::StreamResult>> {
+                use std::task::Poll;
+                use wasmtime::component::StreamResult;
+                match std::future::Future::poll(Pin::new(&mut self.0), cx) {
+                    Poll::Ready(_) => Poll::Ready(Ok(StreamResult::Dropped)),
+                    Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let route = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        route.connect("192.0.2.1:80").await.unwrap();
+        let ip = route.local_addr().unwrap().ip();
+        let IpAddr::V4(v4) = ip else {
+            panic!("expected IPv4 route")
+        };
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cidr = format!("{ip}/32");
+
+        for discard_store in [false, true] {
+            let quota = Arc::new(TcpSocketQuota::with_limit(1));
+            let guard = guard_with_quota(
+                policy(vec![entry(&ip.to_string(), port)], vec![&cidr], 4),
+                quota.clone(),
+            );
+            let mut store = Store::new(
+                &build_engine(Allocation::OnDemand).unwrap(),
+                state_with_tcp(guard.clone()),
+            );
+            let socket =
+                P3Socket::create(&mut store.data_mut().tcp_sockets(), P3Family::Ipv4).unwrap();
+            let rep = socket.rep();
+            store
+                .run_concurrent(async |accessor| {
+                    let accessor = accessor.with_getter::<PlectoTcpSockets>(HostState::tcp_sockets);
+                    <PlectoTcpSockets as P3SocketWithStore<HostState>>::connect(
+                        &accessor,
+                        socket,
+                        P3Address::Ipv4(P3V4Address {
+                            port,
+                            address: v4.octets().into(),
+                        }),
+                    )
+                    .await
+                })
+                .await
+                .unwrap()
+                .unwrap();
+
+            let access = Access::<HostState, PlectoTcpSockets>::new(
+                store.as_context_mut(),
+                HostState::tcp_sockets,
+            );
+            let (mut received, mut receive_done) = <PlectoTcpSockets as P3SocketWithStore<
+                HostState,
+            >>::receive(
+                access, Resource::new_borrow(rep)
+            )
+            .unwrap();
+            let (finish_send, rx) = tokio::sync::oneshot::channel();
+            let data = StreamReader::new(&mut store, PendingBytes(rx)).unwrap();
+            let access = Access::<HostState, PlectoTcpSockets>::new(
+                store.as_context_mut(),
+                HostState::tcp_sockets,
+            );
+            let mut send_done = <PlectoTcpSockets as P3SocketWithStore<HostState>>::send(
+                access,
+                Resource::new_borrow(rep),
+                data,
+            )
+            .unwrap();
+            // Dropping completion futures must not cancel the host's accounting consumers.
+            receive_done.close(&mut store).unwrap();
+            send_done.close(&mut store).unwrap();
+            P3Socket::drop(&mut store.data_mut().tcp_sockets(), Resource::new_own(rep)).unwrap();
+            guard.begin_request();
+            assert_eq!(quota.used(), 1);
+            assert!(P3Socket::create(&mut store.data_mut().tcp_sockets(), P3Family::Ipv4).is_err());
+            let mut other =
+                state_with_tcp(guard_with_quota(policy(vec![], vec![], 1), quota.clone()));
+            assert!(
+                P3Socket::create(&mut other.tcp_sockets(), P3Family::Ipv4).is_err(),
+                "host quota spans Stores"
+            );
+
+            if discard_store {
+                drop(store);
+                assert_eq!(
+                    quota.used(),
+                    0,
+                    "discarding a Store reclaims stream reservations"
+                );
+                continue;
+            }
+            received.close(&mut store).unwrap();
+            store
+                .run_concurrent(async |_| tokio::task::yield_now().await)
+                .await
+                .unwrap();
+            assert_eq!(quota.used(), 1, "the send half still owns its FD");
+            finish_send.send(()).unwrap();
+            store
+                .run_concurrent(async |_| {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while quota.used() != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("closing both stream halves releases the quota");
+                })
+                .await
+                .unwrap();
+            let replacement =
+                P3Socket::create(&mut store.data_mut().tcp_sockets(), P3Family::Ipv4).unwrap();
+            P3Socket::drop(&mut store.data_mut().tcp_sockets(), replacement).unwrap();
+            assert_eq!(quota.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn p3_lookup_and_tcp_socket_connect_enforce_pin_budget_and_deny_listen() {
+        use crate::engine::{Allocation, build_engine};
+        use wasmtime::{AsContextMut as _, Store};
+        use wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::{
+            ErrorCode as P3LookupErrorCode, HostWithStore as P3LookupHostWithStore,
+        };
+        use wasmtime_wasi::p3::bindings::sockets::types::{
+            ErrorCode as P3SocketErrorCode, Host as P3TypesHost, HostTcpSocket as P3HostTcpSocket,
+            HostTcpSocketWithStore as P3HostTcpSocketWithStore, IpAddress as P3IpAddress,
+            IpAddressFamily as P3IpAddressFamily, IpSocketAddress as P3IpSocketAddress,
+            Ipv4SocketAddress as P3Ipv4SocketAddress,
+        };
+
+        let route = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        route.connect("192.0.2.1:80").await.unwrap();
+        let ip = route.local_addr().unwrap().ip();
+        let IpAddr::V4(v4) = ip else {
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+            .await
+            .unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while let Ok((_sock, _)) = listener.accept().await {} });
+
+        let mut static_map = StdHashMap::new();
+        static_map.insert("backend.internal".to_string(), vec![ip]);
+        let cidr = format!("{ip}/32");
+        let tcp_state = OutboundTcpState::new(
+            policy(
+                vec![entry("backend.internal", bound_port)],
+                vec![cidr.as_str()],
+                1, // 1 connect per request
+            ),
+            Resolver::Static(static_map),
+            Arc::new(TcpSocketQuota::new()),
+        );
+        let engine = build_engine(Allocation::OnDemand).unwrap();
+        let mut store = Store::new(&engine, state_with_tcp(tcp_state.guard()));
+
+        let remote = P3IpSocketAddress::Ipv4(P3Ipv4SocketAddress {
+            port: bound_port,
+            address: v4.octets().into(),
+        });
+
+        // 1. Connecting before resolving `backend.internal` is denied (IP not pinned yet).
+        let unpinned_sock = <TcpSocketsView<'_> as P3HostTcpSocket>::create(
+            &mut store.data_mut().tcp_sockets(),
+            P3IpAddressFamily::Ipv4,
+        )
+        .unwrap();
+        let unpinned_err = store
+            .run_concurrent(async move |accessor| {
+                let accessor = accessor.with_getter::<PlectoTcpSockets>(HostState::tcp_sockets);
+                <PlectoTcpSockets as P3HostTcpSocketWithStore<HostState>>::connect(
+                    &accessor,
+                    unpinned_sock,
+                    remote,
+                )
+                .await
+            })
+            .await
+            .unwrap()
+            .expect_err("connect before resolve must be denied");
+        let code = <TcpSocketsView<'_> as P3TypesHost>::convert_error_code(
+            &mut store.data_mut().tcp_sockets(),
+            unpinned_err,
+        )
+        .unwrap();
+        assert!(matches!(code, P3SocketErrorCode::AccessDenied));
+
+        // 2. Unlisted hostname resolution via `wasi:sockets/ip-name-lookup@0.3.0` is denied.
+        let unlisted_res = store
+            .run_concurrent(async move |accessor| {
+                let accessor = accessor.with_getter::<PlectoTcpLookup>(HostState::tcp_lookup);
+                <PlectoTcpLookup as P3LookupHostWithStore<HostState>>::resolve_addresses(
+                    &accessor,
+                    "evil.internal".to_string(),
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            unlisted_res,
+            Ok(Err(P3LookupErrorCode::PermanentResolverFailure))
+        ));
+
+        // 3. Vetted resolution via `wasi:sockets/ip-name-lookup@0.3.0` succeeds and pins the IP.
+        let resolved = store
+            .run_concurrent(async move |accessor| {
+                let accessor = accessor.with_getter::<PlectoTcpLookup>(HostState::tcp_lookup);
+                <PlectoTcpLookup as P3LookupHostWithStore<HostState>>::resolve_addresses(
+                    &accessor,
+                    "backend.internal".to_string(),
+                )
+                .await
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("allowed p3 resolve_addresses succeeds");
+        assert!(matches!(
+            resolved.as_slice(),
+            [P3IpAddress::Ipv4(octets)] if *octets == v4.octets().into()
+        ));
+
+        // 4. First connect to the pinned IP succeeds (`max_connections = 1`).
+        let sock1 = <TcpSocketsView<'_> as P3HostTcpSocket>::create(
+            &mut store.data_mut().tcp_sockets(),
+            P3IpAddressFamily::Ipv4,
+        )
+        .unwrap();
+        store
+            .run_concurrent(async move |accessor| {
+                let accessor = accessor.with_getter::<PlectoTcpSockets>(HostState::tcp_sockets);
+                <PlectoTcpSockets as P3HostTcpSocketWithStore<HostState>>::connect(
+                    &accessor, sock1, remote,
+                )
+                .await
+            })
+            .await
+            .unwrap()
+            .expect("first p3 connect to pinned IP succeeds");
+
+        // 5. Second connect in the same request exceeds the 1-connect budget and fails closed.
+        let sock2 = <TcpSocketsView<'_> as P3HostTcpSocket>::create(
+            &mut store.data_mut().tcp_sockets(),
+            P3IpAddressFamily::Ipv4,
+        )
+        .unwrap();
+        let budget_err = store
+            .run_concurrent(async move |accessor| {
+                let accessor = accessor.with_getter::<PlectoTcpSockets>(HostState::tcp_sockets);
+                <PlectoTcpSockets as P3HostTcpSocketWithStore<HostState>>::connect(
+                    &accessor, sock2, remote,
+                )
+                .await
+            })
+            .await
+            .unwrap()
+            .expect_err("second p3 connect must be denied by per-request budget");
+        let code = <TcpSocketsView<'_> as P3TypesHost>::convert_error_code(
+            &mut store.data_mut().tcp_sockets(),
+            budget_err,
+        )
+        .unwrap();
+        assert!(matches!(code, P3SocketErrorCode::AccessDenied));
+
+        // 6. `tcp-socket.listen` on WASI 0.3 is unconditionally denied (`AccessDenied`).
+        let listen_sock = <TcpSocketsView<'_> as P3HostTcpSocket>::create(
+            &mut store.data_mut().tcp_sockets(),
+            P3IpAddressFamily::Ipv4,
+        )
+        .unwrap();
+        let access = wasmtime::component::Access::<HostState, PlectoTcpSockets>::new(
+            store.as_context_mut(),
+            HostState::tcp_sockets,
+        );
+        let listen_err =
+            <PlectoTcpSockets as P3HostTcpSocketWithStore<HostState>>::listen(access, listen_sock)
+                .await
+                .expect_err("p3 tcp-socket.listen must be denied");
+        let code = <TcpSocketsView<'_> as P3TypesHost>::convert_error_code(
+            &mut store.data_mut().tcp_sockets(),
+            listen_err,
+        )
+        .unwrap();
+        assert!(matches!(code, P3SocketErrorCode::AccessDenied));
     }
 }

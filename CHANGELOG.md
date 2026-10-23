@@ -32,6 +32,36 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-24
+
+Patch release: lockfile updates for two RustSec advisories (`ctutils` 0.4.2 → 0.4.5 and `tokio`
+1.53.1 → 1.54.1) and documentation alignment across the READMEs and roadmap. No WIT contract,
+manifest schema, CLI, or public API change from 0.15.0, and `cargo semver-checks` against the
+crates.io 0.15.0 baseline reports no semver update required on each of `plecto-host` /
+`plecto-control` / `plecto-server` (default features). **Deployed filters do not need a rebuild**:
+the filter contract stays at `plecto:filter@0.4.0` and the reference-filter shelf is unchanged.
+
+### Security
+
+- **`ctutils` 0.4.2 → 0.4.5 (`plecto/Cargo.lock`)** for
+  [RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385): `ctutils::Choice`
+  mask-generation `const fn` helpers could emit branch instructions on common targets, and `u128`
+  comparisons could emit branches on 32-bit targets. Pulled transitively via `sigstore` key
+  handling on the offline provenance verification path. No source change.
+- **`tokio` 1.53.1 → 1.54.1 (`plecto/Cargo.lock`, `bench/loadgen/Cargo.lock`,
+  `plecto/spike/streaming-async/host/Cargo.lock`)** for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386):
+  `tokio::io::unix::AsyncFd` safe constructors (`new`, `with_interest`, `try_new`,
+  `try_with_interest`) accepted any `T: AsRawFd` without proof of file-descriptor ownership or
+  lifetime, violating I/O safety. Plecto does not construct `AsyncFd` directly; the workspace and
+  independent benchmark/spike lockfiles take the patched release. No source change.
+
+### Changed
+
+- **Documentation (`README.md`, `README.ja.md`, `docs/ROADMAP.md`)**: updated milestone progress
+  summaries and inline-dispatch performance figures (~1.4 µs/req pooled no-op dispatch floor) to
+  match landed M2 / M3 / M5 / M6 capabilities.
+
 ## [0.15.0] - 2026-10-21
 
 Minor-line release carrying the wasmtime 49 → 50 major bump ([ADR 000120](docs/ADR/000120.md),

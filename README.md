@@ -110,7 +110,7 @@ gate on what you load, with **mesh-less mutual TLS** as the complementary second
 
 **Rule of thumb:** policy, WAF, auth, and rewriting go in a filter; TLS, routing, LB, and
 connection pools stay native ([ADR 000029](docs/ADR/000029.md)). The WASM "tax" is paid only on
-decision logic — pooled no-op dispatch is **≈ 4.5 µs/req** ([performance](performance/README.md)).
+decision logic — pooled no-op dispatch is **≈ 1.4 µs/req** ([performance](performance/README.md)).
 Canon: [docs/design-principles.md](docs/design-principles.md).
 
 ## Quick start
@@ -149,17 +149,19 @@ whose scripts prove drain-without-drops, cross-replica TLS resumption, and downs
 
 The native fast path has matured well past "a proxy that works." It terminates **HTTP/1.1,
 HTTP/2 (ALPN), and HTTP/3 (QUIC)** over TLS — post-quantum key exchange preferred by default,
-stateless TLS 1.3 resumption, **mutual TLS in both directions**, opt-in PROXY protocol v2. It
-**routes** by host · path-prefix · method · header · query in specificity order with weighted
-traffic split, runs the route's filter chain over headers and the body, and **load-balances**
-across healthy upstreams (round-robin, weighted least-request, weighted Maglev) behind health
-checks, outlier detection, circuit breakers, two-tier timeouts, and jittered retry. Upstream legs
-re-encrypt with TLS+ALPN and re-resolve from DNS; WebSocket tunnels splice end to end. Inbound
-admission control caps connections globally *and* per source IP; ingress path normalization makes
-route selection a reliable auth boundary. The binary wires SIGHUP reload, graceful shutdown, OTLP
-export, and an operator CLI covering a filter's whole lifecycle — scaffold, dev loop, a
-versioned conformance battery, packaging/signing, and a CI pre-flight of the loader's own
-provenance gate.
+stateless TLS 1.3 resumption, **mutual TLS in both directions**, opt-in PROXY protocol v2, and
+trusted-proxy `X-Forwarded-For` restoration. It **routes** by host · path-prefix · method ·
+header · query in specificity order with weighted traffic split, declarative response headers, and
+response compression, runs the route's filter chain over headers (inline on the worker for trusted
+non-blocking filters) and the body, and **load-balances** across healthy upstreams (round-robin,
+weighted least-request, weighted Maglev) behind health checks, outlier detection, circuit
+breakers, two-tier timeouts, and jittered retry. Upstream legs re-encrypt with TLS+ALPN and
+re-resolve from DNS; WebSocket tunnels splice end to end. Inbound admission control caps
+connections globally *and* per source IP and bounds in-flight requests; ingress path and authority
+normalization makes route selection a reliable auth boundary. The binary wires SIGHUP reload,
+graceful shutdown, per-route RED metrics and access logs, OTLP export, and an operator CLI
+covering a filter's whole lifecycle — scaffold, dev loop, a versioned conformance battery,
+packaging/signing, and a CI pre-flight of the loader's own provenance and static contract gates.
 
 **[docs/features.md](docs/features.md)** is the full table, concern by concern, with the deciding
 ADR on every row — and what is deliberately *not* there.
@@ -258,9 +260,11 @@ silently — the full rule, with the access log's field contract, is in
 
 Built ADR-first, milestone by milestone. Landed: the foundation (**M0** — contract, host,
 capability boundary, CI), the hardened filter runtime (**M1**), and provenance + zero-downtime
-reload (**M4**). In progress: the data path (**M2**), async and bodies (**M3** — Stages 1–2 landed,
-streaming still experimental), observability (**M5** — opt-in distribution deferred), and polyglot
-work (**M6** — example filters and conformance CI, no SDKs yet).
+reload (**M4**). Maturing / mostly landed: the data path (**M2**), async and bodies (**M3** —
+Stages 1–2 and inline header-hook dispatch landed, streaming still experimental), observability
+(**M5** — traces, per-route RED metrics, and OTLP export landed; opt-in distribution deferred),
+and polyglot & reference filters (**M6** — polyglot conformance CI, tokenlimit starters, signed
+reference filters, and SSRF-guarded outbound HTTP/TCP landed; SDKs pending).
 [`docs/ROADMAP.md`](docs/ROADMAP.md) has the detail and the deciding ADR per item.
 
 ## Contributing

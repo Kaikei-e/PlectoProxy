@@ -109,7 +109,7 @@ capability 契約を必須ゲートとし、mesh を持ち込まない環境向�
 
 **判断の指針:** ポリシー・WAF・認証・書換 → フィルタ。TLS・ルーティング・LB・コネクションプール →
 native（[ADR 000029](docs/ADR/000029.md)）。WASM 税は判断ロジックにのみ課され、pooled no-op の
-dispatch は **≈ 4.5 µs/req**（[performance](performance/README.md)）。原典は
+dispatch は **≈ 1.4 µs/req**（[performance](performance/README.md)）。原典は
 [docs/design-principles.ja.md](docs/design-principles.ja.md)。
 
 ## クイックスタート
@@ -147,16 +147,19 @@ drain 時の無欠損・レプリカ跨ぎの TLS resumption・downstream mTLS �
 
 native fast path は「動くプロキシ」をとうに越えて成熟している。**HTTP/1.1・HTTP/2（ALPN）・
 HTTP/3（QUIC）** を TLS 上で終端し——post-quantum 鍵交換を既定で優先、stateless な TLS 1.3
-resumption、**両方向 mTLS**、opt-in の PROXY protocol v2——host · path-prefix · method · header ·
-query を specificity 順で **routing**（weighted traffic split つき）し、ルートの filter chain を
-ヘッダと body に回し、healthy な upstream へ **ロードバランシング**する（round-robin・weighted
-least-request・weighted Maglev）。その背後に health check・outlier detection・circuit breaker・
-二段 timeout・jittered retry が付く。upstream への脚は TLS+ALPN で再暗号化し DNS を再解決する。
-WebSocket トンネルは end-to-end で成立する。inbound の admission control は接続数を全体*と*送信元 IP
-単位で抑え、ingress の path 正規化が route 選択を信頼できる認証境界にする。出荷バイナリには SIGHUP
-reload・graceful shutdown・OTLP export・フィルタの全ライフサイクルを覆う operator CLI——scaffold・
-dev ループ・版付き conformance battery・パッケージング/署名・loader 自身の provenance ゲートの
-CI pre-flight——が配線済み。
+resumption、**両方向 mTLS**、opt-in の PROXY protocol v2 と trusted-proxy の `X-Forwarded-For`
+復元——host · path-prefix · method · header · query を specificity 順で **routing**（weighted
+traffic split・宣言的レスポンスヘッダ・レスポンス圧縮つき）し、ルートの filter chain をヘッダ
+（trusted かつ非ブロッキングなフィルタは worker 上で inline 実行）と body に回し、healthy な
+upstream へ **ロードバランシング**する（round-robin・weighted least-request・weighted Maglev）。
+その背後に health check・outlier detection・circuit breaker・二段 timeout・jittered retry が付く。
+upstream への脚は TLS+ALPN で再暗号化し DNS を再解決する。WebSocket トンネルは end-to-end で成立
+する。inbound の admission control は接続数を全体*と*送信元 IP 単位で抑えた上で in-flight リクエスト
+数も有界化し、ingress の path / authority 正規化が route 選択を信頼できる認証境界にする。出荷
+バイナリには SIGHUP reload・graceful shutdown・per-route RED メトリクスとアクセスログ・OTLP
+export・フィルタの全ライフサイクルを覆う operator CLI——scaffold・dev ループ・版付き conformance
+battery・パッケージング/署名・loader 自身の provenance ゲートと静的契約ゲートの CI pre-flight——が
+配線済み。
 
 概念ごとの完全な表（各行に決定 ADR つき）と、**意図的に置いていないもの**の一覧は
 **[docs/features.ja.md](docs/features.ja.md)**。
@@ -253,10 +256,12 @@ opt-in する。**Go/TinyGo** が最初の Tier B ゲスト。
 ## 現状とロードマップ
 
 ADR ファーストで、マイルストーン単位に作る。**着地済み**: 基盤（**M0** — 契約・ホスト・能力境界・CI）、
-フィルタランタイムの堅牢化（**M1**）、provenance ＋ 無停止リロード（**M4**）。**進行中**: データ経路
-（**M2**）、async & ボディ（**M3** — Stage 1–2 着地、streaming は実験的）、可観測性（**M5** —
-オプトイン分散は deferred）、polyglot（**M6** — 例フィルタと conformance CI は着地、SDK は未着手）。
-項目ごとの詳細と決定 ADR は [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+フィルタランタイムの堅牢化（**M1**）、provenance ＋ 無停止リロード（**M4**）。**成熟中 / 大半着地**:
+データ経路（**M2**）、async & ボディ（**M3** — Stage 1–2 と header フックの inline dispatch が着地、
+streaming は実験的）、可観測性（**M5** — トレース・per-route RED メトリクス・OTLP export は着地、
+オプトイン分散は deferred）、polyglot & リファレンスフィルタ（**M6** — 多言語 conformance CI・
+tokenlimit starter・署名付き reference filter・SSRF ガード付き outbound HTTP/TCP は着地、SDK は
+未着手）。項目ごとの詳細と決定 ADR は [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ## コントリビュート
 

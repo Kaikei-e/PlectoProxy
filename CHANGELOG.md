@@ -32,6 +32,53 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-24
+
+Patch release: dual WASI 0.2 (`@0.2.x`) and WASI 0.3 (`@0.3.0`) host capability support across
+`fat-guest`, `outbound-http`, `outbound-tcp`, and `streaming-body` ([ADR 000121](docs/ADR/000121.md),
+amending [ADR 000036](docs/ADR/000036.md), [ADR 000060](docs/ADR/000060.md), and
+[ADR 000063](docs/ADR/000063.md)), plus refreshed T1 / Criterion performance baselines and
+Flint 1.0.1 charts. No WIT contract, manifest schema, CLI, or public API change from 0.15.1, and
+`cargo semver-checks` against the crates.io 0.15.1 baseline reports no semver update required on
+each of `plecto-host` / `plecto-control` / `plecto-server` (default features). **Deployed filters
+do not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0` and the
+reference-filter shelf is unchanged.
+
+### Added
+
+- **Dual WASI 0.2 + 0.3 (`@0.3.0`) host capability linker (`plecto-host`,
+  [ADR 000121](docs/ADR/000121.md))**: every host capability tier now registers its matching
+  `wasmtime_wasi::p3` / `wasmtime_wasi_http::p3` interfaces alongside `p2` under the existing
+  Cargo feature and `GuestCapabilities` opt-in gates, enforcing identical security and resource
+  invariants across both WASI epochs:
+  - **`wasi_minimal` (`fat-guest`)**: `p3::clocks`, `p3::random`, and `p3::cli` alongside `p2`,
+    plus a custom `StdioStream` (`crates/host/src/stdio.rs`) implementing `AsyncWrite` directly on
+    top of `HostLogBridge` so WASIp3 `stdout::write-via-stream` and `stderr::write-via-stream`
+    drain line-buffered guest diagnostic frames without spawning intermediate background tasks.
+  - **`outbound-http`**: `wasmtime_wasi_http::p3::add_to_linker` alongside `p2`, implementing
+    `wasmtime_wasi_http::p3::WasiHttpHooks::send_request` over the shared `OutboundHttpPool` and
+    enforcing the same SSRF validation (`check_url_and_resolve`), per-call request budget, header /
+    body caps, and DNS pinning before opening a connection.
+  - **`outbound-tcp`**: `p3::sockets` (`ip-name-lookup` and `types`) alongside `p2`, enforcing the
+    same `tcp_connect_hosts` allowlist, literal-IP CIDR guard, DNS-resolved IP CIDR guard, and
+    per-call socket budget (`consume_socket` / `release_socket`). Because WASIp3 splits `connect`,
+    `send`, and `receive` across independent async host entries, `P3SocketLease` retains the
+    socket quota slot across the receive `StreamReader` until stream drop or store teardown.
+  - **Tokio timer driver on the synchronous `block_on_wasi` bridge (`crates/host/src/runtime.rs`)**:
+    when `fat-guest` or `streaming-body` is compiled in, `block_on_wasi` enters an ambient
+    process-wide `current_thread` Tokio runtime context (with the time driver enabled) only when
+    not already inside a Tokio runtime, allowing `wasi:clocks/monotonic-clock@0.3.0` (`wait-for` /
+    `wait-until`) to register timer resources while keeping single-poll fast paths allocation-free.
+
+### Changed
+
+- **Performance baselines and charts (`performance/README.md`, `performance/HISTORY.md`,
+  `performance/flint/package.json`, `performance/img/*.png`)**: recorded 2026-10-24 Criterion
+  WASM micro-benchmark (`on_request/trusted_pooled` 2.20 µs, `on_request/untrusted_fresh` 27.92 µs,
+  `filter_load/trusted_cold` 7.75 ms) and T1 E2E regression gate (`10 pass, 0 fail, 0 inconclusive`,
+  `dispatch_floor_us` 1.1714 ± 0.0330 µs) measurements on Wasmtime 50.0.0 + dual WASI 0.2/0.3, and
+  regenerated the 21 performance charts with `flint-chart-mcp` 1.0.1.
+
 ## [0.15.1] - 2026-10-24
 
 Patch release: lockfile updates for two RustSec advisories (`ctutils` 0.4.2 → 0.4.5 and `tokio`

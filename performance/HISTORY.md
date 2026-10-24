@@ -5,38 +5,29 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
-## 2026-10-24 (wasmtime 50.0.0 + WASI 0.3 dual capability host confirmation)
+## 2026-10-24 (v0.15.2 full T2 snapshot, T1 gate & Criterion confirmation — wasmtime 50.0.0 + WASI 0.3)
 
-T1 regression gate (`bash bench/perf/run-perf.sh gate`) and Criterion WASM micro-benchmarks (`crates/host/benches/wasm.rs`) measured at `3b8ca45` (`v0.15.1+`) after landing the lockstep Wasmtime 50.0.0 bump ([ADR 000120](../docs/ADR/000120.md)) and full WASI 0.3 (`@0.3.0`) capability host support alongside WASI 0.2 (`@0.2.x`) across `fat-guest`, `outbound-http`, `outbound-tcp`, and `streaming-body` ([ADR 000121](../docs/ADR/000121.md), amending ADR 000036, ADR 000060, and ADR 000063):
+Full T2 release report (`bash bench/perf/run-perf.sh all`, `RUN_DIR: 20261024T035518Z-1061a79`), T1 regression gate (`bash bench/perf/run-perf.sh gate`), and Criterion WASM micro-benchmarks (`crates/host/benches/wasm.rs`) measured at tag **`v0.15.2`** (`1061a79`, plus pre-tag verification at `3b8ca45`) after landing the lockstep Wasmtime 50.0.0 bump ([ADR 000120](../docs/ADR/000120.md)), full WASI 0.3 (`@0.3.0`) capability host support alongside WASI 0.2 (`@0.2.x`) across `fat-guest`, `outbound-http`, `outbound-tcp`, and `streaming-body` ([ADR 000121](../docs/ADR/000121.md), amending ADR 000036, ADR 000060, and ADR 000063), inline header hooks ([ADR 000119](../docs/ADR/000119.md)), and the default allocator arena cap transition (`4 → 32`, [ADR 000118](../docs/ADR/000118.md)):
 - **Hot-path execution model unchanged**: Tier A zero-WASI filters (`wasi_minimal = false`, no outbound) continue to execute on `pollster::block_on` (and inline on the Tokio worker when eligible under [ADR 000119](../docs/ADR/000119.md)). Wasmtime's ambient Tokio runtime (`block_on_wasi`) is entered only for `wasi = "minimal"` (`fat-guest`) and `streaming-body` invocations so WASI 0.3 clock waits (`wasi:clocks/monotonic-clock@0.3.0#wait-for`) have a timer driver even when called outside Tokio.
-- **Criterion WASM micro-benchmarks (`cargo bench -p plecto-host --bench wasm --features outbound-http,outbound-tcp,fat-guest,streaming-body`)**:
-  - `on_request/trusted_pooled`: **2.20 µs** `[2.191 µs .. 2.216 µs]` (v0.9.0 baseline: ~2.88 µs)
-  - `on_request/untrusted_fresh`: **27.92 µs** `[27.61 µs .. 28.29 µs]` (v0.9.0 baseline: ~44.0 µs)
-  - `filter_load/trusted_cold`: **7.75 ms** `[7.66 ms .. 7.84 ms]` (v0.9.0 baseline: ~27.3 ms)
-- **T1 gate (`bash bench/perf/run-perf.sh gate`, `PROXY_CPUS=0-11`, `GEN_CPUS=12-23`, 3 interleaved rounds)**: **PASS (`10 pass, 0 fail, 0 inconclusive`)**:
-  - **Closed-loop ceilings (oha, `-c 50`, 3 interleaved rounds)**:
-    - `/baseline`: 216,270.1 / 222,076.6 / 219,515.8 rps (mean **219.3k rps**, p50 0.22 ms, p99 0.36–0.47 ms)
-    - `/noop-pooled`: 173,512.1 / 175,182.0 / 174,680.0 rps (mean **174.5k rps**, p50 0.28 ms, p99 0.42–0.48 ms)
-    - `/trusted` (`filter-apikey`): 146,023.8 / 144,189.3 / 144,485.6 rps (mean **144.9k rps**, p50 0.34 ms, p99 0.50 ms)
-  - **Fixed-rate tails at 2,000 rps (`oha -q --latency-correction`)**:
-    - `/baseline`: p50 0.0636 ms, p90 0.0928 ms, p95 0.1067 ms, p99 0.1390 ms, p99.9 0.2059 ms
-    - `/noop-pooled`: p50 0.0771 ms, p90 0.1122 ms, p95 0.1290 ms, p99 0.1628 ms, p99.9 0.2144 ms
-    - `/trusted`: p50 0.0866 ms, p90 0.1284 ms, p95 0.1503 ms, p99 0.1944 ms, p99.9 0.2736 ms
-    - `/resp-ctx`: p50 0.0782 ms, p90 0.1170 ms, p95 0.1364 ms, p99 0.1719 ms, p99.9 0.2329 ms
-  - **Rate-limit tax & enforcement (k6)**:
-    - Closed-loop (`VUS=50`, 2 rounds): `/baseline` 151,829 / 149,994 rps (p50 0.23 ms, p99 1.25–1.27 ms) vs `/ratelimit` 129,839 / 127,522 rps (p50 0.30 ms, p99 1.16–1.21 ms), 0 % failed.
-    - Enforcement (5,000/s offered): allowed 1,100/s (11,000 ok / 39,000 429 / 0 no-status, 78.0 % shed; accept p99 0.20 ms, 429 p99 0.15 ms).
-  - **Gate invariants (`gate.csv`)**:
-    - `dispatch_floor_us`: **1.1714 ± 0.0330 µs** (band `0.9..2.1`, pass)
-    - `apikey_cost_us`: **1.1694 ± 0.0710 µs** (band `0.3..1.7`, pass)
-    - `pooled_tail_p50_ms`: **0.0135 ms** (band `0.00..0.20`, pass; informational `pooled_tail_p99_ms` 0.0238 ms)
-    - `apikey_tail_p50_ms`: **0.0095 ms** (band `-0.02..0.15`, pass)
-    - `respctx_tail_p50_ms`: **0.0011 ms** (band `-0.05..0.25`, pass; informational `respctx_tail_p99_ms` 0.0091 ms)
-    - `ratelimit_tax_us`: **1.1452 ± 0.0297 µs** (band `0.9..2.4`, pass)
-    - `enforce_allowed_ratio`: **0.9166** (band `0.90..1.10`, pass; informational `enforce_limited_frac` 0.7800)
+- **Criterion WASM micro-benchmarks (`cargo bench -p plecto-host --bench wasm --features outbound-http,outbound-tcp,fat-guest,streaming-body` at `1061a79` `v0.15.2`)**:
+  - `on_request/trusted_pooled`: **2.09 µs** `[2.080 µs .. 2.104 µs]` (`3b8ca45`: 2.20 µs; v0.9.0 baseline: ~2.88 µs)
+  - `on_request/untrusted_fresh`: **28.53 µs** `[28.05 µs .. 29.08 µs]` (`3b8ca45`: 27.92 µs; v0.9.0 baseline: ~44.0 µs)
+  - `filter_load/trusted_cold`: **7.89 ms** `[7.79 ms .. 7.99 ms]` (`3b8ca45`: 7.75 ms; v0.9.0 baseline: ~27.3 ms)
+- **T1 gate (`bash bench/perf/run-perf.sh gate`, `PROXY_CPUS=0-11`, `GEN_CPUS=12-23`, 3 interleaved rounds)**:
+  - Two pre-T2 runs at `1061a79` returned `INCONCLUSIVE (exit 2: 9 pass, 0 fail, 1 inconclusive)` solely on `ratelimit_tax_us` (`1.2976 ± 0.5181 µs` and `1.1216 ± 0.3806 µs`, where `value - ci_half` straddled the fast-side band edge `0.9` of `0.9..2.4`; `dispatch_floor_us` `1.1383 ± 0.0809` / `1.2628 ± 0.0073 µs`, `apikey_cost_us` `1.1582 ± 0.0576` / `1.1066 ± 0.0325 µs`).
+  - The post-T2 confirmation run (`20261024T042039Z-1061a79`, `gate.csv`) and the pre-tag run (`20261024T025042Z-3b8ca45`) both returned **PASS (`10 pass, 0 fail, 0 inconclusive`)**:
+    - `dispatch_floor_us`: **1.2878 ± 0.0970 µs** (`3b8ca45`: `1.1714 ± 0.0330 µs`; band `0.9..2.1`, pass)
+    - `apikey_cost_us`: **1.0640 ± 0.1228 µs** (`3b8ca45`: `1.1694 ± 0.0710 µs`; band `0.3..1.7`, pass)
+    - `pooled_tail_p50_ms`: **0.0131 ms** (`3b8ca45`: `0.0135 ms`; band `0.00..0.20`, pass; informational `pooled_tail_p99_ms`: `0.0265 ms`)
+    - `apikey_tail_p50_ms`: **0.0106 ms** (`3b8ca45`: `0.0095 ms`; band `-0.02..0.15`, pass)
+    - `respctx_tail_p50_ms`: **0.0010 ms** (`3b8ca45`: `0.0011 ms`; band `-0.05..0.25`, pass; informational `respctx_tail_p99_ms`: `-0.0020 ms`)
+    - `ratelimit_tax_us`: **1.1967 ± 0.0630 µs** (`3b8ca45`: `1.1452 ± 0.0297 µs`; band `0.9..2.4`, pass)
+    - `enforce_allowed_ratio`: **0.9166** (band `0.90..1.10`, pass; informational `enforce_limited_frac` `0.7800`)
     - `rr_spread_req`: **0** (40,000 / 40,000 / 40,000 across 120,000 responses, pass)
     - `ejection_transition_s`: **1.0000 s** (band `0..2`, pass)
     - `ejection_stray_failed`: **0** (band `0..0`, pass)
+- **T2 full suite (`bash bench/perf/run-perf.sh all`, `20261024T035518Z-1061a79`, all 14 phases `ok`)**:
+  - First full T2 refresh since inline header hooks ([ADR 000119](../docs/ADR/000119.md)) and default arena cap 32 ([ADR 000118](../docs/ADR/000118.md)) landed: `/baseline` keep-alive **212,730 req/s** (cold CRR **106,165 req/s**), `/noop-pooled` **170,316 req/s** (`1.17 µs/req` over baseline), `/trusted` **142,813 req/s** (`1.13 µs/req` over noop-pooled), `/noop-fresh` **13,102 req/s**, `/ondemand` **12,609 req/s**; open-loop **103,026/s** (p50 0.84 ms, p99 2.83 ms, 0 dropped); TLS keep-alive **144,025 req/s**, handshake/req **26,229 req/s**, h2 **129,587 req/s**; WebSocket echo **211,337 msg/s** (1 KB) / **59,500 msg/s** (64 KB, 3,899 MB/s); footprint idle RSS **41,992 kB** (`~25.4 KB/conn`). All 21 charts in `performance/img/*.png` regenerated with `flint-chart-mcp` 1.0.1.
 
 ## 2026-09-29 (inline header hooks: dispatch floor reduction)
 
@@ -96,6 +87,10 @@ Methodology update establishing a new comparable series for upcoming runs:
 - **Three-valued gate verdict**: The T1 perf gate evaluates conservative uncertainty intervals (`[value - ci_half, value + ci_half]`) producing three-valued verdicts: `pass` (exit code 0), `fail` (exit code 1; dominates inconclusive), or `inconclusive` (exit code 2; interval straddles band edge, requiring a re-run).
 
 Numbers measured before this change (the 2026-09-25 snapshot and earlier) were taken with partial pinning and uncapped arenas outside the body phase, so footprint KB/conn and gate spreads are not directly comparable. The next T1 runs start a new comparable series.
+
+## 2026-08-15 (v0.9.0 snapshot)
+
+A full refresh of the fast path at commit `b2a89be` (**v0.9.0**): T2 `all`, T3 `v03`, the T1 `gate` three times, and both micro layers (criterion + gungraun instruction counts, each saved as a local `main` baseline). The harness repairs described next landed on top of that commit and touch no crate source, so every figure stands for v0.9.0 as shipped. **The 07-20 pass's harness contamination is fixed, and the rows it invalidated are trustworthy again.** Two defects compounded: the k6 scenarios' VU pools exceeded ADR 000092's per-source-IP connection cap (**256**/IP), and the scripts folded a status-less response — a connection the proxy never accepted — into a meaningful bucket (`mixed.js` counted anything not 200 as a short-circuit "reject"; `weighted-mix.js` fed its near-zero duration straight into the published percentiles). Both are repaired: every pool is now bounded below the cap (Little's law leaves them ample at loopback service times) and every scenario counts status-less responses in their own `no_status` bucket, reported in the CSVs so the artifact can never pass as signal again. **Every re-measured scenario reports `no_status` = 0 this pass**, and the corrected figures land back where the pre-cap 07-11 snapshot had them: the short-circuit mix reads its designed **90.0 % / 10.0 %** split (was 76 %/24 %), enforcement accounts for **all 150,000** offered requests (48.8 % were missing) and sheds **79.3 %** — the 07-11 figure to the decimal — and the light rate-limit key passes **500/500 untouched** (was 140/500). The `footprint` phase was repaired the same way — it asked for 1,000 connections, got the cap's 256, and then divided by 1,000 — and its corrected marginal cost (**~25.4 KB/conn**) returns to the historical figure. The one scenario still crossing the cap is the closed-loop **sweep** at VU 400/800, which does so *deliberately* (its whole point is the concurrency curve); under the cap it is failure-free. **Verdicts this pass**: T1 `gate` **PASS**, then **FAIL**, then **PASS** — the single excursion was `ratelimit_tax_us` at 4.88 µs against a 2.2–4.2 band, with the phase's other three same-day measurements at 3.11 / 3.42 / 3.79 µs. This host was *not* idle (a browser, cadvisor and a clickhouse-server were resident; 15-min load average ~10), which is the honest explanation for a between-session excursion the interleave cannot cancel; the band was left untouched.
 
 ## 2026-07-20 (v0.5.1/v0.5.2 patch confirmation)
 

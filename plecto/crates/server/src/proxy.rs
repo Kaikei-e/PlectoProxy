@@ -32,6 +32,7 @@ use crate::headers::{
     copy_headers, copy_headers_direct, headers_to_vec, normalize_ingress_authority, set_forwarded,
     to_http_request,
 };
+use crate::listener::ConnGuards;
 use crate::metrics::InspectionSkip;
 use crate::respond::{
     discard_upstream_body, fault, http_response, stream_response, stream_response_direct, synth,
@@ -61,8 +62,21 @@ pub(crate) async fn proxy_core(
     state: Arc<ServerState>,
     scheme: &'static str,
     peer: SocketAddr,
+    parts: hyper::http::request::Parts,
+    body: ReqBody,
+) -> Result<Response<ResponseBody>, ServerError> {
+    proxy_core_with_conn_guards(state, scheme, peer, parts, body, None).await
+}
+
+/// Like [`proxy_core`], carrying the TCP connection's admission guards (`ConnGuards`) so an
+/// HTTP/1.1 `101 Switching Protocols` upgrade can retain them inside its detached tunnel task.
+pub(crate) async fn proxy_core_with_conn_guards(
+    state: Arc<ServerState>,
+    scheme: &'static str,
+    peer: SocketAddr,
     mut parts: hyper::http::request::Parts,
     body: ReqBody,
+    conn_guards: Option<Arc<ConnGuards>>,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let admission = match state.request_limit.clone().try_acquire_owned() {
         Ok(permit) => Arc::new(permit),
@@ -163,6 +177,7 @@ pub(crate) async fn proxy_core(
             hyper::Request::from_parts(parts, body),
             &mut attribution,
             admission.clone(),
+            conn_guards,
         )
         .await
     } else {
@@ -211,6 +226,7 @@ pub(crate) async fn proxy_core(
 /// The transaction core proper: route → chain (request side) → forward → chain (response side).
 /// Takes the request head + a boxed body (so HTTP/1.1, HTTP/2 and HTTP/3 all share it) and returns
 /// the client-visible response. Errors here are upstream/transport failures the caller maps to 502.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_core_inner(
     state: Arc<ServerState>,
     scheme: &'static str,
@@ -219,6 +235,7 @@ async fn proxy_core_inner(
     request: hyper::Request<ReqBody>,
     attribution: &mut Attribution,
     admission: Arc<OwnedSemaphorePermit>,
+    conn_guards: Option<Arc<ConnGuards>>,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let (mut parts, body) = request.into_parts();
     let mut http_req = to_http_request(&parts, scheme);
@@ -497,6 +514,7 @@ async fn proxy_core_inner(
                 upstream_resp,
                 permit,
                 upstream_pick,
+                conn_guards,
             )
             .await
             .map(Routed::Synthesised);
@@ -782,6 +800,7 @@ fn upstream_switched_to(headers: &hyper::HeaderMap, token: &str) -> bool {
 /// `permit` is the breaker slot (ADR 000028) — nameable only as `impl Send` because the breaker
 /// module keeps its permit type private — and `pick` the LB in-flight guard; both move into the
 /// tunnel task so they live exactly as long as the tunnel.
+#[allow(clippy::too_many_arguments)]
 async fn upgrade_switch(
     state: &Arc<ServerState>,
     chain: &ChainRef<'_>,
@@ -790,6 +809,7 @@ async fn upgrade_switch(
     mut upstream_resp: Response<ResponseBody>,
     permit: impl Send + 'static,
     pick: plecto_control::Pick,
+    conn_guards: Option<Arc<ConnGuards>>,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let Some((token, downstream_on, idle)) = upgrade else {
         // A 101 the client never solicited (or an unlisted token): relaying it would hand
@@ -885,9 +905,11 @@ async fn upgrade_switch(
     let admission = chain.admission.clone();
     tokio::spawn(async move {
         // Long-lived tunnels stay inside the existing resource accounting (ADR 000048): the
-        // breaker permit (ADR 000028), the LB pick guard (least-request in-flight) and the
-        // `tunnels_active` gauge guard (ADR 000059) live exactly as long as the tunnel, and
-        // the drain flag closes it at shutdown. The byte totals are recorded once, at close.
+        // connection guards (`MAX_CONNECTIONS` + per-IP slot), the breaker permit (ADR 000028),
+        // the LB pick guard (least-request in-flight) and the `tunnels_active` gauge guard
+        // (ADR 000059) live exactly as long as the tunnel, and the drain flag closes it at
+        // shutdown. The byte totals are recorded once, at close.
+        let _conn_guards = conn_guards;
         let _permit = permit;
         let _pick = pick;
         let _active = tunnel_active;

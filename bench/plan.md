@@ -43,7 +43,7 @@ TIER 表（`TIER=gate|report`）1 箇所で管理する。
 | phase | tier | subject | generator | 出力 | invariant |
 | --- | --- | --- | --- | --- | --- |
 | `quick` | T0 | ceiling 1 点 + idle RSS の smoke check（~1 分、k6/Docker 不要） | oha | （非追跡・console のみ） | 動作確認のみ |
-| `gate` | T1 | **変更ごとの回帰ゲート**（~6–7 分）: dispatch floor / apikey cost の A/B/C interleave ×3、固定 2,000 rps tail（+ `resp-ctx`）、rate-limit tax ×2、enforcement 10 s、RR、圧縮 ejection 40 s | oha + k6 + loadgen | `gate.csv`（invariant, value, ci_half, band, verdict） | **機械判定**: 全 invariant が [`perf/gate_tolerances.toml`](perf/gate_tolerances.toml) の帯内 → exit 0 |
+| `gate` | T1 | **変更ごとの回帰ゲート**（~7 分）: dispatch floor / apikey cost の paired A/B/C ×8 round（4 s、偶数 round で順序反転）、固定 2,000 rps tail（+ `resp-ctx`）、rate-limit tax paired ×8（3 s）、固定 20k/s の CPU-µs/req ×4（info）、enforcement 10 s、RR、圧縮 ejection 40 s。INCONCLUSIVE 後は `GATE_POOL_FROM=<RUN_DIR>` で round をプールして再判定 | oha + k6 + loadgen | `gate.csv`（invariant, value, ci_half = 95 % t 半幅, band, verdict, n） | **機械判定**: 全 invariant の 95 % 区間が [`perf/gate_tolerances.toml`](perf/gate_tolerances.toml) の帯内 → exit 0 |
 | `industry` | T2 束 | RFC 9411 形のコア KPI 束: RR/CRR ceiling + open-loop latency + mix | oha + loadgen + k6 | `ceiling.csv`, `openloop.json`, `mix.csv` | 方法論の最短回帰。詳細は `all` |
 
 ### Fast path（native）
@@ -87,7 +87,7 @@ TIER 表（`TIER=gate|report`）1 箇所で管理する。
 | phase | tier | subject | generator | 出力 | invariant |
 | --- | --- | --- | --- | --- | --- |
 | `mix` | T2 | 重み付き request mix（60/25/10/5 read/auth/write/large）+ 同レート read-only 対照 | k6 constant-arrival-rate | `mix.csv` | blend のコストが offered load ではなく traffic 構成に帰属する |
-| `h3` | T2（負荷は T3 予定） | HTTP/3 の機能確認のみ（負荷は deferred — oha/k6 に native H3 無し。h2load `--npn-list h3` 等が候補） | curl `--http3-only` | `h3.txt` | status=200 http_version=3 |
+| `h3` | T2（負荷は T3 予定） | HTTP/3 の機能確認のみ（負荷は deferred — k6 に native H3 無し。`oha --features http3` / `h2load --alpn-list=h3` / `plecto-loadgen` 等が候補） | curl `--http3-only` | `h3.txt` | status=200 http_version=3 |
 
 ## 実行
 
@@ -100,7 +100,8 @@ cd plecto && cargo build --release -p plecto-server --features bench-harnesses \
 # 1 phase か all。proxy を core 集合へ、generator を互いに素な集合へ pin して performance/data/*.csv を出力。
 # phases: quick gate ceiling sweep openloop rr ejection swap wasm v03 tls h3 ws footprint ratelimit body mix industry all
 bash bench/perf/run-perf.sh all      # T2 report（`just report`）。BACKEND_LATENCY_MS=0 の
-                                     # bench-server 系 4 phase は 1 起動を共有する
+                                     # bench-server 系 4 phase は 2 起動（footprint+ceiling、および
+                                     # クリーンな idle RSS 用の再起動を挟む ws+wasm）を共有する
 # 変更ごとの回帰ゲート（T1、機械判定。band: bench/perf/gate_tolerances.toml）
 bash bench/perf/run-perf.sh gate     # `just gate`。exit 0 = 全 invariant が帯内
 

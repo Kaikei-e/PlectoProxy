@@ -4,8 +4,18 @@
 #
 # Bands are host-relative (loopback, no governor pinning): these initial values are calibrated
 # from the 2026-07-11 report snapshots on the reference host. On a new host, run the gate 2-3
-# times, read gate.csv's value/ci_half columns, and re-centre lo/hi around them (half-width
-# guidance: >= 3x the observed interleave half-range). Prefer DELTAS (µs/req, ms) over absolute
+# times, read gate.csv's value/ci_half/n columns, and re-centre lo/hi around them.
+#
+# `ci_half` semantics (since ADR 000122): the two-sided 95% Student-t half-width of the mean of the
+# n per-round PAIRED deltas, `t_{0.975,n-1} * s / sqrt(n)`, with `n` reported in the last column.
+# A verdict is `pass` only if the whole interval lies inside the band. Historical half-widths quoted
+# in the comments below (e.g. "1.4386 ± 0.1045") are the OLD sample half-range `(max - min) / 2`
+# over 2-3 rounds — roughly ±1 SE, NOT a 95% interval; re-judging the archived 2026-10-21..24 raw
+# rounds with the t interval (n = 2..3) turns all five INCONCLUSIVE on ratelimit_tax_us against the
+# then-current 0.9..2.4 band (three of five against today's 0.5..2.4). That is why the gate now runs
+# ROUNDS = 8 short paired rounds (t/sqrt(n) = 0.84 vs 2.48 at n = 3). Band edges were set with the old
+# half-range rule (centre ± >= 3x half-range) and are kept as-is until n = 8 runs give calibrated
+# spreads — except ratelimit_tax_us's lower edge, moved on 2026-10-25 (see its entry). Prefer DELTAS (µs/req, ms) over absolute
 # throughput — they survive host drift far better; see bench/methodology.md § Measurement tiers.
 
 # noop-pooled − baseline, closed-loop µs/req (interleaved mean): the WASM dispatch floor.
@@ -79,13 +89,44 @@ hi = 0.25
 # 2026-10-21 (wasmtime 50.0.0): Criterion on_request/trusted_pooled improved -9.4% (2.271 → 2.091 µs)
 # and T1 gate landed at 1.1752 ± 0.0282 µs, straddling lo = 1.2 from below. Lower lo 1.2 → 0.9
 # (matching dispatch_floor_us lo = 0.9) while keeping hi = 2.4.
+# 2026-10-24 (ADR 000122): this closed-loop k6 delta is NOT additive with dispatch_floor_us (oha):
+# the k6 /baseline arm runs near the generator's own ceiling (~150k rps vs oha's ~213k in the 10-24
+# confirmation run), which plausibly lets generator slack absorb part of the filter's work — the tax
+# reads BELOW the same run's floor in 7 of 9 gate runs (1.20 vs 1.29 there). Track it for regressions
+# only; the CPU row below is a candidate generator-independent read (additivity not yet verified).
+# 2026-10-25 (first 8-round paired runs, 95 % t interval): 1.0768 ± 0.1538, 1.0183 ± 0.2610, 1.0964 ± 0.3878
+# (pooled n = 24: 1.0638 ± 0.1378). Two of three single runs were INCONCLUSIVE only because the interval's
+# lower edge (0.757 / 0.709) dipped under lo = 0.9 — i.e. on the FAST side. lo moves 0.9 → 0.5 (below the
+# lowest observed lower edge 0.709, rounded outward). This only admits a cheaper tax; the slow-side guard
+# hi = 2.4 (a blocking-pool regression reads ~4.6 µs) is unchanged, and "the filter silently stopped
+# limiting" is caught by enforce_allowed_ratio, not by this lower edge. Confirmed by an independent
+# holdout gate run (`20261025T061734Z`, n = 8, no pooling): PASS on all 10 invariants (`ratelimit_tax_us`
+# 1.4863 ± 0.5407 µs, `dispatch_floor_us` 1.1652 ± 0.1237 µs, `apikey_cost_us` 1.0562 ± 0.0918 µs).
 [ratelimit_tax_us]
-lo = 0.9
+lo = 0.5
 hi = 2.4
 
-# Enforcement convergence: allowed_rps / (refill + capacity/window). The initial burst drains the
-# full bucket into the window, so the expectation depends on the window length — the params here
-# MUST match phase_gate's launch env and D_ENF.
+# CPU-µs/req (ADR 000122): /ratelimit − /baseline proxy CPU time per completed request at a FIXED
+# 20k/s (k6 constant-arrival-rate, well below saturation; /proc/<pid>/task/*/schedstat around each
+# arm). Reported as `info` (with `baseline_cpu_us_per_req`, whose absolute value includes the
+# in-process mock upstream) until calibrated. To promote it to a judged invariant, add
+#   [ratelimit_cpu_us_per_req]
+#   lo = ...
+#   hi = ...
+# here after >= 3 gate runs on the reference host; gate_verdict.py judges any row that has a band.
+# 2026-10-25 (first run, 20261025T052103Z, n = 4): +14.29 ± 1.54 µs over a 32.66 µs/req baseline;
+# 3-run pooled (n = 12): +15.27 ± 0.97 µs over 32.35 ± 0.39 µs; holdout (`20261025T061734Z`, n = 4,
+# with 11 s pre-window settle so zero threads exit mid-window): +18.34 ± 0.80 µs over 34.52 ± 0.68 µs.
+
+# Enforcement convergence: allowed_rps / ((capacity + max(0, window_s - 1) * refill_per_s) / window_s).
+# In plecto-host (`apply_bucket`), token refills happen in discrete integer multiples of
+# `refill_interval_ms = 1000` (`intervals = elapsed / 1000`). Over `window_s` seconds, after the
+# initial burst of `capacity` (2,000) is drained at t=0, the bucket experiences `window_s - 1`
+# discrete 1 s refill ticks (9 ticks in 10 s -> 2,000 + 9 * 1,000 = 11,000 tokens = 1,100 req/s)
+# because the tick at t = window_s coincides with the end of the test window. Before ADR 000122 the
+# expectation used the continuous approximation refill + capacity / window_s (1,200 req/s), which is
+# why every historical gate.csv reads 0.9166 for a correctly behaving bucket; the band itself was
+# already 0.90..1.10 and is unchanged. The params here MUST match phase_gate's launch env and D_ENF.
 [enforce_allowed_ratio]
 refill_per_s = 1000
 capacity = 2000

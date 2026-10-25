@@ -25,7 +25,7 @@ Numeric snapshots live in [`../performance/README.md`](../performance/README.md)
 - 飽和時の p99 をサービスレイテンシとして読まない。
 - generator が先に溶けると tail は proxy ではなく generator の待ち行列になる。
 - k6 latency は iteration 時間であり wrk2 schedule-latency とは定義が違う（`OPENLOOP_GEN=k6` は A/B 用）。
-- HTTP/3 *load* は oha/k6 に native H3 が無く deferred（機能確認のみ）。
+- HTTP/3 *load* は既定ビルドの oha/k6 に native H3 が無く deferred（機能確認のみ。`oha --features http3` や `h2load --alpn-list=h3` 等が候補）。
 - loopback は latency を過小評価する。絶対値は回帰用下界。
 
 ### 推奨アクション（実装済み）
@@ -88,17 +88,48 @@ Numeric snapshots live in [`../performance/README.md`](../performance/README.md)
 単発 30–60 s 窓は分散推定を持たない**点推定**で、run-to-run 変動（clock / thermal / 隣接負荷）
 をそのまま食らう。warm-up 除外済みの loopback 定常状態では percentile のサンプリング誤差は
 ~10 s で既に無視でき、残る変動はホスト状態由来——これは窓を伸ばしても消えない（同じホスト状態を
-長く見るだけ）。同じ総時間なら **短い窓 × 複数 round の A/B/C interleave** に振り替えるほうが、
-遅いドリフトが round 内でペア化されて隣接差分から相殺され、round 間の広がり（mean ± half-range）
-という信頼幅まで手に入る。反復をどのレベルに配分すべきかの一般論は Kalibera & Jones,
+長く見るだけ）。同じ総時間なら **短い窓 × 複数 round の対応のある（paired）A/B/C 設計** に振り替えるほうが、
+遅いドリフトが round 内でペア化されて round 内差分から相殺され、round 間の広がりから信頼区間まで手に入る。
+反復をどのレベルに配分すべきかの一般論は Kalibera & Jones,
 *Rigorous Benchmarking in Reasonable Time* (ISMM 2013) に従う。
 
+**区間の定義（ADR 000122 で改訂）。** `gate.csv` の `ci_half` は、round ごとの差分 $d_1..d_n$ の平均に対する
+両側 95 % Student-t 半幅 $t_{0.975,n-1}\cdot s/\sqrt{n}$（$s$ は標本標準偏差）で、`n` 列に round 数を出す。
+改訂前は 2–3 round の標本半範囲 `(max - min) / 2` を使っており、これは $n=2$ でちょうど $1\,\text{SE}$
+（$t_1$ 下の被覆率 50 %）に過ぎず、95 % 区間ではなかった。半幅の倍率 $t_{0.975,n-1}/\sqrt{n}$ は
+$n=2$ で 8.99、$n=3$ で 2.48、$n=8$ で 0.84 と急速に縮むため、gate は **8 round × 短窓**（ladder 4 s、
+rate-limit 3 s）を既定とし、偶数 round では rung の順序を反転して順序効果を相殺する。総計測時間は
+ladder 90 s → 96 s、rate-limit 対 60 s → 66 s 程度で、CPU-µs/req の 4 対（24 s）を加えても gate 全体
+（計測窓の合計 ~265 s → ~300 s）でおよそ +15 % に収まる。保存済みの 2026-10-21〜24 の生 round を t 区間で再判定すると、`ratelimit_tax_us` は
+当時の帯 `0.9..2.4` に対して 5 run すべてが INCONCLUSIVE になる（例: 確認 run `1.1967 ± 0.8007 µs`、$n=2$。
+2026-10-25 以降の帯 `0.5..2.4` でも 5 run 中 3 run が INCONCLUSIVE）——旧 half-range が判定力を
+過大に見せていたことの実データでの確認である。
+
+**再実行はプールし、置き換えない。** INCONCLUSIVE の後に再実行して PASS が出た run だけを採用すると、
+「通るまで回す」選択バイアスになる。`GATE_POOL_FROM=<前回の RUN_DIR>[:<さらに前>...] bash bench/perf/run-perf.sh gate`
+で再実行すると、`gate_verdict.py` は前回 run の round 生データを今回の round と合わせて 1 つの推定にする
+（`build_id.txt` = 計測したハーネス binary の SHA-256 が一致しない run とはプールを拒否、exit 64）。
+INCONCLUSIVE 時のメッセージもこの手順を案内する。
+
 gate の測定項目は performance/README.md が invariant と宣言しているものに 1:1 対応する:
-dispatch floor / apikey cost（µs/req, interleave ×3）、固定レート tail p50（+ `resp-ctx`）、
-rate-limit tax（interleave ×2）、enforcement 収束（バケット数学は 2–3 s で収束するので 10 s）、
+dispatch floor / apikey cost（µs/req, paired ×8）、固定レート tail p50（+ `resp-ctx`）、
+rate-limit tax（paired ×8）、enforcement 収束（バケット数学は 2–3 s で収束するので 10 s）、
 RR 正確性、圧縮 ejection タイムライン（eject@10 / rejoin@18 / eject-all@26 / restore@32、40 s）。
 判定帯は [`perf/gate_tolerances.toml`](perf/gate_tolerances.toml)（リポジトリ追跡——**性能の期待値
 変更は PR でレビューされる**）、照合は [`perf/gate_verdict.py`](perf/gate_verdict.py)。
+
+**rate-limit tax は dispatch floor と加法的ではない。** `ratelimit_tax_us`（k6 閉ループ）は ADR 000119 以降の
+gate 9 run 中 7 run で同じ run の `dispatch_floor_us`（oha）より小さく出る（2026-10-24 確認 run: 1.20 vs 1.29 µs。
+例外は `20261024T033147Z` の 1.30 vs 1.14 と holdout `20261025T061734Z` の 1.49 vs 1.17）。k6 の `/baseline` 腕は ~117k–155k rps と生成器自身の天井付近で走る
+（oha は ~213k rps）ため、フィルタの仕事の一部が生成器側の待ちの減少に吸収され、逆スループット差分が圧縮される
+と考えられる（推論であり分解は計測していない。生成器の異なる差分どうしは足し引きできない）。そこで gate は
+生成器に依存しない **CPU-µs/req** を加法的な不変量の候補として併測する（加法性はまだ検証していない。低負荷ではウェイクアップや受け渡しのコストが乗りうる）: 飽和より十分下の固定レート（既定 20k/s、
+[`perf/ratelimit-cpu.js`](perf/ratelimit-cpu.js) の constant-arrival-rate、VU は per-IP 上限 256 未満）で
+`/baseline` と `/ratelimit` を交互に流し、各腕の前後で [`perf/proc_cpu.py`](perf/proc_cpu.py) が
+`/proc/<pid>/task/*/schedstat` を採取して、プロキシ CPU 時間 ÷ 完了要求数を出す（計測窓内でスレッドが
+終了した場合は `/proc/<pid>/stat` の utime+stime にフォールバック）。絶対値は in-process mock upstream の分を
+含むが、`ratelimit_cpu_us_per_req`（差分）では相殺される。較正が済むまでは `info` 行（判定しない）で、
+`gate_tolerances.toml` に帯を足した時点で判定対象になる。
 
 固定レート tail は report tier の「slowest rung の 60 % 自動導出」ではなく **2,000 rps 定数**。
 自動導出は rung 構成が変わるたびに offered rate が変わり snapshot 間比較を壊す；gate は fresh
@@ -121,6 +152,23 @@ gungraun の instruction ジョブが **main push で baseline を保存し、PR
 criterion を CI の閾値判定に使わない方針は criterion 公式 FAQ の推奨どおり。
 （[gungraun](https://github.com/gungraun/gungraun), Tier S;
 [criterion FAQ](https://bheisler.github.io/criterion.rs/book/faq.html), Tier S）
+
+**二層の自己整合チェック。** 両層は同じ 1 回の呼び出しを測っているはずなので、命令数は
+「Criterion の時間 × クロック × 現実的な IPC 上限」を超えられない。v0.9.0 の表（`on_request` pooled
+507,977 命令 vs Criterion 2.88 µs）は 5.4 GHz でも IPC ≈ 33 を要求し、物理的に不可能だった——原因は
+fixture の teardown が callgrind 区間内にあったこと（`wasm_inst` は ADR 000113、`fastpath_inst` は
+ADR 000122 で区間外へ移した）。同種の混入を機械的に捕まえるため
+[`perf/ipc_check.py`](perf/ipc_check.py) を置く: `plecto/target/gungraun/**`（スレッド別ファイルの Ir を合算）と
+`plecto/target/criterion/**/new/estimates.json` を対応づけ、`Ir / (ns × GHz) > 5` を違反として非ゼロ終了する
+（`--ghz` 既定は基準ホスト P コアの最大 5.4 GHz。実クロックが低いほど真の IPC は高くなるので、既定値は誤検出より
+見逃し側に倒れる）。CI は Criterion を回さないため任意手順とし、両層をローカルで回した後に
+`python3 bench/perf/ipc_check.py` を実行する。片方のデータが無い組は `skip` と表示して判定しない。
+
+**K 回ループ化はしない（判断）。** 固定費に埋もれないよう 1 ベンチ内で K 回呼ぶ形も検討したが採らない。
+CI の `ir=5%` ソフトリミットは main で保存した baseline との比較なので、K 倍化した最初の PR が必ず上限を
+踏む。さらに現行の「setup で 1 回温めてから 1 回呼び、fixture を返して drop を区間外へ出す」形で固定費は
+既に区間外にあり、`ir=5%` は `on_request` pooled（30,448 命令）で約 1.5k 命令——ホットパス 1 回分より
+桁違いに小さく、退行検知の感度として十分である。
 
 ### 依存 bump の再ベースライン手順
 
@@ -272,6 +320,9 @@ enforcement は offered の 48.8 % を失い、fairness の light key は 500/s 
 
 同じ理由で `footprint` phase も接続数を 250（上限未満）に落とし、bytes/conn の除数を「要求数」ではなく
 **生成器が実際に開いたと報告した数**に変えた。要求数で割ると、拒否された分だけ小さい値を publish してしまう。
+同様に `ws` phase（Part 10.2 tunnel footprint）も、`101 Switching Protocols` 後のトンネルタスクが `ConnGuards`（`MAX_CONNECTIONS` permit + `PerIpConnGuard`）をトンネル終了まで保持する修正に伴い、以下の衛生管理を徹底する:
+- `10.1 handshake`（10,000 回の Upgrade バースト）の直後に測ると `idle_rss` が 34.5 MB 高く出た（アロケータが解放済みメモリを保持している分と推定。使用中バイトは未計測）。後続トンネルがそれを再利用して限界 RSS 増分を過小評価しないよう、`phase_ws` 冒頭で `stop_proxy` して新規起動した直後のクリーンな `bench-server` に対して **`10.2 tunnel footprint` を最初に実行**する。
+- トンネル保持数は per-IP 上限（256）未満の `--conns 250` とし、`loadgen ws --mode hold` が実際に確立・保持したと報告した `held` 数で RSS 差分を除算する。
 
 ### 情報の鮮度
 
@@ -307,10 +358,10 @@ enforcement は offered の 48.8 % を失い、fairness の light key は 500/s 
    - ホスト指紋 `$RUN_DIR/host.txt`（UTC 時刻、git revision + dirty、OS / カーネル major.minor、メモリ量、lscpu の許可リスト項目とトポロジ、scaling_governor、boost/turbo、smt、アフィニティ分割、ツールバージョン）を記録。Release に添付される前提で許可リスト方式にしており、ホスト名・カーネルのビルド文字列・脆弱性ごとの緩和状態は載せない（署名を行うマシンのパッチ水準を公開しないため）。緩和策は性能に効く唯一の区別として、`/proc/cmdline` の `mitigations=` 上書きの有無だけを残す。
    - `just perf-archive` により run ディレクトリを `.tar.gz` に固めて GitHub Release 添付用にパッケージ可能にした。
 5. **3 値判定ゲート (T1 gate)**:
-   - `gate_verdict.py` は保守的不確実性幅 `[value - ci_half, value + ci_half]` を評価し、3 値を返す:
+   - `gate_verdict.py` は不確実性区間 `[value - ci_half, value + ci_half]` を評価し、3 値を返す（この時点の `ci_half` は 2–3 round の標本半範囲 `(max - min) / 2` で、$n=2$ では $1\text{ SE}$ 相当に過ぎなかった。ADR 000122 で paired round の 95 % Student-t 半幅に改訂——§ T1 gate の統計設計）:
      - `pass` (exit code 0): 不確実性区間が許容帯 `[band_lo, band_hi]` に収まる。
      - `fail` (exit code 1): 区間が帯の外側に外れる（fail は inconclusive に優先）。
-     - `inconclusive` (exit code 2): 帯の境界を跨ぐ。`gate INCONCLUSIVE — re-run` を出力し再計測を要求（自動再実行は行わない）。
+     - `inconclusive` (exit code 2): 帯の境界を跨ぐ。再計測を要求（自動再実行は行わない。ADR 000122 以降は `GATE_POOL_FROM` で前回 run の round をプールして再判定する）。
    - `Report.dump` のサマリ行は stderr へ出力し、`gate.csv` の純粋な CSV フォーマットを維持する。
 
 ### 比較可能性についての注意

@@ -94,9 +94,9 @@ export function handleSummary(data) {
     limited: data.metrics.limited_429 ? data.metrics.limited_429.values.count : 0,
     no_status: data.metrics.no_status ? data.metrics.no_status.values.count : 0,
     read_p50: rd.med || 0, read_p99: rd["p(99)"] || 0, read_p99_9: rd["p(99.9)"] || 0,
-    auth_p50: au.med || 0, auth_p99: au["p(99)"] || 0,
-    write_p50: wr.med || 0, write_p99: wr["p(99)"] || 0,
-    large_p50: lg.med || 0, large_p99: lg["p(99)"] || 0,
+    auth_p50: au.med || 0, auth_p99: au["p(99)"] || 0, auth_p99_9: au["p(99.9)"] || 0,
+    write_p50: wr.med || 0, write_p99: wr["p(99)"] || 0, write_p99_9: wr["p(99.9)"] || 0,
+    large_p50: lg.med || 0, large_p99: lg["p(99)"] || 0, large_p99_9: lg["p(99.9)"] || 0,
   };
   const line = `\nweighted ${PROFILE} @ ${Math.round(out.offered_rps)} rps: ` +
     `read p99=${out.read_p99.toFixed(2)}ms  auth p99=${out.auth_p99.toFixed(2)}ms  ` +

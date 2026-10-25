@@ -14,7 +14,8 @@ use hyper::{Request, Response, StatusCode};
 use crate::ResponseBody;
 use crate::ServerState;
 use crate::body::box_incoming;
-use crate::proxy::proxy_core;
+use crate::listener::ConnGuards;
+use crate::proxy::proxy_core_with_conn_guards;
 use crate::respond::{fault, synth};
 
 /// The hyper service entry: never fails the connection (a proxy synthesises an error response
@@ -26,17 +27,26 @@ pub(crate) async fn handle(
     scheme: &'static str,
     peer: SocketAddr,
     req: Request<Incoming>,
+    conn_guards: Option<Arc<ConnGuards>>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     // adapt the hyper inbound body (HTTP/1.1 + HTTP/2) into the transport-agnostic `ReqBody`.
     let (parts, incoming) = req.into_parts();
-    let mut resp =
-        match proxy_core(state.clone(), scheme, peer, parts, box_incoming(incoming)).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!(error = %e, "fast-path error");
-                synth(StatusCode::BAD_GATEWAY, &fault::UPSTREAM, b"upstream error")
-            }
-        };
+    let mut resp = match proxy_core_with_conn_guards(
+        state.clone(),
+        scheme,
+        peer,
+        parts,
+        box_incoming(incoming),
+        conn_guards,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(error = %e, "fast-path error");
+            synth(StatusCode::BAD_GATEWAY, &fault::UPSTREAM, b"upstream error")
+        }
+    };
     attach_alt_svc(&mut resp, state.alt_svc.as_ref());
     Ok(resp)
 }

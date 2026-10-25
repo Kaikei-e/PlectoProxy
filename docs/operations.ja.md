@@ -109,8 +109,8 @@ stop_grace_period: 12s   # > readiness_grace_ms + window_ms
 admin `/metrics` は RED シグナルに加えて次を出す:
 
 - `plecto_requests_in_flight` — 現在処理中のリクエスト。drain はこれの完走を待つ。
-- `plecto_tunnels_active` — 現在開いている Upgrade トンネル（[ADR 000048](ADR/000048.md)）。
-  各トンネルは生存期間中ずっと circuit breaker permit と LB pick を専有するので、リクエスト量に
+- `plecto_tunnels_active` — 現在開いている Upgrade トンネル（[ADR 000048](ADR/000048.md), [ADR 000122](ADR/000122.md)）。
+  各トンネルは生存期間中ずっと全体および送信元 IP 別の接続スロット、circuit breaker permit、LB pick を専有するので、リクエスト量に
   見合わず breaker が開く / least-request が偏るときに最初に見るべきゲージ。drain が何本の
   トンネルを切ることになるかもここでわかる。
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — トンネルが中継した

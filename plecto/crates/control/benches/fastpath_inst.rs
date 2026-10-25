@@ -45,7 +45,11 @@ fn group(algo: &str, hash: &str) -> Arc<UpstreamGroup> {
             inst.record_probe_success();
         }
     }
-    reg.group("pool").expect("pool group")
+    let g = reg.group("pool").expect("pool group");
+    let _ = g.pick(Some(HashInput::Ip(IpAddr::V4(Ipv4Addr::new(
+        203, 0, 113, 7,
+    )))));
+    g
 }
 
 fn rr_group() -> Arc<UpstreamGroup> {
@@ -66,15 +70,18 @@ fn maglev_group() -> Arc<UpstreamGroup> {
 #[library_benchmark]
 #[bench::round_robin(setup = rr_group)]
 #[bench::least_request_p2c(setup = p2c_group)]
-fn lb_pick(group: Arc<UpstreamGroup>) {
+fn lb_pick(group: Arc<UpstreamGroup>) -> Arc<UpstreamGroup> {
+    // Returned so the harness drops `group` OUTSIDE the measured region (ADR 000113).
     let _ = black_box(group.pick(None));
+    group
 }
 
 #[library_benchmark]
 #[bench::source_ip(setup = maglev_group)]
-fn lb_pick_maglev(group: Arc<UpstreamGroup>) {
+fn lb_pick_maglev(group: Arc<UpstreamGroup>) -> Arc<UpstreamGroup> {
     let key = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
     let _ = black_box(group.pick(Some(HashInput::Ip(key))));
+    group
 }
 
 library_benchmark_group!(name = fastpath_inst, benchmarks = [lb_pick, lb_pick_maglev]);

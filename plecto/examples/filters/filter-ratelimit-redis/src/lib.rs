@@ -1,7 +1,7 @@
 //! filter-ratelimit-redis — the **global layer** of Plecto's local-floor × global two-tier
 //! rate-limit model (ADR 000061). The native fast-path token bucket (ADR 000033) is the
 //! per-replica flood floor; this filter is the reference implementation of the fleet-wide layer
-//! Fork 6 ([[000053]]) always pointed at: shared state belongs in the extension plane, consulted
+//! Fork 6 (ADR 000053) always pointed at: shared state belongs in the extension plane, consulted
 //! over a RESP-compatible store (Redis, Valkey, ...) — never native (declined in ADR 000053/000060).
 //!
 //! Algorithm: a general, textbook **fixed-window counter** — `INCRBY key cost` (atomic in Redis)

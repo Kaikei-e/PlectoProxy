@@ -367,3 +367,169 @@ path_prefix = "/plain"
     .await
     .expect("the plain route never served the normal (non-upgrade) response");
 }
+
+#[tokio::test]
+async fn upgraded_tunnels_hold_their_per_ip_connection_slot_until_closed() {
+    // ~4 fds per held tunnel (client socket, accepted socket, upstream connect, upstream accept)
+    // all live in this one test process: ~1,030 for 256 tunnels, above a 1,024 soft RLIMIT_NOFILE
+    // default. Raise soft→hard like the binary does, and skip with a reason if that is not enough
+    // (an EMFILE at accept would otherwise surface as an opaque 15 s timeout).
+    #[cfg(unix)]
+    {
+        plecto_server::raise_nofile_limit();
+        let soft = nofile_soft_limit();
+        if soft < 2048 {
+            eprintln!("skipping: RLIMIT_NOFILE soft limit {soft} < 2048 needed for 256 tunnels");
+            return;
+        }
+    }
+    // Regression test for ADR 000048 + ADR 000092: hyper's `serve_connection().with_upgrades()`
+    // returns as soon as the 101 headers are written and the upgraded I/O is handed to
+    // `OnUpgrade`. Both the global `MAX_CONNECTIONS` permit and the per-source-IP
+    // `MAX_CONNECTIONS_PER_IP` (256) guard must move into the spawned tunnel task (`ConnGuards`),
+    // otherwise a single IP can open >256 concurrent WebSocket tunnels once the 101 completes.
+    let upstream = spawn_echo_upgrade_upstream().await;
+    let toml = format!(
+        r#"
+[[upstream]]
+name = "ws"
+addresses = ["127.0.0.1:{port}"]
+[upstream.health]
+path = "/healthz"
+interval_ms = 50
+healthy_threshold = 1
+
+[[route]]
+upstream = "ws"
+[route.match]
+path_prefix = "/ws"
+[route.upgrade]
+protocols = ["websocket"]
+"#,
+        port = upstream.port()
+    );
+    let proxy = spawn_proxy(&toml).await;
+
+    const CAP: usize = 256;
+    let mut tunnels = Vec::with_capacity(CAP);
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        // Wait for upstream health probe to promote the backend, then open the first tunnel.
+        let first = loop {
+            let mut s = TcpStream::connect(proxy).await.unwrap();
+            s.write_all(
+                b"GET /ws HTTP/1.1\r\n\
+                  host: e2e\r\n\
+                  connection: upgrade\r\n\
+                  upgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let head = String::from_utf8_lossy(&read_head(&mut s).await).to_string();
+            if head.starts_with("HTTP/1.1 101") {
+                break s;
+            }
+            // Release this attempt's per-IP slot deterministically before retrying: half-close and
+            // read to EOF, so the server-side connection task (and its `ConnGuards`) has finished
+            // before the next connect — otherwise a stale slot could make tunnel #256 look refused.
+            let _ = s.shutdown().await;
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink).await;
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        tunnels.push(first);
+
+        for _ in 1..CAP {
+            let mut s = TcpStream::connect(proxy).await.unwrap();
+            s.write_all(
+                b"GET /ws HTTP/1.1\r\n\
+                  host: e2e\r\n\
+                  connection: upgrade\r\n\
+                  upgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let head = String::from_utf8_lossy(&read_head(&mut s).await).to_string();
+            assert!(
+                head.starts_with("HTTP/1.1 101"),
+                "tunnel #{} should upgrade cleanly, got: {head}",
+                tunnels.len() + 1
+            );
+            tunnels.push(s);
+        }
+
+        // Round-trip a byte on the first and last tunnels: `hyper::upgrade::on(req)` resolves only
+        // after `serve_connection().with_upgrades()` finishes and returns, so a successful tunnel
+        // echo proves `serve_conn` has exited and only the spawned tunnel task holds `ConnGuards`.
+        for idx in [0, CAP - 1] {
+            tunnels[idx].write_all(b"x").await.unwrap();
+            let mut echo = [0u8; 1];
+            tunnels[idx].read_exact(&mut echo).await.unwrap();
+            assert_eq!(&echo, b"x");
+        }
+
+        // The 257th connection from the same loopback source IP must be refused at admission
+        // (closed without an HTTP response).
+        let mut over = TcpStream::connect(proxy).await.unwrap();
+        let _ = over
+            .write_all(
+                b"GET /ws HTTP/1.1\r\n\
+                  host: e2e\r\n\
+                  connection: upgrade\r\n\
+                  upgrade: websocket\r\n\r\n",
+            )
+            .await;
+        let mut buf = [0u8; 256];
+        match over.read(&mut buf).await {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!(
+                "257th connection while 256 tunnels are held must be refused, got: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+        }
+
+        // Dropping one tunnel releases its per-IP slot once the tunnel task observes EOF and exits.
+        drop(tunnels.pop());
+        loop {
+            let mut recovered = TcpStream::connect(proxy).await.unwrap();
+            if recovered
+                .write_all(
+                    b"GET /ws HTTP/1.1\r\n\
+                      host: e2e\r\n\
+                      connection: upgrade\r\n\
+                      upgrade: websocket\r\n\r\n",
+                )
+                .await
+                .is_ok()
+            {
+                let mut rbuf = [0u8; 256];
+                if let Ok(n) = recovered.read(&mut rbuf).await
+                    && n > 0
+                {
+                    let head = String::from_utf8_lossy(&rbuf[..n]);
+                    if head.starts_with("HTTP/1.1 101") {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("per-IP cap across upgraded tunnels test timed out");
+}
+
+/// Current soft `RLIMIT_NOFILE` (after `raise_nofile_limit`), for the fd-hungry tunnel test.
+#[cfg(unix)]
+fn nofile_soft_limit() -> libc::rlim_t {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct we pass; RLIMIT_NOFILE is a valid resource.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return 0;
+    }
+    lim.rlim_cur
+}

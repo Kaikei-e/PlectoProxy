@@ -19,14 +19,24 @@ use tokio::sync::watch;
 /// Await both halves of the switch and splice them. Failing to obtain either upgraded connection
 /// (the client vanished before the 101 landed, or the upstream reneged) just drops both ends —
 /// there is no client to answer anymore. Returns the `(down, up)` byte totals the tunnel relayed
-/// (ADR 000059) — `(0, 0)` when it never established.
+/// (ADR 000059) — `(0, 0)` when it never established. The wait for both halves also observes the
+/// drain flag (ADR 000122): the tunnel task holds the connection's admission guards, and graceful
+/// shutdown waits for every `MAX_CONNECTIONS` permit, so a half-switched tunnel must not be able to
+/// stall the drain.
 pub(crate) async fn run(
     downstream: hyper::upgrade::OnUpgrade,
     upstream: hyper::upgrade::OnUpgrade,
     idle_timeout: Option<Duration>,
-    drain: watch::Receiver<bool>,
+    mut drain: watch::Receiver<bool>,
 ) -> (u64, u64) {
-    let (down, up) = match tokio::join!(downstream, upstream) {
+    let joined = tokio::select! {
+        joined = async { tokio::join!(downstream, upstream) } => joined,
+        _ = crate::listener::drained(&mut drain) => {
+            tracing::debug!("server draining before the upgrade tunnel established");
+            return (0, 0);
+        }
+    };
+    let (down, up) = match joined {
         (Ok(d), Ok(u)) => (d, u),
         (d, u) => {
             tracing::debug!(

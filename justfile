@@ -94,9 +94,9 @@ bench-build:
     cd {{plecto}} && cargo build --release -p plecto-server --features bench-harnesses \
         --example load-balancing --example bench-server --example tls-http --example swap-bench
 
-# Interleaved invariant deltas vs bench/perf/gate_tolerances.toml, machine verdict (exit 0 = pass,
-# 1 = fail, 2 = inconclusive -> re-run). Run on hot-path changes; see bench/methodology.md § tiers.
-# T1 perf gate (~6-7 min)
+# Paired-round invariant deltas (95% t interval) vs bench/perf/gate_tolerances.toml, machine verdict
+# (exit 0 = pass, 1 = fail, 2 = inconclusive -> re-run with GATE_POOL_FROM=<RUN_DIR> to pool rounds).
+# Run on hot-path changes; see bench/methodology.md § tiers. T1 perf gate (~7 min)
 gate:
     bash bench/perf/run-perf.sh gate
 

@@ -92,7 +92,12 @@ async fn openloop_worker(
             continue;
         }
         if now < scheduled {
-            tokio::time::sleep_until(scheduled).await;
+            if scheduled.duration_since(now) > Duration::from_millis(2) {
+                tokio::time::sleep_until(scheduled - Duration::from_millis(1)).await;
+            }
+            while Instant::now() < scheduled {
+                tokio::task::yield_now().await;
+            }
         }
 
         let res = match conn.as_mut() {

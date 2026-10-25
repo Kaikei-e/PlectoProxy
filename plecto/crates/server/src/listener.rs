@@ -17,12 +17,12 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use plecto_control::Control;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::body::MAX_INFLIGHT_BODY_BUFFER_BYTES;
-use crate::conn_limit::PerIpConnLimit;
+use crate::conn_limit::{PerIpConnGuard, PerIpConnLimit};
 use crate::dispatch::handle;
 use crate::error::ServerError;
 use crate::h3::{build_h3_endpoint, serve_h3};
@@ -287,7 +287,7 @@ async fn serve_inner(
         let drain = drain_rx.clone();
         let proxy_trust = proxy_trust.clone();
         conns.spawn(async move {
-            let _permit = permit; // released when this connection task ends
+            let permit = permit; // released when this connection task (or its upgraded tunnel) ends
             // PROXY v2 (ADR 000057) sits below TLS: consume (trusted) or peek (untrusted) the
             // header BEFORE the handshake, and let the restored peer replace `peer` for every
             // downstream consumer (rate-limit key, X-Forwarded-*, Maglev SourceIp, access log).
@@ -316,11 +316,15 @@ async fn serve_inner(
             // address, and every connection behind it would collide on one slot. Checked here
             // (post-resolution, pre-TLS) rather than before accept: the real client is only known
             // once PROXY v2 (if any) has been read off the wire.
-            let Some(_ip_guard) = PerIpConnLimit::try_acquire(&state.per_ip_conn_limit, peer.ip())
+            let Some(ip_guard) = PerIpConnLimit::try_acquire(&state.per_ip_conn_limit, peer.ip())
             else {
                 tracing::debug!(peer = %peer, "per-IP connection limit reached; refusing connection");
                 return;
             };
+            let conn_guards = Arc::new(ConnGuards {
+                _permit: permit,
+                _ip_guard: ip_guard,
+            });
             match tls {
                 // The handshake is bounded like the h1 header read (pre-TLS slowloris): a client
                 // that connects and never completes its ClientHello would otherwise hold this
@@ -339,14 +343,34 @@ async fn serve_inner(
                         // ALPN) → HTTP/1.1 (ADR 000015 — h2 over TLS+ALPN only). The connection
                         // terminated TLS, so the chain sees `https`.
                         let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_ref());
-                        serve_conn(state, TokioIo::new(tls_stream), "https", h2, peer, drain).await;
+                        serve_conn(
+                            state,
+                            TokioIo::new(tls_stream),
+                            "https",
+                            h2,
+                            peer,
+                            drain,
+                            Some(conn_guards),
+                        )
+                        .await;
                     }
                     // a failed TLS handshake (incl. ALPN mismatch) just drops the connection
                     // (fail-closed; nothing is forwarded), it is not a server error.
                     Ok(Err(e)) => tracing::debug!(error = %e, "TLS handshake failed"),
                 },
                 // plaintext: HTTP/1.1 only — no h2c / prior-knowledge (ADR 000015). `http` scheme.
-                None => serve_conn(state, TokioIo::new(stream), "http", false, peer, drain).await,
+                None => {
+                    serve_conn(
+                        state,
+                        TokioIo::new(stream),
+                        "http",
+                        false,
+                        peer,
+                        drain,
+                        Some(conn_guards),
+                    )
+                    .await
+                }
             }
         });
     }
@@ -418,6 +442,16 @@ pub(crate) async fn drained(drain: &mut watch::Receiver<bool>) {
     let _ = drain.wait_for(|d| *d).await;
 }
 
+/// Connection-lifetime admission guards (the global `MAX_CONNECTIONS` semaphore permit and the
+/// per-source-IP `MAX_CONNECTIONS_PER_IP` slot). Wrapped in an `Arc` so an HTTP/1.1 `101 Switching
+/// Protocols` upgrade can move a reference into its detached tunnel task (`upgrade_switch`),
+/// holding both limits for the tunnel's lifetime after hyper's connection driver returns on
+/// writing the 101 headers.
+pub(crate) struct ConnGuards {
+    _permit: OwnedSemaphorePermit,
+    _ip_guard: PerIpConnGuard,
+}
+
 /// Serve one connection: HTTP/2 when `h2` (the ALPN result), HTTP/1.1 otherwise. `scheme` is the
 /// connection's wire scheme, passed through to the chain. Request handling (route → chain →
 /// forward) is identical across protocols; only the wire framing differs — for h2 the multiplexed
@@ -432,11 +466,18 @@ async fn serve_conn<I>(
     h2: bool,
     peer: SocketAddr,
     mut drain: watch::Receiver<bool>,
+    conn_guards: Option<Arc<ConnGuards>>,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| handle(state.clone(), scheme, peer, req));
+    // `conn_guards` lives in this frame for the whole connection, so both the global permit and the
+    // per-IP slot are held until `serve_conn` returns. Only the HTTP/1.1 branch hands a clone to each
+    // request: a `101 Switching Protocols` makes hyper return from the h1 driver while the tunnel
+    // task keeps running, so that task must own its own reference. h2 has no Upgrade path (ADR
+    // 000048 — h2/h3 use extended CONNECT), so its streams get `None` and skip the per-stream `Arc`
+    // clone/drop on one shared cache line.
     let result = if h2 {
+        let service = service_fn(move |req| handle(state.clone(), scheme, peer, req, None));
         let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
             // Detect dead h2 peers (the h2 sibling of h1's `header_read_timeout`): without a
@@ -457,6 +498,9 @@ async fn serve_conn<I>(
             }
         }
     } else {
+        let request_guards = conn_guards.clone();
+        let service =
+            service_fn(move |req| handle(state.clone(), scheme, peer, req, request_guards.clone()));
         let conn = hyper::server::conn::http1::Builder::new()
             // enforce a header-read timeout (slowloris on headers) and an explicit
             // header-count cap. The header-read timeout only fires with a timer configured, so set
@@ -480,4 +524,6 @@ async fn serve_conn<I>(
     if let Err(e) = result {
         tracing::debug!(error = %e, "connection closed with error");
     }
+    // Released here (end of the connection), or later by an upgraded tunnel's own clone.
+    drop(conn_guards);
 }

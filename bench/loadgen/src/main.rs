@@ -1094,7 +1094,9 @@ fn parse_ejection(rest: &[String]) -> EjectionArgs {
             // wholesale, so a caller owns the whole timeline or none of it.
             "--toggle-at" => {
                 let spec = take(&mut it, flag);
-                let Some((at, tail)) = spec.split_once('=') else { usage() };
+                let Some((at, tail)) = spec.split_once('=') else {
+                    usage()
+                };
                 let Ok(at) = at.parse::<u64>() else { usage() };
                 let (keys, label) = match tail.split_once(':') {
                     Some((k, l)) => (k, l.to_string()),

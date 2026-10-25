@@ -112,8 +112,8 @@ stop_grace_period: 12s   # > readiness_grace_ms + window_ms
 The admin `/metrics` endpoint exposes, alongside the RED signals:
 
 - `plecto_requests_in_flight` — requests currently being served; a drain waits for these.
-- `plecto_tunnels_active` — upgrade tunnels currently open ([ADR 000048](ADR/000048.md)).
-  Each holds a circuit-breaker permit and a load-balancer pick for its whole life, so this
+- `plecto_tunnels_active` — upgrade tunnels currently open ([ADR 000048](ADR/000048.md), [ADR 000122](ADR/000122.md)).
+  Each holds a global and per-source-IP connection slot, a circuit-breaker permit, and a load-balancer pick for its whole life, so this
   gauge is the first thing to check when a breaker opens or least-request skews without
   matching request volume. It is also what a drain will cut: tunnels do not outlive shutdown.
 - `plecto_tunnel_bytes_down_total` / `plecto_tunnel_bytes_up_total` — bytes relayed

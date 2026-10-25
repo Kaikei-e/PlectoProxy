@@ -51,15 +51,20 @@ mkdir -p "$DATA"
 # for repetition: with warm-up excluded, loopback steady-state percentiles converge within ~10 s,
 # and what remains is slow host drift (clock/thermal/neighbours) — which interleaved repetition
 # cancels out of adjacent deltas and a longer single window cannot (it just watches the same host
-# state for longer). `quick` bypasses this table. ROUNDS = interleave rounds for `gate`'s ladder.
+# state for longer). `quick` bypasses this table. ROUNDS = paired interleave rounds for `gate`'s
+# ladder and rate-limit tax (the verdict's 95% t interval needs n >= 2, and its half-width shrinks
+# with t_{0.975,n-1}/sqrt(n): 8.99 at n=2, 2.48 at n=3, 0.84 at n=8 — so the gate runs many SHORT
+# rounds rather than a few long ones). CPU_ROUNDS = fixed-rate CPU-µs/req pairs (info row). The
+# gate's per-round windows are separate knobs (GATE_D_LADDER / GATE_D_RL / GATE_D_CPU, set in
+# phase_gate) so `TIER=gate` never shortens the wasm / ratelimit phases' own windows.
 # NOTE for the first post-restructure `all` snapshot: these report windows are SHORTER than the
 # pre-2026-07-11 suite (sweep/wasm 60->30 s etc), so absolute figures will step vs older history.
 # That snapshot's measurement-history entry must say "window lengths changed here — absolutes are
 # not comparable across the restructure; invariants are". One-time event, one-time note.
 TIER="${TIER:-report}"; [[ "${1:-all}" == "gate" ]] && TIER=gate
 case "$TIER" in
-  gate)   D_CEIL=10; D_SWEEP=10; D_WASM=10; D_TAIL=15; D_TLS=10; D_RL=10; D_ENF=10; D_BODY=10; D_MIX=30; ROUNDS=3;;
-  report) D_CEIL=20; D_SWEEP=30; D_WASM=30; D_TAIL=20; D_TLS=20; D_RL=20; D_ENF=30; D_BODY=15; D_MIX=60; ROUNDS=1;;
+  gate)   D_CEIL=10; D_SWEEP=10; D_WASM=10; D_TAIL=15; D_TLS=10; D_RL=10; D_ENF=10; D_BODY=10; D_MIX=30; ROUNDS=8; CPU_ROUNDS=4;;
+  report) D_CEIL=20; D_SWEEP=30; D_WASM=30; D_TAIL=20; D_TLS=20; D_RL=20; D_ENF=30; D_BODY=15; D_MIX=60; ROUNDS=1; CPU_ROUNDS=1;;
   *) echo "unknown TIER: $TIER (expected gate|report)"; exit 64;;
 esac
 
@@ -292,6 +297,12 @@ run_phase(){
     PHASE_RESULTS+=("INCONCLUSIVE $name (exit $rc)")
     (( RUN_RC == 0 )) && RUN_RC=2
     err "phase $name INCONCLUSIVE (exit $rc)"
+  elif (( rc == 64 )); then
+    # Invalid invocation (e.g. a bad GATE_POOL_FROM): nothing was judged. Kept distinct from a
+    # performance FAIL (1) so hooks can tell "fix the command" from "fix the code".
+    PHASE_RESULTS+=("INVALID $name (exit $rc)")
+    (( RUN_RC != 1 )) && RUN_RC=64
+    err "phase $name INVALID INVOCATION (exit $rc) — nothing judged"
   elif (( rc )); then
     PHASE_RESULTS+=("FAIL $name (exit $rc)")
     RUN_RC=1
@@ -589,7 +600,7 @@ phase_swap(){
   echo "  backends: a=${be[0]} b=${be[1]} c=${be[2]} d=${be[3]} (spare)"
   echo "  manifest: $manifest"
   # At t=15s (post-warmup): drop c, add the spare d — a genuinely different address set, the shape
-  # a periodic-DNS re-resolution swap takes (ADR 000044), not a health-based ejection ([[000017]]).
+  # a periodic-DNS re-resolution swap takes (ADR 000044), not a health-based ejection (ADR 000017).
   local tmp="$RUN_DIR/swap"; mkdir -p "$tmp"
   local swapped="$tmp/swapped.toml"
   cat > "$swapped" <<EOF
@@ -785,27 +796,75 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
 # against the bands in gate_tolerances.toml (tracked in-repo, so changing a performance expectation
 # is a reviewable diff like any other contract change). Exit 0 = every invariant in band.
 #
-# Method (bench/methodology.md § Measurement tiers): the ladder rungs are measured as an A/B/C
-# INTERLEAVE over ROUNDS short windows instead of one long window — slow host drift (clock,
-# thermal, neighbours) lands inside a round and cancels out of the adjacent deltas, and the
-# per-round spread gives a confidence half-width a single window cannot. Fixed-rate tails use a
+# Method (bench/methodology.md § Measurement tiers): the ladder rungs are measured as PAIRED
+# A/B/C rounds — ROUNDS short windows, with the rung order reversed on every even round so neither
+# arm systematically runs first — instead of one long window. Slow host drift (clock, thermal,
+# neighbours) lands inside a round and cancels out of the within-round deltas, and the spread of
+# the n per-round deltas gives a 95% Student-t interval a single window cannot. Fixed-rate tails use a
 # CONSTANT 2000 rps rather than the report tier's auto-derived 60%-of-floor: the gate never
 # measures the fresh rungs, so there is no knee to dodge, and a constant offered rate keeps every
 # snapshot comparable across rung-set changes.
+#
+# Re-runs POOL, never replace: after an INCONCLUSIVE verdict, re-run with
+# GATE_POOL_FROM=<earlier RUN_DIR>[:<another>...] and gate_verdict.py merges the earlier runs' rounds
+# with the new ones into one estimate (refused unless every run measured the same binaries —
+# build_id.txt). Picking the run that happened to PASS would bias the gate toward passing.
 phase_gate(){
-  log "Gate — invariant deltas, interleaved x${ROUNDS}, banded verdict -> gate.csv"
+  log "Gate — invariant deltas, ${ROUNDS} paired rounds, 95% t interval vs band -> gate.csv"
   # Binary existence AND freshness are enforced centrally (require_fresh, run preflight + launch).
   local tmp="$RUN_DIR/gate"; mkdir -p "$tmp"
-  local round r hdr
+  local round r hdr order
   local ladder=(baseline noop-pooled trusted)
+  local d_ladder="${GATE_D_LADDER:-4}" d_rl="${GATE_D_RL:-3}" d_cpu="${GATE_D_CPU:-3}"
+  local cpu_rate="${GATE_CPU_RATE:-20000}"
 
-  # -- 1. WASM dispatch floor + filter cost: interleaved closed-loop ladder --
+  # Provenance for pooling: the SHA-256 of every harness binary the gate measures, of every WASM
+  # filter component they read from disk at runtime (the paths are baked into the binary at compile
+  # time, so a rebuilt filter can change without the binary changing), and of the gate parameters
+  # (CPU-µs/req depends on the offered rate). Rounds that differ in any of these are not samples of
+  # the same quantity, so gate_verdict.py refuses to pool them.
+  local bin_dir="$WS/target/release/examples"
+  printf 'ROUNDS=%s CPU_ROUNDS=%s GATE_D_LADDER=%s GATE_D_RL=%s GATE_D_CPU=%s GATE_CPU_RATE=%s GATE_QLAT=%s\n' \
+    "$ROUNDS" "$CPU_ROUNDS" "$d_ladder" "$d_rl" "$d_cpu" "$cpu_rate" "${GATE_QLAT:-2000}" > "$tmp/gate_params.txt"
+  {
+    (cd "$bin_dir" && sha256sum bench-server load-balancing 2>/dev/null)
+    grep -aohE '/[^[:space:]"]+\.component\.wasm' "$bin_dir/bench-server" "$bin_dir/load-balancing" 2>/dev/null \
+      | sort -u | while IFS= read -r f; do [[ -f "$f" ]] && sha256sum "$f"; done
+    cat "$tmp/gate_params.txt"
+  } | sha256sum | cut -d' ' -f1 > "$tmp/build_id.txt"
+  if [[ -n "${GATE_POOL_FROM:-}" ]]; then
+    # Absolute paths, so transitive pooling resolves from any working directory later.
+    tr ':' '\n' <<<"$GATE_POOL_FROM" | sed '/^$/d' | while IFS= read -r src; do
+      realpath -m "$src"
+    done > "$tmp/pooled_from.txt"
+    echo "  pooling rounds from: $(paste -sd' ' "$tmp/pooled_from.txt")"
+    # Validate BEFORE measuring: a mistyped path or a different build would otherwise only surface
+    # in the verdict, after the whole gate has run.
+    local src sd
+    while IFS= read -r src; do
+      sd="$src"; [[ -d "$src/gate" ]] && sd="$src/gate"
+      if [[ ! -d "$sd" ]]; then
+        err "GATE_POOL_FROM: no such run directory: $src"; return 64
+      elif ! compgen -G "$sd/r[0-9]*_baseline.json" >/dev/null; then
+        err "GATE_POOL_FROM: $src has no gate round data"; return 64
+      elif [[ "$(cat "$sd/build_id.txt" 2>/dev/null)" != "$(cat "$tmp/build_id.txt")" ]]; then
+        err "GATE_POOL_FROM: $src measured a different build, filter set or gate parameters (build_id.txt; compare gate_params.txt)"; return 64
+      fi
+    done < "$tmp/pooled_from.txt"
+  fi
+
+  # -- 1. WASM dispatch floor + filter cost: paired, order-counterbalanced closed-loop ladder --
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
+  for r in "${ladder[@]}"; do
+    hdr=(); [[ "$r" == trusted ]] && hdr=(-H "x-api-key: alice-secret")
+    warm_oha -c 50 "${hdr[@]}" "http://$BENCH_ADDR/$r/x"
+  done
   for round in $(seq "$ROUNDS"); do
-    for r in "${ladder[@]}"; do
+    order=("${ladder[@]}")
+    (( round % 2 == 0 )) && order=(trusted noop-pooled baseline)
+    for r in "${order[@]}"; do
       hdr=(); [[ "$r" == trusted ]] && hdr=(-H "x-api-key: alice-secret")
-      [[ "$round" == 1 ]] && warm_oha -c 50 "${hdr[@]}" "http://$BENCH_ADDR/$r/x"
-      gen "$OHA" -z "${D_WASM}s" -c 50 --no-tui --output-format json "${hdr[@]}" \
+      gen "$OHA" -z "${d_ladder}s" -c 50 --no-tui --output-format json "${hdr[@]}" \
         "http://$BENCH_ADDR/$r/x" > "$tmp/r${round}_$r.json" 2>/dev/null
       echo "  round $round /$r -> $(oha_row "$tmp/r${round}_$r.json")"
     done
@@ -822,15 +881,36 @@ phase_gate(){
   done
   stop_proxy
 
-  # -- 3. rate-limit tax (interleaved pair) + enforcement convergence (bucket maths converge in
-  #       2-3 s, so D_ENF=10 s is plenty — the 30 s report window buys nothing here) --
+  # -- 3. rate-limit tax (paired, order-counterbalanced rounds), proxy CPU-µs/req at a fixed rate
+  #       (info row: generator-independent and additive, unlike the closed-loop k6 delta), and
+  #       enforcement convergence (bucket maths converge in 2-3 s, so D_ENF=10 s is plenty) --
   if command -v k6 >/dev/null 2>&1 || [[ -n "${K6:-}" && -x "${K6}" ]]; then
     launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" || return 1
-    for round in 1 2; do
-      for r in baseline ratelimit; do
+    for round in $(seq "$ROUNDS"); do
+      order=(baseline ratelimit); (( round % 2 == 0 )) && order=(ratelimit baseline)
+      for r in "${order[@]}"; do
+        # Round 1 also warms the k6 connection pool; later rounds hit an already-warm proxy.
         gen "$K6" run -q -e BASE="http://$BENCH_ADDR" -e ROUTE_PATH="/$r" \
-          -e KEYS=1000 -e VUS=50 -e DUR="${D_RL}s" -e OUT="$tmp/rl_r${round}_$r.json" \
+          -e KEYS=1000 -e VUS=50 -e DUR="${d_rl}" -e WARMUP_S="$([[ $round == 1 ]] && echo 2 || echo 1)" \
+          -e OUT="$tmp/rl_r${round}_$r.json" \
           "$BENCH/k6-wasm/ratelimit-overhead.js" 2>&1 | tail -1
+      done
+    done
+    # Let the blocking-pool threads spawned during the closed-loop rounds reach their 10 s idle
+    # keep-alive and exit BEFORE the CPU windows: a thread exiting mid-window forces proc_cpu.py
+    # onto the 10 ms-tick fallback clock.
+    sleep "${GATE_CPU_SETTLE_S:-11}"
+    # Fixed-rate CPU pairs on the same (warm) launch: proxy CPU time from /proc/$PROXY_PID around
+    # each arm, divided by completed requests. Absolute CPU/req includes the in-process mock
+    # upstream; it cancels in the /ratelimit − /baseline delta.
+    for round in $(seq "$CPU_ROUNDS"); do
+      order=(baseline ratelimit); (( round % 2 == 0 )) && order=(ratelimit baseline)
+      for r in "${order[@]}"; do
+        python3 "$HERE/proc_cpu.py" snapshot "$PROXY_PID" > "$tmp/cpu_r${round}_$r.snap0.json"
+        gen "$K6" run -q -e BASE="http://$BENCH_ADDR" -e ROUTE_PATH="/$r" -e KEYS=1000 \
+          -e RATE="$cpu_rate" -e DUR="${d_cpu}s" -e OUT="$tmp/cpu_r${round}_$r.json" \
+          "$HERE/ratelimit-cpu.js" 2>&1 | tail -1
+        python3 "$HERE/proc_cpu.py" snapshot "$PROXY_PID" > "$tmp/cpu_r${round}_$r.snap1.json"
       done
     done
     stop_proxy
@@ -864,7 +944,9 @@ phase_gate(){
   if [[ "$rc" == 0 ]]; then
     log "gate: PASS (every invariant in band)"
   elif [[ "$rc" == 2 ]]; then
-    err "gate INCONCLUSIVE — re-run"
+    err "gate INCONCLUSIVE — re-run with GATE_POOL_FROM=$RUN_DIR to POOL its rounds into one estimate (a re-run adds evidence; it never replaces this run)"
+  elif [[ "$rc" == 64 ]]; then
+    err "gate: invalid GATE_POOL_FROM (missing round data or a different build) — nothing judged"
   else
     log "gate: FAIL — an invariant left its band (bands: bench/perf/gate_tolerances.toml)"
   fi
@@ -1041,7 +1123,7 @@ print("%d,%s,%.1f,%.2f,%.3f,%.3f"%(d["size"],d["route"],d["rps"],d["req_mbps"],d
 # ---------------------------------------------------------------- Phase 4b HTTP/3 functional check
 phase_h3(){
   # HTTP/3 is a first-class server feature (tls-http serves it over QUIC). A rigorous, CO-safe H3
-  # LOAD benchmark needs an H3-capable open-loop generator (e.g. h2load --npn-list h3);
+  # LOAD benchmark needs an H3-capable open-loop generator (e.g. h2load --alpn-list=h3);
   # oha and k6 lack native H3, so we VERIFY H3 works end-to-end here and defer the load
   # numbers (see performance/README.md).
   log "Phase 4b — HTTP/3 functional check (curl --http3-only over QUIC) -> h3.txt"
@@ -1081,9 +1163,9 @@ with open(sys.argv[3],"w",newline="") as o:
         d=json.load(open(f)); p=d["profile"]
         w.writerow([p,"read",round(d["read_p50"],3),round(d["read_p99"],3),round(d["read_p99_9"],3)])
         if p=="mix":
-            w.writerow([p,"auth",round(d["auth_p50"],3),round(d["auth_p99"],3),""])
-            w.writerow([p,"write",round(d["write_p50"],3),round(d["write_p99"],3),""])
-            w.writerow([p,"large",round(d["large_p50"],3),round(d["large_p99"],3),""])
+            w.writerow([p,"auth",round(d["auth_p50"],3),round(d["auth_p99"],3),round(d["auth_p99_9"],3) if "auth_p99_9" in d else ""])
+            w.writerow([p,"write",round(d["write_p50"],3),round(d["write_p99"],3),round(d["write_p99_9"],3) if "write_p99_9" in d else ""])
+            w.writerow([p,"large",round(d["large_p50"],3),round(d["large_p99"],3),round(d["large_p99_9"],3) if "large_p99_9" in d else ""])
         print("%s: offered %.0f rps, dropped %d, 429s %d, no-status %d"%(p,d["offered_rps"],d["dropped"],d.get("limited",0),d.get("no_status",0)))
 ' "$tmp/mix_read-only.json" "$tmp/mix_mix.json" "$DATA/mix.csv"
   cat "$DATA/mix.csv"
@@ -1091,28 +1173,38 @@ with open(sys.argv[3],"w",newline="") as o:
 
 # ---------------------------------------------------------------- Phase 10 WebSocket upgrade (ADR 000048)
 phase_ws(){
-  log "Phase 10 — WebSocket Upgrade tunnel (ADR 000048): handshake rate + tunnel footprint + echo throughput -> ws_*.csv"
+  log "Phase 10 — WebSocket Upgrade tunnel (ADR 000048): tunnel footprint + handshake rate + echo throughput -> ws_*.csv"
+  # Stop any shared proxy and measure 10.2 tunnel footprint first on a freshly launched bench-server
+  # so idle_rss is read on a clean process before 10.1 handshake inflates the heap.
+  stop_proxy
   launch bench-server "$BENCH_ADDR" "http://$BENCH_ADDR/baseline/x" BACKEND_LATENCY_MS=0 || return 1
   local tmp="$RUN_DIR/ws"; mkdir -p "$tmp"
+
+  log "  10.2 — tunnel footprint: 250 held tunnels, RSS before/after -> ws_footprint.csv"
+  sleep 2
+  local idle; idle="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
+  local hold_out="$tmp/ws_hold.txt"
+  loadgen ws --mode hold --target "ws://$BENCH_ADDR/ws" --conns 250 --seconds 6 >"$hold_out" 2>&1 &
+  local HOLD=$!
+  sleep 3
+  local busy; busy="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
+  wait $HOLD 2>/dev/null
+  local held; held="$(sed -n 's/^ws hold: \([0-9]\{1,\}\) tunnels.*/\1/p' "$hold_out")"
+  if [[ "${held:-0}" -le 0 ]]; then
+    err "ws hold opened no tunnels (see $hold_out) — refusing to publish a per-tunnel footprint"
+    cat "$hold_out" >&2; stop_proxy; return 1
+  fi
+  { echo "metric,value_kb"
+    echo "idle_rss,$idle"
+    echo "rss_with_${held:-0}_tunnels,$busy"
+    python3 -c "print(f'bytes_per_tunnel,{($busy-$idle)*1024/max(1,${held:-0}):.0f}')"
+  } > "$DATA/ws_footprint.csv"
+  cat "$DATA/ws_footprint.csv"
 
   log "  10.1 — handshake rate (open-loop, paced) -> ws_handshake.csv"
   loadgen ws --mode handshake --target "ws://$BENCH_ADDR/ws" --rate 500 --duration 20 --warmup 5 --workers 32 \
     --out "$DATA/ws_handshake.csv"
   cat "$DATA/ws_handshake.csv"
-
-  log "  10.2 — tunnel footprint: 1000 held tunnels, RSS before/after -> ws_footprint.csv"
-  local idle; idle="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
-  loadgen ws --mode hold --target "ws://$BENCH_ADDR/ws" --conns 1000 --seconds 6 &
-  local HOLD=$!
-  sleep 3
-  local busy; busy="$(grep VmRSS /proc/$PROXY_PID/status | awk '{print $2}')"
-  wait $HOLD 2>/dev/null
-  { echo "metric,value_kb"
-    echo "idle_rss,$idle"
-    echo "rss_with_1000_tunnels,$busy"
-    python3 -c "print(f'bytes_per_tunnel,{($busy-$idle)*1024/1000:.0f}')"
-  } > "$DATA/ws_footprint.csv"
-  cat "$DATA/ws_footprint.csv"
 
   log "  10.3 — echo throughput: 50 conns, message-size sweep -> ws_echo.csv"
   echo "conns,size_bytes,duration_s,messages,messages_per_sec,mb_per_sec,p50_ms,p90_ms,p99_ms" > "$DATA/ws_echo.csv"
@@ -1139,9 +1231,10 @@ case "$PHASE" in
   ratelimit) run_phase ratelimit phase_ratelimit;; body) run_phase body phase_body;;
   mix) run_phase mix phase_mix;; industry) phase_industry;;
   all)
-    # The four BACKEND_LATENCY_MS=0 bench-server phases share ONE launch (SHARE_PROXY +
-    # memoized launch): footprint runs first because its idle-RSS read must precede any load
-    # (ws's own footprint row is a held-tunnel DELTA, so it tolerates the shared warm proxy).
+    # The BACKEND_LATENCY_MS=0 bench-server phases share launches via SHARE_PROXY + memoized
+    # launch: footprint + ceiling share one launch (footprint first so its idle-RSS read precedes
+    # any load), and ws starts a fresh bench-server for its own clean idle-RSS tunnel footprint
+    # read before sharing that proxy into wasm.
     SHARE_PROXY=1
     run_phase footprint phase_footprint; run_phase ceiling phase_ceiling
     run_phase ws phase_ws; run_phase wasm phase_wasm
@@ -1159,7 +1252,9 @@ esac
 log "done: $PHASE"
 if (( ${#PHASE_RESULTS[@]} )); then printf '  %s\n' "${PHASE_RESULTS[@]}"; fi
 if [[ -n "${RUN_DIR:-}" ]]; then echo "RUN_DIR: $RUN_DIR"; fi
-if (( RUN_RC == 2 )); then
+if (( RUN_RC == 64 )); then
+  err "run INVALID — an invocation error (see above); nothing was judged"
+elif (( RUN_RC == 2 )); then
   err "run INCONCLUSIVE — re-run"
 elif (( RUN_RC != 0 )); then
   err "run FAILED — see the phase summary above; measured data for failed phases is absent or partial"

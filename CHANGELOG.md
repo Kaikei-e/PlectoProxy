@@ -32,6 +32,67 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-25
+
+Patch release: HTTP/1.1 `Upgrade` tunnel connection-slot retention across the full tunnel lifetime
+([ADR 000122](docs/ADR/000122.md), amending [ADR 000048](docs/ADR/000048.md) and
+[ADR 000092](docs/ADR/000092.md)), teardown-excluded Gungraun LB pick instruction counts
+(amending [ADR 000113](docs/ADR/000113.md)), sub-millisecond open-loop arrival pacing in
+`plecto-loadgen`, and mathematical / statistical alignment of the T1 performance regression gate.
+No WIT contract, manifest schema, CLI, or public API change from 0.15.2, and `cargo semver-checks`
+against the crates.io 0.15.2 baseline reports no semver update required on each of `plecto-host` /
+`plecto-control` / `plecto-server` (default features). **Deployed filters do not need a rebuild**:
+the filter contract stays at `plecto:filter@0.4.0` and the reference-filter shelf is unchanged.
+
+### Security
+
+- **Retain global and per-source-IP connection guards across HTTP/1.1 `101 Switching Protocols`
+  tunnels (`plecto-server`, [ADR 000122](docs/ADR/000122.md))**: `hyper`'s
+  `http1::Builder::serve_connection(..).with_upgrades()` returns `Ok(())` as soon as the `101`
+  response headers are written and hands the upgraded I/O stream to `hyper::upgrade::on`, which
+  previously dropped `serve_conn`'s stack-held `OwnedSemaphorePermit` (`MAX_CONNECTIONS = 10,000`,
+  [ADR 000027](docs/ADR/000027.md)) and `PerIpConnGuard` (`MAX_CONNECTIONS_PER_IP = 256`,
+  [ADR 000092](docs/ADR/000092.md)) while the detached WebSocket tunnel remained open (CWE-770).
+  Both guards are now bundled into `Arc<ConnGuards>` and moved into `upgrade_switch`'s spawned
+  tunnel task alongside the circuit-breaker permit and load-balancer `Pick` guard (HTTP/2 streams,
+  which have no HTTP/1.1 `Upgrade` path, receive `None` so per-stream atomic refcount traffic is
+  avoided). `tunnel::run` also selects on the graceful-drain watch during the pre-splice
+  `OnUpgrade` handshake so half-switched tunnels cannot stall shutdown.
+
+### Fixed
+
+- **Exclude `UpstreamGroup` teardown and cold first-pick initialization from `fastpath_inst`
+  instruction counts (`plecto-control`, [ADR 000122](docs/ADR/000122.md))**: `lb_pick` and
+  `lb_pick_maglev` in `crates/control/benches/fastpath_inst.rs` now warm one pick inside `group()`
+  and return `Arc<UpstreamGroup>` out of the `#[library_benchmark]` function so teardown runs
+  outside Callgrind's measured block (`lb_pick_rr` `2,114 → 225`, `lb_pick_p2c` `2,377 → 340`,
+  `lb_pick_maglev` `2,277 → 282` instructions).
+- **Eliminate 1 ms Tokio timer-wheel quantization in `plecto-loadgen openloop`
+  (`bench/loadgen/src/openloop.rs`, [ADR 000122](docs/ADR/000122.md))**: `openloop` now sleeps to
+  `scheduled - 1 ms` when `> 2 ms` remains and cooperative-spins via `tokio::task::yield_now()`
+  through the sub-millisecond tail, removing the 0.2–1.4 ms schedule-latency plateau (`p50`
+  `0.841 → 0.050 ms` at 103,026 req/s with 0 dropped requests).
+
+### Changed
+
+- **T1 regression gate statistical design, discrete-refill expectation, round pooling, and
+  fixed-rate CPU-µs/req (`bench/perf/*`, `performance/*`, [ADR 000122](docs/ADR/000122.md))**:
+  - `gate_verdict.py` now computes `ci_half` as the two-sided 95 % Student-$t$ half-width
+    $t_{0.975,n-1}\cdot s/\sqrt{n}$ over paired per-round deltas (adding column `n` to `gate.csv`),
+    replacing the 2–3-round sample half-range `(max - min) / 2`.
+  - `run-perf.sh` (`gate` tier) runs 8 short paired rounds with even-round order counterbalancing,
+    validates and transitively pools prior inconclusive runs via `GATE_POOL_FROM` (enforcing matching
+    `build_id.txt` hashes across binaries, runtime `.component.wasm` guests, and `gate_params.txt`),
+    and records fixed-rate 20,000 req/s proxy CPU-µs/req via `/proc/<pid>/task/*/schedstat`
+    (`proc_cpu.py` / `ratelimit-cpu.js`).
+  - `enforce_allowed_ratio` now divides by the exact discrete 1 s refill expectation
+    `(capacity + (W - 1) * refill_per_s) / W` (`1,100.0 req/s` over 10 s, ratio `1.0000`), and
+    `ipc_check.py` cross-checks Gungraun instruction counts against Criterion wall-clock times
+    (`IPC <= 5.0`).
+  - Re-measured `ws` (`21,348 B/tunnel` across 250 held tunnels on a clean process), `openloop`
+    (`p50 = 0.050 ms`), and `gate` (24-round pooled + standalone 8-round holdout, both `10 pass`),
+    and regenerated `performance/img/*.png`.
+
 ## [0.15.2] - 2026-10-24
 
 Patch release: dual WASI 0.2 (`@0.2.x`) and WASI 0.3 (`@0.3.0`) host capability support across

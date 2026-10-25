@@ -32,8 +32,10 @@ CI は意図して **PR-light / merge-heavy** に分割している: pull reques
 
 独立 lock の gate は手作業の一覧を持たず、追跡される lockfile を発見する。そのため新たに commit された
 guest / fixture workspace も自動的に対象になる。advisory の例外は `filter-jwt` ローカルの
-`RUSTSEC-2023-0071` だけであり、RSA 公開鍵だけを使う検証経路に限定して受理する。この filter は
-RSA 秘密鍵を parse も操作もしていない。秘密鍵操作の追加または RSA 依存の変更時には例外を再評価し、可能なら除去する。
+`RUSTSEC-2023-0071`（`rsa`）および `RUSTSEC-2026-0387`（`p256 0.13` 経由の `crypto-bigint`）だけであり、
+公開鍵だけを使う RS256 / ES256 検証経路に限定して受理する（出荷 WASM component への重複暗号スタック混入を避けるため、
+`rsa 0.9` と同じ `digest 0.10` 系の `p256 0.13` に揃えている）。この filter は秘密鍵や秘密整数を
+parse も操作もしていない。秘密鍵操作の追加または暗号依存の変更時には例外を再評価し、可能なら除去する。
 
 正直な限界（含意ではなく明記する）:
 

@@ -8,4 +8,15 @@ version = 2
 # `RsaPrivateKey`, signing, decryption, or private-key parsing path. The advisory has no patched
 # release, so retaining this narrowly scoped record is safer than a global ignore. Re-evaluate
 # and remove this exception before adding any RSA private-key operation or changing rsa versions.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0387 (crypto-bigint 0.5.5 via elliptic-curve 0.13.8 / p256 0.13.2) reports
+# compiler/target-dependent secret-dependent branches in operations intended to be constant-time
+# on *secret integers*. filter-jwt's ES256 path is likewise strictly verify-only: it loads only
+# public keys (`p256::ecdsa::VerifyingKey`) and verifies public JWS `(r, s)` signatures over
+# public message digests; it has no `SigningKey`, `SecretKey`, ECDH, or secret-integer path.
+# Furthermore, per filter-jwt/Cargo.toml, `p256` is deliberately held on 0.13 (digest 0.10 /
+# signature 2) alongside `rsa` 0.9 until `rsa` ships a stable release on digest 0.11 / signature 3,
+# avoiding duplicate hash/signature/ASN.1 stacks in the shipped component. Re-evaluate and remove
+# this exception when moving the RustCrypto trio to digest 0.11 (`p256 >= 0.14` /
+# `crypto-bigint >= 0.7.6`) or before adding any secret-key EC operation.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

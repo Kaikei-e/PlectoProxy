@@ -31,10 +31,13 @@ requires). Scheduled jobs cover what neither needs to block on.
 | Unsolicited-PR policy (invitation-only contributions) | [pr-policy.yml](../.github/workflows/pr-policy.yml) | every PR when opened |
 
 The independent-lock gate discovers tracked lockfiles rather than keeping a hand-maintained list,
-so a newly committed guest or fixture workspace is covered automatically. Its only advisory exception
-is local to `filter-jwt`: `RUSTSEC-2023-0071` is accepted solely for that filter's public-key-only
-RSA verification path. It does not parse or operate on RSA private keys; adding such an operation or
-changing the RSA dependency requires re-evaluating and removing the exception where possible.
+so a newly committed guest or fixture workspace is covered automatically. Its only advisory exceptions
+are local to `filter-jwt`: `RUSTSEC-2023-0071` (`rsa`) and `RUSTSEC-2026-0387` (`crypto-bigint` via
+`p256 0.13`) are accepted solely for that filter's public-key-only RS256 / ES256 verification paths
+(while `p256` stays on `0.13` / `digest 0.10` alongside `rsa 0.9` to avoid duplicate cryptographic
+stacks in the shipped WASM component). It does not parse or operate on private keys or secret
+integers; adding such an operation or changing the cryptographic dependencies requires re-evaluating
+and removing the exceptions where possible.
 
 Honest bounds, stated rather than implied:
 

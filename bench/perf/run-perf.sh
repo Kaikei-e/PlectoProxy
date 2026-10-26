@@ -798,17 +798,19 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
 #
 # Method (bench/methodology.md § Measurement tiers): the ladder rungs are measured as PAIRED
 # A/B/C rounds — ROUNDS short windows, with the rung order reversed on every even round so neither
-# arm systematically runs first — instead of one long window. Slow host drift (clock, thermal,
-# neighbours) lands inside a round and cancels out of the within-round deltas, and the spread of
-# the n per-round deltas gives a 95% Student-t interval a single window cannot. Fixed-rate tails use a
+# arm systematically runs first — instead of one long window. Per-round level shifts cancel inside
+# each round and linear host drift cancels in the mean across counterbalanced odd/even round pairs
+# (while remaining in s as alternating-sign spread), and the spread of the n per-round deltas gives
+# a 95% Student-t interval a single window cannot. Fixed-rate tails use a
 # CONSTANT 2000 rps rather than the report tier's auto-derived 60%-of-floor: the gate never
 # measures the fresh rungs, so there is no knee to dodge, and a constant offered rate keeps every
 # snapshot comparable across rung-set changes.
 #
-# Re-runs POOL, never replace: after an INCONCLUSIVE verdict, re-run with
-# GATE_POOL_FROM=<earlier RUN_DIR>[:<another>...] and gate_verdict.py merges the earlier runs' rounds
-# with the new ones into one estimate (refused unless every run measured the same binaries —
-# build_id.txt). Picking the run that happened to PASS would bias the gate toward passing.
+# Re-runs POOL (up to MAX_POOL_RUNS=3 runs), never replace: after an INCONCLUSIVE verdict, re-run
+# with GATE_POOL_FROM=<earlier RUN_DIR>[:<another>...] and gate_verdict.py merges the earlier runs'
+# rounds with the new ones into one estimate (refused with exit 64 unless every run measured the
+# same binaries + gate_params.txt -> build_id.txt, or if >3 runs are pooled). Picking the run that
+# happened to PASS would bias the gate toward passing.
 phase_gate(){
   log "Gate — invariant deltas, ${ROUNDS} paired rounds, 95% t interval vs band -> gate.csv"
   # Binary existence AND freshness are enforced centrally (require_fresh, run preflight + launch).
@@ -816,16 +818,16 @@ phase_gate(){
   local round r hdr order
   local ladder=(baseline noop-pooled trusted)
   local d_ladder="${GATE_D_LADDER:-4}" d_rl="${GATE_D_RL:-3}" d_cpu="${GATE_D_CPU:-3}"
-  local cpu_rate="${GATE_CPU_RATE:-20000}"
+  local cpu_rate="${GATE_CPU_RATE:-20000}" cpu_settle="${GATE_CPU_SETTLE_S:-11}"
 
   # Provenance for pooling: the SHA-256 of every harness binary the gate measures, of every WASM
   # filter component they read from disk at runtime (the paths are baked into the binary at compile
   # time, so a rebuilt filter can change without the binary changing), and of the gate parameters
-  # (CPU-µs/req depends on the offered rate). Rounds that differ in any of these are not samples of
-  # the same quantity, so gate_verdict.py refuses to pool them.
+  # (CPU-µs/req depends on the offered rate and pre-window idle settle). Rounds that differ in any
+  # of these are not samples of the same quantity, so gate_verdict.py refuses to pool them.
   local bin_dir="$WS/target/release/examples"
-  printf 'ROUNDS=%s CPU_ROUNDS=%s GATE_D_LADDER=%s GATE_D_RL=%s GATE_D_CPU=%s GATE_CPU_RATE=%s GATE_QLAT=%s\n' \
-    "$ROUNDS" "$CPU_ROUNDS" "$d_ladder" "$d_rl" "$d_cpu" "$cpu_rate" "${GATE_QLAT:-2000}" > "$tmp/gate_params.txt"
+  printf 'ROUNDS=%s CPU_ROUNDS=%s GATE_D_LADDER=%s GATE_D_RL=%s GATE_D_CPU=%s GATE_CPU_RATE=%s GATE_CPU_SETTLE_S=%s GATE_QLAT=%s\n' \
+    "$ROUNDS" "$CPU_ROUNDS" "$d_ladder" "$d_rl" "$d_cpu" "$cpu_rate" "$cpu_settle" "${GATE_QLAT:-2000}" > "$tmp/gate_params.txt"
   {
     (cd "$bin_dir" && sha256sum bench-server load-balancing 2>/dev/null)
     grep -aohE '/[^[:space:]"]+\.component\.wasm' "$bin_dir/bench-server" "$bin_dir/load-balancing" 2>/dev/null \
@@ -899,7 +901,7 @@ phase_gate(){
     # Let the blocking-pool threads spawned during the closed-loop rounds reach their 10 s idle
     # keep-alive and exit BEFORE the CPU windows: a thread exiting mid-window forces proc_cpu.py
     # onto the 10 ms-tick fallback clock.
-    sleep "${GATE_CPU_SETTLE_S:-11}"
+    sleep "$cpu_settle"
     # Fixed-rate CPU pairs on the same (warm) launch: proxy CPU time from /proc/$PROXY_PID around
     # each arm, divided by completed requests. Absolute CPU/req includes the in-process mock
     # upstream; it cancels in the /ratelimit − /baseline delta.

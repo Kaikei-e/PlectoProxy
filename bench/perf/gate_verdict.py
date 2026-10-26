@@ -19,8 +19,8 @@ Pooling: if the raw dir holds `pooled_from.txt` (written by run-perf.sh from GAT
 per-round raw data of every listed earlier run — and, transitively, of the runs THOSE pooled — is
 merged with this run's rounds into one estimate. A re-run after INCONCLUSIVE therefore adds
 evidence; it never replaces the earlier run. Pooling is refused (exit 64) unless every run carries
-the same `build_id.txt` (the measured binaries' SHA-256): rounds of different builds are not samples
-of the same quantity.
+the same `build_id.txt` (the measured binaries' + gate parameters' SHA-256) or if more than
+MAX_POOL_RUNS (3) runs are pooled.
 
 verdict ∈ pass / fail / inconclusive / skipped (input missing, e.g. no k6) / info (reported, never
 judged). An info row is promoted to a judged one by adding its band to gate_tolerances.toml.
@@ -213,6 +213,7 @@ class PoolError(Exception):
 
 POOL_FILE = "pooled_from.txt"
 BUILD_FILE = "build_id.txt"
+MAX_POOL_RUNS = 3
 ROUND_GLOBS = ("r[0-9]*_baseline.json", "rl_r*_baseline.json", "cpu_r*_baseline.json")
 
 
@@ -262,6 +263,11 @@ def resolve_sources(tmp):
 def check_pool_builds(sources):
     if len(sources) < 2:
         return
+    if len(sources) > MAX_POOL_RUNS:
+        raise PoolError(
+            f"refusing to pool {len(sources)} runs (max {MAX_POOL_RUNS}): "
+            "unbounded sequential pooling inflates false-pass probability"
+        )
     ids = {d: _read_build_id(d) for d in sources}
     own = ids[sources[0]]
     if own is None:

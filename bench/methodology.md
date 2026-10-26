@@ -89,7 +89,7 @@ Numeric snapshots live in [`../performance/README.md`](../performance/README.md)
 をそのまま食らう。warm-up 除外済みの loopback 定常状態では percentile のサンプリング誤差は
 ~10 s で既に無視でき、残る変動はホスト状態由来——これは窓を伸ばしても消えない（同じホスト状態を
 長く見るだけ）。同じ総時間なら **短い窓 × 複数 round の対応のある（paired）A/B/C 設計** に振り替えるほうが、
-遅いドリフトが round 内でペア化されて round 内差分から相殺され、round 間の広がりから信頼区間まで手に入る。
+round ごとの共通レベルシフトが round 内差分で相殺され、偶数 round での順序反転により線形ドリフトが奇数・偶数 round 対の平均で相殺され（標本標準偏差 $s$ には符号反転成分として残るため保守的な区間幅となる）、round 間の広がりから信頼区間まで手に入る。
 反復をどのレベルに配分すべきかの一般論は Kalibera & Jones,
 *Rigorous Benchmarking in Reasonable Time* (ISMM 2013) に従う。
 
@@ -105,10 +105,10 @@ ladder 90 s → 96 s、rate-limit 対 60 s → 66 s 程度で、CPU-µs/req の 
 2026-10-25 以降の帯 `0.5..2.4` でも 5 run 中 3 run が INCONCLUSIVE）——旧 half-range が判定力を
 過大に見せていたことの実データでの確認である。
 
-**再実行はプールし、置き換えない。** INCONCLUSIVE の後に再実行して PASS が出た run だけを採用すると、
+**再実行はプールし、置き換えない（最大 3 run 上限）。** INCONCLUSIVE の後に再実行して PASS が出た run だけを採用すると、
 「通るまで回す」選択バイアスになる。`GATE_POOL_FROM=<前回の RUN_DIR>[:<さらに前>...] bash bench/perf/run-perf.sh gate`
 で再実行すると、`gate_verdict.py` は前回 run の round 生データを今回の round と合わせて 1 つの推定にする
-（`build_id.txt` = 計測したハーネス binary の SHA-256 が一致しない run とはプールを拒否、exit 64）。
+（`build_id.txt` = 計測したハーネス binary・WASM フィルタ・`gate_params.txt` の SHA-256 が一致しない run とのプール、および `MAX_POOL_RUNS = 3` を超えるプールは exit 64 で拒否。また帯の再較正時はプールなしの独立 holdout run を必須とする）。
 INCONCLUSIVE 時のメッセージもこの手順を案内する。
 
 gate の測定項目は performance/README.md が invariant と宣言しているものに 1:1 対応する:

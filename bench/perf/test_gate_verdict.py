@@ -287,6 +287,20 @@ class TestPooling(unittest.TestCase):
             with self.assertRaises(gate_verdict.PoolError):
                 gate_verdict.check_pool_builds(sources)
 
+    def test_pooling_refuses_more_than_max_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            r1 = self._run(root, "run1", "abc", [(1.0, 2.0, 3.0)])
+            r2 = self._run(root, "run2", "abc", [(1.0, 2.0, 3.0)])
+            r3 = self._run(root, "run3", "abc", [(1.0, 2.0, 3.0)])
+            r4 = self._run(root, "run4", "abc", [(1.0, 2.0, 3.0)])
+            (r2 / "pooled_from.txt").write_text(str(r1) + "\n", encoding="utf-8")
+            (r3 / "pooled_from.txt").write_text(str(r2) + "\n", encoding="utf-8")
+            (r4 / "pooled_from.txt").write_text(str(r3) + "\n", encoding="utf-8")
+            sources = gate_verdict.resolve_sources(str(r4))
+            self.assertEqual(len(sources), 4)
+            with self.assertRaisesRegex(gate_verdict.PoolError, "max 3"):
+                gate_verdict.check_pool_builds(sources)
+
 
 class TestIncompleteRounds(unittest.TestCase):
     def test_incomplete_ratelimit_pair_is_dropped_not_fatal(self):

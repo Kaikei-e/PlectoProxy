@@ -491,9 +491,9 @@ protocols = ["websocket"]
 
         // Dropping one tunnel releases its per-IP slot once the tunnel task observes EOF and exits.
         drop(tunnels.pop());
-        loop {
-            let mut recovered = TcpStream::connect(proxy).await.unwrap();
-            if recovered
+        let recovered = loop {
+            let mut candidate = TcpStream::connect(proxy).await.unwrap();
+            if candidate
                 .write_all(
                     b"GET /ws HTTP/1.1\r\n\
                       host: e2e\r\n\
@@ -504,17 +504,51 @@ protocols = ["websocket"]
                 .is_ok()
             {
                 let mut rbuf = [0u8; 256];
-                if let Ok(n) = recovered.read(&mut rbuf).await
+                if let Ok(n) = candidate.read(&mut rbuf).await
                     && n > 0
                 {
                     let head = String::from_utf8_lossy(&rbuf[..n]);
                     if head.starts_with("HTTP/1.1 101") {
-                        break;
+                        break candidate;
                     }
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // Dropping all 256 active tunnels releases all per-IP and global slots so a full batch of
+        // 256 new tunnels can be established again without any leaked Arc<ConnGuards>.
+        drop(recovered);
+        tunnels.clear();
+        let mut reopened = Vec::with_capacity(CAP);
+        for _ in 0..CAP {
+            let s = loop {
+                let mut candidate = TcpStream::connect(proxy).await.unwrap();
+                if candidate
+                    .write_all(
+                        b"GET /ws HTTP/1.1\r\n\
+                          host: e2e\r\n\
+                          connection: upgrade\r\n\
+                          upgrade: websocket\r\n\r\n",
+                    )
+                    .await
+                    .is_ok()
+                {
+                    let mut rbuf = [0u8; 256];
+                    if let Ok(n) = candidate.read(&mut rbuf).await
+                        && n > 0
+                    {
+                        let head = String::from_utf8_lossy(&rbuf[..n]);
+                        if head.starts_with("HTTP/1.1 101") {
+                            break candidate;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            reopened.push(s);
         }
+        assert_eq!(reopened.len(), CAP);
     })
     .await
     .expect("per-IP cap across upgraded tunnels test timed out");

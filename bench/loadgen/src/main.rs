@@ -55,7 +55,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::Resumption;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, HandshakeKind, NamedGroup, RootCertStore};
 
 mod openloop;
 mod ws;
@@ -631,18 +631,22 @@ fn tls_client_config(ca_path: &str, mode: &str) -> Result<Arc<ClientConfig>, Box
 }
 
 /// One request on a FRESH connection: TCP connect + TLS handshake + GET, then close. Returns which
-/// handshake happened. The response read matters beyond realism: TLS 1.3 NewSessionTickets are
-/// post-handshake messages, so reading is what pulls them into the shared session cache for the
-/// next connection to offer.
-async fn tls_get_once(t: &TlsTarget, connector: &TlsConnector) -> Result<HandshakeKind, BoxError> {
+/// handshake happened and the negotiated key-exchange group (e.g. `X25519MLKEM768` under aws-lc-rs's
+/// default `prefer-post-quantum` provider). The response read matters beyond realism: TLS 1.3
+/// NewSessionTickets are post-handshake messages, so reading is what pulls them into the shared
+/// session cache for the next connection to offer.
+async fn tls_get_once(
+    t: &TlsTarget,
+    connector: &TlsConnector,
+) -> Result<(HandshakeKind, Option<NamedGroup>), BoxError> {
     let tcp = TcpStream::connect(&t.addr).await?;
     tcp.set_nodelay(true)?;
     let tls = connector.connect(t.sni.clone(), tcp).await?;
-    let kind = tls
-        .get_ref()
-        .1
+    let conn_info = tls.get_ref().1;
+    let kind = conn_info
         .handshake_kind()
         .ok_or("handshake kind unavailable after connect")?;
+    let kx_group = conn_info.negotiated_key_exchange_group().map(|g| g.name());
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
     tokio::spawn(async move {
         let _ = conn.await;
@@ -654,7 +658,7 @@ async fn tls_get_once(t: &TlsTarget, connector: &TlsConnector) -> Result<Handsha
     while let Some(frame) = resp.frame().await {
         frame?;
     }
-    Ok(kind)
+    Ok((kind, kx_group))
 }
 
 /// Closed-loop per worker (oha's `-c N` shape): connect/handshake/GET back-to-back until
@@ -666,10 +670,11 @@ async fn tls_worker(
     start: Instant,
     warmup: u64,
     duration: u64,
-) -> (Vec<f64>, u64, u64, u64) {
+) -> (Vec<f64>, u64, u64, u64, Option<NamedGroup>) {
     let connector = TlsConnector::from(config);
     let mut latencies = Vec::new();
     let (mut full, mut resumed, mut errors) = (0u64, 0u64, 0u64);
+    let mut sample_kx = None;
     let end = start + Duration::from_secs(warmup + duration);
     let warm_until = start + Duration::from_secs(warmup);
     while Instant::now() < end {
@@ -679,8 +684,11 @@ async fn tls_worker(
             continue;
         }
         match res {
-            Ok(kind) => {
+            Ok((kind, kx)) => {
                 latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if sample_kx.is_none() {
+                    sample_kx = kx;
+                }
                 match kind {
                     HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest => full += 1,
                     HandshakeKind::Resumed => resumed += 1,
@@ -689,7 +697,7 @@ async fn tls_worker(
             Err(_) => errors += 1,
         }
     }
-    (latencies, resumed, full, errors)
+    (latencies, resumed, full, errors, sample_kx)
 }
 
 async fn run_tls(a: TlsArgs) -> Result<(), BoxError> {
@@ -710,13 +718,20 @@ async fn run_tls(a: TlsArgs) -> Result<(), BoxError> {
 
     let mut all: Vec<f64> = Vec::new();
     let (mut resumed, mut full, mut errors) = (0u64, 0u64, 0u64);
+    let mut kx_group = None;
     for h in handles {
-        let (lat, r, f, e) = h.await?;
+        let (lat, r, f, e, kx) = h.await?;
         all.extend(lat);
         resumed += r;
         full += f;
         errors += e;
+        if kx_group.is_none() {
+            kx_group = kx;
+        }
     }
+    let kx_name = kx_group
+        .map(|g| format!("{g:?}"))
+        .unwrap_or_else(|| "none".to_string());
     all.sort_by(f64::total_cmp);
     let n = all.len();
     let pct = |p: f64| -> f64 {
@@ -733,14 +748,14 @@ async fn run_tls(a: TlsArgs) -> Result<(), BoxError> {
     // the CSV, not silently mislabeled.
     let resumed_pct = 100.0 * resumed as f64 / (resumed + full).max(1) as f64;
     let csv = format!(
-        "mode,workers,duration_s,requests,rps,full,resumed,resumed_pct,errors,p50_ms,p90_ms,p99_ms\n\
-         {},{},{},{n},{rps:.1},{full},{resumed},{resumed_pct:.1},{errors},{p50:.3},{p90:.3},{p99:.3}\n",
+        "mode,workers,duration_s,requests,rps,full,resumed,resumed_pct,errors,p50_ms,p90_ms,p99_ms,kx_group\n\
+         {},{},{},{n},{rps:.1},{full},{resumed},{resumed_pct:.1},{errors},{p50:.3},{p90:.3},{p99:.3},{kx_name}\n",
         a.mode, a.workers, a.duration
     );
     std::fs::write(&a.out, csv)?;
     println!(
         "tls {}: {n} requests over {} s ({} workers) -> {rps:.0} req/s, \
-         full={full} resumed={resumed} ({resumed_pct:.1}% resumed), errors={errors}, \
+         full={full} resumed={resumed} ({resumed_pct:.1}% resumed), kx_group={kx_name}, errors={errors}, \
          p50={p50:.3}ms p99={p99:.3}ms",
         a.mode, a.duration, a.workers
     );

@@ -32,6 +32,50 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-10-26
+
+Patch release: T1 regression gate pooling cap and pre-CPU-window settle fingerprinting
+(`bench/perf/*`, [ADR 000122](docs/ADR/000122.md)), TLS 1.3 negotiated key-exchange group
+reporting in `plecto-loadgen tls`, full-batch connection-slot recovery regression coverage for
+HTTP/1.1 `Upgrade` tunnels (`plecto-server`), and documentation / hardening guide alignment
+(RFC 9846 §4.3.9 + `X25519MLKEM768` hybrid post-quantum key exchange, `RATELIMIT_CPU_US_PER_REQ`
+decomposition, and `RUSTSEC-2026-0387` advisory exception rationale for the reference `filter-jwt`
+guest). No WIT contract, manifest schema, CLI, or public API change from 0.15.3, and
+`cargo semver-checks` against the crates.io 0.15.3 baseline reports no semver update required on
+each of `plecto-host` / `plecto-control` / `plecto-server` (default features). **Deployed filters
+do not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0` and the
+reference-filter shelf is unchanged.
+
+### Changed
+
+- **Cap sequential T1 gate round pooling and fingerprint `GATE_CPU_SETTLE_S` (`bench/perf/*`,
+  [ADR 000122](docs/ADR/000122.md))**: `gate_verdict.py` now enforces `MAX_POOL_RUNS = 3` (refusing
+  with exit 64 if more than 3 runs are transitively pooled), and `run-perf.sh` records
+  `GATE_CPU_SETTLE_S` in `gate_params.txt` (`build_id.txt` SHA-256 input) so runs with different
+  pre-CPU-window idle settle durations cannot be pooled together.
+- **Report negotiated TLS 1.3 key-exchange group in `plecto-loadgen tls`
+  (`bench/loadgen/src/main.rs`)**: `tls` now records
+  `ServerConnection::negotiated_key_exchange_group()` (e.g. `X25519MLKEM768` under `aws-lc-rs`'s
+  default `prefer-post-quantum` provider) and emits `kx_group` in both stdout and CSV output.
+- **Extend HTTP/1.1 `Upgrade` per-IP slot regression test to verify full-batch recovery
+  (`crates/server/tests/upgrade.rs`)**: `upgraded_tunnels_hold_their_per_ip_connection_slot_until_closed`
+  now also drops all 256 active tunnels and verifies that a full second batch of 256 tunnels can be
+  established without leaking `Arc<ConnGuards>`.
+- **Documentation & hardening guide alignment (`performance/README.md`, `docs/hardening.md`,
+  `docs/ADR/000122.md`, `bench/methodology.md`, `docs/verification*.md`)**:
+  - Document HTTP/1.1 `Upgrade` tunnel connection-slot retention (`MAX_CONNECTIONS = 10,000` and
+    `MAX_CONNECTIONS_PER_IP = 256`) under `Current security boundaries` in `docs/hardening.md`, and
+    record the affected version ranges (`v0.4.0`–`v0.15.2` / `v0.7.0`–`v0.15.2`) in the 0.15.3
+    security entry below.
+  - Update TLS 1.3 resumption citations in `performance/README.md` to RFC 9846 §4.3.9 and §2.2
+    (with RFC 9257 §4.2 / §6) and document the default `X25519MLKEM768` hybrid post-quantum key
+    exchange.
+  - Align the remaining `2026-10-24` T1 gate cells in `performance/README.md` with the 95 %
+    Student-$t$ re-judgment (`9 pass, 1 inconclusive`), and document why `proc_cpu.py`'s
+    `schedstat` and `/proc/<pid>/stat` agree across all 32 windows while the 11 s `powersave` idle
+    settle shifts CPU-µs/req and `max_requests_per_instance = 65,536` (`IdleMiss::PoolFilling`)
+    spawns replacement-instance tasks on `/ratelimit`.
+
 ## [0.15.3] - 2026-10-25
 
 Patch release: HTTP/1.1 `Upgrade` tunnel connection-slot retention across the full tunnel lifetime
@@ -52,7 +96,10 @@ the filter contract stays at `plecto:filter@0.4.0` and the reference-filter shel
   response headers are written and hands the upgraded I/O stream to `hyper::upgrade::on`, which
   previously dropped `serve_conn`'s stack-held `OwnedSemaphorePermit` (`MAX_CONNECTIONS = 10,000`,
   [ADR 000027](docs/ADR/000027.md)) and `PerIpConnGuard` (`MAX_CONNECTIONS_PER_IP = 256`,
-  [ADR 000092](docs/ADR/000092.md)) while the detached WebSocket tunnel remained open (CWE-770).
+  [ADR 000092](docs/ADR/000092.md)) while the detached WebSocket tunnel remained open (CWE-770;
+  affected versions: `v0.4.0`–`v0.15.2` for `MAX_CONNECTIONS` since [ADR 000048](docs/ADR/000048.md)
+  and `v0.7.0`–`v0.15.2` for `MAX_CONNECTIONS_PER_IP` since [ADR 000092](docs/ADR/000092.md), on
+  routes with `[route.upgrade]` enabled).
   Both guards are now bundled into `Arc<ConnGuards>` and moved into `upgrade_switch`'s spawned
   tunnel task alongside the circuit-breaker permit and load-balancer `Pick` guard (HTTP/2 streams,
   which have no HTTP/1.1 `Upgrade` path, receive `None` so per-stream atomic refcount traffic is

@@ -18,6 +18,15 @@ front proxy, granting outbound capabilities, or preparing an operator manifest.
   an HTTP/2 or HTTP/3 adapter that supplies an origin-form URI and a single valid `Host` also
   has that host normalized into the URI authority. Both absent, duplicate `Host` values, and
   conflicting authorities are rejected for HTTP/2 and HTTP/3.
+- **Connection admission:** each listener enforces a global ceiling of `MAX_CONNECTIONS = 10,000`
+  concurrent connections ([ADR 000027](ADR/000027.md)) and a per-client-source ceiling of
+  `MAX_CONNECTIONS_PER_IP = 256` concurrent connections per IPv4 `/32` or IPv6 `/64` prefix
+  ([ADR 000092](ADR/000092.md)), across both TCP (HTTP/1.1, HTTP/2) and QUIC (HTTP/3). HTTP/1.1
+  `101 Switching Protocols` (`Upgrade`) tunnels retain both their global semaphore permit and their
+  per-IP slot for the entire tunnel lifetime until EOF, error, activity-based `idle_timeout_ms`
+  (default 5 minutes, [ADR 000048](ADR/000048.md)), or graceful drain ([ADR 000122](ADR/000122.md)).
+  Include long-lived WebSocket tunnels from a single client IP or NAT egress when sizing connection
+  budgets.
 - **Request admission:** each server admits at most 1,024 request lifetimes across HTTP/1.1,
   HTTP/2, and HTTP/3. Saturation returns 503 with `x-plecto-fault: request-overloaded` without
   queueing filter work. Blocking filter calls, upload/response data retained by the transport,

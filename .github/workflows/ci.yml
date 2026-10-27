@@ -570,11 +570,11 @@ jobs:
               exit 1
             fi
             crate_dir="$(dirname "${manifest}")"
-            args=(--manifest-path "${manifest}" --locked check)
+            args=(--manifest-path "${manifest}" --locked)
             if [ -f "${crate_dir}/deny.toml" ]; then
               args+=(--config "${crate_dir}/deny.toml")
             fi
-            "${cargo_deny}" "${args[@]}" advisories
+            "${cargo_deny}" "${args[@]}" check advisories
             scanned=$((scanned + 1))
           done < <(git ls-files -z -- ':(glob)**/Cargo.lock' | sort -z)
 

@@ -92,9 +92,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           components: rustfmt
       - run: cargo fmt --all -- --check
       # Every example filter guest is a SEPARATE workspace; loop them all so a new guest
@@ -164,9 +164,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           components: clippy
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -207,9 +207,9 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           # Default features build only the zero-WASI guests (build.rs) — no wasip2 here.
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -252,9 +252,9 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -373,9 +373,9 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -416,9 +416,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -457,9 +457,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.97.1"
+          toolchain: "1.99.1"
           components: clippy
           targets: wasm32-unknown-unknown,wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -570,11 +570,11 @@ jobs:
               exit 1
             fi
             crate_dir="$(dirname "${manifest}")"
-            args=(--manifest-path "${manifest}" --locked)
+            args=(--manifest-path "${manifest}" --locked check)
             if [ -f "${crate_dir}/deny.toml" ]; then
               args+=(--config "${crate_dir}/deny.toml")
             fi
-            "${cargo_deny}" "${args[@]}" check advisories
+            "${cargo_deny}" "${args[@]}" advisories
             scanned=$((scanned + 1))
           done < <(git ls-files -z -- ':(glob)**/Cargo.lock' | sort -z)
 

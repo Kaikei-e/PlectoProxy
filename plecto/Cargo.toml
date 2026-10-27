@@ -10,11 +10,11 @@ members = ["crates/host", "crates/control", "crates/server", "crates/plecto"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.15.4"
+version = "0.15.5"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
-rust-version = "1.97"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/Kaikei-e/PlectoProxy"
 keywords = ["proxy", "gateway", "wasm", "webassembly", "http"]
@@ -36,15 +36,44 @@ unsafe_op_in_unsafe_fn = "deny"
 # packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
 # package at all without one). Bump `version` here in lockstep with `workspace.package.version`
 # above at release time.
-plecto-host = { path = "crates/host", version = "0.15.4" }
-plecto-control = { path = "crates/control", version = "0.15.4" }
-plecto-server = { path = "crates/server", version = "0.15.4" }
+plecto-host = { path = "crates/host", version = "0.15.5" }
+plecto-control = { path = "crates/control", version = "0.15.5" }
+plecto-server = { path = "crates/server", version = "0.15.5" }
 # wasmtime 50.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
 # WASI 0.3). 50 adds no newly default-on Cranelift proposals; GC (47), exception handling (47),
 # and wide-arithmetic (49) stay explicitly turned off (deny-by-default, crates/host/src/engine.rs).
 # The async / bindgen API is still moving on this line, so we track the latest 50 patch (Cargo.lock
 # pins the resolved build).
-wasmtime = "50.0.0"
+# `default-features = false` drops `cache` (`wasmtime-internal-cache`), which Plecto never uses
+# and which pins `zstd 0.13` (`zstd-safe 7.3.0` / `zstd-sys 2.0.16`, RUSTSEC-2026-0403 /
+# RUSTSEC-2026-0410); all other default features are retained.
+wasmtime = { version = "50.0.0", default-features = false, features = [
+    "addr2line",
+    "anyhow",
+    "async",
+    "backtrace",
+    "compile-time-builtins",
+    "component-model",
+    "component-model-async",
+    "coredump",
+    "cranelift",
+    "debug",
+    "debug-builtins",
+    "demangle",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "parallel-compilation",
+    "pooling-allocator",
+    "profiling",
+    "runtime",
+    "stack-switching",
+    "std",
+    "threads",
+    "wat",
+    "wit-parser",
+] }
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
 wasmtime-wasi = "50.0.0"
@@ -157,6 +186,16 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+
+# --- Dev/test-profile debuginfo floor: line tables only for workspace crates (keeps file:line in
+# --- panic backtraces without full DWARF variable/type tables), and no debuginfo for third-party
+# --- dependencies (wasmtime/cranelift + aws-lc + quinn statically linked into every integration
+# --- test binary otherwise multiply target/ disk footprint and link time).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 # --- Dev/test-profile overrides for the wasm-compilation pipeline. Unoptimized Cranelift
 # --- compiles guest components an order of magnitude slower than release Cranelift, and the

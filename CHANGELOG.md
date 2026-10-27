@@ -32,6 +32,48 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-10-27
+
+Patch release: MSRV / CI / Docker toolchain pin follows Rust **1.99.1** (was 1.97.1), `zstd` moves
+0.13 → 0.14.3 (`zstd-safe` 8.2.0 / `zstd-sys` 2.1.2, clearing `RUSTSEC-2026-0403` and
+`RUSTSEC-2026-0410`; the unused `wasmtime` `cache` feature is dropped so `wasmtime-internal-cache`
+no longer pins `zstd` 0.13), dev/test profile debuginfo is tuned to `line-tables-only` for
+workspace crates and `false` for third-party dependencies, and the reference-filter shelf is
+republished under the new guest toolchain. No WIT contract, manifest schema, CLI, or public API
+change from 0.15.4, and `cargo semver-checks` against the crates.io 0.15.4 baseline reports no
+semver update required on each of `plecto-host` / `plecto-control` / `plecto-server` (default
+features). **Deployed filters do not need a rebuild**: the filter contract stays at
+`plecto:filter@0.4.0`.
+
+### Security
+
+- **Update `zstd` 0.13.3 → 0.14.3 (`zstd-safe` 7.3.0 → 8.2.0, `zstd-sys` 2.0.16 → 2.1.2) and drop
+  the unused `wasmtime` `cache` feature (`plecto/Cargo.toml`, `crates/server/Cargo.toml`,
+  `spike/streaming-async/host/Cargo.toml`)**: clears `RUSTSEC-2026-0403` (`zstd-safe` legacy-frame
+  streaming decompression error path) and `RUSTSEC-2026-0410` (`zstd-sys` `wasm32` allocator shim).
+  `plecto-server`'s production build uses `zstd` on the compress-only response path, and
+  `plecto-host` never uses `wasmtime`'s on-disk module cache (`wasmtime-internal-cache`, the only
+  transitive consumer of `zstd` 0.13 in `wasmtime`).
+
+### Changed
+
+- **Toolchain / MSRV (`rust-toolchain.toml`, `Cargo.toml`, `.github/workflows/*`, `Dockerfile`)**:
+  `plecto/rust-toolchain.toml`, `plecto/Cargo.toml` (`rust-version = "1.99"`), CI
+  (`dtolnay/rust-toolchain` SHA pin `683b588c487a`), the release bookworm container
+  (`rust:1.99.1-bookworm`), and `Dockerfile` (`ARG RUST_VERSION=1.99.1`) all move to Rust 1.99.1
+  (LLVM 23.1.1). Replace `AtomicU32::fetch_update` / `AtomicU64::fetch_update` calls in
+  `crates/host/src/outbound_tcp.rs` and `crates/host/src/backend.rs` with `try_update` (stabilized
+  and `fetch_update` deprecated in Rust 1.99.0).
+- **Dev / test profile debuginfo (`plecto/Cargo.toml`)**: set `[profile.dev] debug = "line-tables-only"`
+  and `[profile.dev.package."*"] debug = false` so local debug and test builds preserve `file:line`
+  panic backtraces in workspace crates while omitting DWARF debuginfo for third-party dependencies
+  (`wasmtime`/`cranelift`/`aws-lc`/`quinn`).
+- **Reference-filter shelf republished (`docs/reference-filters.md`,
+  `plecto/examples/filters/filter-*`)**: `filters/jwt` 0.1.9 → 0.1.10, `filters/cors` 0.2.3 → 0.2.4,
+  `filters/apikey` 0.1.9 → 0.1.10, `filters/extauthz` 0.2.1 → 0.2.2 (ADR 000080 — filter tags are
+  immutable). No filter source change: compiling the guest workspaces under rustc 1.99.1 changes the
+  stripped component bytes across all four shelf entries.
+
 ## [0.15.4] - 2026-10-26
 
 Patch release: T1 regression gate pooling cap and pre-CPU-window settle fingerprinting

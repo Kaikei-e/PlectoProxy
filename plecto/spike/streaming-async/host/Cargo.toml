@@ -11,7 +11,7 @@ name = "streaming-host"
 path = "src/main.rs"
 
 [dependencies]
-wasmtime = { version = "50.0.0", features = ["async", "component-model-async"] }
+wasmtime = { version = "50.0.0", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
 wasmtime-wasi = "50.0.0"
 tokio = { version = "1", features = ["macros", "rt"] }
 

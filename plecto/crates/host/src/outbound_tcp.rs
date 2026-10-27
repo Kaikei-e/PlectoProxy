@@ -89,7 +89,7 @@ impl TcpSocketQuota {
 
     fn try_acquire(&self) -> bool {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < self.limit).then(|| used + 1)
             })
             .is_ok()
@@ -103,7 +103,7 @@ impl TcpSocketQuota {
         // must never free another Store's descriptor slot.
         if self
             .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 used.checked_sub(count)
             })
             .is_err()
@@ -215,7 +215,7 @@ impl TcpGuard {
         };
         if inner
             .live_sockets
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < MAX_LIVE_TCP_SOCKETS_PER_STORE).then(|| used + 1)
             })
             .is_err()
@@ -236,7 +236,7 @@ impl TcpGuard {
         };
         if inner
             .live_sockets
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used > 0).then(|| used - 1)
             })
             .is_ok()
@@ -310,7 +310,7 @@ impl TcpGuard {
         }
         inner
             .connects
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < inner.policy.max_connections).then(|| used + 1)
             })
             .is_ok()

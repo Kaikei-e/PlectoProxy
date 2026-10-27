@@ -81,7 +81,7 @@ This crate is one member of the Plecto Proxy Cargo workspace (all members versio
 - Release notes live in the
   [CHANGELOG](https://github.com/Kaikei-e/PlectoProxy/blob/main/CHANGELOG.md); git tags mark
   every published release.
-- **MSRV**: Rust 1.97 (declared as `rust-version` in `Cargo.toml`).
+- **MSRV**: Rust 1.99 (declared as `rust-version` in `Cargo.toml`).
 
 ## Links
 

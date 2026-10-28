@@ -7,5 +7,8 @@
   },
   "dependencies": {
     "flint-chart-mcp": "1.0.1"
+  },
+  "overrides": {
+    "zod": "^4.6.6"
   }
 }

@@ -5,6 +5,35 @@ numbers plus the delta they were judged against); everything older moves here ve
 first. Method changes are recorded in [`bench/methodology.md`](../bench/methodology.md); per-pass
 CSVs are regenerable working data (`performance/data/`, untracked).
 
+## 2026-10-31 (`v0.15.5` / `HEAD` `983cbed`: gungraun instruction-count reduction on Rust 1.99.1 & contended-host T2/T1 verification)
+
+Re-measured at `HEAD` `983cbed` (one commit past **`v0.15.5`**, `6a8959a`; Rust `1.99.1`, `zstd 0.14.3`, unused `wasmtime` `cache` feature removed, `Atomic::try_update` migration; `PROXY_CPUS=0-11`, `GEN_CPUS=12-23`):
+- **gungraun instruction-count micro-benchmarks (`crates/host/benches/wasm_inst.rs`, `crates/control/benches/fastpath_inst.rs`, frequency- and neighbour-invariant)**:
+  - `on_request/trusted_pooled`: **28,290** instructions (down from `30,448` on `v0.15.2` / `rustc 1.98.0`, **−7.1 %** / `−2,158 Ir`), L1 hits `42,318` (was `45,406`), LL hits `1,357` (was `1,416`), RAM hits `19` (was `20`), total read/write `43,694` (was `46,842`), est. cycles **49,768** (was `53,186`, **−6.4 %**).
+  - `on_request/untrusted_fresh`: **101,983** instructions (down from `112,951`, **−9.7 %** / `−10,968 Ir`; **`3.60×`** `trusted_pooled`), L1 hits `148,700` (was `164,118`), LL hits `6,090` (was `6,375`), RAM hits `41` (was `42`), total read/write `154,831` (was `170,535`), est. cycles **180,585** (was `197,463`, **−8.5 %**).
+  - `lb_pick/round_robin`: **223** instructions (was `225`), L1 `310`, LL `1`, RAM `2`, total r/w `313`, est. cycles `385` (was `417`).
+  - `lb_pick/least_request_p2c`: **335** instructions (was `340`), L1 `453`, LL `1`, RAM `2`, total r/w `456`, est. cycles `528` (was `569`).
+  - `lb_pick_maglev/source_ip`: **278** instructions (was `282`), L1 `378`, LL `0`, RAM `3`, total r/w `381`, est. cycles `483` (was `489`).
+  - [`bench/perf/ipc_check.py`](../bench/perf/ipc_check.py) passed all 5 pairs (`ok` across `on_request/trusted_pooled` IPC `1.34`, `on_request/untrusted_fresh` IPC `0.65`, `lb_pick/round_robin` IPC `1.37`, `lb_pick/least_request_p2c` IPC `1.33`, `lb_pick/maglev` IPC `2.00`, limit `5.0`).
+- **Criterion wall-clock micro-benchmarks (`fastpath.rs`, `wasm.rs` at `983cbed`, pinned `0-11`, under external host load `load average ≈ 28`)**:
+  - `fastpath.rs`: `lb_pick/round_robin` `33.2 → 39.4 → 37.1 ns` (`3 → 8 → 32`), `least_request_p2c` `44.2 → 51.6 → 83.0 ns`, `maglev` `25.7 → 29.1 → 24.3 ns`; `pick_under_swap_churn` `133.3 → 51.1 → 54.8 ns`; `find_route` `57.1 → 115.7 → 254.2 ns` (`1 → 16 → 64`); `normalize_path` `53.9 ns` (`plain`), `36.4 ns` (`with_query`), `145.1 ns` (`dot_segments`).
+  - `wasm.rs` (`--features outbound-http,outbound-tcp,fat-guest,streaming-body`): `on_request/trusted_pooled` `3.88 µs` `[3.874 .. 3.883 µs]`, `on_request/untrusted_fresh` `29.60 µs` `[28.63 .. 30.65 µs]`, `filter_load/trusted_cold` `15.22 ms` `[14.82 .. 15.63 ms]` (elevated vs idle `2.09 µs` / `28.53 µs` / `7.89 ms` due to external CPU contention on the host).
+- **Contended-host T2 `all` (`20261030T164100Z-983cbed`, all 14 phases `ok`) & T1 `gate` (`20261030T171451Z-983cbed-dirty`, `INCONCLUSIVE` exit 2: `7 pass, 0 fail, 3 inconclusive`)**:
+  - Unpinned external containers/processes on the reference host consumed ~1,500–1,700 % CPU across all 24 logical CPUs (`load average ≈ 22–33`) throughout the macro runs.
+  - All functional and load-invariant checks held identically to idle runs:
+    - `rr_spread_req`: **0** (`40,000 / 40,000 / 40,000` across `120,000` requests in both T2 and T1).
+    - `ejection`: `300,000` responses over 75 s in T2 (`60,120` failed = `20.04 %` during total ejection) and `160,000` over 40 s in T1 (`24,040` failed = `15.03 %`), `ejection_transition_s` = **1.0 s**, `ejection_stray_failed` = **0**.
+    - `swap`: `240,000` responses over 60 s, **0 failed (0.00 %)**, 1 s transition at `t = 15 s`.
+    - `ratelimit` enforcement & fairness: T1 `enforce_allowed_ratio` = **0.9999** (`11,000` allowed = `1,100.0/s`, `39,003` 429s = `78.0 %` shed, `0` status-less over 10 s); T2 `enforce` **1,033.3/s** allowed (`31,000` accepted, `119,000` limited = `79.3 %` shed, `0` status-less over 30 s); T2 `fairness` hot key `1,033.3/s` allowed (`74.17 %` shed, `0` status-less), light key **500.0/s allowed (`0 %` shed, `0` status-less)**.
+    - `wasm_mixed` short-circuit: `108,084` accepted (`1,801.4/s`, `90.05 %`, p50 `16.344 ms`, p95 `17.365 ms`, p99 `18.732 ms`) / `11,945` rejected (`199.1/s`, `9.95 %`, p50 `0.105 ms`, p95 `1.070 ms`, p99 `1.512 ms`), **0 status-less**.
+    - `footprint` & `ws`: `footprint.txt` idle `45,308 kB` → `51,616 kB` over 250 conns (**`25,838 B/conn`**); `ws_footprint.csv` fresh-process idle `41,144 kB` → `46,364 kB` over 250 held tunnels (**`21,381 B/tunnel`**); `ws_handshake` `10,000 / 10,000` (`500.0/s`, `0` failed); `h3` `status=200 http_version=3`; `body_rss.csv` (1 MB × 50 VUs) `148,620 / 286,640 / 134,000 kB` (`/baseline` / `/body` / `/body-headeronly`).
+    - T1 fixed-rate 2,000 rps tails: `pooled_tail_p50_ms` **+0.0430 ms** (`pass`, p99 `+0.3082 ms`), `apikey_tail_p50_ms` **−0.0083 ms** (`pass`), `respctx_tail_p50_ms` **−0.0178 ms** (`pass`, p99 `−0.0216 ms`).
+  - Contended throughput / latency figures (archived in `performance/data/runs/20261030T164100Z-983cbed/csv/` and `20261030T171451Z-983cbed-dirty/csv/`, not used to overwrite [`README.md`](README.md)'s idle-host macro tables and charts):
+    - T2 `ceiling`: keep-alive `90,801.9 rps` (p50 `0.45 ms`, p99 `1.99 ms`), cold CRR `46,376.2 rps` (`51.1 %` of keep-alive, p50 `0.94 ms`, p99 `3.21 ms`).
+    - T2 `wasm` ladder: `/baseline` `90,801.9` → `/noop-pooled` `72,706.1` → `/trusted` `65,318.9` → `/noop-fresh` `8,037.4` / `/ondemand` `8,329.2 rps`; fixed-rate `4,822 rps` tails p50 `0.144 / 0.157 / 0.196 ms` (`baseline` / `noop-pooled` / `trusted`).
+    - T2 `tls`: keep-alive `77,235.5 rps`, handshake/req `11,046.3 rps`, h2 `59,702.0 rps`; `ws_echo`: 1 KB `56,209.2 msg/s` (`57.56 MB/s`), 64 KB `23,648.5 msg/s` (`1,549.82 MB/s`); `sweep`: VU 50/100/200/400/800 = `47,992 / 55,816 / 50,062 / 48,527 (27.8 % failed) / 43,230 rps (50.6 % failed)`; `openloop` at `39,070/s`: `39,070/s` achieved, `0` dropped, p50 `0.556 ms`, p99 `48.671 ms`; `body`: 1 KB `51,628 / 48,185 / 42,794 rps`, 100 KB `14,260 / 9,569 / 14,655 rps`, 1 MB `3,513 / 1,254 / 3,749 rps`; `mix` at 20k/s: `read-only` dropped `4,379`, `mix` dropped `9,996` (`0` status-less).
+    - T1 `gate` (`20261030T171451Z-983cbed-dirty`): `dispatch_floor_us` `2.7291 ± 1.6192 µs` (`inconclusive`, n = 8), `apikey_cost_us` `4.3395 ± 3.5856 µs` (`inconclusive`, n = 8), `ratelimit_tax_us` `4.0742 ± 5.2226 µs` (`inconclusive`, n = 8); info `baseline_cpu_us_per_req` `46.5172 ± 4.5292 µs`, `ratelimit_cpu_us_per_req` `22.8146 ± 2.1891 µs` (n = 4, with rate-hold warnings on 7 of 8 arms: `achieved 19,199–19,937 rps, dropped 185–2,382`).
+
 ## 2026-10-25 (ADR 000122 re-measurement: Upgrade per-IP fix, open-loop pacing, 8-round paired gate)
 
 Targeted re-runs on the same reference host after [ADR 000122](../docs/ADR/000122.md) (`9c0b84b` + working tree; `PROXY_CPUS=0-11`, `GEN_CPUS=12-23`):

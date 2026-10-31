@@ -10,7 +10,7 @@ members = ["crates/host", "crates/control", "crates/server", "crates/plecto"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.15.5"
+version = "0.15.6"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
@@ -36,9 +36,9 @@ unsafe_op_in_unsafe_fn = "deny"
 # packaged for crates.io — `cargo package` strips `path` and keeps only `version`, and refuses to
 # package at all without one). Bump `version` here in lockstep with `workspace.package.version`
 # above at release time.
-plecto-host = { path = "crates/host", version = "0.15.5" }
-plecto-control = { path = "crates/control", version = "0.15.5" }
-plecto-server = { path = "crates/server", version = "0.15.5" }
+plecto-host = { path = "crates/host", version = "0.15.6" }
+plecto-control = { path = "crates/control", version = "0.15.6" }
+plecto-server = { path = "crates/server", version = "0.15.6" }
 # wasmtime 50.0.x continues the M3 Stage 1 host async line (ADR 000021; Component Model async +
 # WASI 0.3). 50 adds no newly default-on Cranelift proposals; GC (47), exception handling (47),
 # and wide-arithmetic (49) stay explicitly turned off (deny-by-default, crates/host/src/engine.rs).
@@ -47,7 +47,7 @@ plecto-server = { path = "crates/server", version = "0.15.5" }
 # `default-features = false` drops `cache` (`wasmtime-internal-cache`), which Plecto never uses
 # and which pins `zstd 0.13` (`zstd-safe 7.3.0` / `zstd-sys 2.0.16`, RUSTSEC-2026-0403 /
 # RUSTSEC-2026-0410); all other default features are retained.
-wasmtime = { version = "50.0.0", default-features = false, features = [
+wasmtime = { version = "50.0.1", default-features = false, features = [
     "addr2line",
     "anyhow",
     "async",
@@ -76,8 +76,8 @@ wasmtime = { version = "50.0.0", default-features = false, features = [
 ] }
 # wasmtime-wasi / wasmtime-wasi-http must be bumped in LOCKSTEP with `wasmtime` above — declared
 # here (not inline in crates/host) so a partial bump cannot produce two wasmtime stacks.
-wasmtime-wasi = "50.0.0"
-wasmtime-wasi-http = "50.0.0"
+wasmtime-wasi = "50.0.1"
+wasmtime-wasi-http = "50.0.1"
 # wit-component must stay on the wasm-tools series `wasmtime` above bundles (50.0.x ⇒ 0.261):
 # `bindgen!(include_component_type)` encodes each world with wasmtime's own copy, and the static
 # contract gate decodes it through wasmtime's `wit_parser` re-export — two series would not even

@@ -32,6 +32,48 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-10-31
+
+Patch release: lockstep update of `wasmtime` / `wasmtime-wasi` / `wasmtime-wasi-http` **50.0.0 →
+50.0.1** (`cranelift-*` 0.137.0 → 0.137.1) across the workspace and the streaming-async spike host
+to clear five RustSec advisories (`RUSTSEC-2026-0420` through `RUSTSEC-2026-0424`), `performance/flint`
+lockfile alignment (`flint-bench` 1.0.1, `zod >= 4.6.6`), and refreshed `v0.15.5` instruction-count
+benchmark documentation. No WIT contract, manifest schema, CLI, or public API change from 0.15.5,
+and `cargo semver-checks` against the crates.io 0.15.5 baseline reports no semver update required on
+each of `plecto-host` / `plecto-control` / `plecto-server` (default features). **Deployed filters do
+not need a rebuild**: the filter contract stays at `plecto:filter@0.4.0` and the reference-filter
+shelf is unchanged.
+
+### Security
+
+- **`wasmtime` / `wasmtime-wasi` / `wasmtime-wasi-http` 50.0.0 → 50.0.1 (`plecto/Cargo.toml`,
+  `plecto/Cargo.lock`, `plecto/spike/streaming-async/host/Cargo.toml`,
+  `plecto/spike/streaming-async/host/Cargo.lock`)** for five Wasmtime security advisories:
+  - [RUSTSEC-2026-0420](https://rustsec.org/advisories/RUSTSEC-2026-0420)
+    (`GHSA-hmmr-87qq-258j`): `wasip3` UDP `send` could deliver a datagram to an address only
+    permitted for receiving.
+  - [RUSTSEC-2026-0421](https://rustsec.org/advisories/RUSTSEC-2026-0421)
+    (`GHSA-h4wp-g4x3-7398`): `wasi-http` p2 outgoing `content-length` validation.
+  - [RUSTSEC-2026-0422](https://rustsec.org/advisories/RUSTSEC-2026-0422)
+    (`GHSA-3982-jqvv-277m`): typed functions with `i31` or `nullref` arguments could panic due to
+    insufficient type-checking (Plecto explicitly disables Wasm GC in `crates/host/src/engine.rs`).
+  - [RUSTSEC-2026-0423](https://rustsec.org/advisories/RUSTSEC-2026-0423)
+    (`GHSA-qw58-7h65-crq2`): cross-engine type confusion with host-created struct-types-with-supertypes
+    (Wasm GC disabled in Plecto).
+  - [RUSTSEC-2026-0424](https://rustsec.org/advisories/RUSTSEC-2026-0424)
+    (`GHSA-6fr9-xmw9-5352`): unchecked memory usage when transferring borrowed resources between
+    components.
+- **`performance/flint` lockfile (`performance/flint/package.json`, `package-lock.json`)**: synced
+  with `flint-bench` 1.0.1, added an explicit `zod >= 4.6.6` override, and removed the unused
+  `pnpm-lock.yaml`.
+
+### Changed
+
+- **Performance documentation (`performance/README.md`, `performance/HISTORY.md`)**: recorded the
+  `2026-10-31` (`v0.15.5`, Rust 1.99.1) teardown-excluded gungraun instruction-count measurements
+  (`on_request/trusted_pooled` 28,290 vs `untrusted_fresh` 101,983 instructions, down 7.1% / 9.7%
+  from `v0.15.2`) and contended-host T2/T1 verification notes.
+
 ## [0.15.5] - 2026-10-27
 
 Patch release: MSRV / CI / Docker toolchain pin follows Rust **1.99.1** (was 1.97.1), `zstd` moves

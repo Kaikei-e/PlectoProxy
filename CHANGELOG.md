@@ -32,6 +32,80 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-06
+
+Minor-line release refreshing the dependency graph across every workspace and the CI toolchain
+pins. Minor rather than patch because two dependencies whose types are re-surfaced through public
+signatures move to a new breaking line: `opentelemetry` 0.32 → 0.33 (`FilterSpan`'s public
+`trace_id` / `span_id` / `kind` / `attributes` / `events` fields and `RequestTrace`'s accessors
+expose its `TraceId` / `SpanId` / `SpanKind` / `Status` / `KeyValue` / `Event`) and `sigstore`
+0.14 → 0.15 (`DevKeyError::Crypto` carries `sigstore::errors::SigstoreError` as its `source`). A
+downstream crate naming the 0.32 / 0.14 types cannot compile against this build; `cargo
+semver-checks` cannot see this (the type paths are unchanged), which is the gap the versioning
+policy above assigns to manual judgement (the same call as 0.15.0). No WIT contract, manifest
+schema, CLI, or access-log change. **Deployed filters do not need a rebuild**: the contract stays
+at `plecto:filter@0.4.0`.
+
+Against the crates.io 0.15.6 baseline, `cargo semver-checks` reports no semver update required on
+each of `plecto-host` / `plecto-control` / `plecto-server` (default features). The T1 perf gate,
+pooled over 24 rounds, fails no invariant: 8 pass, and 2 stay inconclusive with their point
+estimates inside the band (`dispatch_floor_us` 1.13 ± 0.26 µs in 0.9–2.1, `ratelimit_tax_us` 0.55
+± 0.38 µs in 0.5–2.4).
+
+### Changed
+
+- **`sigstore` 0.14.0 → 0.15.0 with `features = ["rustls-tls"]` (`plecto/Cargo.toml`)**. 0.15
+  selects its crypto backend through a TLS feature and refuses to compile with neither:
+  `rustls-tls` keeps aws-lc-rs as the single crypto backend ([ADR 000051](docs/ADR/000051.md)),
+  `native-tls` would link OpenSSL. The feature's `oci-client` / `reqwest` hooks are weak (`?/`)
+  and stay unbuilt — `cargo tree` confirms neither enters any build — although Cargo records
+  them as `Cargo.lock` rows. 0.15 also moves its RustCrypto line together (`x509-cert` 0.3, `der`
+  0.8, `spki` 0.8, `pkcs8` 0.11, `signature` 3). Cosign verification through the new backend is
+  exercised by the existing negative conformance tests (untrusted key, tampered component, bad
+  SBOM signature, SBOM for another component).
+- **`opentelemetry` / `opentelemetry-proto` 0.32 → 0.33.1**: the trace data-model types and the
+  `gen-tonic-messages` / `trace` proto modules Plecto uses are unchanged in shape; no source
+  change.
+- **`parking_lot` 0.12 → 0.13** (`lock_api` 0.5, MSRV 1.95): only `Mutex` / `RwLock`
+  construction and `lock` / `read` / `write` are used; no source change. The dev-only `dhat` keeps
+  its own 0.12.
+- **`gungraun` 0.19 → 0.20** (dev / instruction-count benches): the `--baseline` /
+  `--save-baseline` / `--callgrind-limits` flags `bench.yml` passes are unchanged, and
+  `bench.yml` reads the `gungraun-runner` version from `Cargo.lock`, so the runner follows.
+- **Workspace lockfile refresh** (in range): `hyper` 1.12.0, `h2` 0.4.20, `hyper-util` 0.1.21,
+  `hyper-rustls` 0.27.10, `tokio-rustls` 0.26.6, `tokio-util` 0.7.20, `mio` 1.2.4, `aws-lc-rs`
+  1.19.0 / `aws-lc-sys` 0.47.0, `quinn` 0.11.12, `redb` 4.5.0, `brotli` 9.1.1, `flate2` 1.1.11,
+  `toml` 1.2.1, `serde_json` 1.0.154, `webpki-roots` 1.0.11, among others. Every satellite lockfile
+  is refreshed too: the example filter guests, the host fixtures, `bench/loadgen`, the bench
+  guests, and both halves of the streaming spike.
+- **Reference-filter shelf republished**: `filters/cors` 0.2.4 → 0.2.5, `filters/apikey` 0.1.10 →
+  0.1.11, `filters/jwt` 0.1.10 → 0.1.11, `filters/extauthz` 0.2.2 → 0.2.3 (ADR 000080 — filter
+  tags are immutable). No filter source change: the guests' lockfile refresh (`bitflags` 2.13.2 in
+  all four; `serde_json` / `smallvec` / `zerocopy` / `zeroize` in `filter-jwt`) changes the
+  compiled bytes — built with the previous lockfiles, `cors` and `apikey` reproduce their
+  published digests exactly, and with the new ones they do not.
+- **Polyglot guest toolchains**: TinyGo 0.41.1 → 0.44.0 (sha256-pinned) with Go 1.26.4 → 1.27.3
+  in the polyglot job (TinyGo 0.42 added Go 1.27 support); both Tier B Go guests still import
+  only `wasi:{cli,clocks,filesystem,io,random}`. `filter-tokenlimit-go` takes `gjson` 1.18.0 →
+  1.20.1. `wkg` 0.16.0 → 0.16.1 (sha256-pinned, CI and release).
+- **JavaScript example guests declare `@bytecodealliance/preview2-shim` 0.25.0**. ComponentizeJS
+  0.23.0 imports it without declaring it and got it only as an optional peer of `jco-std`, which
+  npm 11 (Node 24 / 26) no longer installs under `npm ci` — the polyglot job's move to Node 26
+  would have failed the JS guest builds with `ERR_MODULE_NOT_FOUND`. 0.25.0 is the version npm 10
+  already resolved, so the build input is unchanged; both lockfiles are regenerated under Node
+  26.13.0 / npm 11.20.0 (`just regen-js-lockfiles`), and the builds pass under npm 10 and npm 11.
+- **CI**: GitHub Actions moved to their current releases, still pinned by commit SHA
+  (`actions/checkout` v7.0.1, `actions/setup-go` v7.0.0, `actions/github-script` v9.0.0,
+  `EmbarkStudios/cargo-deny-action` v2.1.1 — which bundles cargo-deny 0.20.2, the version the
+  per-lockfile step already pins — and patch releases of the cache / artifact / Docker / cosign /
+  SBOM actions); `zizmor` 1.30.0 → 1.32.0 (hash-pinned wheel) reports no findings, including its
+  online audits that check each SHA against its tag; Go 1.27.0 → 1.27.3 for the docdag job.
+- **Held deliberately**: `wasmtime` stays on 50.0.1 (51.0.0 is only at `rc.1`; Wasmtime's
+  monthly cadence schedules it for 2026-11-20), so per [ADR 000114](docs/ADR/000114.md) `wit-component` / `wit-parser` stay on the
+  0.261 series and the `wasm-tools` CLI on 1.261.0. `wit-bindgen` stays on 0.62 for the same
+  reason: 0.63 depends on `wit-component` 0.262, newer than the host's 0.261 decoder; it moves
+  with wasmtime 51. `generic-array` holds at 0.14.7 on `crypto-common` 0.1.7's `=0.14.7` pin.
+
 ## [0.15.6] - 2026-10-31
 
 Patch release: lockstep update of `wasmtime` / `wasmtime-wasi` / `wasmtime-wasi-http` **50.0.0 →

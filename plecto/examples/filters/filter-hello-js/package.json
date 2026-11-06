@@ -7,7 +7,8 @@
     "build": "node build.mjs"
   },
   "devDependencies": {
-    "@bytecodealliance/componentize-js": "0.23.0"
+    "@bytecodealliance/componentize-js": "0.23.0",
+    "@bytecodealliance/preview2-shim": "0.25.0"
   },
   "overrides": {
     "@bytecodealliance/componentize-js": "$@bytecodealliance/componentize-js"

@@ -10,11 +10,11 @@
 # `plecto:filter` world with `include wasi:cli/imports@0.2.0` on the guest side (the shared
 # `plecto/wit/world.wit` stays untouched — ADR 000063 Decision 3). `wasi:filesystem` also appears
 # in the import set: TinyGo's wasip2 runtime unconditionally imports it even though this program
-# touches no file (confirmed against TinyGo 0.41.1) — the host lends an EMPTY one (zero preopens,
-# so zero reachable paths; see `add_inert_filesystem` in crates/host/src/state.rs). `wasi:sockets`
-# is also present in the WIT type universe (a wasi:cli/imports transitive dependency) but never
-# imported by the compiled component below, and the host links no `wasi:sockets` for a fat guest —
-# confirmed by the allowlist assertion.
+# touches no file (confirmed against TinyGo 0.41.1 and 0.44.0) — the host lends an EMPTY one
+# (zero preopens, so zero reachable paths; see `add_inert_filesystem` in
+# crates/host/src/state.rs). `wasi:sockets` is also present in the WIT type universe (a
+# wasi:cli/imports transitive dependency) but never imported by the compiled component below, and
+# the host links no `wasi:sockets` for a fat guest — confirmed by the allowlist assertion.
 set -euo pipefail
 cd "$(dirname "$0")"
 

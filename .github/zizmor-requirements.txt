@@ -2,5 +2,5 @@
 # Hash-pinned (pip --require-hashes): the sha256 is the linux-x86_64 manylinux wheel, the only
 # platform CI installs on. Bump the version and hash together (pip download zizmor==X.Y.Z
 # --no-deps && sha256sum the wheel).
-zizmor==1.30.0 \
-    --hash=sha256:9c08a7c34b33ed6f9a3a3d28fcf8c64e3e078c53c51bc9ce05c32ec3ba7feae9
+zizmor==1.32.0 \
+    --hash=sha256:84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071

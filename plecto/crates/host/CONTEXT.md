@@ -116,7 +116,7 @@ _Avoid_: pure component（ComponentizeJS 固有の呼称）, header-only filter�
 **Fat guest（Tier B）**:
 言語ランタイムが WASI 0.2 / 0.3 interface（`wasi:cli` / `wasi:io` / `wasi:clocks` …）の提供を前提とする
 ゲストコンポーネント。TinyGo（Go）が代表——ファイルを一切使わないプログラムでも `wasi:filesystem/types`
-/ `preopens` を無条件 import する（wasip2 ランタイムの起動処理由来、TinyGo 0.41.1 で実機確認）。host の
+/ `preopens` を無条件 import する（wasip2 ランタイムの起動処理由来、TinyGo 0.41.1 と 0.44.0 で実機確認）。host の
 `fat-guest` feature（off-by-default）＋フィルタの manifest `wasi = "minimal"` 宣言の両方が揃ったときのみ、
 固定・最小の WASI スライス（`wasi:io`（0.2） / `clocks` / `random` / `cli` ＋ preopens 空の `filesystem` を
 `@0.2.x` と `@0.3.0` の両方で貸与。fs アクセスも sockets も一切なし）を host が貸す（ADR 000063 / 000121）。

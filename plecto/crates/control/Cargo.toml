@@ -121,7 +121,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # gungraun (the renamed iai-callgrind): callgrind-based instruction counts for the LB pick hot
 # path (benches/fastpath_inst.rs) — the deterministic twin of the criterion wall-clock benches.
 # Dev-only + feature-gated (`instruction-bench`); see the host crate's note.
-gungraun = "0.19"
+gungraun = "0.20"
 
 [[bench]]
 name = "fastpath"

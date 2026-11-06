@@ -185,14 +185,14 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # / thermal / neighbour load, so the "did the contract surface get more expensive?" judgement is
 # deterministic where wall-clock drifts double digits on an unpinned host. Dev-only + feature-gated
 # (`instruction-bench`), so neither production builds nor a valgrind-less `cargo bench` see it.
-gungraun = "0.19"
+gungraun = "0.20"
 # dhat: host-heap profiler for the `mem-probe` example (feature `dhat-heap`). Dev-only, so it is
 # never linked into a production build of the lib.
 dhat = "0.3"
 # OTLP decode ORACLE for the hand-written exporter (ADR 000040): the official generated proto
 # types verify the encoder's bytes in round-trip tests. `gen-tonic-messages` pulls prost only —
 # no tonic/gRPC stack. Dev-only, never linked into a production build.
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14"
 # filter-jwt host tests (ADR 000070): mint ES256/RS256 test tokens and hand-build an alg=none
 # token (jsonwebtoken refuses to encode one) to exercise the alg-allowlist gate directly.

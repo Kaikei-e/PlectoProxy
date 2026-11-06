@@ -3,7 +3,7 @@ module filter-tokenlimit-go
 go 1.26.4
 
 require (
-	github.com/tidwall/gjson v1.18.0
+	github.com/tidwall/gjson v1.20.1
 	go.bytecodealliance.org/cm v0.3.0
 )
 

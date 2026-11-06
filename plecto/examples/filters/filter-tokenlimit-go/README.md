@@ -120,7 +120,7 @@ host (here, to the host-owned token bucket), never to a guest global.
 ## Build
 
 ```bash
-export PATH="$HOME/.local/opt/tinygo-0.41.1/bin:$HOME/go/bin:$PATH"   # or wherever yours live
+export PATH="$HOME/.local/opt/tinygo-0.44.0/bin:$HOME/go/bin:$PATH"   # or wherever yours live
 bash build.sh
 ```
 
@@ -151,7 +151,7 @@ manifest shape, same numbers, and every language answers identically by construc
 shared test battery below). Two Tier B deltas apply here:
 
 ```bash
-export PATH="$HOME/.local/opt/tinygo-0.41.1/bin:$HOME/go/bin:$PATH"
+export PATH="$HOME/.local/opt/tinygo-0.44.0/bin:$HOME/go/bin:$PATH"
 bash build.sh
 plecto package dist/filter_tokenlimit_go.wasm --key signer.pem --out artifacts/tokenlimit-go
 ```

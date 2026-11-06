@@ -89,7 +89,7 @@ redb = "4.1"
 # parking_lot: non-poisoning locks. A panicking filter thread must not cascade a
 # poisoned lock across every later request (ADR 000011). Sync today; redb's blocking
 # story moves behind a pool only when host calls become async.
-parking_lot = "0.12"
+parking_lot = "0.13"
 # tracing: host-internal diagnostics (never println!, bp-rust). Distinct from the
 # host-log capability, which is the filter-facing log surface.
 tracing = "0.1"
@@ -103,7 +103,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # local public key, NO Fulcio / Rekor / OCI-registry / network (verified footprint). cosign
 # `sign-blob` over the component/SBOM bytes; the registry fetch + base64 decode is the
 # ADR 000007 / wkg boundary, kept out of the host.
-sigstore = { version = "0.14.0", default-features = false }
+# Since 0.15 the crypto backend is chosen by a TLS feature and the crate refuses to build with
+# neither: `rustls-tls` selects aws-lc-rs (ADR 000051's single backend); `native-tls` would link
+# OpenSSL. Its oci-client / reqwest hooks are `?`-weak, so no network stack comes along.
+sigstore = { version = "0.15.0", default-features = false, features = ["rustls-tls"] }
 # zeroize: already resolved transitively via sigstore's own key material; declared directly so
 # `DevSigner` (ADR 000065 dev key) can name `Zeroizing<String>` for the persisted private-key PEM
 # without widening the dependency tree.
@@ -113,7 +116,7 @@ zeroize = "1"
 # default-features=false drops `metrics`/`logs`/`tracing`/`futures`, and crucially NO `rt-tokio`,
 # so this stays no-tokio. The async `SpanExporter` SDK + OTLP network export (and the wasi-otel
 # guest contract) are named-deferred; our sync `TelemetrySink` seam maps to them later.
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 
 # --- plecto-control (ADR 000007 / 000008): declarative manifest, OCI artifact load,
 # --- chain dispatch, atomic hot-reload. ---
@@ -158,8 +161,8 @@ http-body-util = "0.1"
 bytes = "1"
 
 # --- TLS termination (ADR 000013 slice / ADR 000014 / ADR 000051). rustls + the `aws_lc_rs`
-# --- crypto provider: `sigstore` (cosign signature verification, ADR 000006/000047) already
-# --- unconditionally links aws-lc-rs regardless of feature flags, so this is a one-backend
+# --- crypto provider: `sigstore` (cosign signature verification, ADR 000006/000047) links
+# --- aws-lc-rs as its crypto backend (its `rustls-tls` feature, above), so this is a one-backend
 # --- consolidation, not a new dependency — see ADR 000051 for the full rationale (why the prior
 # --- `ring` default's "avoid vendored C" premise did not hold). `prefer-post-quantum` puts the
 # --- X25519MLKEM768 hybrid key exchange first in the negotiation order (rustls 0.23.27+ default). ---

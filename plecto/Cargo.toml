@@ -14,7 +14,7 @@ version = "0.16.0"
 edition = "2024"
 # MSRV (bp-rust §1): the toolchain rust-toolchain.toml pins for dev/CI, declared so `cargo`
 # gives consumers a proper diagnostic on older compilers instead of a random parse error.
-rust-version = "1.99"
+rust-version = "1.100"
 license = "Apache-2.0"
 repository = "https://github.com/Kaikei-e/PlectoProxy"
 keywords = ["proxy", "gateway", "wasm", "webassembly", "http"]

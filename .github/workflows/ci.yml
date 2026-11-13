@@ -92,9 +92,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
       # Every example filter guest is a SEPARATE workspace; loop them all so a new guest
@@ -164,9 +164,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: clippy
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -207,9 +207,9 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           # Default features build only the zero-WASI guests (build.rs) — no wasip2 here.
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -252,9 +252,9 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -376,9 +376,9 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost &
           echo "$!" > /tmp/disk-rm.pid
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -419,9 +419,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -460,9 +460,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.99.1 zizmor: ignore[ref-version-mismatch]
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: clippy
           targets: wasm32-unknown-unknown,wasm32-wasip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

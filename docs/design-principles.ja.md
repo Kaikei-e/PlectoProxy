@@ -110,7 +110,7 @@ plecto`）——データプレーン・コントロールプレーン・wasmtim
 - **types**: `http-request` / `http-response`（ヘッダ値は原文バイト）・`request-edit` / `response-edit`（書換は差分で表現）・型付き decision variant——request 側 `continue` / `modified` / `short-circuit`、response 側 `continue` / `modified` / `replace`（ADR 000073）。
 - **host-API（6能力・1 interface = 1 capability）**: `host-log` / `host-clock`（リクエスト開始時スナップショット）/ `host-kv` / `host-counter` / `host-ratelimit`（token bucket は **host-native**）/ `host-config`（manifest `[filter.config]` の読み取り専用、ADR 000066）。
 - **二つの world**: `filter`（header-only）と `filter-body`（+ `on-request-body` / `on-response-body`、buffer-then-decide、v1 は `list<u8>`。component は body フックの任意の部分集合を export でき、二つの world はその格子の両端である）。`include` ではなく敢えて重複記述しているのは WIT の `use` 伝播仕様への対処であり、コメントで理由が明記される——**契約ファイル自身が設計判断の注釈を持つ**のがこのリポジトリの流儀である。
-- **実験系**: `plecto:filter-streaming`（`stream<u8>`・async）は off-by-default の `streaming-body` feature に隔離され、`wasm32-wasip3` の Tier-2 到達まで既定ビルドに入らない。
+- **実験系**: `plecto:filter-streaming`（`stream<u8>`・async）は off-by-default の `streaming-body` feature に隔離され、wit-bindgen async の成熟まで既定ビルドに入らない（`wasm32-wasip3` は Rust 1.100.0 で Tier-2 到達済み）。
 
 契約進化の方針: 変更は additive を基本とし、body の真のストリーミング化は `list<u8>` → `stream<u8>` の差し替えとして契約に席を確保済み。ホット経路（rate limit の refill 等）は契約の外＝native に落とす——「WASM 税は判断ロジックにのみ払う」。`plecto new-filter` はバイナリに同梱した契約をそのまま書き出す——ADR 000072 が採択したオフライン self-vendoring で、ネットワークは介在しない。`wkg` 公開（ADR 000064 / 000065）は scaffold を使わない作者向けの配布チャネルとして残る。
 
@@ -161,7 +161,7 @@ ADR 000029 の役割駆動基準と Fork 6 から、配置は次の順で問う:
 
 ### 3.2 能力（capability）を増やすときの規律
 
-新しい host-API は「1 interface = 1 capability」で切り、deny-by-default を維持する。危険な能力は **off-by-default の feature gate に隔離してから**入れる——現行の実例は `outbound-http`（wasi:http 収斂ゲートまで既定ビルド外）、`outbound-tcp`（同じ SSRF 床の下に置く raw-TCP consult 能力、ADR 000060）、`streaming-body`（wasip3 Tier-2 まで）、`polyglot-conformance`（既定 `cargo test` に影響しない）、`fat-guest`（Tier B guest 向け最小 WASI 貸与、ADR 000063——既定 off、on でもフィルタの manifest が `wasi = "minimal"` を宣言しない限り不活性）。outbound 2 つ ＋ `fat-guest` が、そのまま **capabilities** release profile がコンパイル時に含むもの（ADR 000079）——含めることは、特定のフィルタに manifest が宣言するまで貸すことではない。フィルタが自分に課された制約を自己申告で緩められる形（バケット容量の guest 指定等）は設計段階で禁じる。
+新しい host-API は「1 interface = 1 capability」で切り、deny-by-default を維持する。危険な能力は **off-by-default の feature gate に隔離してから**入れる——現行の実例は `outbound-http`（wasi:http 収斂ゲートまで既定ビルド外）、`outbound-tcp`（同じ SSRF 床の下に置く raw-TCP consult 能力、ADR 000060）、`streaming-body`（wit-bindgen async の成熟まで；wasip3 は Rust 1.100 で Tier-2 到達済み）、`polyglot-conformance`（既定 `cargo test` に影響しない）、`fat-guest`（Tier B guest 向け最小 WASI 貸与、ADR 000063——既定 off、on でもフィルタの manifest が `wasi = "minimal"` を宣言しない限り不活性）。outbound 2 つ ＋ `fat-guest` が、そのまま **capabilities** release profile がコンパイル時に含むもの（ADR 000079）——含めることは、特定のフィルタに manifest が宣言するまで貸すことではない。フィルタが自分に課された制約を自己申告で緩められる形（バケット容量の guest 指定等）は設計段階で禁じる。
 
 ### 3.3 依存を増やすときの規律
 
@@ -205,7 +205,7 @@ ADR は `docs/ADR/NNNNNN.md`、frontmatter + wikilink、テンプレは `templat
 
 | トリガ | 再検討対象 |
 |---|---|
-| `wasm32-wasip3` が Rust Tier-2 到達・wit-bindgen async 成熟 | `streaming-body` feature の既定化に向けた昇格判断（`stream<u8>` 本実装、M3 の真のストリーミング増分） |
+| `wasm32-wasip3` が Rust Tier-2 到達（Rust 1.100 で到達済み）・wit-bindgen async 成熟 | `streaming-body` feature の既定化に向けた昇格判断（`stream<u8>` 本実装、M3 の真のストリーミング増分） |
 | `wasi:http`（proxy / middleware）収斂ゲートの成立 | 型語彙の `wasi:http` 収斂実施（ADR 000020）と、`outbound-http` の既定ビルド入り判断 |
 | Go（`gc`）本体が wasip2/p3 で Tier 相当の Component Model 対応に到達 | Tier B（ADR 000063、2026-07-06 判断・2026-07-08 実装）が前提とする TinyGo 限定の再訪 |
 | 着地済み mTLS floor に失効確認 / identity 伝搬の需要が現れる | mTLS スライス（ADR 000078、2026-07-12 着地）の declared deferred: CRL/OCSP の本番級配線、検証済み client identity の filter 伝搬 |

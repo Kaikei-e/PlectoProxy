@@ -48,7 +48,8 @@ polyglot-conformance = []
 # plecto:filter@0.1.0 path and the default build are untouched. When on, it pulls a minimally-sliced
 # WASI (wasi:http/proxy interfaces — no fs/sockets/env) and drives an async `stream<u8>` body filter
 # on wasmtime's component-model-async. Building the fixture also needs `rustup target add
-# wasm32-wasip2`. Stays out of the default build until wasm32-wasip3 reaches Tier 2.
+# wasm32-wasip3`. Stays out of the default build until wit-bindgen async matures (wasm32-wasip3
+# reached Tier 2 in Rust 1.100.0; promotion waits on wasmtime 51 / ADR 000114 and its own ADR).
 streaming-body = ["dep:wasmtime-wasi", "wasmtime/component-model-async"]
 # Experimental outbound HTTP capability for filters (ADR 000036): lends `wasi:http/outgoing-handler`
 # through the same deny-by-default Linker, gated per-filter by an operator allowlist + an SSRF guard

@@ -168,7 +168,7 @@ jobs:
         with:
           toolchain: "1.100.0"
           components: clippy
-          targets: wasm32-unknown-unknown, wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip2, wasm32-wasip3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: plecto-clippy
@@ -255,7 +255,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 1.100.0 zizmor: ignore[ref-version-mismatch]
         with:
           toolchain: "1.100.0"
-          targets: wasm32-unknown-unknown, wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip2, wasm32-wasip3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: plecto-features
@@ -447,8 +447,9 @@ jobs:
 
   # Lint the excluded WASM guest workspaces against their real targets (previously only
   # filter-hello was linted; the other cargo guests compiled via build.rs but never saw clippy).
-  # Zero-WASI guests build for wasm32-unknown-unknown; the outbound/streaming fixtures use
-  # wasip2 std, so they lint against wasm32-wasip2 (the split mirrors crates/host/build.rs).
+  # Zero-WASI guests build for wasm32-unknown-unknown; the outbound fixtures use wasip2 std, and
+  # filter-streaming uses wasip3 std, so they lint against their respective targets (the split
+  # mirrors crates/host/build.rs).
   guest-lint:
     name: guest workspaces (clippy, wasm targets)
     runs-on: ubuntu-latest
@@ -464,7 +465,7 @@ jobs:
         with:
           toolchain: "1.100.0"
           components: clippy
-          targets: wasm32-unknown-unknown,wasm32-wasip2
+          targets: wasm32-unknown-unknown,wasm32-wasip2,wasm32-wasip3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: plecto-guest
@@ -483,12 +484,14 @@ jobs:
       - name: clippy every cargo guest workspace
         run: |
           set -euo pipefail
-          # wasip2 guests (wasi std / outbound imports), per crates/host/build.rs:
-          wasip2="filter-streaming filter-extauthz filter-jwt filter-tcp-gate filter-ratelimit-redis"
+          # wasip2/wasip3 guests (wasi std / outbound imports), per crates/host/build.rs:
+          wasip2="filter-extauthz filter-jwt filter-tcp-gate filter-ratelimit-redis"
+          wasip3="filter-streaming"
           for m in */Cargo.toml; do
             d=$(dirname "$m")
             target=wasm32-unknown-unknown
             case " $wasip2 " in *" $d "*) target=wasm32-wasip2;; esac
+            case " $wasip3 " in *" $d "*) target=wasm32-wasip3;; esac
             echo "== $d ($target)"
             (cd "$d" && cargo clippy --target "$target" --all-targets --locked -- -D warnings)
           done

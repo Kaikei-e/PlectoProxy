@@ -4,8 +4,9 @@
 //! Target policy (ADR 000010): no-WASI header-only filters build for
 //! `wasm32-unknown-unknown` and are wrapped into a component with `wit-component`
 //! (no WASI adapter needed — the component imports ONLY granted plecto
-//! capabilities). The body / stream<u8> / wasi:http increment moves to
-//! `wasm32-wasip2` once wasmtime 46 ships.
+//! capabilities). Outbound WASI fixtures (`outbound-http` / `outbound-tcp`) build for
+//! `wasm32-wasip2`, and the experimental `streaming-body` (`stream<u8>`) fixture builds for
+//! `wasm32-wasip3`.
 //!
 //! The fixture builds below run ONLY behind the `test-support` feature (this crate's own
 //! `[dev-dependencies]` turn it on for `cargo test`/`--examples`/`cargo bench`; dependent crates do
@@ -131,21 +132,22 @@ fn main() {
         );
     }
 
-    // The wasip2 fixture guests below are ALSO test fixtures (their bytes are only ever read by
+    // The WASI fixture guests below are ALSO test fixtures (their bytes are only ever read by
     // `test_support`'s cfg-gated accessors and the feature-gated integration tests), so they too
     // build only under `test-support` — a production `--features capabilities` build must not
-    // require wasm32-wasip2 or the guest sources. release.yml's binaries job compiles in a plain
-    // rust:bookworm container with no wasm targets installed; gating on the capability feature
-    // alone made that job the first place the gap could surface (E0463, v0.3.2 first attempt),
-    // because ci.yml's release-parity environment does install the targets.
+    // require wasm32-wasip2 / wasm32-wasip3 or the guest sources. release.yml's binaries job
+    // compiles in a plain rust:bookworm container with no wasm targets installed; gating on the
+    // capability feature alone made that job the first place the gap could surface (E0463, v0.3.2
+    // first attempt), because ci.yml's release-parity environment does install the targets.
 
     // Experimental streaming body filter (feature `streaming-body`, OFF by default): build the
-    // filter-streaming guest for wasm32-wasip2, which emits a Component directly (no wit-component
-    // wrap). Only when the feature is on, so the default build never touches wasm32-wasip2.
+    // filter-streaming guest for wasm32-wasip3, which emits a Component directly (no wit-component
+    // wrap). Only when the feature is on, so the default build never touches wasm32-wasip3.
     if test_support && std::env::var("CARGO_FEATURE_STREAMING_BODY").is_ok() {
-        build_wasip2_component(
+        build_wasi_component(
             &cargo,
             &filters.join("filter-streaming"),
+            "wasm32-wasip3",
             &out_dir,
             "filter_streaming",
             "FILTER_STREAMING_COMPONENT",
@@ -157,16 +159,18 @@ fn main() {
     // filter-jwt (ADR 000070) is the same target: JWKS-at-init uses outbound; the static PEM/JWK
     // path simply never calls it.
     if test_support && std::env::var("CARGO_FEATURE_OUTBOUND_HTTP").is_ok() {
-        build_wasip2_component(
+        build_wasi_component(
             &cargo,
             &filters.join("filter-extauthz"),
+            "wasm32-wasip2",
             &out_dir,
             "filter_extauthz",
             "FILTER_EXTAUTHZ_COMPONENT",
         );
-        build_wasip2_component(
+        build_wasi_component(
             &cargo,
             &filters.join("filter-jwt"),
+            "wasm32-wasip2",
             &out_dir,
             "filter_jwt",
             "FILTER_JWT_COMPONENT",
@@ -176,25 +180,28 @@ fn main() {
     // Outbound TCP capability (ADR 000060, feature `outbound-tcp`, OFF by default): the TCP-gate
     // guest imports wasi:sockets, so it builds for wasm32-wasip2.
     if test_support && std::env::var("CARGO_FEATURE_OUTBOUND_TCP").is_ok() {
-        build_wasip2_component(
+        build_wasi_component(
             &cargo,
             &filters.join("filter-tcp-gate"),
+            "wasm32-wasip2",
             &out_dir,
             "filter_tcp_gate",
             "FILTER_TCP_GATE_COMPONENT",
         );
-        build_wasip2_component(
+        build_wasi_component(
             &cargo,
             &manifest.join("fixtures").join("filter-tcp-retain"),
+            "wasm32-wasip2",
             &out_dir,
             "filter_tcp_retain",
             "FILTER_TCP_RETAIN_COMPONENT",
         );
         // filter-ratelimit-redis (ADR 000061): the global-layer reference filter, also outbound-TCP
         // (wasi:sockets) and so also wasm32-wasip2.
-        build_wasip2_component(
+        build_wasi_component(
             &cargo,
             &filters.join("filter-ratelimit-redis"),
+            "wasm32-wasip2",
             &out_dir,
             "filter_ratelimit_redis",
             "FILTER_RATELIMIT_REDIS_COMPONENT",
@@ -202,10 +209,18 @@ fn main() {
     }
 }
 
-/// Build one guest crate for `wasm32-wasip2`, which already emits a Component Model component (the
-/// target links with `wasm-component-ld`), and emit `cargo:rustc-env=<env_var>=<path>`. Used for the
-/// async `stream<u8>` streaming guest, which — unlike the no-WASI header-only filters — imports WASI.
-fn build_wasip2_component(cargo: &str, guest: &Path, out_dir: &Path, stem: &str, env_var: &str) {
+/// Build one guest crate for a WASI component target (`wasm32-wasip2` or `wasm32-wasip3`), which
+/// already emits a Component Model component (the target links with `wasm-component-ld`), and emit
+/// `cargo:rustc-env=<env_var>=<path>`. Used for the async `stream<u8>` streaming guest and the
+/// outbound WASI guests, which — unlike the no-WASI header-only filters — import WASI.
+fn build_wasi_component(
+    cargo: &str,
+    guest: &Path,
+    target: &str,
+    out_dir: &Path,
+    stem: &str,
+    env_var: &str,
+) {
     println!("cargo:rerun-if-changed={}", guest.join("src").display());
     println!(
         "cargo:rerun-if-changed={}",
@@ -221,37 +236,35 @@ fn build_wasip2_component(cargo: &str, guest: &Path, out_dir: &Path, stem: &str,
     let status = Command::new(cargo)
         .current_dir(guest)
         .env_remove("CARGO_TARGET_DIR")
-        .args([
-            "build",
-            "--target",
-            "wasm32-wasip2",
-            "--release",
-            "--target-dir",
-        ])
+        .args(["build", "--target", target, "--release", "--target-dir"])
         .arg(&target_dir)
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn cargo to build {}: {e}", guest.display()));
     if !status.success() {
         panic!(
-            "building {} for wasm32-wasip2 failed.\n\
-             The wasip2 fixture guests (streaming-body / outbound-http / outbound-tcp test\n\
-             fixtures) need the wasm32-wasip2 target:\n    \
-             rustup target add wasm32-wasip2",
+            "building {} for {target} failed.\n\
+             The WASI fixture guests (streaming-body / outbound-http / outbound-tcp test\n\
+             fixtures) need the {target} target:\n    \
+             rustup target add {target}",
             guest.display()
         );
     }
 
-    // wasm32-wasip2 emits a component directly — no wit-component wrapping. Copy the final
-    // artifact into OUT_DIR (like `build_component`'s wrapped output) so the referenced path
+    // wasm32-wasip2 / wasm32-wasip3 emit a component directly — no wit-component wrapping. Copy the
+    // final artifact into OUT_DIR (like `build_component`'s wrapped output) so the referenced path
     // lives in cargo-managed build output — `cargo clean` cleans it, and a concurrent build of
     // the guest workspace cannot rewrite the file the host build points at.
-    let component = target_dir.join(format!("wasm32-wasip2/release/{stem}.wasm"));
+    let component = target_dir
+        .join(target)
+        .join("release")
+        .join(format!("{stem}.wasm"));
     assert!(
         component.exists(),
         "guest component not found at {}",
         component.display()
     );
-    let published = out_dir.join(format!("{stem}-wasip2.wasm"));
+    let suffix = target.strip_prefix("wasm32-").unwrap_or(target);
+    let published = out_dir.join(format!("{stem}-{suffix}.wasm"));
     std::fs::copy(&component, &published).unwrap_or_else(|e| {
         panic!(
             "copying {} to {} failed: {e}",

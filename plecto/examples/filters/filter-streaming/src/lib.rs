@@ -4,7 +4,7 @@
 //! chunk boundary), then returns short-circuit 403 on a hit or continue otherwise. Guest linear
 //! memory stays flat in body size — the property the buffered `list<u8>` contract cannot have.
 //!
-//! Built for wasm32-wasip2 and run by plecto-host's feature-gated `streaming-body` runtime; it is
+//! Built for wasm32-wasip3 and run by plecto-host's feature-gated `streaming-body` runtime; it is
 //! NOT part of the default build (the shipped `plecto:filter@0.1.0` contract is untouched).
 #![allow(clippy::all)]
 

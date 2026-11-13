@@ -60,10 +60,11 @@ build→sign→serve walkthrough.
 ## The filter guests (`filters/`)
 
 The WASM component guests. The Rust guests are built by `crates/host/build.rs` — most for
-`wasm32-unknown-unknown` and componentized with wit-component (ADR 000010), the feature-gated ones
-directly for `wasm32-wasip2` — while the polyglot guests (JS / MoonBit / C / Go) are built outside
-cargo by their own `build.sh`. The demos above load only `filter-quickstart` / `filter-apikey` /
-`filter-hello`; the rest are conformance fixtures, references, and starters.
+`wasm32-unknown-unknown` and componentized with wit-component (ADR 000010), the outbound
+feature-gated ones directly for `wasm32-wasip2`, and `filter-streaming` for `wasm32-wasip3` — while
+the polyglot guests (JS / MoonBit / C / Go) are built outside cargo by their own `build.sh`. The
+demos above load only `filter-quickstart` / `filter-apikey` / `filter-hello`; the rest are
+conformance fixtures, references, and starters.
 
 | Guest | Role |
 |-------|------|

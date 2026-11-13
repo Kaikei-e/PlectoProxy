@@ -2,7 +2,8 @@
 // SEPARATE package so the stable `world filter` resolution is untouched. This is the feature-gated
 // `streaming-body` increment (direction_0003 gates 1+2): a body filter that consumes the request
 // body as a `stream<u8>` (no whole-body buffer) and returns a decision. It stays out of the default
-// build until wasm32-wasip3 reaches Tier 2 (ADR 000010 / 000020 / 000021 / 000025).
+// build until wit-bindgen async matures (wasm32-wasip3 reached Tier 2 in Rust 1.100.0; ADR 000010
+// / 000020 / 000021 / 000025 / 000114).
 package plecto:filter-streaming@0.1.0;
 
 interface types {

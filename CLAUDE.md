@@ -71,7 +71,7 @@ cargo fmt --all -- --check
 # WASM フィルタ（現行契約 plecto:filter@0.4.0: header フック + buffered body フック, list<u8>）
 # Rust ゲスト（無 WASI, ADR 000010）: wasm32-unknown-unknown でビルドし wit-component で component 化
 cargo build --target wasm32-unknown-unknown --release   # crates/host/build.rs が ComponentEncoder で component 化
-# feature-gated ゲスト（outbound-http/tcp・streaming など）は wasm32-wasip2 直ビルド（build.rs が担当）
+# feature-gated ゲスト: outbound-http/tcp は wasm32-wasip2、streaming-body は wasm32-wasip3 直ビルド（build.rs が担当）
 # 多言語ゲスト: Tier A = zero-WASI（MoonBit / JS (ComponentizeJS) / C (wasi-sdk)）、Tier B = Go (TinyGo, wasi minimal)
 examples/filters/filter-hello-{moonbit,js,c,go}/build.sh   # Tier A の build.sh は WASI import ゼロを assert
 cargo test -p plecto-host --features polyglot-conformance --test polyglot                    # Tier A 検証

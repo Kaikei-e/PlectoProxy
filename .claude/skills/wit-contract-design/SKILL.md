@@ -112,8 +112,9 @@ component をロードして契約適合と振る舞いを検証）を更新す�
 
 - 現行ビルドは **zero-WASI の `wasm32-unknown-unknown`**（ADR 000010、wit-component で component 化）。
   buffered `list<u8>` の body v1 も WASI/async 不要でこのターゲットのまま（ADR 000025）。
-  `wasm32-wasip2` への移行は `stream<u8>` true-streaming 増分から。P3 WIT はその先（`wasm32-wasip3`
-  は rustc 正式ターゲット未満、ゲスト toolchain 対応進行中）。確定したら追従する。
+  `stream<u8>` true-streaming の実験 fixture（`filter-streaming`）は Rust 1.100.0 で Tier 2 に昇格した
+  `wasm32-wasip3` 向けにビルドする（outbound capability 系ゲストは `wasm32-wasip2` を維持）。
+  `streaming-body` の既定化は残る `wit-bindgen` async の成熟（ADR 000021 / 000114）と専用 ADR 待ち。
 - async バインディングの DX が実用に達しないなら、ヘッダ系フィルタを当面 **同期契約**に留める
   二段構えを許容（Fork 1 再検討条件）。契約にこの分岐余地を残す。
 - Preview 3 timeframe で `wasi:http` に composable filter の標準ワールドが入り要件を満たすなら、

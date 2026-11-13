@@ -103,7 +103,8 @@ _Avoid_: Stage 2 を stream 契約の意味で使う（ROADMAP と衝突）, Sta
 **Streaming increment**:
 buffered body 契約の外側に置かれた off-by-default の増分。`plecto:filter-streaming` world
 （`streaming-body` feature）で `stream<u8>` を流す実験実装を指し、本固定（凍結解除）のゲートは
-`wasm32-wasip3` の Tier 2 化 + wit-bindgen async の成熟（ADR 000021 / 000025 の再検討条件）。
+`wasm32-wasip3` の Tier 2 化（Rust 1.100.0 で到達済み）+ wit-bindgen async の成熟（ADR 000021 /
+000025 の再検討条件；残る後半と昇格用 ADR は未了）。
 _Avoid_: true streaming（文書ではこの増分名で呼ぶ）
 
 **Zero-WASI guest（Tier A）**:

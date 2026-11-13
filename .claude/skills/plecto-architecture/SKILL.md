@@ -76,9 +76,10 @@ enforced by the Component Model sandbox, **not by convention** (Tenet 2, Fork 7)
   `replace` (ADR 000073). Header values are raw bytes (`list<u8>`, ADR 000071) and `on-response`
   receives the as-forwarded request snapshot. Auth failure and rate-limit exceed are
   `short-circuit`. Never express intent with ambiguous flags.
-- True-streaming bodies (`stream<u8>`, Fork 1, async-first) are projected, not current: today body
-  transforms buffer (`list<u8>`, no WASI needed); the `stream<u8>` swap comes with the
-  wasm32-wasip2 increment (ADR 000025) and tolerates a hot-path intermediate copy at first.
+- True-streaming bodies (`stream<u8>`, Fork 1, async-first) remain off by default: today body
+  transforms buffer (`list<u8>`, no WASI needed); the experimental `streaming-body` increment builds
+  its fixture for `wasm32-wasip3` (Tier 2 since Rust 1.100.0, ADR 000003 / 000025), while promotion
+  toward default waits on `wit-bindgen` async maturity and its own ADR.
 
 ## Init vs per-request (Tenet 4)
 

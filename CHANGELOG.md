@@ -32,6 +32,44 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-14
+
+Patch release: MSRV / CI / Docker toolchain pin follows Rust **1.100.0** (was 1.99.1), the
+`streaming-body` test fixture now builds for `wasm32-wasip3` (Tier 2 since Rust 1.100.0,
+[ADR 000123](docs/ADR/000123.md)), `plecto/Cargo.lock` gets an in-range dependency refresh, and the
+reference-filter shelf is republished under the new guest toolchain. No WIT contract, manifest
+schema, CLI, or public API change from 0.16.0, and `cargo semver-checks` reports no breaking
+change on each of `plecto-host` / `plecto-control` / `plecto-server` (default features). **Filters
+built for earlier releases need no rebuild**: the contract stays at `plecto:filter@0.4.0`.
+
+### Changed
+
+- **Toolchain / MSRV**: Rust 1.99.1 → 1.100.0 across `plecto/rust-toolchain.toml`,
+  `plecto/Cargo.toml` (`rust-version = "1.100"`), the `dtolnay/rust-toolchain` steps in
+  `.github/workflows/{ci,bench,release}.yml` (SHA unchanged: upstream added no master commit for
+  1.100.0), the release binaries' `rust:1.100.0-bookworm` container, and `Dockerfile` (`ARG
+  RUST_VERSION=1.100.0`).
+- **`streaming-body` fixture (`examples/filters/filter-streaming`) moves to `wasm32-wasip3`**:
+  following ADR 000003, the streaming test fixture now builds for `wasm32-wasip3` (promoted to
+  Tier 2 in Rust 1.100.0) instead of `wasm32-wasip2`; the compiled component imports only
+  `wasi:clocks` / `wasi:cli` @0.3.0 and links against the existing deny-by-default streaming Linker
+  with no new capability. The `outbound-http` and `outbound-tcp` fixtures stay on `wasm32-wasip2`,
+  and CI installs `wasm32-wasip3` in the `clippy`, `test-features`, and `guest-lint` jobs.
+  `streaming-body` itself stays off by default: the `wit-bindgen` async half of the ADR 000021
+  Stage 2 gate waits on wasmtime 51 (`wit-component` 0.262) under ADR 000114, and promotion needs
+  its own ADR.
+- **Dependencies (`plecto/Cargo.lock`)**: in-range refresh, no manifest change — `rustls-webpki`
+  0.103.16 → 0.103.17, `rustls-pki-types` 1.15.1 → 1.16.0, `webpki-roots` / `webpki-root-certs`
+  1.0.11 → 1.0.12, `zstd` 0.14.3 → 0.14.4 (`zstd-safe` 8.3.0, `zstd-sys` 2.1.3), `prost` 0.14.4 →
+  0.14.6, `arc-swap` 1.9.5, `uuid` 1.29.2, `notify` 8.2.2 (`notify-types` 2.3.0),
+  `brotli-decompressor` 6.3.1, `syn` 3.0.10, `cc` 1.11.2, `smallvec` 1.16.5, `bincode-next` 3.1.2,
+  `const-oid` 0.10.3, `crc32fast` 1.5.5, among others.
+- **Reference-filter shelf republished (`docs/reference-filters.md`,
+  `plecto/examples/filters/filter-*`)**: `filters/jwt` 0.1.11 → 0.1.12, `filters/cors` 0.2.5 →
+  0.2.6, `filters/apikey` 0.1.11 → 0.1.12, `filters/extauthz` 0.2.3 → 0.2.4 (ADR 000080 — filter
+  tags are immutable). No filter source change: compiling the guest workspaces under rustc 1.100.0
+  changes the stripped component bytes across all four shelf entries.
+
 ## [0.16.0] - 2026-11-06
 
 Minor-line release refreshing the dependency graph across every workspace and the CI toolchain

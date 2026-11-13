@@ -32,6 +32,24 @@ All notable changes to Plecto are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **JavaScript example guests take `minimatch` 11**: `filter-hello-js` and `filter-tokenlimit-js`
+  pulled `minimatch` 10.2.6 (GHSA-g3hv-75wg-m249: denial of service through glob-part
+  amplification) via `@bytecodealliance/componentize-js` → `jco` → `jco-std`. `jco-std` pins
+  `minimatch` to exactly 10.2.6 up to its latest 0.11.0, so each guest's `package.json` adds an npm
+  `overrides` entry for `minimatch` 11.0.8. `jco-std` only builds a `Minimatch` and calls `match()`
+  in its Node `path.matchesGlob` shim, none of whose options or methods 11.0 removed, and neither
+  guest imports that shim: the built components contain no `minimatch` code. Lockfiles regenerated
+  from scratch as `just regen-js-lockfiles` does, under Node 26.13.0 / npm 11.20.0 (in-range
+  build-tool updates come along: `jco` 1.42.0, `rolldown` 1.3.2, `tar` 7.5.23). No filter source, WIT contract, or build option changes, and nothing ships
+  to the proxy or the reference-filter shelf.
+- **Performance chart tooling (`performance/flint`)**: in-range lockfile update to `hono` 4.13.18
+  and `@hono/node-server` 2.1.8 (GHSA-46wx-v44x-9hh2, GHSA-4m76-xfj5-7975, GHSA-3gg2-335m-rxc6,
+  GHSA-4h7h-rv7c-7m2v, GHSA-h7mg-cq63-vhpq, GHSA-qv5m-9pm6-hqp3, GHSA-jpvv-r467-5p4w), which
+  come in through `flint-chart-mcp` → `@modelcontextprotocol/sdk`. Local tooling only; no
+  manifest change.
+
 ## [0.16.1] - 2026-11-14
 
 Patch release: MSRV / CI / Docker toolchain pin follows Rust **1.100.0** (was 1.99.1), the

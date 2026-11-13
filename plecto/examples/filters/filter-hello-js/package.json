@@ -11,6 +11,7 @@
     "@bytecodealliance/preview2-shim": "0.25.0"
   },
   "overrides": {
-    "@bytecodealliance/componentize-js": "$@bytecodealliance/componentize-js"
+    "@bytecodealliance/componentize-js": "$@bytecodealliance/componentize-js",
+    "minimatch": "11.0.8"
   }
 }

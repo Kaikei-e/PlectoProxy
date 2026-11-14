@@ -1,13 +1,13 @@
 {
   "generator": "plecto-loadgen",
   "method": "constant-arrival-rate+schedule-latency",
-  "target_rps": 94028,
-  "achieved_rps": 94028.000000,
-  "reqs": 8462520,
+  "target_rps": 87808,
+  "achieved_rps": 87808.000000,
+  "reqs": 7902720,
   "failed": 0.00000000,
   "dropped": 0,
-  "p50": 0.051000,
-  "p95": 1.151000,
-  "p99": 4.783000,
-  "p99_9": 17.599000
+  "p50": 0.047000,
+  "p95": 1.633000,
+  "p99": 24.447000,
+  "p99_9": 73.791000
 }

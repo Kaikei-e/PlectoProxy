@@ -303,6 +303,11 @@ run_phase(){
     PHASE_RESULTS+=("INVALID $name (exit $rc)")
     (( RUN_RC != 1 )) && RUN_RC=64
     err "phase $name INVALID INVOCATION (exit $rc) — nothing judged"
+  elif (( rc == 75 )); then
+    # Contended host (EX_TEMPFAIL): refused before measuring so noisy host state isn't judged.
+    PHASE_RESULTS+=("CONTENDED $name (exit $rc)")
+    (( RUN_RC != 1 && RUN_RC != 64 )) && RUN_RC=75
+    err "phase $name REFUSED — host contended (exit $rc)"
   elif (( rc )); then
     PHASE_RESULTS+=("FAIL $name (exit $rc)")
     RUN_RC=1
@@ -794,7 +799,15 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
 # ---------------------------------------------------------------- T1 gate — per-change regression verdict
 # Measures ONLY the invariants performance/README.md tracks across snapshots, then checks each
 # against the bands in gate_tolerances.toml (tracked in-repo, so changing a performance expectation
-# is a reviewable diff like any other contract change). Exit 0 = every invariant in band.
+# is a reviewable diff like any other contract change).
+#
+# Exit codes: 0 = pass (every invariant in band), 1 = fail, 2 = inconclusive, 64 = invalid
+# invocation (e.g. bad GATE_POOL_FROM), 75 = host contended (EX_TEMPFAIL, retry later).
+#
+# Pre-run host-contention check (host_load.py): runs before any proxy or generator launches, writing
+# $RUN_DIR/host_load.txt. Refuses with exit 75 if 1-min loadavg > GATE_MAX_LOAD (default 4.0) or
+# PROXY_CPUS busy fraction > GATE_MAX_PROXY_BUSY (default 0.20). Set GATE_ALLOW_CONTENDED=1 to
+# override and run anyway (marks host_load.txt contended=1 and tags the verdict "(contended host)").
 #
 # Method (bench/methodology.md § Measurement tiers): the ladder rungs are measured as PAIRED
 # A/B/C rounds — ROUNDS short windows, with the rung order reversed on every even round so neither
@@ -809,8 +822,9 @@ print(int(min(json.load(open(f))["summary"]["requestsPerSec"] for f in sys.argv[
 # Re-runs POOL (up to MAX_POOL_RUNS=3 runs), never replace: after an INCONCLUSIVE verdict, re-run
 # with GATE_POOL_FROM=<earlier RUN_DIR>[:<another>...] and gate_verdict.py merges the earlier runs'
 # rounds with the new ones into one estimate (refused with exit 64 unless every run measured the
-# same binaries + gate_params.txt -> build_id.txt, or if >3 runs are pooled). Picking the run that
-# happened to PASS would bias the gate toward passing.
+# same binaries + gate_params.txt -> build_id.txt, or if >3 runs are pooled; warns — never refuses —
+# if a pooled run has contended=1 or no host_load.txt). Picking the run that happened to PASS would
+# bias the gate toward passing.
 phase_gate(){
   log "Gate — invariant deltas, ${ROUNDS} paired rounds, 95% t interval vs band -> gate.csv"
   # Binary existence AND freshness are enforced centrally (require_fresh, run preflight + launch).
@@ -852,7 +866,41 @@ phase_gate(){
       elif [[ "$(cat "$sd/build_id.txt" 2>/dev/null)" != "$(cat "$tmp/build_id.txt")" ]]; then
         err "GATE_POOL_FROM: $src measured a different build, filter set or gate parameters (build_id.txt; compare gate_params.txt)"; return 64
       fi
+      local pool_hl="$src/host_load.txt"
+      if [[ ! -f "$pool_hl" && "$(basename "$src")" == "gate" ]]; then
+        pool_hl="$(dirname "$src")/host_load.txt"
+      fi
+      if [[ ! -f "$pool_hl" ]]; then
+        err "GATE_POOL_FROM warning: $src has no host_load.txt (unrecorded host contention state)"
+      elif grep -qx 'contended=1' "$pool_hl" 2>/dev/null; then
+        err "GATE_POOL_FROM warning: $src was marked contended (contended=1 in host_load.txt)"
+      fi
     done < "$tmp/pooled_from.txt"
+  fi
+
+  # -- pre-run host-contention check (before any proxy or generator launches) --
+  local max_load="${GATE_MAX_LOAD:-4.0}" max_busy="${GATE_MAX_PROXY_BUSY:-0.20}"
+  local hl_file="$RUN_DIR/host_load.txt"
+  local hl_rc=0 host_contended=0
+  python3 "$HERE/host_load.py" --cpus "$PROXY_CPUS" \
+    --max-load "$max_load" --max-busy "$max_busy" --out "$hl_file" || hl_rc=$?
+  if (( hl_rc == 3 )); then
+    host_contended=1
+    local hl_load="" hl_busy=""
+    while IFS='=' read -r _k _v; do
+      case "$_k" in
+        loadavg1) hl_load="$_v";;
+        proxy_busy) hl_busy="$_v";;
+      esac
+    done < "$hl_file"
+    if [[ "${GATE_ALLOW_CONTENDED:-}" != "1" ]]; then
+      err "gate: host contended (loadavg1=${hl_load}, max=${max_load}; proxy_busy=${hl_busy} on PROXY_CPUS=${PROXY_CPUS}, max=${max_busy}) — retry on an idle host or override with GATE_ALLOW_CONTENDED=1"
+      return 75
+    fi
+    err "gate: host contended (loadavg1=${hl_load}, max=${max_load}; proxy_busy=${hl_busy} on PROXY_CPUS=${PROXY_CPUS}, max=${max_busy}) — proceeding with GATE_ALLOW_CONTENDED=1 (run marked contended)"
+  elif (( hl_rc != 0 )); then
+    err "gate: host_load.py failed (exit $hl_rc)"
+    return 1
   fi
 
   # -- 1. WASM dispatch floor + filter cost: paired, order-counterbalanced closed-loop ladder --
@@ -940,17 +988,18 @@ phase_gate(){
   stop_proxy
 
   # -- verdict --
-  local rc=0
+  local rc=0 contended_note=""
+  (( host_contended )) && contended_note=" (contended host)"
   python3 "$HERE/gate_verdict.py" "$tmp" "$HERE/gate_tolerances.toml" > "$DATA/gate.csv" || rc=$?
   cat "$DATA/gate.csv"
   if [[ "$rc" == 0 ]]; then
-    log "gate: PASS (every invariant in band)"
+    log "gate: PASS (every invariant in band)${contended_note}"
   elif [[ "$rc" == 2 ]]; then
-    err "gate INCONCLUSIVE — re-run with GATE_POOL_FROM=$RUN_DIR to POOL its rounds into one estimate (a re-run adds evidence; it never replaces this run)"
+    err "gate INCONCLUSIVE${contended_note} — re-run with GATE_POOL_FROM=$RUN_DIR to POOL its rounds into one estimate (a re-run adds evidence; it never replaces this run)"
   elif [[ "$rc" == 64 ]]; then
     err "gate: invalid GATE_POOL_FROM (missing round data or a different build) — nothing judged"
   else
-    log "gate: FAIL — an invariant left its band (bands: bench/perf/gate_tolerances.toml)"
+    log "gate: FAIL${contended_note} — an invariant left its band (bands: bench/perf/gate_tolerances.toml)"
   fi
 
   # -- 5. micro layer (informational): criterion vs a saved `main` baseline when one exists.
@@ -1256,6 +1305,8 @@ if (( ${#PHASE_RESULTS[@]} )); then printf '  %s\n' "${PHASE_RESULTS[@]}"; fi
 if [[ -n "${RUN_DIR:-}" ]]; then echo "RUN_DIR: $RUN_DIR"; fi
 if (( RUN_RC == 64 )); then
   err "run INVALID — an invocation error (see above); nothing was judged"
+elif (( RUN_RC == 75 )); then
+  err "run REFUSED — host contended (EX_TEMPFAIL); retry on an idle host or set GATE_ALLOW_CONTENDED=1"
 elif (( RUN_RC == 2 )); then
   err "run INCONCLUSIVE — re-run"
 elif (( RUN_RC != 0 )); then

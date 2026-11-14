@@ -14,6 +14,7 @@ use crate::manifest::HealthConfig;
 #[derive(Debug)]
 pub struct UpstreamInstance {
     address: String,
+    uri_authority: Option<http::uri::Authority>,
     /// Load-balancing weight (ADR 000035): biases the least-request comparison and the Maglev table
     /// share toward higher-capacity instances. `1` for a bare address. Immutable for the instance's
     /// life; a weight change builds a fresh instance on reconcile (like a health-policy change).
@@ -53,8 +54,10 @@ pub(super) struct HealthCounters {
 
 impl UpstreamInstance {
     pub(super) fn new(address: String, weight: u32, health: &HealthConfig) -> Self {
+        let uri_authority = address.parse::<http::uri::Authority>().ok();
         Self {
             address,
+            uri_authority,
             // a 0 weight would divide by zero in the least-request ratio; validation rejects it, but
             // clamp to >= 1 as defence in depth (data-plane no-panic).
             weight: weight.max(1),
@@ -78,6 +81,12 @@ impl UpstreamInstance {
     /// This instance's `host:port`.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Pre-parsed `host:port` URI authority (built once at upstream reconciliation).
+    #[doc(hidden)]
+    pub fn uri_authority(&self) -> Option<&http::uri::Authority> {
+        self.uri_authority.as_ref()
     }
 
     /// This instance's load-balancing weight (ADR 000035), `>= 1`.

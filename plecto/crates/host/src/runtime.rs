@@ -11,12 +11,12 @@ use wasmtime::{Engine, Store};
 
 use crate::contract::{
     self, FilterPreV01, FilterPreV02, FilterPreV03, FilterPreV04, FilterV01, FilterV02, FilterV03,
-    FilterV04, request_body_decision_from_v01, request_body_decision_from_v02,
-    request_body_decision_from_v03, request_body_decision_from_v04, request_decision_from_v01,
-    request_decision_from_v02, request_decision_from_v03, request_decision_from_v04,
-    request_to_v01, request_to_v02, request_to_v03, response_body_decision_from_v04,
+    FilterV04, HttpRequestV02V03Ref, request_body_decision_from_v01,
+    request_body_decision_from_v02, request_body_decision_from_v03, request_body_decision_from_v04,
+    request_decision_from_v01, request_decision_from_v02, request_decision_from_v03,
+    request_decision_from_v04, request_to_v01, response_body_decision_from_v04,
     response_decision_from_v01, response_decision_from_v02, response_decision_from_v03,
-    response_decision_from_v04, response_to_v01, response_to_v02, response_to_v03,
+    response_decision_from_v04, response_to_v01,
 };
 use crate::errors::InvalidGuestOutput;
 #[cfg(feature = "outbound-http")]
@@ -43,6 +43,8 @@ pub(crate) trait FilterRuntime: Send + Sync {
     /// Reset an instance's per-request state before reuse (pooled path only — a freshly
     /// instantiated instance from `instantiate_initialized` is already in this state).
     fn begin_request(&self, instance: &mut Self::Instance);
+    /// Control whether per-request `host-log` calls are buffered for span attachment.
+    fn set_capture_logs(&self, _instance: &mut Self::Instance, _capture: bool) {}
     /// Set the per-request epoch deadline before a hook call.
     fn set_request_deadline(&self, instance: &mut Self::Instance);
     /// Drain this instance's per-request host-log lines after a call, for an instance that will
@@ -89,6 +91,13 @@ pub(crate) struct WasmtimeRuntime {
     /// This filter's manifest-declared business config (ADR 000066), shared read-only across
     /// every instance of this filter.
     pub(crate) config: Arc<std::collections::BTreeMap<String, String>>,
+    /// True when this component links async WASI interfaces (`outbound-http`/`outbound-tcp` or
+    /// `wasi = "minimal"`), requiring fiber execution (`instantiate_async`/`call_async`). Zero-WASI
+    /// filters run synchronously on `InstancePre::instantiate` + `TypedFunc::call`.
+    pub(crate) needs_async_store: bool,
+    /// True when this component imports `host-clock`, `host-ratelimit`, or non-plecto WASI, so
+    /// per-request wall-clock capture (`wall_now_ms()`) is observed by guest calls.
+    pub(crate) needs_wall_clock: bool,
     /// This filter's outbound HTTP state (ADR 000036): allowlist + SSRF policy + shared concurrency
     /// semaphore. `Some` only when the manifest lent it an allowlist.
     #[cfg(feature = "outbound-http")]
@@ -217,6 +226,40 @@ impl WasmtimeRuntime {
     /// (ADR 000104); each decision is mapped back through the validating adapter. A `None` from
     /// the adapter means the guest's output failed header validation — surfaced as
     /// [`InvalidGuestOutput`], fail-closed.
+    /// Invokes a pre-validated typed component export either directly (`TypedFunc::call`) for
+    /// zero-WASI components or on a wasmtime fiber (`drive_call(call_async)`) when the component
+    /// links async WASI capabilities.
+    fn invoke<Params, Return>(
+        &self,
+        store: &mut Store<HostState>,
+        func: wasmtime::component::TypedFunc<Params, Return>,
+        params: Params,
+    ) -> wasmtime::Result<Return>
+    where
+        Params: wasmtime::component::ComponentNamedList + wasmtime::component::Lower,
+        Return: wasmtime::component::ComponentNamedList + wasmtime::component::Lift + 'static,
+    {
+        if self.needs_async_store {
+            self.drive_call(func.call_async(store, params))
+        } else {
+            func.call(store, params)
+        }
+    }
+
+    /// Instantiate a raw `InstancePre` synchronously or asynchronously depending on whether this
+    /// filter links async WASI capabilities.
+    fn instantiate_raw(
+        &self,
+        instance_pre: &wasmtime::component::InstancePre<HostState>,
+        store: &mut Store<HostState>,
+    ) -> wasmtime::Result<wasmtime::component::Instance> {
+        if self.needs_async_store {
+            self.drive_call(instance_pre.instantiate_async(store))
+        } else {
+            instance_pre.instantiate(store)
+        }
+    }
+
     pub(crate) fn call_on_request(
         &self,
         inst: &mut WasmtimeInstance,
@@ -224,22 +267,23 @@ impl WasmtimeRuntime {
     ) -> wasmtime::Result<RequestDecision> {
         match &mut inst.filter {
             BoundFilter::V04(filter) => {
-                let raw = self.drive_call(filter.call_on_request(&mut inst.store, req))?;
+                let (raw,) = self.invoke(&mut inst.store, filter.func_on_request(), (req,))?;
                 request_decision_from_v04(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V03(filter) => {
-                let guest_req = request_to_v03(req);
-                let raw = self.drive_call(filter.call_on_request(&mut inst.store, &guest_req))?;
+                let borrowed = HttpRequestV02V03Ref::from(req);
+                let (raw,) = self.invoke(&mut inst.store, filter.func_on_request(), (borrowed,))?;
                 request_decision_from_v03(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V02(filter) => {
-                let guest_req = request_to_v02(req);
-                let raw = self.drive_call(filter.call_on_request(&mut inst.store, &guest_req))?;
+                let borrowed = HttpRequestV02V03Ref::from(req);
+                let (raw,) = self.invoke(&mut inst.store, filter.func_on_request(), (borrowed,))?;
                 request_decision_from_v02(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V01(filter) => {
                 let guest_req = request_to_v01(req);
-                let raw = self.drive_call(filter.call_on_request(&mut inst.store, &guest_req))?;
+                let (raw,) =
+                    self.invoke(&mut inst.store, filter.func_on_request(), (&guest_req,))?;
                 request_decision_from_v01(raw).ok_or_else(invalid_guest_header_error)
             }
         }
@@ -257,27 +301,24 @@ impl WasmtimeRuntime {
     ) -> wasmtime::Result<ResponseDecision> {
         match &mut inst.filter {
             BoundFilter::V04(filter) => {
-                let raw = self.drive_call(filter.call_on_response(&mut inst.store, req, resp))?;
+                let (raw,) =
+                    self.invoke(&mut inst.store, filter.func_on_response(), (req, resp))?;
                 response_decision_from_v04(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V03(filter) => {
-                let guest_req = request_to_v03(req);
-                let guest_resp = response_to_v03(resp);
-                let raw = self.drive_call(filter.call_on_response(
-                    &mut inst.store,
-                    &guest_req,
-                    &guest_resp,
-                ))?;
+                let borrowed = HttpRequestV02V03Ref::from(req);
+                let (raw,) =
+                    self.invoke(&mut inst.store, filter.func_on_response(), (borrowed, resp))?;
                 response_decision_from_v03(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V02(filter) => {
-                let guest_resp = response_to_v02(resp);
-                let raw = self.drive_call(filter.call_on_response(&mut inst.store, &guest_resp))?;
+                let (raw,) = self.invoke(&mut inst.store, filter.func_on_response(), (resp,))?;
                 response_decision_from_v02(raw).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V01(filter) => {
                 let guest_resp = response_to_v01(resp);
-                let raw = self.drive_call(filter.call_on_response(&mut inst.store, &guest_resp))?;
+                let (raw,) =
+                    self.invoke(&mut inst.store, filter.func_on_response(), (&guest_resp,))?;
                 response_decision_from_v01(raw).ok_or_else(invalid_guest_header_error)
             }
         }
@@ -289,8 +330,7 @@ impl WasmtimeRuntime {
     /// reaches here for a body-reading filter (`body_export` is `Some`, so `body_func` was
     /// resolved and signature-validated at instantiation — Tenet 4: the lookup/type-check is
     /// init work, not per-request work; a `TypedFunc` itself cannot be cached because its
-    /// borrowed `(&[u8],)` params would need a lifetime on the instance). wasmtime 46 handles
-    /// component `post-return` internally, so a single `call_async` is the whole interaction.
+    /// borrowed `(&[u8],)` params would need a lifetime on the instance).
     pub(crate) fn call_body_hook(
         &self,
         inst: &mut WasmtimeInstance,
@@ -306,25 +346,25 @@ impl WasmtimeRuntime {
             BoundFilter::V04(_) => {
                 use contract::types_v04::RequestBodyDecision as Raw;
                 let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
-                let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
+                let (decision,) = self.invoke(&mut inst.store, func, (body,))?;
                 request_body_decision_from_v04(decision).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V03(_) => {
                 use contract::types_v03::RequestBodyDecision as Raw;
                 let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
-                let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
+                let (decision,) = self.invoke(&mut inst.store, func, (body,))?;
                 request_body_decision_from_v03(decision).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V02(_) => {
                 use contract::types_v02::RequestBodyDecision as Raw;
                 let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
-                let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
+                let (decision,) = self.invoke(&mut inst.store, func, (body,))?;
                 request_body_decision_from_v02(decision).ok_or_else(invalid_guest_header_error)
             }
             BoundFilter::V01(_) => {
                 use contract::types_v01::RequestBodyDecision as Raw;
                 let func = func.typed::<(&[u8],), (Raw,)>(&inst.store)?;
-                let (decision,) = self.drive_call(func.call_async(&mut inst.store, (body,)))?;
+                let (decision,) = self.invoke(&mut inst.store, func, (body,))?;
                 request_body_decision_from_v01(decision).ok_or_else(invalid_guest_header_error)
             }
         }
@@ -348,7 +388,7 @@ impl WasmtimeRuntime {
         };
         use contract::types_v04::ResponseBodyDecision as Raw;
         let func = func.typed::<(&HttpRequest, &HttpResponse, &[u8]), (Raw,)>(&inst.store)?;
-        let (decision,) = self.drive_call(func.call_async(&mut inst.store, (req, resp, body)))?;
+        let (decision,) = self.invoke(&mut inst.store, func, (req, resp, body))?;
         response_body_decision_from_v04(decision).ok_or_else(invalid_guest_header_error)
     }
 
@@ -383,6 +423,7 @@ impl FilterRuntime for WasmtimeRuntime {
                     ratelimit_bucket: self.ratelimit_bucket,
                     quota: self.kv_quota.clone(),
                     config: self.config.clone(),
+                    needs_wall_clock: self.needs_wall_clock,
                     #[cfg(feature = "fat-guest")]
                     wasi_minimal: self.wasi_minimal,
                 },
@@ -395,34 +436,33 @@ impl FilterRuntime for WasmtimeRuntime {
         store.limiter(|s| &mut s.limits);
         // `init` is heavy (Tenet 4) → the generous init budget, not the tight per-request one.
         store.set_epoch_deadline(self.init_deadline_ms);
-        // Async (ADR 000021): the guest runs on a fiber; `drive` runs it to completion — pollster
-        // for the sync host-API path, the tokio runtime when the guest may issue outbound I/O
-        // (ADR 000036). Two-step instantiate (raw instance + typed view) so the raw `Instance`
-        // survives for the optional body-hook lookup; the typed `Filter` binding still drives the
-        // required init / on-request / on-response, at whichever contract version `pre` targets.
+        // Instantiate + run `init` via direct synchronous `TypedFunc::call` for zero-WASI
+        // filters, or on a fiber when async WASI capabilities are linked (`needs_async_store`).
         let (filter, instance) = match &self.pre {
             FilterPreBinding::V04(pre) => {
-                let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
+                let instance = self.instantiate_raw(pre.instance_pre(), &mut store)?;
                 let filter = FilterV04::new(&mut store, &instance)?;
-                self.drive_call(filter.call_init(&mut store))?;
+                self.invoke(&mut store, filter.func_init(), ())?;
                 (BoundFilter::V04(filter), instance)
             }
             FilterPreBinding::V03(pre) => {
-                let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
+                let instance = self.instantiate_raw(pre.instance_pre(), &mut store)?;
                 let filter = FilterV03::new(&mut store, &instance)?;
-                self.drive_call(filter.call_init(&mut store))?;
-                (BoundFilter::V03(filter), instance)
+                self.invoke(&mut store, filter.func_init(), ())?;
+                let validated = ValidatedV03::new(&store, filter)?;
+                (BoundFilter::V03(validated), instance)
             }
             FilterPreBinding::V02(pre) => {
-                let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
+                let instance = self.instantiate_raw(pre.instance_pre(), &mut store)?;
                 let filter = FilterV02::new(&mut store, &instance)?;
-                self.drive_call(filter.call_init(&mut store))?;
-                (BoundFilter::V02(filter), instance)
+                self.invoke(&mut store, filter.func_init(), ())?;
+                let validated = ValidatedV02::new(&store, filter)?;
+                (BoundFilter::V02(validated), instance)
             }
             FilterPreBinding::V01(pre) => {
-                let instance = self.drive_call(pre.instance_pre().instantiate_async(&mut store))?;
+                let instance = self.instantiate_raw(pre.instance_pre(), &mut store)?;
                 let filter = FilterV01::new(&mut store, &instance)?;
-                self.drive_call(filter.call_init(&mut store))?;
+                self.invoke(&mut store, filter.func_init(), ())?;
                 (BoundFilter::V01(filter), instance)
             }
         };
@@ -487,6 +527,10 @@ impl FilterRuntime for WasmtimeRuntime {
         instance.store.data_mut().begin_request();
     }
 
+    fn set_capture_logs(&self, instance: &mut WasmtimeInstance, capture: bool) {
+        instance.store.data_mut().set_capture_logs(capture);
+    }
+
     fn set_request_deadline(&self, instance: &mut WasmtimeInstance) {
         instance.store.set_epoch_deadline(self.request_deadline_ms);
     }
@@ -500,13 +544,97 @@ impl FilterRuntime for WasmtimeRuntime {
     }
 }
 
+/// Pre-validated borrowed-parameter wrapper for frozen `plecto:filter@0.2.0` exports:
+/// `Func::typed` runs once at instantiation against [`HttpRequestV02V03Ref`] and [`HttpResponse`]
+/// so per-request lowering avoids cloning owned guest records.
+pub(crate) struct ValidatedV02 {
+    on_request: wasmtime::component::Func,
+    on_response: wasmtime::component::Func,
+}
+
+impl ValidatedV02 {
+    fn new(store: &Store<HostState>, filter: FilterV02) -> Result<Self> {
+        let on_request = *filter.func_on_request().func();
+        on_request
+            .typed::<(HttpRequestV02V03Ref<'_>,), (contract::types_v02::RequestDecision,)>(store)?;
+        let on_response = *filter.func_on_response().func();
+        on_response.typed::<(&HttpResponse,), (contract::types_v02::ResponseDecision,)>(store)?;
+        Ok(Self {
+            on_request,
+            on_response,
+        })
+    }
+
+    fn func_on_request<'a>(
+        &self,
+    ) -> wasmtime::component::TypedFunc<
+        (HttpRequestV02V03Ref<'a>,),
+        (contract::types_v02::RequestDecision,),
+    > {
+        // SAFETY: `self.on_request` passed `Func::typed::<(HttpRequestV02V03Ref<'_>,), ...>` in
+        // `ValidatedV02::new` for this instance's Store, matching the wit-bindgen `func_*` pattern.
+        unsafe { wasmtime::component::TypedFunc::new_unchecked(self.on_request) }
+    }
+
+    fn func_on_response<'a>(
+        &self,
+    ) -> wasmtime::component::TypedFunc<(&'a HttpResponse,), (contract::types_v02::ResponseDecision,)>
+    {
+        // SAFETY: `self.on_response` passed `Func::typed::<(&HttpResponse,), ...>` in
+        // `ValidatedV02::new` for this instance's Store, matching the wit-bindgen `func_*` pattern.
+        unsafe { wasmtime::component::TypedFunc::new_unchecked(self.on_response) }
+    }
+}
+
+/// Pre-validated borrowed-parameter wrapper for frozen `plecto:filter@0.3.0` exports.
+pub(crate) struct ValidatedV03 {
+    on_request: wasmtime::component::Func,
+    on_response: wasmtime::component::Func,
+}
+
+impl ValidatedV03 {
+    fn new(store: &Store<HostState>, filter: FilterV03) -> Result<Self> {
+        let on_request = *filter.func_on_request().func();
+        on_request
+            .typed::<(HttpRequestV02V03Ref<'_>,), (contract::types_v03::RequestDecision,)>(store)?;
+        let on_response = *filter.func_on_response().func();
+        on_response.typed::<(HttpRequestV02V03Ref<'_>, &HttpResponse), (
+            contract::types_v03::ResponseDecision,
+        )>(store)?;
+        Ok(Self {
+            on_request,
+            on_response,
+        })
+    }
+
+    fn func_on_request<'a>(
+        &self,
+    ) -> wasmtime::component::TypedFunc<
+        (HttpRequestV02V03Ref<'a>,),
+        (contract::types_v03::RequestDecision,),
+    > {
+        // SAFETY: `self.on_request` passed `Func::typed` in `ValidatedV03::new`.
+        unsafe { wasmtime::component::TypedFunc::new_unchecked(self.on_request) }
+    }
+
+    fn func_on_response<'a>(
+        &self,
+    ) -> wasmtime::component::TypedFunc<
+        (HttpRequestV02V03Ref<'a>, &'a HttpResponse),
+        (contract::types_v03::ResponseDecision,),
+    > {
+        // SAFETY: `self.on_response` passed `Func::typed` in `ValidatedV03::new`.
+        unsafe { wasmtime::component::TypedFunc::new_unchecked(self.on_response) }
+    }
+}
+
 /// The typed guest binding at the contract version this instance was instantiated with — always
 /// the same variant as the runtime's `FilterPreBinding` (both are built in
 /// `instantiate_initialized`), so dispatch matches on this alone.
 pub(crate) enum BoundFilter {
     V01(FilterV01),
-    V02(FilterV02),
-    V03(FilterV03),
+    V02(ValidatedV02),
+    V03(ValidatedV03),
     V04(FilterV04),
 }
 

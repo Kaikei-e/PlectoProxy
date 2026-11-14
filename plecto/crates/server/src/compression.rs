@@ -25,7 +25,7 @@ use hyper::header::{
     ETAG, HeaderMap, HeaderValue, VARY,
 };
 use hyper::{Response, StatusCode};
-use plecto_control::{CompressionAlgorithm, CompressionConfig, RouteInfo};
+use plecto_control::{CompressionAlgorithm, CompressionConfig};
 
 use crate::{BoxError, ResponseBody};
 
@@ -51,10 +51,10 @@ const BROTLI_BUFFER: usize = 4096;
 /// head must keep describing the identity representation a GET would have returned.
 pub(crate) fn apply(
     resp: Response<ResponseBody>,
-    route: &RouteInfo,
+    compression: Option<&CompressionConfig>,
     request: &hyper::http::request::Parts,
 ) -> Response<ResponseBody> {
-    let Some(cfg) = route.compression.as_deref() else {
+    let Some(cfg) = compression else {
         return resp;
     };
     if request.method == hyper::Method::HEAD {

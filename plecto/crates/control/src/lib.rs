@@ -83,6 +83,8 @@ pub use ratelimit::RateLimitDecision;
 #[cfg(unix)]
 pub use reload::SignalReloadSource;
 pub use reload::{ReloadOutcome, ReloadSource, serve_reloads};
+#[doc(hidden)]
+pub use route::MatchedRoute;
 pub use route::{
     CompressionConfig, ResponseBodyConfig, ResponseHeaders, RouteInfo, TimeoutConfig,
     UNMATCHED_ROUTE, UpgradeConfig, normalize_path,
@@ -130,6 +132,8 @@ pub(crate) struct ActiveConfig {
     /// Compiled routing table (ADR 000013): empty unless the manifest declares `[[route]]`.
     /// The fast-path server matches against these, then runs the matched route's chain.
     pub(crate) routes: Vec<route::CompiledRoute>,
+    /// Indices into `routes` sorted in descending specificity order for early-exit matching.
+    pub(crate) route_order: Box<[usize]>,
     /// TLS server config built from `[[tls]]` (ADR 000014), or `None` for plain HTTP/1.1. Rides
     /// the `ArcSwap` with the rest, so a reload swaps certs atomically (new conns get new certs).
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
@@ -745,9 +749,12 @@ fn build_active(
         routes.push(route::CompiledRoute::compile(r, backends, &filters));
     }
 
+    let route_order = route::compile_route_order(&routes);
+
     Ok(ActiveConfig {
         filters,
         routes,
+        route_order,
         tls,
         quic_tls,
         hash,

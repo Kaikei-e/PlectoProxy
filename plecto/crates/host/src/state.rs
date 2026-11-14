@@ -157,6 +157,12 @@ pub struct HostState {
     host_log_budget: LineCountBudget,
     /// Wall-clock ms captured once at request start: a stable per-request snapshot.
     now_ms: u64,
+    /// Whether this component imports `host-clock`, `host-ratelimit`, or external WASI interfaces
+    /// that observe the per-request wall-clock snapshot. Skips `SystemTime::now()` when false.
+    needs_wall_clock: bool,
+    /// Whether `host-log` calls on the active request should be captured. Disabled on pooled/chain
+    /// runs whose active `TelemetrySink` does not consume full spans/logs.
+    capture_logs: bool,
     /// Linear-memory / table / instance caps for this Store (ADR 000006). Wired via
     /// `Store::limiter`; a grow past the cap is denied, bounding mis-allocation and runaway
     /// growth even on the untrusted on-demand engine (which has no pooling reservation).
@@ -220,6 +226,8 @@ pub(crate) struct HostStateInit {
     pub(crate) ratelimit_bucket: Option<Bucket>,
     pub(crate) quota: Arc<KvQuota>,
     pub(crate) config: Arc<BTreeMap<String, String>>,
+    /// Whether the loaded component uses `host-clock` or `host-ratelimit` (or non-plecto WASI).
+    pub(crate) needs_wall_clock: bool,
     /// This filter's manifest `wasi = "minimal"` declaration (ADR 000063). Meaningless (but
     /// harmless) when the `fat-guest` feature is off — the manifest validator rejects the
     /// declaration on such a build before `HostState` is ever constructed.
@@ -240,6 +248,7 @@ impl HostState {
             ratelimit_bucket,
             quota,
             config,
+            needs_wall_clock,
             #[cfg(feature = "fat-guest")]
             wasi_minimal,
         } = init;
@@ -270,7 +279,9 @@ impl HostState {
             kv_prefix,
             logs: Vec::new(),
             host_log_budget: LineCountBudget::new(MAX_LOG_LINES_PER_REQUEST),
-            now_ms: wall_now_ms(),
+            now_ms: if needs_wall_clock { wall_now_ms() } else { 0 },
+            needs_wall_clock,
+            capture_logs: true,
             limits: StoreLimitsBuilder::new()
                 .memory_size(max_memory_bytes as usize)
                 .table_elements(MAX_TABLE_ELEMENTS)
@@ -307,10 +318,20 @@ impl HostState {
     /// queued (ADR 000063) — both feed the same OTLP span-event path
     /// (`observe::build_filter_span`), so a trapped guest's stdout/stderr shows up in the same
     /// trace as the failing request. Called once per guest call, from `runtime.rs`.
+    pub(crate) fn set_capture_logs(&mut self, capture: bool) {
+        self.capture_logs = capture;
+    }
+
     pub(crate) fn take_logs(&mut self) -> Vec<LogLine> {
         #[cfg(feature = "fat-guest")]
         if let Some(bridge) = &self.stdio_bridge {
-            self.logs.extend(bridge.drain());
+            let drained = bridge.drain();
+            if self.capture_logs {
+                self.logs.extend(drained);
+            }
+        }
+        if !self.capture_logs || self.logs.is_empty() {
+            return Vec::new();
         }
         std::mem::take(&mut self.logs)
     }
@@ -325,7 +346,13 @@ impl HostState {
     pub(crate) fn take_logs_final(&mut self) -> Vec<LogLine> {
         #[cfg(feature = "fat-guest")]
         if let Some(bridge) = &self.stdio_bridge {
-            self.logs.extend(bridge.drain_final());
+            let drained = bridge.drain_final();
+            if self.capture_logs {
+                self.logs.extend(drained);
+            }
+        }
+        if !self.capture_logs || self.logs.is_empty() {
+            return Vec::new();
         }
         std::mem::take(&mut self.logs)
     }
@@ -335,11 +362,14 @@ impl HostState {
     pub(crate) fn begin_request(&mut self) {
         self.logs.clear();
         self.host_log_budget.reset();
+        self.capture_logs = true;
         #[cfg(feature = "fat-guest")]
         if let Some(bridge) = &self.stdio_bridge {
             bridge.begin_request();
         }
-        self.now_ms = wall_now_ms();
+        if self.needs_wall_clock {
+            self.now_ms = wall_now_ms();
+        }
         // A reused instance's connect budget belongs to the request, not the instance.
         #[cfg(feature = "outbound-tcp")]
         self.tcp.begin_request();
@@ -490,6 +520,9 @@ impl bindings::plecto::filter::types::Host for HostState {}
 
 impl host_log::Host for HostState {
     fn log(&mut self, level: LogLevel, message: String) {
+        if !self.capture_logs {
+            return;
+        }
         // `LineCountBudget` bounds per-request log volume (CWE-770: a guest can loop `log` until
         // its deadline) and `sanitize_log_message` (inside `admit`) neutralizes control bytes.
         if let Some((level, message)) = self.host_log_budget.admit(level, message) {
@@ -705,6 +738,7 @@ mod tests {
             ratelimit_bucket: None,
             quota: Arc::new(KvQuota::new()),
             config: Arc::new(BTreeMap::new()),
+            needs_wall_clock: true,
             #[cfg(feature = "fat-guest")]
             wasi_minimal: false,
         }

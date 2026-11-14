@@ -242,13 +242,14 @@ impl ServerMetrics {
             .unwrap_or_else(|| Arc::new(RouteCounters::new()))
     }
 
-    fn counters(&self, route: &str) -> Arc<RouteCounters> {
+    fn with_counters(&self, route: &str, f: impl FnOnce(&RouteCounters)) {
         let routes = self.routes.load();
         if let Some(counters) = routes.get(route) {
-            counters.clone()
+            f(counters);
         } else {
             drop(routes);
-            self.insert_route_lazy(route)
+            let counters = self.insert_route_lazy(route);
+            f(&counters);
         }
     }
 
@@ -284,9 +285,9 @@ impl ServerMetrics {
 
     /// Record one request rejected by a native route rate limit (ADR 000033 / 000112).
     pub(crate) fn inc_rate_limited(&self, route: &str) {
-        self.counters(route)
-            .rate_limited
-            .fetch_add(1, Ordering::Relaxed);
+        self.with_counters(route, |c| {
+            c.rate_limited.fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     /// Pre-register route names for the `route` metric label (ADR 000112).
@@ -332,10 +333,11 @@ impl ServerMetrics {
     /// never panics. A route not yet registered is lazily inserted via RCU.
     pub(crate) fn record_request(&self, route: &str, status: u16, elapsed: Duration) {
         let idx = (status / 100).clamp(1, 5) as usize - 1;
-        let counters = self.counters(route);
-        if let Some(slot) = counters.status_class.get(idx) {
-            slot.fetch_add(1, Ordering::Relaxed);
-        }
+        self.with_counters(route, |counters| {
+            if let Some(slot) = counters.status_class.get(idx) {
+                slot.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         self.duration.observe(elapsed.as_secs_f64());
     }
 

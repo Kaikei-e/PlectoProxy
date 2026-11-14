@@ -126,11 +126,14 @@ struct LiveSlotGuard<'a, I> {
 impl<I> Drop for LiveSlotGuard<'_, I> {
     fn drop(&mut self) {
         if self.armed {
-            {
+            let has_waiters = {
                 let mut g = self.pool.inner.lock();
                 g.live = g.live.saturating_sub(1);
+                g.waiters > 0
+            };
+            if has_waiters {
+                self.pool.available.notify_one();
             }
-            self.pool.available.notify_one();
         }
     }
 }
@@ -194,10 +197,14 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 } else if g.live < pool.cap {
                     g.live += 1; // reserve the slot before the (slow) build, done outside the lock
                     Step::Build
-                } else if pool.available.wait_until(&mut g, deadline).timed_out() {
-                    // saturated and nothing freed in time → shed load, fail closed.
-                    return Err(RunError::Unavailable);
                 } else {
+                    g.waiters += 1;
+                    let timed_out = pool.available.wait_until(&mut g, deadline).timed_out();
+                    g.waiters = g.waiters.saturating_sub(1);
+                    if timed_out {
+                        // saturated and nothing freed in time → shed load, fail closed.
+                        return Err(RunError::Unavailable);
+                    }
                     Step::Retry
                 }
             };
@@ -240,6 +247,7 @@ impl<R: FilterRuntime> LoadedInner<R> {
     fn run_fresh<T>(
         &self,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+        capture_logs: bool,
     ) -> HookResult<T> {
         if self.untrusted_breaker.lock().is_open() {
             return Err((RunError::Unavailable, Vec::new()));
@@ -252,55 +260,62 @@ impl<R: FilterRuntime> LoadedInner<R> {
                 return Err((RunError::Instantiate(e), Vec::new()));
             }
         };
+        if !capture_logs {
+            self.runtime.set_capture_logs(&mut inst, false);
+        }
         self.runtime.set_request_deadline(&mut inst);
         match call(&mut inst) {
             Ok(value) => {
-                // A fresh/untrusted instance is used for exactly one call and then discarded
-                // regardless of outcome — the final drain (not the plain mid-lifetime one) so an
-                // unterminated stdio partial line (ADR 000063: e.g. a guest that writes without a
-                // trailing newline before returning normally) is recovered here exactly like the
-                // trap arm below, instead of being silently lost with the discarded instance.
-                let logs = self.runtime.take_logs_final(&mut inst);
+                let logs = if capture_logs {
+                    self.runtime.take_logs_final(&mut inst)
+                } else {
+                    Vec::new()
+                };
                 self.untrusted_breaker.lock().clear();
                 Ok((value, logs))
             }
             Err(e) => {
-                // The instance is discarded either way (its linear memory is undefined after a
-                // trap), so recover whatever host-log/stdio output it produced before failing —
-                // ADR 000063's whole point is that a trapping guest's own diagnostic output
-                // (e.g. a TinyGo panic on stderr) still reaches the span this request emits.
-                let logs = self.runtime.take_logs_final(&mut inst);
+                let logs = if capture_logs {
+                    self.runtime.take_logs_final(&mut inst)
+                } else {
+                    Vec::new()
+                };
                 self.untrusted_breaker.lock().record_trap();
                 Err((RunError::from_call(e), logs))
             }
         }
     }
 
-    /// Run one request through the trusted pool (ADR 000012): check out an instance, run `call`
-    /// under the per-request deadline, then check it back in — returning it to `idle`, recycling
-    /// it once it has served `max_requests_per_instance` (so init re-runs, bounding linear-memory
-    /// state accumulation, §6.6), or discarding it on a trap. The circuit breaker is **pool-wide**
-    /// (review f000003 #5, generalised): a deterministically-trapping filter trips the whole pool
-    /// once rather than forcing every instance to the threshold independently. A trapped
-    /// instance's memory is undefined, so the discard is per-instance.
     fn run_pooled<T>(
         &self,
         pool: &TrustedPool<R::Instance>,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+        capture_logs: bool,
     ) -> HookResult<T> {
         // Nothing instantiated yet on a checkout failure → no Store, no logs to recover.
         let pooled = self.checkout(pool).map_err(|e| (e, Vec::new()))?;
-        self.execute_pooled(pool, pooled, call)
+        self.execute_pooled_opts(pool, pooled, call, capture_logs)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn execute_pooled<T>(
+        &self,
+        pool: &TrustedPool<R::Instance>,
+        pooled: PooledInstance<R::Instance>,
+        call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+    ) -> HookResult<T> {
+        self.execute_pooled_opts(pool, pooled, call, true)
     }
 
     /// Shared post-checkout execution: runs `call` under the per-request deadline, handles
     /// return-to-idle, recycling after `max_requests_per_instance`, or trap recording and discard.
     /// Shared identically between blocking checkout and non-blocking idle checkout.
-    pub(crate) fn execute_pooled<T>(
+    pub(crate) fn execute_pooled_opts<T>(
         &self,
         pool: &TrustedPool<R::Instance>,
         mut pooled: PooledInstance<R::Instance>,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+        capture_logs: bool,
     ) -> HookResult<T> {
         // Armed across the guest call: a panic unwinding out of `call` must still release the
         // `live` slot and wake a waiter. Both normal arms below disarm and do their own
@@ -308,6 +323,9 @@ impl<R: FilterRuntime> LoadedInner<R> {
         let mut slot = LiveSlotGuard { pool, armed: true };
 
         self.runtime.begin_request(&mut pooled.instance);
+        if !capture_logs {
+            self.runtime.set_capture_logs(&mut pooled.instance, false);
+        }
         self.runtime.set_request_deadline(&mut pooled.instance);
         let result = call(&mut pooled.instance);
 
@@ -315,16 +333,15 @@ impl<R: FilterRuntime> LoadedInner<R> {
             Ok(value) => {
                 pooled.served = pooled.served.saturating_add(1);
                 let recycle = pooled.served >= pool.max_requests_per_instance;
-                // An instance about to be DISCARDED (recycle) gets the final drain — recovering
-                // an unterminated fat-guest stdio partial line (ADR 000063) exactly like the trap
-                // arm below — while one returning to `idle` gets the plain mid-lifetime drain.
-                let logs = if recycle {
+                let logs = if !capture_logs {
+                    Vec::new()
+                } else if recycle {
                     self.runtime.take_logs_final(&mut pooled.instance)
                 } else {
                     self.runtime.take_logs(&mut pooled.instance)
                 };
                 slot.armed = false;
-                if recycle {
+                let has_waiters = if recycle {
                     // Recycle: drop the Store (returning the slot + freeing memory) BEFORE the
                     // logical `live` decrement, so the physical instance count never transiently
                     // exceeds `cap`. The next checkout lazily rebuilds (re-init).
@@ -332,27 +349,36 @@ impl<R: FilterRuntime> LoadedInner<R> {
                     let mut g = pool.inner.lock();
                     g.breaker.clear();
                     g.live = g.live.saturating_sub(1);
+                    g.waiters > 0
                 } else {
                     let mut g = pool.inner.lock();
                     g.breaker.clear();
                     g.idle.push(pooled);
+                    g.waiters > 0
+                };
+                if has_waiters {
+                    pool.available.notify_one();
                 }
-                pool.available.notify_one();
                 Ok((value, logs))
             }
             Err(e) => {
-                // Trap → this instance's linear memory is undefined → discard it. Recover its
-                // logs (including any unterminated stdio partial line, ADR 000063) BEFORE the
-                // discard, then bump the pool-wide breaker; past the threshold open a short
-                // cooldown so a deterministically-trapping filter fails closed cheaply.
-                let logs = self.runtime.take_logs_final(&mut pooled.instance);
+                // Trap → this instance's linear memory is undefined → discard it.
+                let logs = if capture_logs {
+                    self.runtime.take_logs_final(&mut pooled.instance)
+                } else {
+                    Vec::new()
+                };
                 slot.armed = false;
                 drop(pooled);
-                let mut g = pool.inner.lock();
-                g.live = g.live.saturating_sub(1);
-                g.breaker.record_trap();
-                drop(g);
-                pool.available.notify_one();
+                let has_waiters = {
+                    let mut g = pool.inner.lock();
+                    g.live = g.live.saturating_sub(1);
+                    g.breaker.record_trap();
+                    g.waiters > 0
+                };
+                if has_waiters {
+                    pool.available.notify_one();
+                }
                 Err((RunError::from_call(e), logs))
             }
         }
@@ -388,14 +414,24 @@ impl<R: FilterRuntime> LoadedInner<R> {
     /// lost the moment the instance is discarded. `filter.rs` feeds these into the span it emits
     /// for the failing call, then drops them from the public `Result` it returns (unchanged
     /// contract: a `RunError` alone).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn run_hook<T>(
         &self,
         trusted: Option<&TrustedPool<R::Instance>>,
         call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
     ) -> HookResult<T> {
+        self.run_hook_opts(trusted, call, true)
+    }
+
+    pub(crate) fn run_hook_opts<T>(
+        &self,
+        trusted: Option<&TrustedPool<R::Instance>>,
+        call: impl FnOnce(&mut R::Instance) -> wasmtime::Result<T>,
+        capture_logs: bool,
+    ) -> HookResult<T> {
         match trusted {
-            Some(pool) => self.run_pooled(pool, call),
-            None => self.run_fresh(call),
+            Some(pool) => self.run_pooled(pool, call, capture_logs),
+            None => self.run_fresh(call, capture_logs),
         }
     }
 }
@@ -424,6 +460,7 @@ pub(crate) struct PooledInstance<I> {
 struct PoolInner<I> {
     idle: Vec<PooledInstance<I>>,
     live: usize,
+    waiters: usize,
     breaker: TrapBreaker,
 }
 
@@ -455,6 +492,7 @@ impl<I> TrustedPool<I> {
                     served: 0,
                 }],
                 live: 1,
+                waiters: 0,
                 breaker: TrapBreaker::new(TRUSTED_TRAP_BREAKER_THRESHOLD, TRUSTED_TRAP_COOLDOWN),
             }),
             available: Condvar::new(),
@@ -474,6 +512,7 @@ impl<I> TrustedPool<I> {
             inner: Mutex::new(PoolInner {
                 idle: Vec::new(),
                 live: 0,
+                waiters: 0,
                 breaker: TrapBreaker::new(TRUSTED_TRAP_BREAKER_THRESHOLD, TRUSTED_TRAP_COOLDOWN),
             }),
             available: Condvar::new(),
@@ -933,6 +972,52 @@ mod pool_tests {
             Ok::<_, wasmtime::Error>(inst.id)
         });
         assert!(res4.is_ok());
+    }
+
+    #[test]
+    fn pool_wakes_blocked_waiter_on_checkin() {
+        let runtime = FakeRuntime::new();
+        let first = runtime.instantiate_initialized().unwrap();
+        let pool = std::sync::Arc::new(TrustedPool::new(1, Duration::from_secs(2), 100, first));
+        let inner = std::sync::Arc::new(fake_inner(runtime));
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let pool1 = pool.clone();
+        let inner1 = inner.clone();
+        let h1 = std::thread::spawn(move || {
+            inner1.run_hook(Some(&pool1), |inst: &mut FakeInstance| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+        });
+        held_rx.recv().unwrap();
+
+        let pool2 = pool.clone();
+        let inner2 = inner.clone();
+        let h2 = std::thread::spawn(move || {
+            inner2.run_hook(Some(&pool2), |inst: &mut FakeInstance| {
+                Ok::<_, wasmtime::Error>(inst.id)
+            })
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while pool.inner.lock().waiters == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            pool.inner.lock().waiters,
+            1,
+            "second caller must register as a waiting checkout"
+        );
+
+        release_tx.send(()).unwrap();
+        let (id1, _) = h1.join().unwrap().unwrap();
+        let (id2, _) = h2.join().unwrap().unwrap();
+        assert_eq!(id1, id2, "waiter reuses checked-in instance on max=1 pool");
+        assert_eq!(pool.inner.lock().waiters, 0);
     }
 
     #[test]

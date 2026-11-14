@@ -3,11 +3,13 @@
 //! `C: UpstreamClient` (audunhalland pattern — static dispatch), so this can be exercised against a
 //! `FakeUpstreamClient` without a real socket.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hyper::header::HeaderValue;
+use hyper::http::uri::{Authority, PathAndQuery, Scheme};
 use hyper::{HeaderMap, Request};
 use plecto_control::{HashInput, UpstreamGroup};
 
@@ -134,7 +136,7 @@ pub(crate) struct ForwardRequest<'a> {
     /// ADR 000042 keeps the upstream leg HTTP/1.1, which requires one).
     pub(crate) authority: &'a str,
     pub(crate) upstream_path: &'a str,
-    pub(crate) traceparent: &'a str,
+    pub(crate) traceparent: &'a [u8; 55],
     /// `Some(token)` when this is an allowlisted Upgrade handshake (ADR 000048): the exact
     /// (lower-cased) token to re-issue toward the upstream. `None` for every plain request.
     pub(crate) upgrade_token: Option<&'a str>,
@@ -160,6 +162,19 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
     let mut tries_left = max_retries;
     let mut attempt: u32 = 0;
 
+    let scheme = match group.scheme() {
+        "http" => Scheme::HTTP,
+        "https" => Scheme::HTTPS,
+        other => match Scheme::from_str(other) {
+            Ok(s) => s,
+            Err(e) => return ForwardOutcome::BuildFailed(e.into()),
+        },
+    };
+    let path_and_query = match PathAndQuery::from_str(forward.upstream_path) {
+        Ok(pq) => pq,
+        Err(e) => return ForwardOutcome::BuildFailed(e.into()),
+    };
+
     loop {
         let per_try = match retry::per_try_timeout(overall_deadline, per_try_bound, Instant::now())
         {
@@ -169,13 +184,23 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
 
         let attempt_body = body.attempt_body(forward.admission.clone());
         // The scheme is the GROUP's (ADR 000042): `https` re-encrypts via the TLS client the
-        // caller selected for this group, `http` keeps the plain pre-000042 leg.
-        let uri = format!(
-            "{}://{}{}",
-            group.scheme(),
-            pick.address(),
-            forward.upstream_path
-        );
+        // caller selected for this group, `http` keeps the plain pre-000042 leg. Build the Uri
+        // from pre-parsed Scheme / Authority / PathAndQuery parts instead of formatting a string.
+        let authority = match pick.uri_authority() {
+            Some(a) => a.clone(),
+            None => match Authority::from_str(pick.address()) {
+                Ok(a) => a,
+                Err(e) => return ForwardOutcome::BuildFailed(e.into()),
+            },
+        };
+        let mut uri_parts = hyper::http::uri::Parts::default();
+        uri_parts.scheme = Some(scheme.clone());
+        uri_parts.authority = Some(authority);
+        uri_parts.path_and_query = Some(path_and_query.clone());
+        let uri = match hyper::http::Uri::from_parts(uri_parts) {
+            Ok(u) => u,
+            Err(e) => return ForwardOutcome::BuildFailed(e.into()),
+        };
         let mut builder = Request::builder().method(forward.method).uri(uri);
         match forward.headers {
             AttemptHeaders::Chain(headers) => copy_headers(builder.headers_mut(), headers),
@@ -194,7 +219,7 @@ pub(crate) async fn forward_with_retry<C: UpstreamClient>(
         }
         set_framing(builder.headers_mut(), &body, forward.original_headers);
         if let Some(h) = builder.headers_mut()
-            && let Ok(v) = HeaderValue::from_str(forward.traceparent)
+            && let Ok(v) = HeaderValue::from_bytes(forward.traceparent)
         {
             h.insert("traceparent", v);
         }
@@ -339,6 +364,8 @@ mod tests {
         group
     }
 
+    const TEST_TRACEPARENT: &[u8; 55] = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
     fn req<'a>(method: &'a str, headers: &'a HeaderMap) -> ForwardRequest<'a> {
         ForwardRequest {
             method,
@@ -346,7 +373,7 @@ mod tests {
             original_headers: headers,
             authority: "test-authority",
             upstream_path: "/",
-            traceparent: "test-trace",
+            traceparent: TEST_TRACEPARENT,
             upgrade_token: None,
             admission: test_admission(),
         }
@@ -398,7 +425,7 @@ mod tests {
             original_headers: &headers,
             authority: "test-authority",
             upstream_path: "/",
-            traceparent: "test-trace",
+            traceparent: TEST_TRACEPARENT,
             upgrade_token: None,
             admission,
         };
@@ -756,7 +783,7 @@ mod tests {
             original_headers: &original,
             authority: "h2-client.example",
             upstream_path: "/",
-            traceparent: "test-trace",
+            traceparent: TEST_TRACEPARENT,
             upgrade_token: None,
             admission: test_admission(),
         };
@@ -802,7 +829,7 @@ mod tests {
             original_headers: &original,
             authority: "should-not-be-used.example",
             upstream_path: "/",
-            traceparent: "test-trace",
+            traceparent: TEST_TRACEPARENT,
             upgrade_token: None,
             admission: test_admission(),
         };
@@ -826,6 +853,66 @@ mod tests {
         assert_eq!(
             sent[0].get(hyper::header::HOST).unwrap(),
             "h1-client.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn uri_parts_assembly_handles_ipv6_and_query_paths() {
+        struct RecordingClient {
+            uris: Mutex<Vec<String>>,
+            headers: Mutex<Vec<HeaderMap>>,
+        }
+        impl UpstreamClient for RecordingClient {
+            async fn request(
+                &self,
+                req: Request<ReqBody>,
+            ) -> Result<hyper::Response<ResponseBody>, UpstreamSendError> {
+                self.uris.lock().unwrap().push(req.uri().to_string());
+                self.headers.lock().unwrap().push(req.headers().clone());
+                Ok(hyper::Response::new(crate::body::full(Vec::new())))
+            }
+        }
+
+        let group = test_group(&["[::1]:8080"], 0);
+        let pick = group.pick(None).unwrap();
+        let client = RecordingClient {
+            uris: Mutex::new(Vec::new()),
+            headers: Mutex::new(Vec::new()),
+        };
+        let metrics = ServerMetrics::new();
+        let original = HeaderMap::new();
+        let forward = ForwardRequest {
+            method: "GET",
+            headers: AttemptHeaders::Direct(&original),
+            original_headers: &original,
+            authority: "example.com",
+            upstream_path: "/v2/items?q=1",
+            traceparent: TEST_TRACEPARENT,
+            upgrade_token: None,
+            admission: test_admission(),
+        };
+
+        let outcome = forward_with_retry(
+            &client,
+            &metrics,
+            &group,
+            pick,
+            None,
+            forward,
+            ForwardBody::Bodyless,
+            Duration::from_secs(5),
+            None,
+            0,
+        )
+        .await;
+
+        assert!(matches!(outcome, ForwardOutcome::Response(..)));
+        let uris = client.uris.lock().unwrap();
+        assert_eq!(uris[0], "http://[::1]:8080/v2/items?q=1");
+        let sent = client.headers.lock().unwrap();
+        assert_eq!(
+            sent[0].get("traceparent").unwrap().as_bytes(),
+            TEST_TRACEPARENT
         );
     }
 }

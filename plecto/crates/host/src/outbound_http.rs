@@ -1092,6 +1092,7 @@ mod tests {
                     ratelimit_bucket: None,
                     quota: Arc::new(KvQuota::new()),
                     config: Arc::new(BTreeMap::new()),
+                    needs_wall_clock: true,
                     #[cfg(feature = "fat-guest")]
                     wasi_minimal: false,
                 },

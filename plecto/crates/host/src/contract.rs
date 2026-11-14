@@ -173,6 +173,7 @@ pub(crate) fn response_to_v01(resp: &HttpResponse) -> types_v01::HttpResponse {
 /// byte-valued shape, so this is a mechanical per-field clone, not a lossy projection
 /// (unlike [`request_to_v01`]). `path_with_query` lands on the frozen `path` — the 0.4.0
 /// rename is a field NAME change, so the value a frozen guest sees is unchanged (ADR 000104).
+#[cfg(test)]
 pub(crate) fn request_to_v02(req: &HttpRequest) -> types_v02::HttpRequest {
     types_v02::HttpRequest {
         method: req.method.clone(),
@@ -190,6 +191,32 @@ pub(crate) fn request_to_v02(req: &HttpRequest) -> types_v02::HttpRequest {
     }
 }
 
+/// Borrowed lowering projection for frozen 0.2 and 0.3 `http-request` parameters (`path`
+/// aliases canonical `path_with_query`). Binary component-ABI layout is identical to
+/// `types_v02::HttpRequest` / `types_v03::HttpRequest`, avoiding per-call String/Vec clones.
+#[derive(wasmtime::component::ComponentType, wasmtime::component::Lower)]
+#[component(record)]
+pub(crate) struct HttpRequestV02V03Ref<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub authority: &'a str,
+    pub scheme: &'a str,
+    pub headers: &'a [Header],
+}
+
+impl<'a> From<&'a HttpRequest> for HttpRequestV02V03Ref<'a> {
+    fn from(req: &'a HttpRequest) -> Self {
+        Self {
+            method: &req.method,
+            path: &req.path_with_query,
+            authority: &req.authority,
+            scheme: &req.scheme,
+            headers: &req.headers,
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn response_to_v02(resp: &HttpResponse) -> types_v02::HttpResponse {
     types_v02::HttpResponse {
         status: resp.status,
@@ -207,6 +234,7 @@ pub(crate) fn response_to_v02(resp: &HttpResponse) -> types_v02::HttpResponse {
 
 /// Project the canonical request into the frozen 0.3 record. Byte-faithful like
 /// [`request_to_v02`]; the only difference from the canonical shape is the field name.
+#[cfg(test)]
 pub(crate) fn request_to_v03(req: &HttpRequest) -> types_v03::HttpRequest {
     types_v03::HttpRequest {
         method: req.method.clone(),
@@ -221,21 +249,6 @@ pub(crate) fn request_to_v03(req: &HttpRequest) -> types_v03::HttpRequest {
                 value: h.value.clone(),
             })
             .collect(),
-    }
-}
-
-pub(crate) fn response_to_v03(resp: &HttpResponse) -> types_v03::HttpResponse {
-    types_v03::HttpResponse {
-        status: resp.status,
-        headers: resp
-            .headers
-            .iter()
-            .map(|h| types_v03::Header {
-                name: h.name.clone(),
-                value: h.value.clone(),
-            })
-            .collect(),
-        body: resp.body.clone(),
     }
 }
 

@@ -710,6 +710,7 @@ pub(crate) fn validate_routes<'a>(
 
 /// The request attributes route matching reads (ADR 000034), borrowed so matching stays
 /// allocation-free. `path` may carry `?query`; the query is split out only inside `select`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RequestParts<'a> {
     pub(crate) authority: &'a str,
     pub(crate) path: &'a str,
@@ -803,6 +804,76 @@ impl RouteInfo {
     }
 }
 
+/// Borrowed handle to a matched route returned by [`crate::ConfigSnapshot::match_route_parts`].
+/// Eliminates per-request `Arc` reference-count bumps on the server hot path.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct MatchedRoute<'a> {
+    index: usize,
+    route: &'a CompiledRoute,
+}
+
+impl<'a> MatchedRoute<'a> {
+    pub(crate) fn new(index: usize, route: &'a CompiledRoute) -> Self {
+        Self { index, route }
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn name(&self) -> &'a str {
+        &self.route.name
+    }
+
+    pub fn has_filters(&self) -> bool {
+        !self.route.filters.is_empty()
+    }
+
+    pub fn body_hooks(&self) -> BodyHooks {
+        self.route.body_hooks
+    }
+
+    pub fn pick_upstream(&self) -> Option<Arc<UpstreamGroup>> {
+        self.route.backends.pick()
+    }
+
+    pub fn rewrite_path<'p>(&self, path: &'p str) -> Cow<'p, str> {
+        rewrite_path(path, self.route.strip_prefix.as_deref())
+    }
+
+    pub fn request_timeout(&self, group: &UpstreamGroup) -> Duration {
+        self.route.timeouts.request_timeout(group.request_timeout())
+    }
+
+    pub fn overall_timeout(&self, group: &UpstreamGroup) -> Duration {
+        self.route.timeouts.overall_timeout(group.overall_timeout())
+    }
+
+    pub fn check_rate_limit(&self, peer: IpAddr) -> RateLimitDecision {
+        match &self.route.rate_limit {
+            Some(rl) => rl.check(peer),
+            None => RateLimitDecision::Allow,
+        }
+    }
+
+    pub fn upgrade(&self) -> Option<&'a UpgradeConfig> {
+        self.route.upgrade.as_deref()
+    }
+
+    pub fn compression(&self) -> Option<&'a CompressionConfig> {
+        self.route.compression.as_deref()
+    }
+
+    pub fn response_headers(&self) -> Option<&'a ResponseHeaders> {
+        self.route.response_headers.as_deref()
+    }
+
+    pub fn response_body(&self) -> &'a ResponseBodyConfig {
+        &self.route.response_body
+    }
+}
+
 /// Normalise an authority for host matching: drop any `:port` and a trailing dot, borrowed — no
 /// allocation on the request path. (`example.COM:8443` → `example.COM`; case is handled at the
 /// comparison via `eq_ignore_ascii_case` against the pre-lowered route host.) IPv6 literals in
@@ -843,66 +914,96 @@ fn normalize_host(authority: &str) -> &str {
 /// A path with no `.`/`..` segments — the overwhelming majority — is returned borrowed
 /// (`Cow::Borrowed`), so the per-request common case allocates nothing.
 pub fn normalize_path(target: &str) -> Option<Cow<'_, str>> {
-    let (raw, query) = match target.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (target, None),
-    };
+    let bytes = target.as_bytes();
     // A non-origin target (asterisk-form, or no leading `/`) cannot fall under a `/`-prefixed
     // route, so it needs no traversal handling — pass it through unchanged.
-    if !raw.starts_with('/') {
+    if bytes.first() != Some(&b'/') {
         return Some(Cow::Borrowed(target));
     }
-    // Reject control bytes / backslash and percent-encoded separators or dots: an origin that
-    // decodes `%2f`/`%2e`/`%5c` would re-derive a path different from the one we route on and
-    // forward, re-opening the front-end/back-end normalization gap.
-    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) || raw.contains('\\') {
-        return None;
+    // Single-pass scan over the path portion (up to `?`): reject control bytes, backslash, and
+    // percent-encoded separators/dots (`%2e`/`%2f`/`%5c`) while checking for `.` or `..` segments.
+    // All inspected delimiters are ASCII (`< 0x80`), so byte offsets stay valid UTF-8 boundaries.
+    let mut query_idx = None;
+    let mut has_dot_segment = false;
+    let mut seg_start = 1usize;
+    let mut i = 1usize;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'?' {
+            query_idx = Some(i);
+            break;
+        }
+        if b < 0x20 || b == 0x7f || b == b'\\' {
+            return None;
+        }
+        if b == b'%'
+            && matches!(
+                (bytes.get(i + 1), bytes.get(i + 2)),
+                (Some(&b'2'), Some(&(b'e' | b'E' | b'f' | b'F')))
+                    | (Some(&b'5'), Some(&(b'c' | b'C')))
+            )
+        {
+            return None;
+        }
+        if b == b'/' {
+            let seg_len = i - seg_start;
+            if (seg_len == 1 && bytes.get(seg_start) == Some(&b'.'))
+                || (seg_len == 2
+                    && bytes.get(seg_start) == Some(&b'.')
+                    && bytes.get(seg_start + 1) == Some(&b'.'))
+            {
+                has_dot_segment = true;
+            }
+            seg_start = i + 1;
+        }
+        i += 1;
     }
-    if contains_encoded_separator(raw) {
-        return None;
+    let raw_end = query_idx.unwrap_or(bytes.len());
+    let tail_len = raw_end - seg_start;
+    if (tail_len == 1 && bytes.get(seg_start) == Some(&b'.'))
+        || (tail_len == 2
+            && bytes.get(seg_start) == Some(&b'.')
+            && bytes.get(seg_start + 1) == Some(&b'.'))
+    {
+        has_dot_segment = true;
     }
     // No `.`/`..` segment → the lexical resolution below is the identity (split + join over `/`
     // reproduces the input byte-for-byte, empty segments included), so return the input borrowed.
-    if !raw.split('/').any(|seg| seg == "." || seg == "..") {
+    if !has_dot_segment {
         return Some(Cow::Borrowed(target));
     }
-    // Lexically resolve `.` / `..` over `/`-separated segments. `out` always holds the leading ""
-    // (root); a `..` that would pop past it escapes the root and is rejected (fail-closed).
-    let mut out: Vec<&str> = Vec::new();
-    for seg in raw.split('/') {
+    // Lexically resolve `.` / `..` directly into `norm`, avoiding a temporary `Vec<&str>`.
+    let raw = target.get(..raw_end)?;
+    let mut norm = String::with_capacity(target.len());
+    let mut depth = 0usize;
+    let mut segs = raw.split('/');
+    let _ = segs.next(); // consume leading empty root segment before first `/`
+    for seg in segs {
         match seg {
             "." => {}
             ".." => {
-                if out.len() <= 1 {
+                if depth == 0 {
                     return None;
                 }
-                out.pop();
+                depth -= 1;
+                let last_slash = norm.rfind('/').unwrap_or(0);
+                norm.truncate(last_slash);
             }
-            other => out.push(other),
+            other => {
+                norm.push('/');
+                norm.push_str(other);
+                depth += 1;
+            }
         }
     }
-    let mut norm = out.join("/");
     if norm.is_empty() {
         norm.push('/');
     }
-    if let Some(q) = query {
-        norm.push('?');
-        norm.push_str(q);
+    if let Some(q) = query_idx
+        && let Some(query) = target.get(q..)
+    {
+        norm.push_str(query);
     }
     Some(Cow::Owned(norm))
-}
-
-/// Does the path contain a percent-encoded separator or dot (`%2e`/`%2f`/`%5c`, any hex case)?
-// `.windows(3)` guarantees each `w` has exactly 3 elements, so w[0..=2] are always in bounds.
-#[allow(clippy::indexing_slicing)]
-fn contains_encoded_separator(path: &str) -> bool {
-    path.as_bytes().windows(3).any(|w| {
-        w[0] == b'%'
-            && matches!(
-                (w[1], w[2]),
-                (b'2', b'e' | b'E') | (b'2', b'f' | b'F') | (b'5', b'c' | b'C')
-            )
-    })
 }
 
 /// Does `path` fall under `prefix` on a `/` boundary? `/api` matches `/api` and `/api/x` but not
@@ -920,16 +1021,69 @@ fn path_under_prefix(prefix: &str, path: &str) -> bool {
     path.as_bytes().get(prefix.len()) == Some(&b'/')
 }
 
+/// Borrowed header lookup abstraction shared between the projected contract slice (`&[Header]`)
+/// and hyper's inbound `&HeaderMap` so route matching does not force an early `Vec<Header>` copy.
+pub(crate) trait HeaderLookup {
+    fn first_header_value(&self, lower_name: &str) -> Option<&[u8]>;
+}
+
+impl HeaderLookup for [Header] {
+    fn first_header_value(&self, lower_name: &str) -> Option<&[u8]> {
+        self.iter()
+            .find(|h| h.name.eq_ignore_ascii_case(lower_name))
+            .map(|h| h.value.as_slice())
+    }
+}
+
+fn is_hop_by_hop_lower(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+    )
+}
+
+impl HeaderLookup for HeaderMap {
+    fn first_header_value(&self, lower_name: &str) -> Option<&[u8]> {
+        // Mirror `headers_to_vec` (RFC 9110 §7.6.1 / CWE-436): static hop-by-hop headers and any
+        // header nominated by `Connection` are stripped before routing/filters can observe them.
+        if is_hop_by_hop_lower(lower_name) {
+            return None;
+        }
+        if !lower_name.eq_ignore_ascii_case("close") && self.contains_key(http::header::CONNECTION)
+        {
+            for val in self.get_all(http::header::CONNECTION) {
+                if let Ok(s) = val.to_str() {
+                    for token in s.split(',') {
+                        let token = token.trim();
+                        if !token.is_empty() && token.eq_ignore_ascii_case(lower_name) {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        self.get(lower_name).map(HeaderValue::as_bytes)
+    }
+}
+
 /// Does the request match every dimension this route specifies (ADR 000034)? All specified
 /// dimensions are ANDed; an unspecified one is a wildcard. `host` is pre-normalised, `query` is the
 /// already-split query string. Header name is matched case-insensitively and value exact; query name
 /// is case-sensitive. Byte-/string-exact comparison never panics on untrusted input (no-panic tenet).
-fn route_matches(
+fn route_matches<H: HeaderLookup + ?Sized>(
     r: &CompiledRoute,
     host: &str,
     path: &str,
     method: &str,
-    headers: &[Header],
+    headers: &H,
     query: &str,
 ) -> bool {
     if let Some(h) = &r.host
@@ -950,8 +1104,8 @@ fn route_matches(
         // flip the decision (CWE-436): the origin receives every copy and may read a different one,
         // so deciding on the first occurrence keeps our routing aligned with Gateway-API's
         // "first match entry decides" and mirrors the query rule below.
-        match headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)) {
-            Some(h) if h.value.as_slice() == value.as_bytes() => {}
+        match headers.first_header_value(name) {
+            Some(v) if v == value.as_bytes() => {}
             _ => return false,
         }
     }
@@ -977,16 +1131,78 @@ fn query_param_matches(query: &str, name: &str, value: &str) -> bool {
     false
 }
 
+fn split_target_for_match(target: &str) -> (&str, &str) {
+    let bytes = target.as_bytes();
+    let Some(pos) = bytes.iter().position(|&b| b == b'?' || b == b'#') else {
+        return (target, "");
+    };
+    let path = target.get(..pos).unwrap_or(target);
+    let tail = target.get(pos + 1..).unwrap_or("");
+    if bytes.get(pos) == Some(&b'?') {
+        (path, tail)
+    } else {
+        let query = tail.split_once('?').map_or("", |(_, q)| q);
+        (path, query)
+    }
+}
+
+/// Compile route indices sorted in descending Gateway-API specificity order, breaking ties by
+/// earliest manifest index so request-time matching stops at the first matching route.
+pub(crate) fn compile_route_order(routes: &[CompiledRoute]) -> Box<[usize]> {
+    let mut order: Vec<usize> = (0..routes.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (Some(ra), Some(rb)) = (routes.get(a), routes.get(b)) else {
+            return std::cmp::Ordering::Equal;
+        };
+        let key_a = (
+            ra.host.is_some(),
+            ra.path_prefix.len(),
+            ra.method.is_some(),
+            ra.headers.len(),
+            ra.query.len(),
+        );
+        let key_b = (
+            rb.host.is_some(),
+            rb.path_prefix.len(),
+            rb.method.is_some(),
+            rb.headers.len(),
+            rb.query.len(),
+        );
+        key_b.cmp(&key_a).then_with(|| a.cmp(&b))
+    });
+    order.into_boxed_slice()
+}
+
+/// Select the most specific matching route using pre-sorted `order`.
+pub(crate) fn select_ordered<H: HeaderLookup + ?Sized>(
+    routes: &[CompiledRoute],
+    order: &[usize],
+    authority: &str,
+    target: &str,
+    method: &str,
+    headers: &H,
+) -> Option<usize> {
+    let host = normalize_host(authority);
+    let (path, query) = split_target_for_match(target);
+    for &idx in order {
+        if let Some(r) = routes.get(idx)
+            && route_matches(r, host, path, method, headers, query)
+        {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// Select the best route for `req` (ADR 000013 / 000034): among all routes whose every specified
 /// match dimension is satisfied, the most specific wins, ordered by host-constrained > longest
 /// `path_prefix` > `method` present > more header matches > more query matches, with the earliest
 /// manifest index the final stable tie-break (Gateway-API v1.5.0 precedence, adapted). Returns the
 /// winner's index, or `None` (no route → the server responds 404).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn select(routes: &[CompiledRoute], req: &RequestParts<'_>) -> Option<usize> {
     let host = normalize_host(req.authority);
-    let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
-    // Strip the query/fragment once here; `path_under_prefix` then compares bare paths per route.
-    let path = req.path.split(['?', '#']).next().unwrap_or(req.path);
+    let (path, query) = split_target_for_match(req.path);
     routes
         .iter()
         .enumerate()
@@ -2062,5 +2278,115 @@ mod tests {
         );
         // (the un-normalized path would have selected the laxer route 0 — the bug.)
         assert_eq!(select(&routes, &parts("h", raw)), Some(0));
+    }
+
+    #[test]
+    fn normalize_path_handles_edge_cases_and_dot_segments() {
+        assert_eq!(normalize_path("").as_deref(), Some(""));
+        assert_eq!(normalize_path("foo/../bar").as_deref(), Some("foo/../bar"));
+        assert_eq!(normalize_path("/.").as_deref(), Some("/"));
+        assert_eq!(normalize_path("/a/.").as_deref(), Some("/a"));
+        assert_eq!(normalize_path("/a/./").as_deref(), Some("/a/"));
+        assert_eq!(normalize_path("/a/b/../").as_deref(), Some("/a/"));
+        assert_eq!(normalize_path("/a/..").as_deref(), Some("/"));
+        assert_eq!(normalize_path("/a//b/./c").as_deref(), Some("/a//b/c"));
+        assert_eq!(normalize_path("/a//..").as_deref(), Some("/a"));
+        assert_eq!(normalize_path("//..").as_deref(), Some("/"));
+        assert_eq!(normalize_path("//../.."), None);
+        assert_eq!(
+            normalize_path("/clean/path?next=..%2fadmin").as_deref(),
+            Some("/clean/path?next=..%2fadmin")
+        );
+        assert!(matches!(
+            normalize_path("/clean/path?next=..%2f"),
+            Some(Cow::Borrowed(_))
+        ));
+        assert_eq!(
+            normalize_path("/a/b/../c?%2e=%5c").as_deref(),
+            Some("/a/c?%2e=%5c")
+        );
+        assert_eq!(normalize_path("/a%2f?k=1"), None);
+        assert_eq!(normalize_path("/a%2e"), None);
+        assert_eq!(normalize_path("/a%5C"), None);
+    }
+
+    #[test]
+    fn select_ordered_matches_select_across_specificity_and_ties() {
+        let mut r0 = route(None, "/", "fallback");
+        let mut r1 = route(Some("api.example"), "/api", "api-only");
+        r1.method = Some("POST".to_string());
+        let mut r2 = route(Some("api.example"), "/api", "api-hdr");
+        r2.method = Some("POST".to_string());
+        r2.headers = vec![("x-env".to_string(), "prod".to_string())];
+        let mut r3 = route(Some("api.example"), "/api", "api-hdr-tie");
+        r3.method = Some("POST".to_string());
+        r3.headers = vec![("x-role".to_string(), "admin".to_string())];
+        r0.query = vec![];
+
+        let routes = vec![r0, r1, r2, r3];
+        let order = compile_route_order(&routes);
+        let hdrs = vec![
+            header("X-Env", "prod"),
+            header("x-role", "admin"),
+            header("x-role", "guest"),
+        ];
+        let mut map = HeaderMap::new();
+        map.insert("x-env", HeaderValue::from_static("prod"));
+        map.append("x-role", HeaderValue::from_static("admin"));
+        map.append("x-role", HeaderValue::from_static("guest"));
+
+        for (auth, target, method) in [
+            ("api.example:8443", "/api/users?a=1", "POST"),
+            ("api.example", "/api/users", "GET"),
+            ("other.example", "/other", "GET"),
+        ] {
+            let expected = select(
+                &routes,
+                &RequestParts {
+                    authority: auth,
+                    path: target,
+                    method,
+                    headers: &hdrs,
+                },
+            );
+            let actual_slice =
+                select_ordered(&routes, &order, auth, target, method, hdrs.as_slice());
+            let actual_map = select_ordered(&routes, &order, auth, target, method, &map);
+            assert_eq!(
+                actual_slice, expected,
+                "slice parity for {auth} {target} {method}"
+            );
+            assert_eq!(
+                actual_map, expected,
+                "map parity for {auth} {target} {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_map_lookup_ignores_hop_by_hop_and_connection_nominated_headers() {
+        let mut r_conn = route(None, "/", "conn");
+        r_conn.headers = vec![("connection".to_string(), "keep-alive".to_string())];
+        let mut r_nom = route(None, "/", "nom");
+        r_nom.headers = vec![("x-custom-hop".to_string(), "secret".to_string())];
+        let mut r_dup = route(None, "/", "dup");
+        r_dup.headers = vec![("x-role".to_string(), "first".to_string())];
+
+        let mut map = HeaderMap::new();
+        map.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, X-Custom-Hop"),
+        );
+        map.insert("x-custom-hop", HeaderValue::from_static("secret"));
+        map.append("x-role", HeaderValue::from_static("first"));
+        map.append("x-role", HeaderValue::from_static("second"));
+
+        assert_eq!(map.first_header_value("connection"), None);
+        assert_eq!(map.first_header_value("x-custom-hop"), None);
+        assert_eq!(map.first_header_value("x-role"), Some(b"first".as_slice()));
+
+        assert!(!route_matches(&r_conn, "h", "/", "GET", &map, ""));
+        assert!(!route_matches(&r_nom, "h", "/", "GET", &map, ""));
+        assert!(route_matches(&r_dup, "h", "/", "GET", &map, ""));
     }
 }

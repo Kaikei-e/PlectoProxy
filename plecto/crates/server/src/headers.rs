@@ -34,12 +34,30 @@ fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
+fn is_hop_by_hop_lower(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+    )
+}
+
 /// The set of header names DYNAMICALLY designated hop-by-hop by `Connection` (RFC 9110 §7.6.1):
 /// `Connection: X-Foo, close` marks `X-Foo` connection-specific, so a proxy must not forward it.
 /// Forwarding such a header is a request-smuggling / header-leak primitive, so we strip these too
 /// — not just the static `HOP_BY_HOP` set (review f000005 P2#5). Tokens are lower-cased for the
 /// case-insensitive name compare; `close` / `keep-alive` are inert (no such header to drop).
 fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
+    if !map.contains_key(hyper::header::CONNECTION) {
+        return HashSet::new();
+    }
     let mut named = HashSet::new();
     for value in map.get_all(hyper::header::CONNECTION).iter() {
         if let Ok(s) = value.to_str() {
@@ -65,7 +83,16 @@ fn connection_named(map: &hyper::HeaderMap) -> HashSet<String> {
 /// so both must be present — an `Upgrade` header without the `Connection` option is not an
 /// upgrade request and stays subject to the plain hop-by-hop strip.
 pub(crate) fn upgrade_request_header(map: &hyper::HeaderMap) -> Option<&str> {
-    if !connection_named(map).contains("upgrade") {
+    if !map.contains_key(hyper::header::CONNECTION) {
+        return None;
+    }
+    let has_upgrade = map.get_all(hyper::header::CONNECTION).iter().any(|val| {
+        val.to_str().is_ok_and(|s| {
+            s.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
+    });
+    if !has_upgrade {
         return None;
     }
     map.get(hyper::header::UPGRADE)?.to_str().ok()
@@ -178,13 +205,27 @@ pub(crate) fn set_forwarded(
         // `HeaderName` lookups are case-insensitive; the constants are already lowercase.
         headers.remove(*name);
     }
-    // An IP address in decimal/hex-free ASCII is always a valid header value; stay total on the
-    // data plane regardless (drop rather than panic if that were ever not the case).
-    if let Ok(ip_value) = HeaderValue::from_str(&client.to_string()) {
+    // Format the canonical IP into a stack buffer (IPv6 max length is 45 bytes) to avoid a
+    // per-request heap `String` allocation; stay total if formatting somehow overflows.
+    let mut ip_buf = [0u8; 48];
+    let ip_len = {
+        use std::io::Write;
+        let mut cur = std::io::Cursor::new(ip_buf.as_mut_slice());
+        let _ = write!(cur, "{client}");
+        cur.position() as usize
+    };
+    if let Some(ip_bytes) = ip_buf.get(..ip_len)
+        && let Ok(ip_value) = HeaderValue::from_bytes(ip_bytes)
+    {
         headers.insert("x-forwarded-for", ip_value.clone());
         headers.insert("x-real-ip", ip_value);
     }
-    if let Ok(proto) = HeaderValue::from_str(scheme) {
+    let proto = match scheme {
+        "https" => Ok(HeaderValue::from_static("https")),
+        "http" => Ok(HeaderValue::from_static("http")),
+        other => HeaderValue::from_str(other),
+    };
+    if let Ok(proto) = proto {
         headers.insert("x-forwarded-proto", proto);
     }
     client
@@ -206,16 +247,22 @@ pub(crate) fn normalize_ingress_authority(
     let uri_authority = parts
         .uri
         .authority()
-        .map(|authority| parse_authority(authority.as_str()))
+        .map(|authority| validate_authority(authority.as_str()))
         .transpose()?;
 
     let mut hosts = parts.headers.get_all(hyper::header::HOST).iter();
     let host_authority = match hosts.next() {
-        Some(value) => Some(parse_authority(value.to_str().map_err(|_| ())?)?),
+        Some(value) => Some(validate_authority(value.to_str().map_err(|_| ())?)?),
         None => None,
     };
     if hosts.next().is_some() {
         return Err(());
+    }
+
+    enum SelectedAuthority<'u, 'h> {
+        FromUri(&'u str),
+        FromHost(&'h str),
+        None,
     }
 
     let scheme = parts.uri.scheme_str().unwrap_or(wire_scheme);
@@ -223,36 +270,38 @@ pub(crate) fn normalize_ingress_authority(
         && uri_authority.is_none()
         && host_authority.is_some();
     let selected = match parts.version {
-        Version::HTTP_10 => match (uri_authority.as_deref(), host_authority.as_deref()) {
+        Version::HTTP_10 => match (uri_authority, host_authority) {
             (Some(uri), Some(host)) if !authorities_match(uri, host, scheme) => return Err(()),
-            (Some(uri), _) => Some(uri),
-            (None, Some(host)) => Some(host),
-            (None, None) => None,
+            (Some((raw, _, _)), _) => SelectedAuthority::FromUri(raw),
+            (None, Some((raw, _, _))) => SelectedAuthority::FromHost(raw),
+            (None, None) => SelectedAuthority::None,
         },
         Version::HTTP_11 => {
-            let host = host_authority.as_deref().ok_or(())?;
-            match uri_authority.as_deref() {
+            let host = host_authority.ok_or(())?;
+            match uri_authority {
                 Some(uri) if !authorities_match(uri, host, scheme) => return Err(()),
-                Some(uri) => Some(uri),
-                None => Some(host),
+                Some((raw, _, _)) => SelectedAuthority::FromUri(raw),
+                None => SelectedAuthority::FromHost(host.0),
             }
         }
-        _ => match (uri_authority.as_deref(), host_authority.as_deref()) {
+        _ => match (uri_authority, host_authority) {
             (Some(uri), Some(host)) if !authorities_match(uri, host, scheme) => return Err(()),
-            (Some(uri), _) => Some(uri),
+            (Some((raw, _, _)), _) => SelectedAuthority::FromUri(raw),
             // RFC 9113 §8.3.1 requires direct h2 clients to send `:authority` when they have
             // authority information, but an adapter can expose a valid origin-form request with
             // the corresponding single Host field. Treat it as the one authority rather than
             // inventing a second interpretation; H3 shares this transport-neutral path.
-            (None, Some(host)) => Some(host),
+            (None, Some((raw, _, _))) => SelectedAuthority::FromHost(raw),
             (None, None) => return Err(()),
         },
     };
 
     match selected {
-        Some(authority) => {
+        SelectedAuthority::FromUri(authority) => {
             let value = HeaderValue::from_str(authority).map_err(|_| ())?;
             parts.headers.insert(hyper::header::HOST, value);
+        }
+        SelectedAuthority::FromHost(authority) => {
             // A transport adapter can expose authority solely as Host beside an origin-form Uri.
             // Materialize that same validated authority in the Uri so every later consumer reads
             // one canonical value.
@@ -263,17 +312,41 @@ pub(crate) fn normalize_ingress_authority(
                 parts.uri = Uri::from_parts(uri_parts).map_err(|_| ())?;
             }
         }
-        None => {
+        SelectedAuthority::None => {
             parts.headers.remove(hyper::header::HOST);
         }
     }
     Ok(())
 }
 
-fn parse_authority(value: &str) -> Result<String, ()> {
+fn is_simple_host_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~')
+}
+
+/// Borrowed validator returning `(raw_authority, host, port)` without heap allocations.
+fn validate_authority(value: &str) -> Result<(&str, &str, Option<u16>), ()> {
     // URI authority permits userinfo, but Host field values do not (RFC 9110 §7.2).
     if value.is_empty() || value.contains('@') {
         return Err(());
+    }
+    if !value.starts_with('[') {
+        match value.split_once(':') {
+            Some((host, port_str)) => {
+                if !host.is_empty()
+                    && host.bytes().all(is_simple_host_byte)
+                    && !port_str.is_empty()
+                    && port_str.bytes().all(|b| b.is_ascii_digit())
+                    && let Ok(port) = port_str.parse::<u16>()
+                {
+                    return Ok((value, host, Some(port)));
+                }
+            }
+            None => {
+                if value.bytes().all(is_simple_host_byte) {
+                    return Ok((value, value, None));
+                }
+            }
+        }
     }
     let authority = Authority::from_str(value).map_err(|_| ())?;
     // `Authority` permits a non-numeric or out-of-range port as generic URI syntax, while an
@@ -284,7 +357,13 @@ fn parse_authority(value: &str) -> Result<String, ()> {
     {
         return Err(());
     }
-    Ok(authority.to_string())
+    let port = authority.port_u16();
+    let host = if port.is_some() {
+        value.rsplit_once(':').map_or(value, |(h, _)| h)
+    } else {
+        value
+    };
+    Ok((value, host, port))
 }
 
 fn has_valid_port_syntax(authority: &str) -> bool {
@@ -303,22 +382,28 @@ fn has_valid_port_syntax(authority: &str) -> bool {
             None => return true,
         }
     };
-    !port.is_empty() && port.parse::<u16>().is_ok()
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
-fn authorities_match(left: &str, right: &str, scheme: &str) -> bool {
-    let Ok(left) = Authority::from_str(left) else {
-        return false;
+fn authorities_match(
+    left: (&str, &str, Option<u16>),
+    right: (&str, &str, Option<u16>),
+    scheme: &str,
+) -> bool {
+    let left_host = if !left.1.starts_with('[') {
+        left.1.strip_suffix('.').unwrap_or(left.1)
+    } else {
+        left.1
     };
-    let Ok(right) = Authority::from_str(right) else {
-        return false;
+    let right_host = if !right.1.starts_with('[') {
+        right.1.strip_suffix('.').unwrap_or(right.1)
+    } else {
+        right.1
     };
-    let left_host = left.host().strip_suffix('.').unwrap_or(left.host());
-    let right_host = right.host().strip_suffix('.').unwrap_or(right.host());
     if !left_host.eq_ignore_ascii_case(right_host) {
         return false;
     }
-    match (left.port_u16(), right.port_u16()) {
+    match (left.2, right.2) {
         (Some(left), Some(right)) => left == right,
         (None, None) => true,
         (Some(port), None) | (None, Some(port)) => {
@@ -333,37 +418,49 @@ fn authorities_match(left: &str, right: &str, scheme: &str) -> bool {
 ///
 /// `scheme` is the connection-level truth (`"https"` when the fast path terminated TLS on this
 /// connection, `"http"` for plaintext) — not the request URI's scheme, which a client can spoof.
+#[cfg(test)]
 pub(crate) fn to_http_request(parts: &hyper::http::request::Parts, scheme: &str) -> HttpRequest {
     let path = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+    to_http_request_with(parts, scheme, path, request_authority_str(parts))
+}
+
+pub(crate) fn to_http_request_with(
+    parts: &hyper::http::request::Parts,
+    scheme: &str,
+    path_with_query: String,
+    authority: &str,
+) -> HttpRequest {
     HttpRequest {
         method: parts.method.as_str().to_string(),
-        path_with_query: path,
-        authority: request_authority(parts),
+        path_with_query,
+        authority: authority.to_string(),
         scheme: scheme.to_string(),
         headers: headers_to_vec(&parts.headers),
     }
 }
 
-/// The request's authority: for HTTP/2 the `:authority` pseudo-header lands in the URI; for
-/// HTTP/1.1 it is the Host header. Prefer the URI authority (h2), falling back to Host, then to
-/// empty. Shared by the contract projection above and the access-log capture.
-pub(crate) fn request_authority(parts: &hyper::http::request::Parts) -> String {
+/// Borrowed request authority: URI authority first (h2/h3 or absolute-form h1), else Host, else `""`.
+pub(crate) fn request_authority_str(parts: &hyper::http::request::Parts) -> &str {
     parts
         .uri
         .authority()
-        .map(|a| a.to_string())
+        .map(Authority::as_str)
         .or_else(|| {
             parts
                 .headers
                 .get(hyper::header::HOST)
                 .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
         })
-        .unwrap_or_default()
+        .unwrap_or("")
+}
+
+#[cfg(test)]
+pub(crate) fn request_authority(parts: &hyper::http::request::Parts) -> String {
+    request_authority_str(parts).to_string()
 }
 
 /// Convert a hyper `HeaderMap` to the contract's `Vec<Header>` (byte-preserving). Both the static
@@ -377,7 +474,8 @@ pub(crate) fn headers_to_vec(map: &hyper::HeaderMap) -> Vec<Header> {
         .filter(|(name, _)| {
             // `HeaderName::as_str()` is already lowercase (the `http` crate normalizes on parse),
             // and `named` holds lowered tokens — compare directly, no per-header allocation.
-            !is_hop_by_hop(name.as_str()) && (named.is_empty() || !named.contains(name.as_str()))
+            !is_hop_by_hop_lower(name.as_str())
+                && (named.is_empty() || !named.contains(name.as_str()))
         })
         .map(|(name, value)| Header {
             name: name.as_str().to_string(),
@@ -429,7 +527,9 @@ pub(crate) fn copy_headers_direct(dst: Option<&mut hyper::HeaderMap>, src: &hype
     let Some(dst) = dst else { return };
     let named = connection_named(src);
     for (name, value) in src {
-        if is_hop_by_hop(name.as_str()) || (!named.is_empty() && named.contains(name.as_str())) {
+        if is_hop_by_hop_lower(name.as_str())
+            || (!named.is_empty() && named.contains(name.as_str()))
+        {
             continue;
         }
         dst.append(name.clone(), value.clone());
@@ -616,6 +716,7 @@ mod tests {
         // open a smuggling-adjacent gap (CWE-444): a name one side strips and the other
         // forwards. This assertion is the only guard.
         assert_eq!(HOP_BY_HOP, plecto_host::HOP_BY_HOP_GUEST_HEADERS);
+        assert!(HOP_BY_HOP.iter().all(|h| is_hop_by_hop_lower(h)));
     }
 
     #[test]
@@ -1041,5 +1142,65 @@ mod tests {
             "a CRLF-bearing value is rejected, not split into a second header"
         );
         assert_eq!(dst.len(), 1, "only the one valid header survives");
+    }
+
+    #[test]
+    fn set_forwarded_stack_formatting_covers_ipv4_mapped_and_ipv6() {
+        for (peer, expected) in [
+            ("192.0.2.10", "192.0.2.10"),
+            ("::ffff:192.0.2.10", "192.0.2.10"),
+            (
+                "2001:db8:85a3::8a2e:370:7334",
+                "2001:db8:85a3::8a2e:370:7334",
+            ),
+        ] {
+            let mut headers = hyper::HeaderMap::new();
+            let client = set_forwarded(&mut headers, peer.parse().unwrap(), "http", None);
+            assert_eq!(client.to_string(), expected);
+            assert_eq!(xff(&headers), Some(expected));
+            assert_eq!(
+                headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
+                Some(expected)
+            );
+            assert_eq!(
+                headers
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok()),
+                Some("http")
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_ingress_authority_handles_plus_port_and_preserves_single_host() {
+        let mut plus_port = request_parts(Version::HTTP_11, "/", &["example.com:+80"]);
+        assert!(normalize_ingress_authority(&mut plus_port, "http").is_err());
+
+        let mut origin_h1 = request_parts(Version::HTTP_11, "/api", &["api.example:8443"]);
+        normalize_ingress_authority(&mut origin_h1, "https").unwrap();
+        assert_eq!(request_authority_str(&origin_h1), "api.example:8443");
+        assert_eq!(
+            origin_h1
+                .headers
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("api.example:8443")
+        );
+
+        let mut ipv6_plus_port = request_parts(Version::HTTP_11, "/", &["[2001:db8::1]:+80"]);
+        assert!(normalize_ingress_authority(&mut ipv6_plus_port, "http").is_err());
+
+        let mut pct_host = request_parts(Version::HTTP_11, "/", &["ex%2d.example"]);
+        assert!(normalize_ingress_authority(&mut pct_host, "http").is_err());
+
+        for valid_fallback in [
+            "[2001:db8::1]:8443",
+            "[fe80::1:2:3:4%25eth0]",
+            "ex+sub.example:8080",
+        ] {
+            let mut parts = request_parts(Version::HTTP_11, "/", &[valid_fallback]);
+            normalize_ingress_authority(&mut parts, "http").unwrap();
+            assert_eq!(request_authority_str(&parts), valid_fallback);
+        }
     }
 }

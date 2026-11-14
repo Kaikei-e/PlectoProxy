@@ -425,23 +425,35 @@ impl Host {
         }
 
         let mut has_blocking_or_unknown_import = false;
+        let mut needs_wall_clock = false;
         let backend_may_block = self.kv.may_block();
         for (import_name, _) in component.component_type().imports(engine) {
             if let Some(rest) = import_name.strip_prefix("plecto:filter/") {
                 let interface = rest.split('@').next().unwrap_or(rest);
                 match interface {
-                    "host-log" | "host-clock" | "host-config" | "types" => {}
-                    "host-kv" | "host-counter" | "host-ratelimit" => {
+                    "host-log" | "host-config" | "types" => {}
+                    "host-clock" => {
+                        needs_wall_clock = true;
+                    }
+                    "host-kv" | "host-counter" => {
+                        if backend_may_block {
+                            has_blocking_or_unknown_import = true;
+                        }
+                    }
+                    "host-ratelimit" => {
+                        needs_wall_clock = true;
                         if backend_may_block {
                             has_blocking_or_unknown_import = true;
                         }
                     }
                     _ => {
                         has_blocking_or_unknown_import = true;
+                        needs_wall_clock = true;
                     }
                 }
             } else {
                 has_blocking_or_unknown_import = true;
+                needs_wall_clock = true;
             }
         }
 
@@ -497,6 +509,7 @@ impl Host {
             .then(|| component.get_export_index(None, "on-response-body"))
             .flatten();
 
+        let needs_async_store = lent.wasi_base || needs_rt;
         let runtime = WasmtimeRuntime {
             engine: engine.clone(),
             kv: self.kv.clone(),
@@ -510,6 +523,8 @@ impl Host {
             ratelimit_bucket: opts.ratelimit_bucket,
             kv_quota: self.kv_quota.clone(),
             config: Arc::new(opts.config.clone()),
+            needs_async_store,
+            needs_wall_clock,
             #[cfg(any(feature = "outbound-http", feature = "outbound-tcp"))]
             rt: needs_rt.then(|| self.outbound_rt.clone()),
             #[cfg(feature = "outbound-http")]

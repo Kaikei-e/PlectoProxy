@@ -45,6 +45,15 @@ pub(crate) fn build_engine(alloc: Allocation) -> Result<Engine> {
         feature = "fat-guest"
     ))]
     config.wasm_component_model_async(true);
+    // Disable fiber/concurrent runtime machinery when none of the async WASI capabilities are
+    // compiled in; workspace Cargo.toml enables `wasmtime/component-model-async`, which otherwise
+    // leaves `concurrency_support` enabled by default.
+    #[cfg(not(any(
+        feature = "outbound-http",
+        feature = "outbound-tcp",
+        feature = "fat-guest"
+    )))]
+    config.concurrency_support(false);
     // epoch interruption: the low-overhead deadline mechanism for the data plane (ADR 000006;
     // epoch over fuel — lighter, no determinism requirement here). A background ticker
     // advances the epoch; each Store sets a deadline before every guest call so a runaway

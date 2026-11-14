@@ -18,7 +18,7 @@ use crate::chain::{
     self, ChainOutcome, InlineRequestOutcome, InlineResponseOutcome, RequestBodyOutcome,
     ResponseBodyOutcome, ResponseOutcome,
 };
-use crate::route::{self, RouteInfo};
+use crate::route::{self, MatchedRoute, RouteInfo};
 
 /// A configuration pinned for one request transaction. Obtain via [`crate::Control::snapshot`];
 /// run `on_request` then (later) `on_response` against the *same* snapshot so a reload cannot
@@ -47,19 +47,16 @@ impl ConfigSnapshot {
     /// 404). The most specific match wins (see [`route::select`]). Pure config lookup — cheap and
     /// non-blocking, so it runs on the async thread; only the returned route's chain dispatch is
     /// blocking work. Reads only borrowed request fields, so matching is allocation-free.
-    // INVARIANT: `route::select` returns an index into the very `routes` slice passed to it, so
-    // indexing `self.config.routes` with its result is always in bounds.
-    #[allow(clippy::indexing_slicing)]
     pub fn find_route(&self, request: &HttpRequest) -> Option<RouteInfo> {
-        let parts = route::RequestParts {
-            authority: &request.authority,
-            path: &request.path_with_query,
-            method: &request.method,
-            headers: &request.headers,
-        };
-        let index = route::select(&self.config.routes, &parts)?;
-        debug_assert!(index < self.config.routes.len());
-        let r = &self.config.routes[index];
+        let index = route::select_ordered(
+            &self.config.routes,
+            &self.config.route_order,
+            &request.authority,
+            &request.path_with_query,
+            &request.method,
+            request.headers.as_slice(),
+        )?;
+        let r = self.config.routes.get(index)?;
         Some(RouteInfo {
             index,
             name: r.name.clone(),
@@ -74,6 +71,27 @@ impl ConfigSnapshot {
             timeouts: r.timeouts,
             response_body: r.response_body.clone(),
         })
+    }
+
+    /// Borrowed zero-allocation route match directly against hyper's inbound request parts.
+    #[doc(hidden)]
+    pub fn match_route_parts<'a>(
+        &'a self,
+        authority: &str,
+        path_with_query: &str,
+        method: &str,
+        headers: &http::HeaderMap,
+    ) -> Option<MatchedRoute<'a>> {
+        let index = route::select_ordered(
+            &self.config.routes,
+            &self.config.route_order,
+            authority,
+            path_with_query,
+            method,
+            headers,
+        )?;
+        let r = self.config.routes.get(index)?;
+        Some(MatchedRoute::new(index, r))
     }
 
     /// Drive a request through a matched route's chain inline on the worker thread.
@@ -221,6 +239,18 @@ impl ConfigSnapshot {
     /// continues the same trace (ADR 000009 propagation).
     pub fn traceparent(&self) -> String {
         self.trace.to_traceparent()
+    }
+
+    /// Fixed-width stack buffer encoding of this transaction's W3C `traceparent`.
+    #[doc(hidden)]
+    pub fn traceparent_bytes(&self) -> [u8; 55] {
+        self.trace.to_traceparent_bytes()
+    }
+
+    /// The pinned [`RequestTrace`] for this transaction.
+    #[doc(hidden)]
+    pub fn trace(&self) -> &RequestTrace {
+        &self.trace
     }
 }
 

@@ -15,9 +15,9 @@ use hyper::{Response, StatusCode};
 use plecto_control::otlp::SpanRecord;
 use plecto_control::{
     ChainOutcome, ConfigSnapshot, HashInput, HashKeySource, HttpRequest, HttpResponse,
-    InlineRequestOutcome, InlineResponseOutcome, OverCapMode, RateLimitDecision,
-    RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseBodyOutcome, ResponseOutcome,
-    RouteInfo, UninspectableMode,
+    InlineRequestOutcome, InlineResponseOutcome, MatchedRoute, OverCapMode, RateLimitDecision,
+    RequestBodyOutcome, RequestTrace, ResponseBodyConfig, ResponseBodyOutcome, ResponseHeaders,
+    ResponseOutcome, UninspectableMode, UpgradeConfig,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -29,8 +29,8 @@ use crate::body::{
 use crate::error::ServerError;
 use crate::forward::{ForwardBody, ForwardOutcome, ForwardRequest, forward_with_retry};
 use crate::headers::{
-    copy_headers, copy_headers_direct, headers_to_vec, normalize_ingress_authority, set_forwarded,
-    to_http_request,
+    copy_headers, copy_headers_direct, headers_to_vec, normalize_ingress_authority,
+    request_authority_str, set_forwarded, to_http_request_with,
 };
 use crate::listener::ConnGuards;
 use crate::metrics::InspectionSkip;
@@ -43,8 +43,8 @@ use crate::{ReqBody, ResponseBody, ServerState, access_log};
 /// What the transaction core reports back to `proxy_core` for the RED tally and the access log —
 /// the chosen route (ADR 000112) and why a response body escaped inspection (ADR 000098).
 #[derive(Default)]
-struct Attribution {
-    route: Option<Arc<str>>,
+struct Attribution<'a> {
+    route: Option<&'a str>,
     inspection_skipped: Option<InspectionSkip>,
 }
 
@@ -138,7 +138,7 @@ pub(crate) async fn proxy_core_with_conn_guards(
         .access_log_enabled()
         .then(|| access_log::Access {
             method: parts.method.as_str().to_string(),
-            authority: crate::headers::request_authority(&parts),
+            authority: request_authority_str(&parts).to_string(),
             path: parts.uri.path().to_string(),
         });
 
@@ -165,15 +165,18 @@ pub(crate) async fn proxy_core_with_conn_guards(
         )
     });
 
+    // Pin config + trace before `attribution` so `attribution.route` can borrow the matched route's
+    // name across the transaction without bumping an `Arc<str>` refcount per request.
+    let snapshot = authority_valid.then(|| state.control.snapshot_with_trace(trace));
     // What the transaction core reports back to `proxy_core` for the RED tally and the access
     // log — the chosen route (ADR 000112) and why a response body escaped inspection (ADR 000098).
     let mut attribution = Attribution::default();
-    let result = if authority_valid {
+    let result = if let Some(snapshot) = snapshot.as_ref() {
         proxy_core_inner(
             state.clone(),
             scheme,
             client,
-            trace,
+            snapshot,
             hyper::Request::from_parts(parts, body),
             &mut attribution,
             admission.clone(),
@@ -195,10 +198,7 @@ pub(crate) async fn proxy_core_with_conn_guards(
         Err(_) => StatusCode::BAD_GATEWAY.as_u16(),
     };
     let elapsed = start.elapsed();
-    let route_name = attribution
-        .route
-        .as_deref()
-        .unwrap_or(plecto_control::UNMATCHED_ROUTE);
+    let route_name = attribution.route.unwrap_or(plecto_control::UNMATCHED_ROUTE);
     state.metrics.record_request(route_name, status, elapsed);
     if let Some(access) = access {
         let outcome = access_log::Outcome {
@@ -227,18 +227,20 @@ pub(crate) async fn proxy_core_with_conn_guards(
 /// Takes the request head + a boxed body (so HTTP/1.1, HTTP/2 and HTTP/3 all share it) and returns
 /// the client-visible response. Errors here are upstream/transport failures the caller maps to 502.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_core_inner(
+async fn proxy_core_inner<'s>(
     state: Arc<ServerState>,
     scheme: &'static str,
     client: IpAddr,
-    trace: RequestTrace,
+    snapshot: &'s ConfigSnapshot,
     request: hyper::Request<ReqBody>,
-    attribution: &mut Attribution,
+    attribution: &mut Attribution<'s>,
     admission: Arc<OwnedSemaphorePermit>,
     conn_guards: Option<Arc<ConnGuards>>,
 ) -> Result<Response<ResponseBody>, ServerError> {
     let (mut parts, body) = request.into_parts();
-    let mut http_req = to_http_request(&parts, scheme);
+    // Detach `extensions` before borrowing `parts.uri` / `parts.headers` across the async body so
+    // upgrade-handle extraction stays disjoint without cloning `norm_path` or `in_authority`.
+    let mut extensions = std::mem::take(&mut parts.extensions);
     // `exact() == Some(0)` is hyper's framing-accurate "no body", computed up front before the
     // body moves: only a bodyless request can be an Upgrade handshake (ADR 000048), and bodyless
     // maps to the trivially replayable `ForwardBody::Bodyless` retry contract (ADR 000058) below.
@@ -249,10 +251,13 @@ async fn proxy_core_inner(
     // use the SAME normalized path, so the upstream cannot re-derive a stricter path than the
     // (possibly laxer, unfiltered) route we selected — closing the per-route-filter bypass. An
     // ambiguous (encoded-separator) or root-escaping path is rejected fail-closed.
-    match plecto_control::normalize_path(&http_req.path_with_query) {
-        // Borrowed = already normalized (the common case); only a rewritten path is stored back.
-        Some(std::borrow::Cow::Owned(path)) => http_req.path_with_query = path,
-        Some(std::borrow::Cow::Borrowed(_)) => {}
+    let raw_path = parts
+        .uri
+        .path_and_query()
+        .map(hyper::http::uri::PathAndQuery::as_str)
+        .unwrap_or("/");
+    let norm_path = match plecto_control::normalize_path(raw_path) {
+        Some(p) => p,
         None => {
             return Ok(with_error_code(
                 synth(
@@ -263,19 +268,21 @@ async fn proxy_core_inner(
                 &plecto_control::PATH_NORMALIZATION_REJECTED,
             ));
         }
-    }
+    };
+    let in_authority = request_authority_str(&parts);
 
-    // One snapshot pins config + trace for the whole transaction (a concurrent reload cannot
-    // desync the request and response halves); cloning it is a cheap Arc + trace-id clone. The
-    // trace itself was resolved by `proxy_core`, which also emits the request span (ADR 000040).
-    let snapshot = state.control.snapshot_with_trace(trace);
-    // Match against the full request — host, path, method, headers, query (ADR 000034); the most
-    // specific route wins. `http_req` carries the forwarded-header-corrected inbound request.
-    let Some(route) = snapshot.find_route(&http_req) else {
+    // Match against borrowed hyper parts directly — no `HttpRequest` / `Vec<Header>` copy until
+    // we know the request is admitted AND its matched route actually runs WASM filters.
+    let Some(route) = snapshot.match_route_parts(
+        in_authority,
+        &norm_path,
+        parts.method.as_str(),
+        &parts.headers,
+    ) else {
         return Ok(synth(StatusCode::NOT_FOUND, &fault::NO_ROUTE, b"no route"));
     };
-    attribution.route = Some(route.name.clone());
-    let idx = route.index;
+    attribution.route = Some(route.name());
+    let idx = route.index();
 
     // From here on the route is chosen, so EVERY response this transaction can produce is that
     // route's to answer. They funnel through the single exit below, where the operator's declared
@@ -284,13 +291,10 @@ async fn proxy_core_inner(
     let routed: Result<Routed, ServerError> = async {
         // Native rate limit (ADR 000033): a coarse token-bucket baseline consulted at the front
         // door — BEFORE the route's filter chain — so a flood is shed without spending any WASM
-        // CPU. The client-keyed (or route-keyed) bucket math is host-native and never crosses the
-        // WASM boundary. Over the limit fails closed with 429 + `Retry-After`, distinct from the
-        // breaker's 503 (`circuit-open`, upstream saturated): this is the client over its inbound
-        // rate floor. The per-filter `host-ratelimit` capability (ADR 000026) is a separate,
-        // policy-shaped limiter.
+        // CPU or building an `HttpRequest`. The client-keyed bucket math is host-native and fails
+        // closed with 429 + `Retry-After`.
         if let RateLimitDecision::Limit { retry_after_ms } = route.check_rate_limit(client) {
-            state.metrics.inc_rate_limited(&route.name);
+            state.metrics.inc_rate_limited(route.name());
             return Ok(Routed::Synthesised(with_error_code(
                 synth_retry_after(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -302,21 +306,23 @@ async fn proxy_core_inner(
             )));
         }
 
-        let upgrade = upgrade_intent(&route, &mut parts, bodyless);
+        let upgrade = upgrade_intent(route.upgrade(), &parts.headers, &mut extensions, bodyless);
 
         // The chain view the remaining phases share (request body hook, upgrade switch, response
         // side): the pinned snapshot + the selected route's chain identity.
         let chain = ChainRef {
-            snapshot: &snapshot,
+            snapshot,
             idx,
-            has_filters: route.has_filters,
+            has_filters: route.has_filters(),
             admission,
         };
 
         // --- request side: the route's chain inline on worker or on blocking pool.
-        // A route with no filters skips the hop entirely — an empty chain is the identity, and the
-        // blocking-pool handoff (~µs each way) would be the pure-proxy path's single largest tax.
-        let mut forward = if route.has_filters {
+        // A route with no filters skips BOTH the contract projection (`to_http_request_with`) AND
+        // the chain dispatch entirely — keeping pure proxying zero-projection end-to-end.
+        let mut chain_req: Option<HttpRequest> = if route.has_filters() {
+            let http_req =
+                to_http_request_with(&parts, scheme, norm_path.as_ref().to_owned(), in_authority);
             // Inline runs only filters that never block or build on the worker; the rest
             // continues on the blocking pool.
             let inline_res = catch_chain_panic(|| snapshot.dispatch_request_inline(idx, http_req))?;
@@ -339,10 +345,10 @@ async fn proxy_core_inner(
                 ChainOutcome::Respond(resp) => {
                     return Ok(Routed::Synthesised(http_response(resp)));
                 }
-                ChainOutcome::Forward(req) => req,
+                ChainOutcome::Forward(req) => Some(req),
             }
         } else {
-            http_req
+            None
         };
 
         // Weighted traffic split (ADR 000034): pick which backend upstream group to forward to, in
@@ -375,7 +381,6 @@ async fn proxy_core_inner(
 
         // --- forward to a healthy instance, with bounded retry onto ANOTHER instance on a
         // retryable failure (ADR 000019 timeout / 000023 retry). Per-attempt invariants once. ---
-        let upstream_path = route.rewrite_path(&forward.path_with_query).into_owned();
         // Both bounds are the ROUTE's (ADR 000102): its `[route.timeouts]` override when it
         // declares one, else the default declared by the upstream this request is going to. Routes
         // with different latency budgets can therefore share one upstream.
@@ -393,18 +398,14 @@ async fn proxy_core_inner(
             ForwardBody::OneShot(body)
         };
 
-        match request_body_hook(
-            &state,
-            &chain,
-            route.body_hooks.request,
-            &mut real_body,
-            &mut forward.headers,
-        )
-        .await?
+        if route.body_hooks().request
+            && let Some(req) = &mut chain_req
         {
-            BodyHookOutcome::Proceed => {}
-            BodyHookOutcome::Respond(resp) => return Ok(Routed::Synthesised(resp)),
-        };
+            match request_body_hook(&state, &chain, true, &mut real_body, &mut req.headers).await? {
+                BodyHookOutcome::Proceed => {}
+                BodyHookOutcome::Respond(resp) => return Ok(Routed::Synthesised(resp)),
+            }
+        }
 
         // Circuit breaker (ADR 000028): take an in-flight slot under this upstream's
         // `max_requests` cap before forwarding. At the cap, shed load with a fast-fail 503 rather
@@ -443,25 +444,35 @@ async fn proxy_core_inner(
         // fail-closed classes are for instead of the normal case. Applied last, after the request
         // body hook, so a filter cannot re-add one. The client's own headers are untouched —
         // `[route.compression]` still negotiates against them on the way back.
-        if route.body_hooks.response {
-            strip_inspection_hostile_headers(&mut forward.headers);
+        if route.body_hooks().response
+            && let Some(req) = &mut chain_req
+        {
+            strip_inspection_hostile_headers(&mut req.headers);
         }
 
+        let eff_path = chain_req
+            .as_ref()
+            .map_or(norm_path.as_ref(), |r| r.path_with_query.as_str());
+        let upstream_path = route.rewrite_path(eff_path);
+        let tp_bytes = snapshot.traceparent_bytes();
         let forward_req = ForwardRequest {
-            method: forward.method.as_str(),
+            method: chain_req
+                .as_ref()
+                .map_or(parts.method.as_str(), |r| r.method.as_str()),
             // The filterless fast path forwards the inbound headers directly (no contract re-parse
             // per attempt) — `set_forwarded` already corrected them on `parts.headers`, and the
             // hop-by-hop strip applies at copy time either way. A filtered route forwards the
             // chain-edited contract bytes.
-            headers: if route.has_filters {
-                crate::forward::AttemptHeaders::Chain(&forward.headers)
-            } else {
-                crate::forward::AttemptHeaders::Direct(&parts.headers)
+            headers: match &chain_req {
+                Some(r) => crate::forward::AttemptHeaders::Chain(&r.headers),
+                None => crate::forward::AttemptHeaders::Direct(&parts.headers),
             },
             original_headers: &parts.headers,
-            authority: &forward.authority,
+            authority: chain_req
+                .as_ref()
+                .map_or(in_authority, |r| r.authority.as_str()),
             upstream_path: &upstream_path,
-            traceparent: &snapshot.traceparent(),
+            traceparent: &tp_bytes,
             upgrade_token: upgrade.as_ref().map(|(t, _, _)| t.as_str()),
             admission: chain.admission.clone(),
         };
@@ -509,7 +520,7 @@ async fn proxy_core_inner(
             return upgrade_switch(
                 &state,
                 &chain,
-                forward,
+                chain_req,
                 upgrade,
                 upstream_resp,
                 permit,
@@ -524,7 +535,7 @@ async fn proxy_core_inner(
             &state,
             &chain,
             &route,
-            forward,
+            chain_req,
             upstream_resp,
             &mut attribution.inspection_skipped,
         )
@@ -550,13 +561,16 @@ async fn proxy_core_inner(
     // forwarded upstream stream is a compression candidate — a synthesised response is host-framed
     // and never transformed (ADR 000075 decision 1).
     Ok(match routed {
-        Routed::Synthesised(resp) => with_declared_headers(resp, &route),
+        Routed::Synthesised(resp) => with_declared_headers(resp, route.response_headers()),
         Routed::Forwarded {
             response,
             body_budget,
         } => {
-            let response =
-                crate::compression::apply(with_declared_headers(response, &route), &route, &parts);
+            let response = crate::compression::apply(
+                with_declared_headers(response, route.response_headers()),
+                route.compression(),
+                &parts,
+            );
             // Compression allocates new DATA: a permit attached only to its input Bytes would
             // disappear at the encoder's EOF while the transport still owns encoded output.
             // Keep the reservation alongside the response until all transformations are built,
@@ -609,9 +623,9 @@ impl Routed {
 /// A route with no declaration is a no-op.
 fn with_declared_headers(
     mut resp: Response<ResponseBody>,
-    route: &RouteInfo,
+    headers: Option<&ResponseHeaders>,
 ) -> Response<ResponseBody> {
-    if let Some(declared) = route.response_headers.as_deref() {
+    if let Some(declared) = headers {
         declared.apply(resp.headers_mut());
     }
     resp
@@ -638,17 +652,18 @@ type UpgradeIntent = (String, hyper::upgrade::OnUpgrade, Option<Duration>);
 /// do), and the handshake is bodyless. Anything else stays a plain HTTP request with the
 /// Upgrade/Connection pair stripped as hop-by-hop, exactly as before.
 fn upgrade_intent(
-    route: &RouteInfo,
-    parts: &mut hyper::http::request::Parts,
+    cfg: Option<&UpgradeConfig>,
+    headers: &hyper::HeaderMap,
+    extensions: &mut hyper::http::Extensions,
     bodyless: bool,
 ) -> Option<UpgradeIntent> {
     if !bodyless {
         return None;
     }
-    let cfg = route.upgrade.as_ref()?;
-    let header = crate::headers::upgrade_request_header(&parts.headers)?;
+    let cfg = cfg?;
+    let header = crate::headers::upgrade_request_header(headers)?;
     let token = cfg.allowed_token(header)?.to_string();
-    let on_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>()?;
+    let on_upgrade = extensions.remove::<hyper::upgrade::OnUpgrade>()?;
     Some((token, on_upgrade, cfg.idle_timeout()))
 }
 
@@ -804,7 +819,7 @@ fn upstream_switched_to(headers: &hyper::HeaderMap, token: &str) -> bool {
 async fn upgrade_switch(
     state: &Arc<ServerState>,
     chain: &ChainRef<'_>,
-    forward: HttpRequest,
+    forward: Option<HttpRequest>,
     upgrade: Option<UpgradeIntent>,
     mut upstream_resp: Response<ResponseBody>,
     permit: impl Send + 'static,
@@ -835,6 +850,9 @@ async fn upgrade_switch(
     // hop-by-hop strip, then the switch signal itself is re-issued deliberately.
     let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
     if chain.has_filters {
+        let Some(forward) = forward else {
+            return Err(ServerError::ChainPanic);
+        };
         let http_resp = HttpResponse {
             status: StatusCode::SWITCHING_PROTOCOLS.as_u16(),
             headers: headers_to_vec(upstream_resp.headers()),
@@ -929,8 +947,8 @@ async fn upgrade_switch(
 async fn respond_through_chain(
     state: &ServerState,
     chain: &ChainRef<'_>,
-    route: &RouteInfo,
-    forward: HttpRequest,
+    route: &MatchedRoute<'_>,
+    forward: Option<HttpRequest>,
     upstream_resp: Response<ResponseBody>,
     inspection_skipped: &mut Option<InspectionSkip>,
 ) -> Result<Routed, ServerError> {
@@ -942,13 +960,16 @@ async fn respond_through_chain(
             ubody,
         )));
     }
+    let Some(forward) = forward else {
+        return Err(ServerError::ChainPanic);
+    };
     // Classify BEFORE the chain runs, on the response exactly as the upstream sent it (ADR 000098
     // decision 3). Deciding on a content-type a chain filter could have rewritten would let an
     // earlier filter steer a response past the one that inspects it.
     let inspectability = route
-        .body_hooks
+        .body_hooks()
         .response
-        .then(|| classify_response(uparts.status, &uparts.headers, &route.response_body));
+        .then(|| classify_response(uparts.status, &uparts.headers, route.response_body()));
 
     let http_resp = HttpResponse {
         status: uparts.status.as_u16(),
@@ -1014,7 +1035,7 @@ async fn respond_through_chain(
         Some(Inspectability::Uninspectable(reason)) => {
             state.metrics.inc_inspection_skipped(reason);
             *inspection_skipped = Some(reason);
-            match route.response_body.uninspectable() {
+            match route.response_body().uninspectable() {
                 UninspectableMode::Passthrough => Ok(Routed::forwarded(stream_response(
                     edited.status,
                     &edited.headers,
@@ -1119,14 +1140,14 @@ fn is_content_encoded(headers: &hyper::HeaderMap) -> bool {
 async fn inspect_response_body(
     state: &ServerState,
     chain: &ChainRef<'_>,
-    route: &RouteInfo,
+    route: &MatchedRoute<'_>,
     forward: HttpRequest,
     edited: HttpResponse,
     upstream_headers: hyper::HeaderMap,
     ubody: ResponseBody,
     inspection_skipped: &mut Option<InspectionSkip>,
 ) -> Result<Routed, ServerError> {
-    let cfg = &route.response_body;
+    let cfg = route.response_body();
     let cap = cfg.max_bytes();
     let status = edited.status;
     let permit = match state

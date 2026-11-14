@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use plecto_host::{
-    Header, HttpRequest, HttpResponse, LoadedFilter, LogLine, RequestBodyDecision, RequestBodyEdit,
+    Header, HttpRequest, HttpResponse, LoadedFilter, RequestBodyDecision, RequestBodyEdit,
     RequestDecision, RequestEdit, RequestTrace, ResponseBodyDecision, ResponseBodyEdit,
-    ResponseDecision, ResponseEdit, RunError, TryHookOutcome,
+    ResponseDecision, ResponseEdit, RunError,
 };
 
 /// The fixed host-wide cap for a request body buffered for `on-request-body`. The server reserves
@@ -98,15 +98,15 @@ enum StepOutcome<T> {
 
 fn handle_request_step(
     request: &mut HttpRequest,
-    result: Result<(RequestDecision, Vec<LogLine>), RunError>,
+    result: Result<RequestDecision, RunError>,
 ) -> StepOutcome<ChainOutcome> {
     match result {
-        Ok((RequestDecision::Continue, _logs)) => StepOutcome::Continue,
-        Ok((RequestDecision::Modified(edit), _logs)) => {
+        Ok(RequestDecision::Continue) => StepOutcome::Continue,
+        Ok(RequestDecision::Modified(edit)) => {
             apply_request_edit(request, edit);
             StepOutcome::Continue
         }
-        Ok((RequestDecision::ShortCircuit(response), _logs)) => {
+        Ok(RequestDecision::ShortCircuit(response)) => {
             StepOutcome::Terminal(ChainOutcome::Respond(response))
         }
         // fail-closed: a trapped / timed-out filter must not reach upstream.
@@ -122,14 +122,14 @@ pub(crate) fn dispatch_request_inline(
     for (k, filter) in chain.iter().enumerate() {
         // `trace` parents each filter span (ADR 000009): the host times the call and emits the
         // span to its sink; we drive only the decision here.
-        match filter.try_on_request(&request, trace) {
-            TryHookOutcome::WouldBlock => {
+        match filter.try_on_request_for_chain(&request, trace) {
+            None => {
                 return InlineRequestOutcome::Pending {
                     filter_index: k,
                     request,
                 };
             }
-            TryHookOutcome::Executed(res) => match handle_request_step(&mut request, res) {
+            Some(res) => match handle_request_step(&mut request, res) {
                 StepOutcome::Continue => {}
                 StepOutcome::Terminal(outcome) => {
                     return InlineRequestOutcome::Complete(outcome);
@@ -149,7 +149,7 @@ pub(crate) fn dispatch_request_from(
     for filter in chain.iter().skip(start) {
         // `trace` parents each filter span (ADR 000009): the host times the call and emits the
         // span to its sink; we drive only the decision here.
-        let result = filter.on_request(&request, trace);
+        let result = filter.on_request_for_chain(&request, trace);
         match handle_request_step(&mut request, result) {
             StepOutcome::Continue => {}
             StepOutcome::Terminal(outcome) => return outcome,
@@ -177,9 +177,9 @@ pub(crate) fn dispatch_request_body(
     trace: &RequestTrace,
 ) -> RequestBodyOutcome {
     for filter in chain {
-        match filter.on_request_body(&body, trace) {
-            Ok((RequestBodyDecision::Continue, _logs)) => {}
-            Ok((RequestBodyDecision::Modified(edit), _logs)) => {
+        match filter.on_request_body_for_chain(&body, trace) {
+            Ok(RequestBodyDecision::Continue) => {}
+            Ok(RequestBodyDecision::Modified(edit)) => {
                 // The initial client body was bounded before it entered the chain. Re-check every
                 // replacement before mutating headers or calling the next filter: otherwise a
                 // guest can turn the shared reservation into a suggestion and hand an unbounded
@@ -189,7 +189,7 @@ pub(crate) fn dispatch_request_body(
                 }
                 body = apply_request_body_edit(&mut headers, edit)
             }
-            Ok((RequestBodyDecision::ShortCircuit(response), _logs)) => {
+            Ok(RequestBodyDecision::ShortCircuit(response)) => {
                 return RequestBodyOutcome::Respond(response);
             }
             // fail-closed: a trapped / timed-out body filter must not reach upstream.
@@ -215,18 +215,18 @@ fn oversize_guest_request_body_response() -> HttpResponse {
 
 fn handle_response_step(
     response: &mut HttpResponse,
-    result: Result<(ResponseDecision, Vec<LogLine>), RunError>,
+    result: Result<ResponseDecision, RunError>,
 ) -> StepOutcome<ResponseOutcome> {
     match result {
-        Ok((ResponseDecision::Continue, _logs)) => StepOutcome::Continue,
-        Ok((ResponseDecision::Modified(edit), _logs)) => {
+        Ok(ResponseDecision::Continue) => StepOutcome::Continue,
+        Ok(ResponseDecision::Modified(edit)) => {
             apply_response_edit(response, edit);
             StepOutcome::Continue
         }
         // A `replace` stops the chain and answers with the synthesised response — same terminal shape
         // as the request side's short-circuit and the fail-closed arm (and the general proxy-filter
         // form: a local response skips the remaining filters).
-        Ok((ResponseDecision::Replace(replacement), _logs)) => {
+        Ok(ResponseDecision::Replace(replacement)) => {
             StepOutcome::Terminal(ResponseOutcome::Respond(replacement))
         }
         // fail-closed: a trapped / timed-out filter must not reach upstream.
@@ -244,14 +244,14 @@ pub(crate) fn dispatch_response_inline(
     trace: &RequestTrace,
 ) -> InlineResponseOutcome {
     for (k, filter) in chain.iter().enumerate().rev() {
-        match filter.try_on_response(request, &response, trace) {
-            TryHookOutcome::WouldBlock => {
+        match filter.try_on_response_for_chain(request, &response, trace) {
+            None => {
                 return InlineResponseOutcome::Pending {
                     filter_index: k,
                     response,
                 };
             }
-            TryHookOutcome::Executed(res) => match handle_response_step(&mut response, res) {
+            Some(res) => match handle_response_step(&mut response, res) {
                 StepOutcome::Continue => {}
                 StepOutcome::Terminal(outcome) => {
                     return InlineResponseOutcome::Complete(outcome);
@@ -280,7 +280,7 @@ pub(crate) fn dispatch_response_from(
         return ResponseOutcome::Forward(response);
     };
     for filter in slice.iter().rev() {
-        let result = filter.on_response(request, &response, trace);
+        let result = filter.on_response_for_chain(request, &response, trace);
         match handle_response_step(&mut response, result) {
             StepOutcome::Continue => {}
             StepOutcome::Terminal(outcome) => return outcome,
@@ -322,16 +322,16 @@ pub(crate) fn dispatch_response_body(
 ) -> ResponseBodyOutcome {
     let mut transformed = false;
     for filter in chain.iter().rev() {
-        match filter.on_response_body(request, &response, &body, trace) {
-            Ok((ResponseBodyDecision::Continue, _logs)) => {}
-            Ok((ResponseBodyDecision::Modified(edit), _logs)) => {
+        match filter.on_response_body_for_chain(request, &response, &body, trace) {
+            Ok(ResponseBodyDecision::Continue) => {}
+            Ok(ResponseBodyDecision::Modified(edit)) => {
                 if edit.body.len() > max_bytes {
                     return ResponseBodyOutcome::Respond(oversize_guest_body_response());
                 }
                 transformed = true;
                 body = apply_response_body_edit(&mut response.headers, edit);
             }
-            Ok((ResponseBodyDecision::Replace(replacement), _logs)) => {
+            Ok(ResponseBodyDecision::Replace(replacement)) => {
                 if replacement.body.len() > max_bytes {
                     return ResponseBodyOutcome::Respond(oversize_guest_body_response());
                 }

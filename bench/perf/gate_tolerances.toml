@@ -32,8 +32,16 @@
 # (performance/data/runs/gate-inline-hooks-{1,2}). Recalibrated using centre ± ≥3x max half-range
 # rounded outward: lo moves 2.0 → 0.9, hi 5.0 → 2.1. A regression back to the blocking-pool path
 # (~4.1 µs floor) lands clearly outside. PROVISIONAL pending more runs.
+# 2026-11-14 (ADR 000124): synchronous zero-WASI execution (`TypedFunc::call`), borrowed request
+# lowering, lazy telemetry (`needs_full_span`), and zero-alloc routing lowered the dispatch floor.
+# Three 8-round runs (`20261114T090917Z`, `20261114T091754Z`, `20261114T092432Z`, 95% t interval):
+# 0.7195 ± 0.5836, 0.6246 ± 0.4553, and 0.5122 ± 0.3268 µs (pooled n = 24: 0.6188 ± 0.2284 µs,
+# Criterion `on_request/trusted_pooled` 1.9126 µs -> 979.62 ns). Both the pooled upper edge (0.8472)
+# and lower edge (0.3904) moved below old `lo = 0.9` on the fast side, with lowest single-run
+# lower edge 0.1359; lo moves 0.9 -> 0.0 while slow-side guard hi = 2.1 is unchanged.
+# Confirmed by independent holdout (`20261114T093804Z`, n = 8, exit 0, 10 pass): 0.7093 ± 0.3078 µs.
 [dispatch_floor_us]
-lo = 0.9
+lo = 0.0
 hi = 2.1
 
 # trusted − noop-pooled, closed-loop µs/req: the apikey filter's own per-request work.
@@ -48,8 +56,15 @@ hi = 2.1
 # bands remain unchanged. An independent explicit32 T1 holdout run
 # (performance/data/runs/gate-explicit32-validation-20260928) completed with gate exit 0 (10 pass,
 # 0 fail, 0 inconclusive), with apikey_cost_us landing at 1.2994 ± 0.2035 µs inside the 0.3..1.7 band.
+# 2026-11-14 (ADR 000124): with `dispatch_floor_us` and filter-path lowering cuts, the three
+# 8-round runs (`20261114T090917Z`, `20261114T091754Z`, `20261114T092432Z`) landed at
+# 0.4622 ± 0.2658, 0.6267 ± 0.3140, and 0.5687 ± 0.6399 µs (pooled n = 24: 0.5525 ± 0.2140 µs).
+# Although pooled [0.3386, 0.7665] stays above old `lo = 0.3`, two single-run n = 8 lower edges
+# dipped below 0.3 (0.1964 and -0.0711); lo moves 0.3 -> -0.2 (below lowest lower edge -0.0711,
+# rounded outward) while keeping slow-side guard hi = 1.7 unchanged.
+# Confirmed by independent holdout (`20261114T093804Z`, n = 8, exit 0, 10 pass): 0.9210 ± 0.2845 µs.
 [apikey_cost_us]
-lo = 0.3
+lo = -0.2
 hi = 1.7
 
 # Fixed-rate (2000 rps) p50 deltas, ms — the honest tail floor invariants.
@@ -102,8 +117,15 @@ hi = 0.25
 # limiting" is caught by enforce_allowed_ratio, not by this lower edge. Confirmed by an independent
 # holdout gate run (`20261025T061734Z`, n = 8, no pooling): PASS on all 10 invariants (`ratelimit_tax_us`
 # 1.4863 ± 0.5407 µs, `dispatch_floor_us` 1.1652 ± 0.1237 µs, `apikey_cost_us` 1.0562 ± 0.0918 µs).
+# 2026-11-14 (ADR 000124): sync WASM call + lazy telemetry + HeaderMap fast path further lowered
+# the closed-loop k6 delta (`~115k rps` k6 ceiling): three 8-round runs (`20261114T090917Z`,
+# `20261114T091754Z`, `20261114T092432Z`) landed at 0.1067 ± 0.6031, 0.1367 ± 0.3997, and
+# 0.0637 ± 0.5338 µs (pooled n = 24: 0.1024 ± 0.2509 µs, interval [-0.1485, 0.3533], below old
+# `lo = 0.5`). Lowest observed single-run lower edge is -0.4964 µs; lo moves 0.5 -> -0.6 while
+# slow-side guard hi = 2.4 stays unchanged and filter execution stays gated by enforce_allowed_ratio.
+# Confirmed by independent holdout (`20261114T093804Z`, n = 8, exit 0, 10 pass): -0.0947 ± 0.4240 µs.
 [ratelimit_tax_us]
-lo = 0.5
+lo = -0.6
 hi = 2.4
 
 # CPU-µs/req (ADR 000122): /ratelimit − /baseline proxy CPU time per completed request at a FIXED

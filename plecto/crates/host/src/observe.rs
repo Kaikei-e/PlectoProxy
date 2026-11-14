@@ -110,15 +110,43 @@ impl RequestTrace {
         })
     }
 
+    /// Format as a W3C `traceparent` into a fixed 55-byte stack buffer, avoiding a per-request
+    /// heap allocation on hot forwarding paths.
+    pub fn to_traceparent_bytes(&self) -> [u8; 55] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [b'-'; 55];
+        let mut it = out.iter_mut();
+        if let (Some(a), Some(b)) = (it.next(), it.next()) {
+            *a = b'0';
+            *b = b'0';
+        }
+        let _ = it.next(); // '-'
+        for &byte in &self.trace_id.to_bytes() {
+            if let (Some(hi), Some(lo)) = (it.next(), it.next()) {
+                *hi = HEX.get(usize::from(byte >> 4)).copied().unwrap_or(b'0');
+                *lo = HEX.get(usize::from(byte & 0x0f)).copied().unwrap_or(b'0');
+            }
+        }
+        let _ = it.next(); // '-'
+        for &byte in &self.request_span_id.to_bytes() {
+            if let (Some(hi), Some(lo)) = (it.next(), it.next()) {
+                *hi = HEX.get(usize::from(byte >> 4)).copied().unwrap_or(b'0');
+                *lo = HEX.get(usize::from(byte & 0x0f)).copied().unwrap_or(b'0');
+            }
+        }
+        let _ = it.next(); // '-'
+        if let (Some(a), Some(b)) = (it.next(), it.next()) {
+            *a = b'0';
+            *b = if self.flags.is_sampled() { b'1' } else { b'0' };
+        }
+        out
+    }
+
     /// Format as a W3C `traceparent` for downstream propagation. Carries the (locally-minted)
     /// request span id, so the upstream's spans nest under Plecto's request span.
     pub fn to_traceparent(&self) -> String {
-        format!(
-            "00-{}-{}-{:02x}",
-            hex::encode(self.trace_id.to_bytes()),
-            hex::encode(self.request_span_id.to_bytes()),
-            if self.flags.is_sampled() { 1u8 } else { 0u8 },
-        )
+        let bytes = self.to_traceparent_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     pub fn trace_id(&self) -> TraceId {
@@ -341,11 +369,32 @@ pub trait TelemetrySink: Send + Sync {
     fn export(&self, span: &FilterSpan);
 
     /// Whether this sink consumes spans at all. When `false`, the host skips span construction
-    /// entirely on the per-request path — `build_filter_span` allocates (name, attributes, one
-    /// event per host-log line), which would otherwise be paid per hook call just to be dropped
-    /// by `export`. Defaults to `true`; only a sink that discards everything should override.
+    /// and timing entirely on the per-request path. Defaults to `true`.
     fn enabled(&self) -> bool {
         true
+    }
+
+    /// Whether this sink requires a materialized [`FilterSpan`] (name, attributes, `SystemTime`,
+    /// log events). Sinks that only aggregate `(outcome, duration)` (such as [`MetricsSink`])
+    /// override this to `false` so [`record_outcome`](Self::record_outcome) skips `FilterSpan`
+    /// allocation, `SpanId` generation, and `SystemTime::now()` on every hook call.
+    fn needs_full_span(&self) -> bool {
+        self.enabled()
+    }
+
+    /// Record one hook outcome and elapsed duration. Sinks that only need aggregate counts/timing
+    /// read `outcome` and `duration` directly; full-span sinks call `span_builder()` once to
+    /// materialize the [`FilterSpan`] on demand.
+    fn record_outcome(
+        &self,
+        outcome: SpanOutcome,
+        duration: Duration,
+        span_builder: &mut dyn FnMut() -> FilterSpan,
+    ) {
+        let _ = (outcome, duration);
+        if self.enabled() {
+            self.export(&span_builder());
+        }
     }
 }
 
@@ -358,6 +407,18 @@ impl TelemetrySink for NoopSink {
 
     fn enabled(&self) -> bool {
         false
+    }
+
+    fn needs_full_span(&self) -> bool {
+        false
+    }
+
+    fn record_outcome(
+        &self,
+        _outcome: SpanOutcome,
+        _duration: Duration,
+        _span_builder: &mut dyn FnMut() -> FilterSpan,
+    ) {
     }
 }
 
@@ -420,21 +481,9 @@ impl MetricsSink {
         Self::default()
     }
 
-    pub fn snapshot(&self) -> MetricsSnapshot {
-        MetricsSnapshot {
-            total: self.total.load(Ordering::Relaxed),
-            errors: self.errors.load(Ordering::Relaxed),
-            short_circuits: self.short_circuits.load(Ordering::Relaxed),
-            total_duration: Duration::from_nanos(self.duration_nanos.load(Ordering::Relaxed)),
-            inline: InlineMetricsSnapshot::default(),
-        }
-    }
-}
-
-impl TelemetrySink for MetricsSink {
-    fn export(&self, span: &FilterSpan) {
+    fn record(&self, outcome: SpanOutcome, duration: Duration) {
         self.total.fetch_add(1, Ordering::Relaxed);
-        match span.outcome {
+        match outcome {
             // Both are the "filter answered instead of the upstream" terminal decisions —
             // request-side short-circuit and response-side replace (ADR 000073) — so the
             // coarse counter tallies them together; the per-span outcome keeps them distinct.
@@ -450,8 +499,37 @@ impl TelemetrySink for MetricsSink {
             }
             SpanOutcome::Continue | SpanOutcome::Modified => {}
         }
-        self.duration_nanos
-            .fetch_add(span.duration.as_nanos() as u64, Ordering::Relaxed);
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.duration_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            short_circuits: self.short_circuits.load(Ordering::Relaxed),
+            total_duration: Duration::from_nanos(self.duration_nanos.load(Ordering::Relaxed)),
+            inline: InlineMetricsSnapshot::default(),
+        }
+    }
+}
+
+impl TelemetrySink for MetricsSink {
+    fn export(&self, span: &FilterSpan) {
+        self.record(span.outcome, span.duration);
+    }
+
+    fn needs_full_span(&self) -> bool {
+        false
+    }
+
+    fn record_outcome(
+        &self,
+        outcome: SpanOutcome,
+        duration: Duration,
+        _span_builder: &mut dyn FnMut() -> FilterSpan,
+    ) {
+        self.record(outcome, duration);
     }
 }
 
@@ -562,11 +640,19 @@ pub struct MetricsSnapshot {
 /// sink; this composes many behind it.
 pub struct FanOutSink {
     sinks: Vec<std::sync::Arc<dyn TelemetrySink>>,
+    any_enabled: bool,
+    any_needs_full_span: bool,
 }
 
 impl FanOutSink {
     pub fn new(sinks: Vec<std::sync::Arc<dyn TelemetrySink>>) -> Self {
-        Self { sinks }
+        let any_enabled = sinks.iter().any(|s| s.enabled());
+        let any_needs_full_span = sinks.iter().any(|s| s.needs_full_span());
+        Self {
+            sinks,
+            any_enabled,
+            any_needs_full_span,
+        }
     }
 }
 
@@ -577,11 +663,35 @@ impl TelemetrySink for FanOutSink {
         }
     }
 
-    /// Enabled iff ANY child is: without this override the trait default (`true`) would make
-    /// composing onto a `NoopSink` pay per-hook span construction (name / attribute / event
-    /// allocations) for spans no child would ever export.
     fn enabled(&self) -> bool {
-        self.sinks.iter().any(|s| s.enabled())
+        self.any_enabled
+    }
+
+    fn needs_full_span(&self) -> bool {
+        self.any_needs_full_span
+    }
+
+    fn record_outcome(
+        &self,
+        outcome: SpanOutcome,
+        duration: Duration,
+        span_builder: &mut dyn FnMut() -> FilterSpan,
+    ) {
+        if !self.any_enabled {
+            return;
+        }
+        let mut cached_span: Option<FilterSpan> = None;
+        for sink in &self.sinks {
+            if !sink.enabled() {
+                continue;
+            }
+            if sink.needs_full_span() {
+                let span = cached_span.get_or_insert_with(&mut *span_builder);
+                sink.export(span);
+            } else {
+                sink.record_outcome(outcome, duration, span_builder);
+            }
+        }
     }
 }
 
@@ -794,5 +904,64 @@ mod tests {
         assert_eq!(snap.fallbacks_pool_exhausted, 2);
         assert_eq!(snap.fallbacks_pool_filling, 1);
         assert_eq!(snap.fallbacks_breaker_open, 1);
+    }
+
+    #[test]
+    fn to_traceparent_bytes_matches_to_traceparent() {
+        for tp in [
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        ] {
+            let t = RequestTrace::from_traceparent(tp).expect("valid traceparent parses");
+            let bytes = t.to_traceparent_bytes();
+            assert_eq!(bytes.len(), 55);
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), t.to_traceparent());
+        }
+    }
+
+    #[test]
+    fn fan_out_metrics_plus_in_memory_records_both_without_extra_builds() {
+        let metrics = std::sync::Arc::new(MetricsSink::new());
+        let mem = std::sync::Arc::new(InMemorySink::new());
+        let fan = FanOutSink::new(vec![metrics.clone(), mem.clone()]);
+        assert!(fan.enabled());
+        assert!(fan.needs_full_span());
+
+        let mut builds = 0usize;
+        let mut build = || {
+            builds += 1;
+            span(SpanOutcome::Modified, 2_500)
+        };
+        fan.record_outcome(
+            SpanOutcome::Modified,
+            Duration::from_nanos(2_500),
+            &mut build,
+        );
+
+        assert_eq!(builds, 1, "FanOutSink must build FilterSpan at most once");
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total, 1);
+        assert_eq!(snap.total_duration, Duration::from_nanos(2_500));
+        assert_eq!(mem.len(), 1);
+    }
+
+    #[test]
+    fn fan_out_metrics_only_never_invokes_span_builder() {
+        let metrics = std::sync::Arc::new(MetricsSink::new());
+        let noop = std::sync::Arc::new(NoopSink);
+        let fan = FanOutSink::new(vec![noop, metrics.clone()]);
+        assert!(fan.enabled());
+        assert!(!fan.needs_full_span());
+
+        fan.record_outcome(
+            SpanOutcome::ShortCircuit,
+            Duration::from_nanos(4_000),
+            &mut || panic!("span_builder must not run when no sink needs full spans"),
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total, 1);
+        assert_eq!(snap.short_circuits, 1);
+        assert_eq!(snap.total_duration, Duration::from_nanos(4_000));
     }
 }

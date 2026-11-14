@@ -30,7 +30,18 @@ All notable changes to Plecto are documented here. The format follows
   the same supply-chain bar Plecto's own filter loading enforces. Verify commands are in the
   release notes of each release.
 
-## [Unreleased]
+## [0.16.2] - 2026-11-14
+
+Patch release: four-pillar data-plane optimization across `plecto-host`, `plecto-control`, and
+`plecto-server` ([ADR 000124](docs/ADR/000124.md)), strict RFC 3986 §3.2.3 port-digit validation in
+ingress authority normalization, a contended-host guard (`EX_TEMPFAIL`) and fast-side `lo` band
+recalibration for the T1 performance gate, the `v0.16.1` Rust 1.100.0 performance snapshot refresh,
+and lockfile security updates in the JavaScript example guests and `performance/flint`. No WIT
+contract, manifest schema, CLI, `plecto::access` field, or breaking library API change from 0.16.1
+(additive APIs in `plecto-host` / `plecto-control` / `plecto-server` are backwards-compatible, and
+`cargo semver-checks` reports no breaking change across all three crates). **Filters built for
+earlier releases need no rebuild**: the contract stays at `plecto:filter@0.4.0`, and the
+reference-filter shelf (`docs/reference-filters.md`) is unchanged from 0.16.1.
 
 ### Security
 
@@ -42,13 +53,71 @@ All notable changes to Plecto are documented here. The format follows
   in its Node `path.matchesGlob` shim, none of whose options or methods 11.0 removed, and neither
   guest imports that shim: the built components contain no `minimatch` code. Lockfiles regenerated
   from scratch as `just regen-js-lockfiles` does, under Node 26.13.0 / npm 11.20.0 (in-range
-  build-tool updates come along: `jco` 1.42.0, `rolldown` 1.3.2, `tar` 7.5.23). No filter source, WIT contract, or build option changes, and nothing ships
-  to the proxy or the reference-filter shelf.
+  build-tool updates come along: `jco` 1.42.0, `rolldown` 1.3.2, `tar` 7.5.23). No filter source,
+  WIT contract, or build option changes, and nothing ships to the proxy or the reference-filter
+  shelf.
 - **Performance chart tooling (`performance/flint`)**: in-range lockfile update to `hono` 4.13.18
   and `@hono/node-server` 2.1.8 (GHSA-46wx-v44x-9hh2, GHSA-4m76-xfj5-7975, GHSA-3gg2-335m-rxc6,
   GHSA-4h7h-rv7c-7m2v, GHSA-h7mg-cq63-vhpq, GHSA-qv5m-9pm6-hqp3, GHSA-jpvv-r467-5p4w), which
   come in through `flint-chart-mcp` → `@modelcontextprotocol/sdk`. Local tooling only; no
   manifest change.
+
+### Fixed
+
+- **Ingress authority fallback port syntax (`plecto-server`)**: `has_valid_port_syntax` in
+  `normalize_ingress_authority` now requires non-empty ASCII `DIGIT` bytes (`port.bytes().all(|b|
+  b.is_ascii_digit())`) before `u16` range parsing, rejecting leading `+` forms (such as
+  `example.com:+80`) that Rust's `u16::from_str` accepts, in strict alignment with RFC 3986 §3.2.3
+  (`port = *DIGIT`) and RFC 9112 §3.2 ([ADR 000124](docs/ADR/000124.md)).
+
+### Changed
+
+- **Data-plane fast-path and extension-plane optimization (`plecto-host`, `plecto-control`,
+  `plecto-server`; [ADR 000124](docs/ADR/000124.md), amending ADRs 000009, 000021, 000119)**:
+  1. *Host sync dispatch & borrowed lowering (`plecto-host`)*: `engine::build_engine` sets
+     `Config::concurrency_support(false)` when async WASI features (`outbound-http`,
+     `outbound-tcp`, `fat-guest`) are not compiled in; zero-WASI filters (`needs_async_store ==
+     false`) execute via synchronous `InstancePre::instantiate` and `TypedFunc::call` instead of
+     fiber-backed `drive_call`; `ValidatedV02` / `ValidatedV03` pre-typecheck
+     `HttpRequestV02V03Ref<'_>` once per instance to eliminate per-call `String` / `Vec<Header>`
+     cloning on `0.2.0` / `0.3.0` contracts; `HostState` skips `SystemTime::now()` when
+     `needs_wall_clock == false`; and `TrustedPool` notifies its condvar only when `waiters > 0`.
+  2. *Deferred observability (`plecto-host::observe`)*: `TelemetrySink::needs_full_span` and
+     `record_outcome` (defaulted for downstream `TelemetrySink` implementations) skip `FilterSpan`
+     allocation, `SpanId` generation, wall-clock reads, and host log capture (`*_for_chain`) when
+     only `NoopSink` or `MetricsSink` is active, while `FanOutSink` builds a `FilterSpan` at most
+     once; `RequestTrace::to_traceparent_bytes(&self) -> [u8; 55]` formats W3C `traceparent` on the
+     stack.
+  3. *Single-pass routing & pre-parsed upstream authority (`plecto-control`)*: `normalize_path`
+     validates and scans in a single pass returning `Cow::Borrowed` on plain paths; `HeaderLookup`
+     matches directly against `&http::HeaderMap` while preserving static hop-by-hop and dynamic
+     `Connection`-nominated header exclusion (RFC 9110 §7.6.1); `compile_route_order` pre-sorts
+     routes by Gateway-API specificity at snapshot build time for first-match termination in
+     `select_ordered`; and `UpstreamInstance` pre-parses `http::uri::Authority`.
+  4. *Zero-projection filterless proxy path (`plecto-server`)*: `proxy_core_inner` matches routes
+     via borrowed `ConfigSnapshot::match_route_parts` (`MatchedRoute<'a>`) and bypasses
+     `HttpRequest` / `HttpResponse` / `Vec<Header>` projection entirely when `!route.has_filters()`
+     (`copy_headers_direct` + `stream_response_direct`), formats `X-Forwarded-For` / `Forwarded` IP
+     addresses into a `[u8; 48]` stack buffer, and borrows route/metrics metadata across
+     `Attribution<'a>`, `compression::apply`, and `ServerMetrics::with_counters`.
+  - *Measured effect*: Criterion `on_request/trusted_pooled` `-49.25%` (`1,915.68 → 972.25 ns`),
+    `on_request/untrusted_fresh` `-51.33%` (`35.30 → 17.18 µs`), `find_route/16` `-50.50%` (`85.00
+    → 42.08 ns`), `normalize_path/plain` `-47.55%` (`44.32 → 23.25 ns`); Valgrind `gungraun`
+    instructions `-31.31%` (`27,959 → 19,204`) on `trusted_pooled` and `-26.89%` (`101,321 →
+    74,077`) on `untrusted_fresh`; 3-round interleaved `bench-server` A/B proxy CPU/req `-15.90%`
+    to `-17.08%` across all scenarios with `trusted` RPS `+21.19%` and `ratelimit` RPS `+18.20%`.
+- **T1 performance gate contended-host guard & `lo` recalibration (`bench/perf/`)**:
+  `bench/perf/host_load.py` and `bench/perf/run-perf.sh` refuse `just gate` with exit `75`
+  (`EX_TEMPFAIL`) when host 1-minute load average exceeds `4.0` or `PROXY_CPUS` busy fraction
+  exceeds `0.20` (`GATE_ALLOW_CONTENDED=1` overrides), recording `$RUN_DIR/host_load.txt`.
+  `bench/perf/gate_tolerances.toml` recalibrates fast-side `lo` bounds (`dispatch_floor_us` `0.9 →
+  0.0`, `apikey_cost_us` `0.3 → -0.2`, `ratelimit_tax_us` `0.5 → -0.6`) with `hi` ceilings
+  unchanged, verified on an independent `n = 8` holdout (`10 pass, 0 fail, 0 inconclusive`,
+  [ADR 000124](docs/ADR/000124.md)).
+- **Performance snapshot refresh (`performance/`)**: refreshed `performance/README.md`,
+  `performance/HISTORY.md`, `performance/data/{footprint.txt,openloop.json}`, and regenerated charts
+  for the `v0.16.1` Rust 1.100.0 snapshot, with explicit annotations where carried-over scenarios
+  retain earlier dated runs.
 
 ## [0.16.1] - 2026-11-14
 

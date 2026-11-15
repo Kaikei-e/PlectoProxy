@@ -430,6 +430,75 @@ python3 bench/perf/arena_sweep.py --phase throughput \
    - **Holdout 検証完了（T1 gate holdout）**: 改定後の `gate_tolerances.toml`（`apikey_cost_us` 上限 1.7）に対し、独立した `explicit32` の T1 gate holdout 実測（生データ: `performance/data/runs/gate-explicit32-validation-20260928`）が完了し、ゲート正常終了（exit code 0、10 pass, 0 fail, 0 inconclusive）を確認した。
      - 実測値: `dispatch_floor_us` 4.5796 ± 0.1892 µs (pass), `apikey_cost_us` 1.2994 ± 0.2035 µs (pass; 新帯 0.3..1.7 内), `ratelimit_tax_us` 4.3764 ± 0.0745 µs (pass)。固定レート tail p50（pooled 0.1262 ms, apikey 0.0146 ms, respctx -0.0288 ms）、`enforce_allowed_ratio` 0.9166、`rr_spread_req` 0、`ejection_transition_s` 1 s、`ejection_stray_failed` 0 も全項目 pass（informational: pooled p99 0.1517 ms, respctx p99 -0.0009 ms, enforce limited 0.7800; criterion micro は保存 baseline main 不在のため情報層 skip）。
 
+## 2026-11-15 — open-loop の送信遅れ / wire 分解と、事前チェックの単一プロセス検知
+
+### 改訂の背景
+`v0.16.2` スナップショットで CRR・open-loop の上側 tail・固定レート tail が悪化して見えたが、同一ホストでの
+A/B が無く、退行かホスト変動かを区別できなかった。`v0.15.2` / `v0.16.1` / `v0.16.2` を interleave して切り分けた結果、
+三つとも release のコード退行ではなく、**計測系が見分けられていなかった**ことが原因だった（数値は
+`performance/HISTORY.md` の 2026-11-15 節）。
+
+- **ホスト汚染を事前チェックが通していた。** 無関係なプロセスが 1 コアを 100 % 使い続け（スケジューラは
+  ほぼ常に `PROXY_CPUS` 上に置いた）、5 日間の全 run がその隣で取られていた。当時の事前チェックは `PROXY_CPUS`
+  の**集約** busy しか見ず、12 コア中 1 コアは `proxy_busy ≈ 0.10`（閾値 `0.20`）として通る。`GEN_CPUS` は見ておらず、
+  何が CPU を使っているかも記録していなかった。
+- **open-loop の tail が生成器の遅れを含んでいた。** schedule latency（完了 − 予定送信時刻）は
+  「生成器が送信を始めるまでの遅れ」と「送信から応答読了まで」の和だが、出力はその区別を持たなかった。
+  `plecto-loadgen openloop` は各スロットを `yield_now()` で busy-wait するため、レートに依らず生成器側 12 コアの
+  うち約 10 コアを使い切る。余力が無いので、プロキシ側の ms 級の揺らぎが数十 ms の backlog に増幅される。
+  同じ負荷の最中に別接続から 1 ms 間隔で打った独立 prober は、12 run を通じて 9 ms を超える応答を一度も見ていない。
+
+### 改訂内容
+1. **schedule latency の分解（`plecto-loadgen openloop`）**:
+   - 各リクエストで実際の送信開始時刻を取り、`send_lag`（送信開始 − 予定時刻）と `wire`（送信開始 → 応答読了）を
+     schedule latency と同じ終了時刻から別の HdrHistogram に記録する。
+   - `openloop.json` の既存キー（`p50` / `p95` / `p99` / `p99_9` ほか）は名前・順序・意味とも不変。その後ろに
+     `send_lag_p50` / `send_lag_p99` / `send_lag_p99_9` / `wire_p50` / `wire_p99` / `wire_p99_9`（ms）を追加した。
+     `--hist-out` は従来どおり schedule latency の分布のみ。
+   - 読み方: **プロキシの応答時間は `wire_*`**、**生成器の遅れは `send_lag_*`**。schedule latency の tail を
+     プロキシの tail として引用してよいのは、`send_lag` がそれを支配していないときだけ。
+2. **生成器律速の警告（`run-perf.sh openloop`）**: `send_lag_p99 > wire_p99` のとき
+   `openloop: generator-bound — …` を出す。フェーズの終了コードは変えない（判定ではなく読み方の注意）。
+   `OPENLOOP_GEN=k6` 経路はこの二つのキーを持たないので対象外。
+3. **事前チェックの三本立て（`host_load.py`）**: 従来の (a) 1 分 load average、(b) `PROXY_CPUS` 集約 busy に加え、
+   - (b') **`GEN_CPUS` 集約 busy**（`--gen-cpus` / `--max-gen-busy`、gate では `GATE_MAX_GEN_BUSY`、既定 `0.20`）、
+   - (c) **単一プロセスの CPU 使用量**（同じ窓で `/proc/<pid>/stat` の utime+stime 差分をコア数に換算、
+     `--max-proc-cores`、gate では `GATE_MAX_PROC_CORES`、既定 `0.5`）を判定する。
+   - `host_load.txt` に `gen_busy`、上位 3 プロセス `top_cpu=pid:comm:cores,…`、`max_proc_cores_seen`、
+     どの判定が立ったかの `contended_reasons`（`loadavg` / `proxy_busy` / `gen_busy` / `proc`）を追記する。
+     既存キーと `contended=0|1`、終了コード（0 / 3 / 64）は不変で、`GATE_POOL_FROM` の検査もそのまま働く。
+   - (c) は CPU アフィニティで絞らない。問題になるのはピン留めされていない暴走プロセスであり、両セットの外に
+     ピン留めされたプロセスで誤検知したら `GATE_ALLOW_CONTENDED=1` で上書きできる。
+4. **gate 以外のフェーズでも記録する（`run_phase`）**: 各フェーズの開始前に同じチェックを 1 秒窓で取り、
+   `$RUN_DIR/host_load_<phase>.txt` に残す。**記録のみで、拒否も失敗もしない**（汚染されていれば 1 行警告する）。
+   ここでは load average を**判定に使わない**——スイート自身の前フェーズの生成器スレッドを数えるので、
+   run の途中では外部負荷の証拠にならない。値は記録に残る。
+5. **gate の上限（`gate_tolerances.toml`）**: 汚染の無いホストでの非プール holdout（`n = 8`）で、ADR 000124 の
+   下限再校正を独立に確認したうえで、`hi` を `2.1 / 1.7 / 2.4 → 1.5 / 1.4 / 1.2` に下げた（この実装での
+   単独 `n = 8` 区間の上端の最大値を外側に丸めたもの）。**これでも ADR 000124 の巻き戻しは T1 では fail に
+   ならない**: round 間のばらつき（約 0.3–0.45 µs）が改善幅と同程度で、`v0.16.1` 水準の区間は新しい上限の内側に
+   収まる。改善を守るのは命令数（§ micro 層の二本立て）で、この上限が守るのは約 +1 µs 以上の段差である。
+
+### 比較可能性についての注意
+- **2026-11-09 11:37 UTC から 2026-11-15 までの全 run** は暴走プロセスの隣で取られた。`v0.16.2` の keep-alive
+  天井はその影響を強く受ける（6 round 中 2 回 127–129k まで落ちた。`v0.16.1` は受けない）。
+- **CRR は 2026-10-24 以前と比較できない。** 当時 `9.42 µs/conn` を出した `v0.15.2` 自身が、現ホストでは
+  `12.45 µs/conn` になる。`host.txt` のカーネルは `6.14` から `7.0` に変わっている。
+- **`yield_now()` pacing の open-loop 行は、`94k/s` 付近では上側 tail が生成器律速**である。スナップショット間の
+  比較は `OPENLOOP_RATE` を固定し、`wire_*` で行う。
+- **固定レートのコストラダー tail** はレートが `/ondemand` の天井の 60 % で決まるため、天井が動けばレートも動く
+  （`8,128 → 11,757/s`）。行どうしを比べるなら `WASM_QLAT` で揃える。
+- **低レートの info 行**（`baseline_cpu_us_per_req`、2,000 rps の p50 差）は、ほぼアイドルのホストで powersave
+  governor が落とすクロック状態に従って数倍動く。ホスト状態をまたいで比べない。
+
+### 未解決（記録のみ）
+`94k/s` での wire p99 は tokio の worker 数に依存する。既定（許可 CPU ごとに 1 本＝12 本、各約 30 % 稼働）では
+`v0.16.1` `0.83–1.10 ms` / `v0.16.2` `1.08–1.69 ms`、`TOKIO_WORKER_THREADS=6` では `0.55–0.65 ms` /
+`0.50–0.60 ms` で、差は消えて逆転する。リクエストあたりの処理が軽くなるほど、部分負荷では worker の
+park / unpark の比重が増える、という読みと整合するが、機構は確定していない（perf / eBPF が使えないホストのため、
+off-CPU の内訳は未取得）。ランタイムの既定値は変えていない——天井スループットとのトレードオフであり、
+変更するなら設計判断として別途記録する。
+
 ## Offline policy
 
 - **During a load run**: loopback only. `K6_NO_USAGE_REPORT=true`. No registry / CDN / phone-home.

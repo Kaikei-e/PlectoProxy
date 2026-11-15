@@ -1,13 +1,19 @@
 {
   "generator": "plecto-loadgen",
   "method": "constant-arrival-rate+schedule-latency",
-  "target_rps": 87808,
-  "achieved_rps": 87808.000000,
-  "reqs": 7902720,
+  "target_rps": 94028,
+  "achieved_rps": 94028.000000,
+  "reqs": 8462520,
   "failed": 0.00000000,
   "dropped": 0,
-  "p50": 0.047000,
-  "p95": 1.633000,
-  "p99": 24.447000,
-  "p99_9": 73.791000
+  "p50": 0.044000,
+  "p95": 0.446000,
+  "p99": 4.291000,
+  "p99_9": 34.751000,
+  "send_lag_p50": 0.001000,
+  "send_lag_p99": 3.601000,
+  "send_lag_p99_9": 34.079000,
+  "wire_p50": 0.042000,
+  "wire_p99": 0.904000,
+  "wire_p99_9": 1.866000
 }

@@ -40,9 +40,19 @@
 # and lower edge (0.3904) moved below old `lo = 0.9` on the fast side, with lowest single-run
 # lower edge 0.1359; lo moves 0.9 -> 0.0 while slow-side guard hi = 2.1 is unchanged.
 # Confirmed by independent holdout (`20261114T093804Z`, n = 8, exit 0, 10 pass): 0.7093 ± 0.3078 µs.
+# 2026-11-15: every run above shared the host with a runaway process holding one full core on
+# PROXY_CPUS since 2026-11-09 (the preflight read it as proxy_busy ~ 0.10 and passed; it now refuses
+# on any single process above GATE_MAX_PROC_CORES). A non-pooled holdout without it
+# (`20261114T163133Z`, n = 8, contended=0, heaviest process 0.15 cores, exit 0, 10 pass) landed at
+# 0.8258 ± 0.2296 µs, so the lower edge holds. hi moves 2.1 -> 1.5: the highest upper edge over the
+# seven n = 8 runs on this code is 1.30 (0.7195 + 0.5836), rounded outward. This still does NOT fail
+# a clean revert of ADR 000124 — that level (1.09..1.19 ± 0.19..0.30) lies inside or straddles 1.5,
+# because the per-round spread (~0.3..0.45 µs) is as large as the improvement. The instruction-count
+# check on `on_request/trusted_pooled` is what guards the improvement; this edge guards against a
+# step of about +1 µs or more.
 [dispatch_floor_us]
 lo = 0.0
-hi = 2.1
+hi = 1.5
 
 # trusted − noop-pooled, closed-loop µs/req: the apikey filter's own per-request work.
 # 2026-07-06 interleaved A/B: 0.6 ± 0.2 µs; 2026-07-11 single-window: 0.86 µs (uncapped glibc, N=0).
@@ -63,9 +73,12 @@ hi = 2.1
 # dipped below 0.3 (0.1964 and -0.0711); lo moves 0.3 -> -0.2 (below lowest lower edge -0.0711,
 # rounded outward) while keeping slow-side guard hi = 1.7 unchanged.
 # Confirmed by independent holdout (`20261114T093804Z`, n = 8, exit 0, 10 pass): 0.9210 ± 0.2845 µs.
+# 2026-11-15: the non-pooled holdout without the runaway process (`20261114T163133Z`, n = 8, see
+# dispatch_floor_us) landed at 0.6841 ± 0.2273 µs. hi moves 1.7 -> 1.4: the highest upper edge over
+# the seven n = 8 runs on this code is 1.21 (0.5687 + 0.6399 and 0.9210 + 0.2845), rounded outward.
 [apikey_cost_us]
 lo = -0.2
-hi = 1.7
+hi = 1.4
 
 # Fixed-rate (2000 rps) p50 deltas, ms — the honest tail floor invariants.
 # noop-pooled − baseline: +0.11 ms across the last two pre-inline-hook snapshots.
@@ -124,9 +137,15 @@ hi = 0.25
 # `lo = 0.5`). Lowest observed single-run lower edge is -0.4964 µs; lo moves 0.5 -> -0.6 while
 # slow-side guard hi = 2.4 stays unchanged and filter execution stays gated by enforce_allowed_ratio.
 # Confirmed by independent holdout (`20261114T093804Z`, n = 8, exit 0, 10 pass): -0.0947 ± 0.4240 µs.
+# 2026-11-15: the non-pooled holdout without the runaway process (`20261114T163133Z`, n = 8, see
+# dispatch_floor_us) landed at -0.1444 ± 0.2532 µs (lower edge -0.40, inside lo = -0.6). hi moves
+# 2.4 -> 1.2: the highest upper edge over the seven n = 8 runs on this code is 0.71
+# (0.1067 + 0.6031); the margin is wider than on the oha rows because this k6 pair has shown
+# half-widths up to 0.81. The tax is indistinguishable from zero at this resolution, so the row
+# only guards against a step back towards the pre-inline level.
 [ratelimit_tax_us]
 lo = -0.6
-hi = 2.4
+hi = 1.2
 
 # CPU-µs/req (ADR 000122): /ratelimit − /baseline proxy CPU time per completed request at a FIXED
 # 20k/s (k6 constant-arrival-rate, well below saturation; /proc/<pid>/task/*/schedstat around each

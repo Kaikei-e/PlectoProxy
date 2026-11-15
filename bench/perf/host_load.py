@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Pre-run host-contention check for the T1 perf gate.
+"""Pre-run and per-phase host-contention check for the perf harness.
 
-Samples the 1-minute load average (/proc/loadavg) and per-CPU busy fraction
-(/proc/stat delta over a short window) aggregated across a given CPU list
-(typically PROXY_CPUS). Used by run-perf.sh before launching proxies or
-generators so contended-host runs fail fast (exit 3 here -> exit 75 in gate).
+Runs three checks over a sampling window: (1) 1-minute load average (/proc/loadavg),
+(2) aggregate non-idle busy fraction (/proc/stat) across --cpus and optional --gen-cpus,
+and (3) single-process CPU cores (/proc/<pid>/stat utime+stime delta). Used by
+run-perf.sh as a fail-fast gate preflight (exit 3 -> 75) and per-phase recording.
 """
 
 import argparse
 import os
+import re
 import sys
 import time
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -92,6 +93,76 @@ def busy_fraction_between(
     return (total_delta - idle_delta) / total_delta
 
 
+_COMM_BAD_RE = re.compile(r"[,:=\s]")
+
+
+def sanitize_comm(comm: str) -> str:
+    """Replace ',', ':', '=', and whitespace in process comm with '_'."""
+    return _COMM_BAD_RE.sub("_", comm)
+
+
+def parse_pid_stat(text: str) -> Tuple[int, str, int]:
+    """Parse /proc/<pid>/stat into (pid, comm, utime + stime jiffies)."""
+    line = text.rstrip("\n")
+    lparen = line.find("(")
+    rparen = line.rfind(")")
+    if lparen <= 0 or rparen <= lparen:
+        raise ValueError(f"malformed /proc/<pid>/stat line: {line!r}")
+    pid = int(line[:lparen].strip())
+    comm = line[lparen + 1 : rparen]
+    rest = line[rparen + 1 :].split()
+    # Field 3 (state) is rest[0]; fields 14 (utime) and 15 (stime) are rest[11] and rest[12].
+    if len(rest) <= 12:
+        raise ValueError(f"truncated /proc/<pid>/stat line for pid {pid}: {line!r}")
+    return pid, comm, int(rest[11]) + int(rest[12])
+
+
+def read_proc_times(proc_root: str = "/proc") -> Dict[int, Tuple[str, int]]:
+    """Read {pid: (comm, utime+stime jiffies)} across numeric /proc/<pid>/stat entries."""
+    procs: Dict[int, Tuple[str, int]] = {}
+    for entry in os.listdir(proc_root):
+        if not entry.isdigit():
+            continue
+        stat_file = os.path.join(proc_root, entry, "stat")
+        try:
+            with open(stat_file, "r") as f:
+                pid, comm, jiffies = parse_pid_stat(f.read())
+        except (OSError, ValueError):
+            # Processes may vanish or be unreadable mid-scan; skip them.
+            continue
+        procs[pid] = (comm, jiffies)
+    return procs
+
+
+def top_processes_between(
+    before: Dict[int, Tuple[str, int]],
+    after: Dict[int, Tuple[str, int]],
+    elapsed_s: float,
+    clk_tck: Optional[int] = None,
+    exclude_pids: Optional[Set[int]] = None,
+    limit: int = 3,
+) -> List[Tuple[int, str, float]]:
+    """Return up to `limit` heaviest processes as (pid, sanitized_comm, cores) descending."""
+    if elapsed_s <= 0:
+        return []
+    tck = os.sysconf("SC_CLK_TCK") if clk_tck is None else clk_tck
+    if tck <= 0:
+        raise ValueError(f"invalid SC_CLK_TCK: {tck}")
+    excluded = exclude_pids or set()
+    denom = tck * elapsed_s
+    usage: List[Tuple[int, str, float]] = []
+    for pid, (comm, j1) in after.items():
+        if pid in excluded or pid not in before:
+            continue
+        _, j0 = before[pid]
+        dj = j1 - j0
+        if dj <= 0:
+            continue
+        usage.append((pid, sanitize_comm(comm), dj / denom))
+    usage.sort(key=lambda item: (-item[2], item[0]))
+    return usage[:limit]
+
+
 def measure_host_load(
     cpus: Iterable[int],
     max_load: float,
@@ -100,52 +171,137 @@ def measure_host_load(
     loadavg_path: str = "/proc/loadavg",
     stat_path: str = "/proc/stat",
     sleep_fn: Callable[[float], None] = time.sleep,
+    gen_cpus: Optional[Iterable[int]] = None,
+    max_gen_busy: Optional[float] = None,
+    max_proc_cores: float = 0.5,
+    proc_root: str = "/proc",
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    clk_tck: Optional[int] = None,
 ) -> dict:
-    """Measure loadavg1 and aggregate CPU busy fraction over `window` seconds."""
+    """Measure loadavg1, aggregate CPU busy fractions, and top per-process CPU over `window`."""
     cpus_set = set(cpus)
     if not cpus_set:
         raise ValueError("CPU list must not be empty")
+    gen_cpus_set: Optional[Set[int]] = None
+    if gen_cpus is not None:
+        gen_cpus_set = set(gen_cpus)
+        if not gen_cpus_set:
+            raise ValueError("gen CPU list must not be empty")
     if window < 0:
         raise ValueError(f"window must be >= 0, got {window}")
+    if max_proc_cores < 0:
+        raise ValueError(f"max_proc_cores must be >= 0, got {max_proc_cores}")
+    effective_max_gen_busy = max_busy if max_gen_busy is None else max_gen_busy
+    if effective_max_gen_busy < 0:
+        raise ValueError(f"max_gen_busy must be >= 0, got {effective_max_gen_busy}")
 
     before = read_proc_stat(stat_path)
+    before_procs = read_proc_times(proc_root) if window > 0 else {}
+    t0 = monotonic_fn()
     if window > 0:
         sleep_fn(window)
+    t1 = monotonic_fn()
     after = read_proc_stat(stat_path)
+    after_procs = read_proc_times(proc_root) if window > 0 else {}
     loadavg1 = read_loadavg1(loadavg_path)
-    proxy_busy = busy_fraction_between(before, after, cpus_set)
-    contended = 1 if (loadavg1 > max_load or proxy_busy > max_busy) else 0
 
-    return {
+    proxy_busy = busy_fraction_between(before, after, cpus_set)
+    gen_busy: Optional[float] = (
+        busy_fraction_between(before, after, gen_cpus_set)
+        if gen_cpus_set is not None
+        else None
+    )
+    # No CPU-affinity filtering: an unpinned hog is the case that matters. A process pinned away
+    # from both sets can false-positive, and the operator can override.
+    top_cpu = (
+        top_processes_between(
+            before_procs,
+            after_procs,
+            t1 - t0,
+            clk_tck=clk_tck,
+            exclude_pids={os.getpid()},
+        )
+        if window > 0
+        else []
+    )
+    max_proc_cores_seen = top_cpu[0][2] if top_cpu else 0.0
+
+    reasons: List[str] = []
+    if loadavg1 > max_load:
+        reasons.append("loadavg")
+    if proxy_busy > max_busy:
+        reasons.append("proxy_busy")
+    if gen_busy is not None and gen_busy > effective_max_gen_busy:
+        reasons.append("gen_busy")
+    if max_proc_cores_seen > max_proc_cores:
+        reasons.append("proc")
+    contended = 1 if reasons else 0
+
+    record: dict = {
         "loadavg1": loadavg1,
         "proxy_cpus": format_cpuset(cpus_set),
         "proxy_busy": proxy_busy,
+        "top_cpu": top_cpu,
+        "max_proc_cores_seen": max_proc_cores_seen,
         "max_load": max_load,
         "max_busy": max_busy,
+        "max_proc_cores": max_proc_cores,
+        "contended_reasons": reasons,
         "contended": contended,
     }
+    if gen_cpus_set is not None and gen_busy is not None:
+        record["gen_cpus"] = format_cpuset(gen_cpus_set)
+        record["gen_busy"] = gen_busy
+        record["max_gen_busy"] = effective_max_gen_busy
+    return record
 
 
 def format_record(record: dict) -> str:
     """Format a measurement dict as key=value lines."""
+    top_str = ",".join(f"{pid}:{comm}:{cores:.2f}" for pid, comm, cores in record["top_cpu"])
     lines = [
         f"loadavg1={record['loadavg1']:.2f}",
         f"proxy_cpus={record['proxy_cpus']}",
         f"proxy_busy={record['proxy_busy']:.4f}",
+    ]
+    if "gen_cpus" in record:
+        lines.extend([
+            f"gen_cpus={record['gen_cpus']}",
+            f"gen_busy={record['gen_busy']:.4f}",
+            f"max_gen_busy={record['max_gen_busy']:g}",
+        ])
+    lines.extend([
+        f"top_cpu={top_str}",
+        f"max_proc_cores_seen={record['max_proc_cores_seen']:.2f}",
         f"max_load={record['max_load']:g}",
         f"max_busy={record['max_busy']:g}",
+        f"max_proc_cores={record['max_proc_cores']:g}",
+        f"contended_reasons={','.join(record['contended_reasons'])}",
         f"contended={record['contended']}",
-    ]
+    ])
     return "\n".join(lines) + "\n"
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Check host load average and per-CPU busy fraction before running the perf gate."
+        description="Check host load average, per-CPU busy fraction, and per-process CPU usage."
     )
     parser.add_argument("--cpus", required=True, help="CPU list to aggregate (e.g. 0-11)")
+    parser.add_argument("--gen-cpus", default=None, help="Optional generator CPU list (e.g. 12-23)")
     parser.add_argument("--max-load", required=True, type=float, help="Max 1-min loadavg")
     parser.add_argument("--max-busy", required=True, type=float, help="Max busy fraction (0..1)")
+    parser.add_argument(
+        "--max-gen-busy",
+        type=float,
+        default=None,
+        help="Max generator busy fraction (0..1; defaults to --max-busy)",
+    )
+    parser.add_argument(
+        "--max-proc-cores",
+        type=float,
+        default=0.5,
+        help="Max single-process CPU cores (default 0.5)",
+    )
     parser.add_argument("--window", type=float, default=3.0, help="Sampling window in seconds")
     parser.add_argument("--out", default=None, help="Optional path to write key=value record")
     args = parser.parse_args(argv)
@@ -154,10 +310,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         cpus = parse_cpuset(args.cpus)
         if not cpus:
             raise ValueError("empty --cpus list")
+        gen_cpus: Optional[Set[int]] = None
+        if args.gen_cpus is not None:
+            gen_cpus = parse_cpuset(args.gen_cpus)
+            if not gen_cpus:
+                raise ValueError("empty --gen-cpus list")
         if args.window < 0:
             raise ValueError("--window must be >= 0")
         if args.max_load < 0 or args.max_busy < 0:
             raise ValueError("--max-load and --max-busy must be >= 0")
+        if args.max_gen_busy is not None and args.max_gen_busy < 0:
+            raise ValueError("--max-gen-busy must be >= 0")
+        if args.max_proc_cores < 0:
+            raise ValueError("--max-proc-cores must be >= 0")
     except ValueError as e:
         sys.stderr.write(f"host_load.py: {e}\n")
         return 64
@@ -168,6 +333,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_load=args.max_load,
             max_busy=args.max_busy,
             window=args.window,
+            gen_cpus=gen_cpus,
+            max_gen_busy=args.max_gen_busy,
+            max_proc_cores=args.max_proc_cores,
         )
     except (OSError, ValueError) as e:
         sys.stderr.write(f"host_load.py: {e}\n")

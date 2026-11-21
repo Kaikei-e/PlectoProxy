@@ -7,10 +7,17 @@
 version = 2
 # Yanked versions are treated as hard failures.
 yanked = "deny"
-# Deliberately empty: an advisory is cleared by FIXING or REPLACING the crate (as
-# rustls-pemfile → rustls-pki-types), not by silencing it here. Add an id only with a written
+# An advisory is cleared by FIXING or REPLACING the crate (as rustls-pemfile →
+# rustls-pki-types), not by silencing it here. Add an id only with a written
 # justification when an upstream fix is genuinely unavailable.
-ignore = []
+#
+# RUSTSEC-2026-0543 marks every chrono release unmaintained (informational: no patched
+# version, and no vulnerability of its own). Plecto does not depend on chrono. It enters
+# only through sigstore 0.15.0, whose chrono dependency is non-optional, and 0.15.0 is the
+# latest release (https://github.com/sigstore/sigstore-rs/issues/660). The host uses
+# sigstore's offline crypto verify only (`default-features = false`, `rustls-tls`). Remove
+# this exception when a sigstore release drops chrono, or when the host stops depending on it.
+ignore = ["RUSTSEC-2026-0543"]
 
 [bans]
 # Transitive duplicate versions are unavoidable in a tokio / hyper / wasmtime tree; surface them

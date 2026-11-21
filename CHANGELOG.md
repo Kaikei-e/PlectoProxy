@@ -30,6 +30,30 @@ All notable changes to Plecto are documented here. The format follows
   the same supply-chain bar Plecto's own filter loading enforces. Verify commands are in the
   release notes of each release.
 
+## [0.16.3] - 2026-11-21
+
+Patch release: `wasmtime` / `wasmtime-wasi` / `wasmtime-wasi-http` move to 50.0.3 to clear
+RUSTSEC-2026-0566 through RUSTSEC-2026-0587 (50.0.1 is affected; patched on the 50.0 line in
+50.0.2 and 50.0.3), plus performance-gate tooling and benchmark-methodology updates. No WIT
+contract, manifest schema, CLI, `plecto::access` field, or library API change from 0.16.2
+(`cargo semver-checks` reports no breaking change). **Filters built for earlier releases need no
+rebuild**: the contract stays at `plecto:filter@0.4.0`, the wasm-tools series stays at 0.261, and
+the reference-filter shelf (`docs/reference-filters.md`) is unchanged from 0.16.2.
+
+### Security
+
+- **`wasmtime` 50.0.3**: the workspace floor moves from 50.0.1 to 50.0.3 (`wasmtime-wasi` and
+  `wasmtime-wasi-http` in lockstep), covering RUSTSEC-2026-0566 through RUSTSEC-2026-0587.
+  `cargo deny` additionally ignores RUSTSEC-2026-0543 (chrono unmaintained, informational): chrono
+  enters only through `sigstore` 0.15.0, which has no release without it.
+
+### Changed
+
+- **T1 performance gate and open-loop loadgen (`bench/`)**: open-loop latency is split into send
+  lag and wire time, the preflight catches single-process CPU hogs, and the gate's upper bands are
+  lowered after a clean-host holdout. Development tooling only; nothing ships in the binary.
+- **CI**: `docdag` is pinned to v0.6.0.
+
 ## [0.16.2] - 2026-11-14
 
 Patch release: four-pillar data-plane optimization across `plecto-host`, `plecto-control`, and
